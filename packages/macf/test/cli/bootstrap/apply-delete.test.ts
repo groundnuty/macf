@@ -14,7 +14,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { FleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
+import type { FleetLock, FleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import type { PlanItem } from '../../../src/cli/bootstrap/plan.js';
 import {
   planDeletionActions,
@@ -76,14 +76,49 @@ describe('planDeletionActions', () => {
     expect(action.reason).toContain('no agent repos are declared');
   });
 
-  it('a "secret_fingerprint" delete item is ALWAYS skipped this increment — no repo is recoverable for an orphaned role', () => {
+  // groundnuty/macf#1296 DECISIVE PAIR — (1) alone (assert the repo is
+  // NAMED in the reason) would be satisfied by an implementation that ALSO
+  // flipped `executable` to `true` against an invented variable name; (2)
+  // is what proves this module still refuses to guess a target even once
+  // the repo is known — the repo-known / repo-unknown halves must BOTH
+  // stay `executable: false`, only the wording differs.
+  it('DECISIVE (1/2): a "secret_fingerprint" item whose role IS in the lock names the repo it lived on — but STAYS non-executable (no registry-variable name to target)', () => {
+    const manifest = manifestWithAgentRepos(['groundnuty/demo-code']);
+    const item = secretFingerprintDeleteItem('dropped-agent', 'app_private_key');
+    const lock: FleetLock = {
+      schema_version: 1,
+      fleet: 'icsoc-2026',
+      agents: [{ role: 'dropped-agent', app_id: 'a', install_id: 'i', repo: 'groundnuty/icsoc-2026-dropped-agent' }],
+    };
+    const [action] = planDeletionActions(manifest, [item], lock);
+    expect(action?.executable).toBe(false);
+    if (action?.executable !== false) throw new Error('unreachable');
+    expect(action.reason).toContain('groundnuty/icsoc-2026-dropped-agent');
+    expect(action.item).toBe(item);
+  });
+
+  it('DECISIVE (2/2): a "secret_fingerprint" item whose role is NOT in the lock (or no lock given) stays unresolvable, no guessed repo', () => {
     const manifest = manifestWithAgentRepos(['groundnuty/demo-code']);
     const item = secretFingerprintDeleteItem();
+    // No `lock` argument at all — the pre-#1296 caller shape.
     const [action] = planDeletionActions(manifest, [item]);
     expect(action?.executable).toBe(false);
     if (action?.executable !== false) throw new Error('unreachable');
-    expect(action.reason).toContain('fleet.lock does not carry a role→repo mapping');
+    expect(action.reason).toContain('an older fleet.lock');
+    // No repo name fabricated — contrast with the DECISIVE (1/2) sibling
+    // above, which names this exact repo when the lock records it.
+    expect(action.reason).not.toContain('icsoc-2026-dropped-agent');
     expect(action.item).toBe(item);
+  });
+
+  it('a "secret_fingerprint" item whose role is in the lock but has NO recorded repo (an untouched pseudo-role, or a role touched before #1296) also stays unresolvable with the honest-unknown wording', () => {
+    const manifest = manifestWithAgentRepos(['groundnuty/demo-code']);
+    const item = secretFingerprintDeleteItem();
+    const lock: FleetLock = { schema_version: 1, fleet: 'icsoc-2026', agents: [{ role: 'dropped-agent', app_id: 'a', install_id: 'i' }] };
+    const [action] = planDeletionActions(manifest, [item], lock);
+    expect(action?.executable).toBe(false);
+    if (action?.executable !== false) throw new Error('unreachable');
+    expect(action.reason).toContain('an older fleet.lock');
   });
 
   it('empty input -> empty output', () => {

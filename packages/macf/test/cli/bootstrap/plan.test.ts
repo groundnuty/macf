@@ -758,8 +758,13 @@ function extraRoleObserved(role: string): Readonly<Record<string, ObservedAgentS
   return { [role]: { app: 'present', install: 'present', repo: 'present', fingerprints: { app_private_key: 'sha256:x' } } };
 }
 
-function lockWithRole(role: string): FleetLock {
-  return { schema_version: 1, fleet: 'icsoc-2026', agents: [{ role, app_id: 'a', install_id: 'i' }] };
+/**
+ * `repo` omitted by default — the pre-groundnuty/macf#1296 shape every
+ * existing test in this file (predating that issue) exercises unchanged.
+ * Callers that need the "lock records the repo" half pass it explicitly.
+ */
+function lockWithRole(role: string, repo?: string): FleetLock {
+  return { schema_version: 1, fleet: 'icsoc-2026', agents: [{ role, app_id: 'a', install_id: 'i', ...(repo !== undefined ? { repo } : {}) }] };
 }
 
 describe('computePlan — row 4 (DR-043 Amendment P3, groundnuty/macf#1229): negative diff for undeclared-but-locked resources', () => {
@@ -1011,23 +1016,32 @@ describe('orphanResourceUrl (groundnuty/macf#1281) — the pure URL a row-4 orph
     );
   });
 
-  it('repo orphan → ALWAYS "unknown", never a guessed link, regardless of owner type', () => {
+  it('repo orphan, NO lockedRepo given → "unknown", never a guessed link, regardless of owner type', () => {
     const userOwner: FleetManifest['owner'] = { account: 'groundnuty', type: 'user', registry: { type: 'profile', user: 'groundnuty' } };
     const orgOwner: FleetManifest['owner'] = { account: 'demo-org', type: 'org', registry: { type: 'org', org: 'demo-org' } };
     // groundnuty/macf#1281's own AC text asks for a real `https://github.com/
-    // <owner>/<repo>/settings` link here — but `FleetLockAgentSchema` (see
-    // fleet-manifest.ts) carries NO `repo` field for any role, so a row-4
-    // "extra role" (by definition, one absent from `manifest.agents[]`) has
-    // no repo full name anywhere this tool can read. `apply-delete.ts`'s own
-    // module doc hit this identical wall for the `'secret_fingerprint'`
-    // delete-verb case and refused to guess (a guessed repo name would risk
-    // sending the operator to delete the WRONG repository — strictly worse
-    // than the App case's "wrong link" hazard the issue itself warns about).
-    // This test — and `orphanResourceUrl`'s own doc — is the flagged
-    // divergence: implemented as honest-`'unknown'`, not a literal filled-in
-    // URL, because the data to fill it in does not exist in this codebase.
+    // <owner>/<repo>/settings` link here — and groundnuty/macf#1296 makes
+    // that possible ONCE `fleet.lock.agents[].repo` is recorded. This test
+    // pins the OTHER half: a lock written before #1296 (or a role whose
+    // update never carried a repo) has no `lockedRepo` to pass, and this
+    // function must still refuse to guess — never a filled-in URL built from
+    // `role`/`fleetName` alone (that WAS the #1281-era gap; see
+    // `orphanResourceUrl`'s own doc for why guessing stays unacceptable even
+    // now that a real value CAN exist).
     expect(orphanResourceUrl('repo', 'icsoc-2026', 'dropped-agent', userOwner)).toBe('unknown');
     expect(orphanResourceUrl('repo', 'icsoc-2026', 'dropped-agent', orgOwner)).toBe('unknown');
+  });
+
+  // groundnuty/macf#1296 — the "records" half: once `fleet.lock` carries
+  // `repo`, the orphan URL resolves to a real, class-correct settings page —
+  // built from the recorded value VERBATIM, never re-derived from role/owner
+  // (a `deriveAppHandle`-style re-derivation would be exactly the guess this
+  // function's own doc forbids).
+  it('repo orphan, lockedRepo given → a real settings URL, verbatim from the recorded value', () => {
+    const owner: FleetManifest['owner'] = { account: 'groundnuty', type: 'user', registry: { type: 'profile', user: 'groundnuty' } };
+    expect(orphanResourceUrl('repo', 'icsoc-2026', 'dropped-agent', owner, 'groundnuty/icsoc-2026-dropped-agent')).toBe(
+      'https://github.com/groundnuty/icsoc-2026-dropped-agent/settings',
+    );
   });
 });
 
@@ -1070,6 +1084,45 @@ describe('orphan rows say "not deleted" + carry a link, on BOTH the plan and app
     expect(appItem?.reason).toContain('https://github.com/settings/apps/icsoc-2026-dropped-agent/advanced');
     expect(repoItem?.reason).toContain('unknown');
     // Never a guessed repo-settings link — a wrong link is worse than none.
+    expect(repoItem?.reason).not.toMatch(/https:\/\/github\.com\/\S+\/settings/);
+  });
+
+  // groundnuty/macf#1296 — the decisive pair the issue's own "Tests" section
+  // asks for, on the row-4 repo-orphan RENDERED reason specifically. (1)
+  // alone (assert a real URL when the lock records the repo) would be
+  // satisfied by an implementation that ALWAYS fabricates a URL from
+  // role/fleetName — (2) is what proves it's reading the recorded value,
+  // not guessing: a lock predating the field must still refuse.
+  it('DECISIVE (1/2): a lock that RECORDS the repo → the orphan row carries the real settings URL', () => {
+    const manifest = baseManifest();
+    const observed: ObservedState = {
+      lock: lockWithRole('dropped-agent', 'groundnuty/icsoc-2026-dropped-agent'),
+      agents: extraRoleObserved('dropped-agent'),
+      caRegistry: 'unknown',
+      caRepos: {},
+      controlRepoPresence: 'absent',
+    };
+    const plan = computePlan(manifest, observed);
+    const repoItem = plan.items.find((i) => i.kind === 'repo' && i.verb === 'orphan');
+    expect(repoItem?.reason).toContain('https://github.com/groundnuty/icsoc-2026-dropped-agent/settings');
+    expect(repoItem?.reason).not.toContain('unknown');
+    // Same assertion on the rendered plan TEXT, not just the raw item — the
+    // operator-facing surface, per `formatPlanText`.
+    expect(formatPlanText(plan)).toContain('https://github.com/groundnuty/icsoc-2026-dropped-agent/settings');
+  });
+
+  it('DECISIVE (2/2): a lock that PREDATES the field (no repo key at all) → the orphan row stays "unknown", no fabricated link', () => {
+    const manifest = baseManifest();
+    const observed: ObservedState = {
+      lock: lockWithRole('dropped-agent'), // no repo — the pre-#1296 shape
+      agents: extraRoleObserved('dropped-agent'),
+      caRegistry: 'unknown',
+      caRepos: {},
+      controlRepoPresence: 'absent',
+    };
+    const plan = computePlan(manifest, observed);
+    const repoItem = plan.items.find((i) => i.kind === 'repo' && i.verb === 'orphan');
+    expect(repoItem?.reason).toContain('unknown');
     expect(repoItem?.reason).not.toMatch(/https:\/\/github\.com\/\S+\/settings/);
   });
 

@@ -3360,7 +3360,12 @@ export async function runBootstrapApply(
     // which is only guaranteed if they read the same array, not two
     // separately-derived ones.
     const deleteItems = plan.items.filter((i) => i.verb === 'delete');
-    const deletionActions = planDeletionActions(manifest, deleteItems);
+    // groundnuty/macf#1296 — `observed.lock` (already read above, before
+    // `applyFleet` is ever called — the #1000 golden path) lets a
+    // `secret_fingerprint` delete item name the repo it lived on, when the
+    // lock records it; `planDeletionActions` degrades to the pre-#1296
+    // wording when it doesn't.
+    const deletionActions = planDeletionActions(manifest, deleteItems, observed.lock);
     try {
       const approved = opts.yes === true ? true : await mutate.confirmPlan(plan, finalCreations, deletionActions);
       if (!approved) {

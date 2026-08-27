@@ -507,7 +507,16 @@ describe('applyFleet', () => {
     // ordering/fingerprints for the code-agent, not an incidental census
     // of every identity a real `apply` run also provisions.
     const codeAgentEntry = lock.agents.find((a) => a.role === 'code-agent');
-    expect(codeAgentEntry).toEqual({ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1', fingerprints: expect.any(Object) });
+    // groundnuty/macf#1296 — `repo` is now recorded on every `created` role
+    // too (`agent.repo`, this run's manifest-declared value), same as the
+    // reused/resumed-install path exercised elsewhere in this file.
+    expect(codeAgentEntry).toEqual({
+      role: 'code-agent',
+      app_id: 'app-code-agent',
+      install_id: 'install-1',
+      repo: 'groundnuty/demo-code',
+      fingerprints: expect.any(Object),
+    });
     expect(Object.keys(codeAgentEntry?.fingerprints ?? {}).sort()).toEqual(['app_private_key', 'client_secret', 'webhook_secret']);
   });
 
@@ -682,8 +691,25 @@ describe('applyFleet', () => {
     expect(result.vault.status).toBe('skipped'); // nothing NEW to persist
     expect(result.ca.resolve.status).toBe('reused');
     const lock = parseFleetLock(readFileSync(result.lockPath, 'utf-8'));
-    expect(lock.agents.find((a) => a.role === 'code-agent')).toEqual({ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' });
-    expect(lock.agents.find((a) => a.role === 'science-agent')).toEqual({ role: 'science-agent', app_id: 'app-science-agent', install_id: 'install-2-resumed' });
+    // groundnuty/macf#1296 STEADY-STATE fixture: NOTHING is minted this run
+    // (both roles reused/resumed-install, `vault.status === 'skipped'`) —
+    // this is exactly the "a fleet that mints nothing" shape macf#1269's own
+    // lesson warns a lock write can be silently gated on. `repo` is recorded
+    // here regardless, because `writeIncrementalLock` fires unconditionally
+    // on the reused/resumed-install branch (apply-fleet.ts), never gated on
+    // `shouldWriteBatchedFleetLock`'s "something new" predicate.
+    expect(lock.agents.find((a) => a.role === 'code-agent')).toEqual({
+      role: 'code-agent',
+      app_id: 'app-code-agent',
+      install_id: 'install-1',
+      repo: 'groundnuty/demo-code',
+    });
+    expect(lock.agents.find((a) => a.role === 'science-agent')).toEqual({
+      role: 'science-agent',
+      app_id: 'app-science-agent',
+      install_id: 'install-2-resumed',
+      repo: 'groundnuty/demo-science',
+    });
   });
 
   // --- DR-043 §D6 write-back anti-regression (macf#907) ----------------------
@@ -5478,8 +5504,12 @@ agents:
         // groundnuty/macf#1128 — `REUSE_PRIOR_LOCK` now carries a 'router'
         // entry too (see that constant's doc); it survives untouched
         // alongside 'code-agent', same "no NEW secret was minted" claim.
+        // groundnuty/macf#1296 — 'code-agent' now also carries `repo`
+        // (written on every reuse-touch, per `writeIncrementalLock`'s
+        // steady-state path); 'router' has none — a fleet-level pseudo-role
+        // update never passes `repo` (it has no per-manifest-agent repo).
         expect(lockAfter.agents).toEqual([
-          { role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' },
+          { role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1', repo: 'groundnuty/demo-code' },
           { role: 'router', app_id: 'app-code-agent', install_id: 'install-1' },
         ]);
         expect(lockAfter.fingerprints?.['ca_key']).toBeUndefined();
