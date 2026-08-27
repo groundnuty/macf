@@ -29,7 +29,11 @@ A spec-shaped report cannot surface any of them, because in every case the spec 
 
 > **Never make `status` record what it saw.** A read that writes turns every invocation into a mutation, dirties the control repo, and converts an observation into an event.
 
-That choice buys a property Kubernetes does not have — **freshness by construction; there is no staleness class at all** — and costs the thing that makes `lastTransitionTime` possible: **history**. A reader that only ever looks at *now* cannot report when a condition changed.
+That choice buys a property Kubernetes does not have — **freshness by construction** for every fact read live — and costs the thing that makes `lastTransitionTime` possible: **history**. A reader that only ever looks at *now* cannot report when a condition changed.
+
+**The freshness guarantee is a property of DERIVED facts only, and does not extend to Decision 2's tier 2.** A recorded fact is exactly as fresh as the `apply` that wrote it — and `#1269` proved that write can be silently skipped, because a run that mints nothing took a path that never reached the lock write at all. **Tier 2's reliability lives in `apply`, not in `status`**, and a status that presents a recorded value as current inherits a failure it cannot see.
+
+> **Every tier-2 fact carries WHEN it was recorded, and status may not present its value without it.** *"Recorded four days ago on a fleet applied twice since"* is a different fact from both *"unknown"* and the bare value — and it is the only one of the three that is both honest and useful.
 
 ## Decision 2 — where history comes from, in strict preference order
 
