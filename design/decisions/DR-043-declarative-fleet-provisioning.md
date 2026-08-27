@@ -855,6 +855,30 @@ Today's isolation rests on **a single condition** — no agent holds a recipient
 
 ---
 
+### N8 — the scope store holds scope-level APP CREDENTIALS, not only the master key (2026-08-27, #1161)
+
+**N1–N7 treated the scope's shared secret as one thing: the operator master key.** `#1161` proved that wrong on a live fleet.
+
+`macf-fresh` provisions cleanly and **cannot route.** The shared routing App (Amendment O2) is reusable by every fleet in the scope — but **its private key was emitted once, into fleet 1's vault**, and GitHub has no API to re-read it. Fleet 2 possesses the identity and not the credential.
+
+> **Sharing an identity is not sharing a credential.** Reuse is a possession check, not a lookup (`#1086`) — and a shared App's key needs a home at the level of the thing that shares it.
+
+**By the two-level model, that level is the SCOPE.** A credential belongs at the level of the system that issues it: GitHub issues the App, the App is shared across the scope's fleets, so its key is **scope-level state** and a *fleet* vault is the category error. There is no correct place for it today, which is the first concrete cost of Amendment O being correct and inert.
+
+**So the scope store (`#1084`) must hold, at minimum:**
+
+| | why |
+|---|---|
+| the operator **master key** | N2 — machine-independent recovery |
+| **shared App private keys** — the router first, `runner-ops` if it is ever shared | issued once, unrecoverable, reused by every fleet in the scope |
+| **Tailscale OAuth** | operator-supplied, un-mintable, one tailnet per scope (Amendment C's pattern) |
+
+**N1's rule binds here unchanged:** the store must not be readable by the ciphertexts' readers. A scope store that every fleet's agents can read re-creates exactly the concentration N1 forbids — **it is a scope-level vault, not a scope-level variable.**
+
+**Interim, and labelled as one.** Until the store exists, a scope-level key is copied between fleet vaults under operator-authorised decrypt, with a marker recording the **origin fleet** and surfaced by `plan` on every run (`#1167`). That is a stated exception to N1's spirit — the key rests in two places that should each hold only their own — and it is tolerable *only* while it announces itself. **A silent copy is the failure; a loud one is a deferral.**
+
+**Non-secret scope state does NOT belong here** (`#1219`): an org Actions **variable** already is the scope's shared surface for anything unencrypted, and putting a tailnet address behind operator-only decryption buys nothing while costing every fleet's ability to read it. **The store is for what must stay sealed, not for everything that is shared.**
+
 ## Amendment O (2026-08-21, #1089 + #1082 + #1083 + #1088) — the scope model: what is shared, and the three conditions
 
 A **scope** is an owner (an org or a user account) that may host many fleets. Within a scope, some resources are shared; **nothing is shared across scopes**, which is what makes handover a transfer rather than an unpicking.
