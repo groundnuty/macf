@@ -21,8 +21,8 @@ import { dirname, join } from 'node:path';
 import { toVariableSegment, AgentInfoSchema } from '@groundnuty/macf-core';
 import type { AgentInfo, RegistryConfig } from '@groundnuty/macf-core';
 import type { FleetLock, FleetManifest } from './fleet-manifest.js';
-import { deriveAppHandle, deriveControlRepoName, ROUTER_EMITTED_LABELS } from './fleet-manifest.js';
-import type { FleetObserverFn, ObservedAgentState, ObservedState, Presence } from './plan.js';
+import { deriveAppHandle, deriveControlRepoName, parseFleetLock, ROUTER_EMITTED_LABELS } from './fleet-manifest.js';
+import type { FleetObserverFn, FleetLockSource, ObservedAgentState, ObservedState, Presence } from './plan.js';
 import { readFleetLockFile } from './fleet-lock.js';
 import { registryPathPrefix } from '../registry-helper.js';
 import type {
@@ -58,6 +58,69 @@ const execFileAsync = promisify(execFile);
  */
 export function readFleetLock(manifestPath: string): FleetLock | null {
   return readFleetLockFile(join(dirname(manifestPath), 'fleet.lock'));
+}
+
+/**
+ * Best-effort live read of a control repo's committed `fleet.lock` content
+ * — groundnuty/macf#1309. Same `gh api repos/<repo>/contents/<path> --jq
+ * .content` + {@link decodeGhContent} shape {@link readCallerActionsPin}
+ * below already uses for a different file in the same repo family. Kept as
+ * an INDEPENDENT function rather than importing
+ * `control-repo.ts::realReadControlFleetLockFile` (which does the
+ * analogous read for `fleet-teardown-destructive.ts`) to avoid a module
+ * cycle: `control-repo.ts` already imports {@link getStderr} FROM this
+ * file, so importing back would cycle — same documented convention this
+ * file's `fleetLevelPseudoRoles` inlining below already follows. Returns
+ * `undefined` on ANY failure (missing file, private-repo-without-content-
+ * scope, network, `gh` absent) — NEVER throws, same posture as every other
+ * best-effort read in this module.
+ */
+async function readControlRepoFleetLockContent(repo: string): Promise<string | undefined> {
+  try {
+    const { stdout } = await execFileAsync('gh', ['api', `repos/${repo}/contents/fleet.lock`, '--jq', '.content'], { encoding: 'utf-8' });
+    return decodeGhContent(stdout);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Resolves the `fleet.lock` a `plan` (or `apply`-preview) run observes —
+ * groundnuty/macf#1309, closing the gap disclosed by #1270/#1271/#1292: a
+ * `githubRegistryObserver` call whose `manifestPath` is NOT co-located with
+ * any local `fleet.lock` (e.g. a manifest COPY used to preview an edit
+ * without touching the real checkout — precisely the shape that made row
+ * 4's `extraRoles` loop unreachable on a real `plan` run even after #1292)
+ * silently read `lock: null`, indistinguishable from "never provisioned."
+ *
+ * Local file FIRST (unchanged from pre-#1309 — {@link readFleetLock} is
+ * synchronous, no `gh` call, the common case for a `plan` run inside an
+ * actual control-repo checkout). Falls back to ONE live
+ * {@link readControlRepoFleetLockContent} read against the DERIVED control
+ * repo (`<owner>/<fleet>-control`, same derivation `controlRepoFullNameHere`
+ * below already uses) ONLY when the local file is absent/unreadable — so a
+ * fleet whose local checkout already carries a valid lock costs ZERO
+ * additional `gh` calls (asserted by `observer-row4-observation.test.ts`'s
+ * call-count test). Bounded to exactly that one derived repo — never an
+ * enumeration of the owner's other repos or Apps.
+ *
+ * A parse failure on the live-read content degrades to `null`/`'unreadable'`
+ * — same honest-unknown floor {@link readFleetLockFile} already applies to
+ * a malformed local file — never a guessed/partial lock.
+ */
+async function resolveObservedFleetLock(manifest: FleetManifest, manifestPath: string): Promise<{ readonly lock: FleetLock | null; readonly source: FleetLockSource }> {
+  const local = readFleetLock(manifestPath);
+  if (local !== null) return { lock: local, source: 'local' };
+
+  const controlRepoFullName = `${manifest.owner.account}/${deriveControlRepoName(manifest.metadata.name)}`;
+  const content = await readControlRepoFleetLockContent(controlRepoFullName);
+  if (content === undefined) return { lock: null, source: 'unreadable' };
+
+  try {
+    return { lock: parseFleetLock(content), source: 'control-repo' };
+  } catch {
+    return { lock: null, source: 'unreadable' };
+  }
 }
 
 /**
@@ -1200,14 +1263,15 @@ export async function readCallerActionsPin(repo: string): Promise<string | undef
  * still has no mTLS route to `/health.version`, so it never reads live.
  * `macf fleet upgrade -f <fleet.yaml>`'s confirmed-verify-green write-back
  * (macf#907, `fleet-lock-recorder.ts`) is what populates `deployed_version`
- * in the FIRST place; `readFleetLock` here then reads it back from THIS
- * manifest's own local directory, which reflects the control repo's latest
- * commit only once that checkout is pulled — see
- * `ObservedAgentState.deployedVersion`'s doc for the full "why `undefined`
- * happens" account. `actionsPin`, by contrast, genuinely IS a live read —
- * {@link readCallerActionsPin} against `agent.repo` — same "per-repo, not
- * fleet-representative" posture the CA reads above already use, for the
- * same #806-class reason.
+ * in the FIRST place; {@link resolveObservedFleetLock} then reads it back —
+ * see that function's own doc for the local-file-first / live-control-repo-
+ * fallback shape (groundnuty/macf#1309; superseded the pre-#1309 posture of
+ * "reflects the control repo's latest commit only once that checkout is
+ * pulled") — see `ObservedAgentState.deployedVersion`'s doc for the full
+ * "why `undefined` happens" account. `actionsPin`, by contrast, genuinely IS
+ * a live read — {@link readCallerActionsPin} against `agent.repo` — same
+ * "per-repo, not fleet-representative" posture the CA reads above already
+ * use, for the same #806-class reason.
  *
  * `agents` also carries an entry for every `fleet.lock`-recorded role that
  * is NOT in `manifest.agents` (groundnuty/macf#1271, disclosed by #1270's
@@ -1215,16 +1279,26 @@ export async function readCallerActionsPin(repo: string): Promise<string | undef
  * emit a real orphan/delete verb. Bounded strictly to `lock.agents` (never
  * an unbounded scan of the owner's Apps/repos); `app`/`install`/
  * `fingerprints` are lock-sourced exactly like a declared agent's (no
- * additional `gh api` call — `lock` is already an in-memory local-file
- * read by the time this loop runs), and `repo` stays `'unknown'` forever
- * (`FleetLockAgentSchema` records no repo name for ANY role, so there is
- * nothing to check). `routingTrustedActors` is READ regardless of whether
- * `manifest.routing?.runner` is declared (previously gated on it) — the
- * row-4 trigger case (`routing.runner` DROPPED) is precisely when a stale
- * value matters; see `routingTrustedActors`'s own inline comment below.
+ * additional `gh api` call beyond {@link resolveObservedFleetLock}'s own
+ * at-most-one — `lock` is already fully resolved, in memory, by the time
+ * this loop runs), and `repo` stays `'unknown'` forever (`FleetLockAgentSchema`
+ * records no repo name for ANY role, so there is nothing to check).
+ * `routingTrustedActors` is READ regardless of whether `manifest.routing?.runner`
+ * is declared (previously gated on it) — the row-4 trigger case
+ * (`routing.runner` DROPPED) is precisely when a stale value matters; see
+ * `routingTrustedActors`'s own inline comment below.
+ *
+ * **groundnuty/macf#1309 — `lock` was reachable in theory (#1292) but
+ * unreachable in practice on a real `plan` run**, because `manifestPath` is
+ * frequently a manifest COPY that is deliberately NOT co-located with any
+ * local `fleet.lock` (previewing an edit without touching the real
+ * checkout) — the exact shape that made row 4's `extraRoles` loop fire on
+ * every #1292 unit test yet never on the live `macf-trial` reproduction
+ * that motivated this issue. {@link resolveObservedFleetLock} closes that
+ * gap with a bounded, single-call live fallback; see its own doc.
  */
 export async function githubRegistryObserver(manifest: FleetManifest, manifestPath: string): Promise<ObservedState> {
-  const lock = readFleetLock(manifestPath);
+  const { lock, source: lockSource } = await resolveObservedFleetLock(manifest, manifestPath);
   const seg = toVariableSegment(manifest.metadata.name);
   const caVarName = `${seg}_CA_CERT`;
 
@@ -1416,6 +1490,7 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
 
   return {
     lock,
+    lockSource,
     agents,
     caRegistry,
     caRepos,

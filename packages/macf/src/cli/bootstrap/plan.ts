@@ -268,8 +268,43 @@ export interface ObservedAgentState {
  * the registry + other repos have it — so both legs are carried separately
  * (macf#839 review [BLOCKING] 3).
  */
+/**
+ * groundnuty/macf#1309 — where {@link ObservedState.lock} actually came
+ * from, or why it's `null`. `lock === null` alone is ambiguous between
+ * "this fleet was never provisioned" and "we couldn't read the lock" —
+ * Amendment A's honest-unknown floor requires telling those apart, the same
+ * way `app-identity-removal.ts::LockReadability` already does for teardown.
+ *
+ * `'local'` — the manifest-co-located `fleet.lock` file existed and parsed.
+ * The pre-#1309 sole source, and still the common, no-extra-`gh`-call path.
+ *
+ * `'control-repo'` — the local file was absent/unreadable, and a SINGLE
+ * live `gh api .../contents/fleet.lock` read against the DERIVED control
+ * repo (`<owner>/<fleet>-control`) succeeded instead. Added because `plan`
+ * is frequently run against a manifest COPY that is deliberately NOT
+ * co-located with any local `fleet.lock` (e.g. previewing a manifest edit
+ * without touching the real checkout) — before #1309 that shape silently
+ * read as `lock: null`, which made an ALREADY-provisioned role invisible to
+ * row 4's `extraRoles` loop even though `fleet.lock` genuinely records it.
+ *
+ * `'unreadable'` — neither source produced a lock: never provisioned yet,
+ * OR both reads failed/degraded (missing local file AND a live read that
+ * 404'd, was permission-denied, or hit a network/`gh` failure). `lock`
+ * stays `null` in this case too — `lockSource` is what lets a caller tell
+ * "genuinely fresh fleet" apart from "the observation itself was
+ * inconclusive," which `null` alone cannot.
+ */
+export type FleetLockSource = 'local' | 'control-repo' | 'unreadable';
+
 export interface ObservedState {
   readonly lock: FleetLock | null;
+  /**
+   * groundnuty/macf#1309 — provenance for {@link lock}, see
+   * {@link FleetLockSource}'s own doc. Optional so every pre-#1309
+   * hand-built `ObservedState` test fixture keeps compiling; `undefined`
+   * renders identically to `'unreadable'` (see `formatPlanText`'s callers).
+   */
+  readonly lockSource?: FleetLockSource;
   /** Keyed by the manifest's per-agent `role` field. */
   readonly agents: Readonly<Record<string, ObservedAgentState>>;
   /** Registry-scope `<SEG>_CA_CERT` presence. */
