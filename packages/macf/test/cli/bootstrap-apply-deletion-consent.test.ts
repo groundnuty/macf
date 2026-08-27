@@ -307,7 +307,10 @@ describe('formatDeletionResultLines / deletionOutcomeToJson', () => {
       { kind: 'secret_fingerprint', target: 'agent:x:secret_fingerprint:y', status: 'skipped', reason: 'repo unknown' },
     ];
     const lines = formatDeletionResultLines(results);
-    expect(lines[0]).toContain('groundnuty/macf#1272');
+    // macf#1061 — user-facing CLI output explains, never cites an internal
+    // issue/DR number.
+    expect(lines[0]).toContain('Deletions this run:');
+    expect(lines.join('\n')).not.toMatch(/groundnuty\/macf#\d+/);
     expect(lines.some((l) => l.includes('DELETED'))).toBe(true);
     expect(lines.some((l) => l.includes('already absent'))).toBe(true);
     expect(lines.some((l) => l.includes('repo unknown'))).toBe(true);

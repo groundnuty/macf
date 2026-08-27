@@ -1059,7 +1059,9 @@ export function formatApprovalBanner(plan: FleetPlan, creations: readonly Planne
  */
 export function formatDeletionResultLines(results: readonly DeletionOutcome[]): readonly string[] {
   if (results.length === 0) return [];
-  const lines: string[] = ['Deletions this run (DR-043 Amendment P3, groundnuty/macf#1272):'];
+  // macf#1061 — user-facing CLI output explains, never cites an internal
+  // issue/DR number (the module doc above carries that citation instead).
+  const lines: string[] = ['Deletions this run:'];
   for (const r of results) {
     const statusText =
       r.status === 'deleted'
