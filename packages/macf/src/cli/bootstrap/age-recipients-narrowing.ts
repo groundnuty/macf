@@ -168,13 +168,25 @@ export function ageRecipientsRecordAbsent(priorLock: FleetLock | null): boolean 
 /**
  * The advisory a caller emits when {@link ageRecipientsRecordAbsent} holds —
  * names the gap and what closes it, rather than passing silently.
+ *
+ * groundnuty/macf#1269 — the closing sentence used to claim "the next apply
+ * records the set," which was false for exactly the fleet shape this notice
+ * fires on: a fully-provisioned, steady-state fleet's `apply` mints nothing,
+ * so `settleVault` never reaches `status: 'written'`, and the batched
+ * `fleet.lock` write that records `age_recipients` never used to fire no
+ * matter how many times `apply` re-ran. `apply-fleet.ts::shouldWriteBatchedFleetLock`
+ * closes that gap (a CONFIRMED-current vault, not just a freshly-written
+ * one, now also satisfies the write) — this notice's text was updated in
+ * the SAME change to stop promising a fix that depended on it.
  */
 export function ageRecipientsRecordAbsentNotice(): string {
   return (
     'transport.age_recipients cannot be checked for narrowing: this fleet\'s lock records no ' +
     'recipient set, so there is nothing to compare against. Proceeding — but if this run REMOVES ' +
     'a recipient, that removal is neither detected nor recorded, and re-encryption would not ' +
-    'revoke access to vault copies already held. The next apply records the set and closes the gap.'
+    'revoke access to vault copies already held. Any apply that reconciles the vault against the ' +
+    'manifest\'s declared recipients — including a run that mints no new credentials — records the ' +
+    'set and closes the gap.'
   );
 }
 

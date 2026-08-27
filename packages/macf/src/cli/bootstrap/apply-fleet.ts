@@ -574,7 +574,24 @@ export interface AgentApplyRecord {
 }
 
 export type VaultApplyOutcome =
-  | { readonly status: 'skipped' }
+  | {
+      readonly status: 'skipped';
+      /**
+       * groundnuty/macf#1269 — TRUE only when `settleVault`'s "nothing new
+       * to mint" branch actually CONFIRMED (via `reconcileVaultRecipients`'s
+       * count-match `'noop'`) that the on-disk vault already reflects
+       * `transport.age_recipients` — never a forced re-encrypt performed
+       * just to produce this signal (see that function's own doc). `false`/
+       * `undefined` for the OTHER `'skipped'` sub-case — no vault exists at
+       * all yet (`reconcileVaultRecipients`'s `counted.status === 'absent'`
+       * `'noop'`) — where there is nothing to confirm against. Optional at
+       * the TYPE level only so every pre-#1269 hand-built `VaultApplyOutcome`
+       * fixture (this file's own abort-path literal, `apply-fleet.test.ts`)
+       * keeps compiling; every reader treats `undefined` the same as
+       * `false`.
+       */
+      readonly recipientsConfirmedCurrent?: boolean;
+    }
   | { readonly status: 'written'; readonly path: string; readonly versioned: boolean }
   | { readonly status: 'failed'; readonly reason: string };
 
@@ -2271,17 +2288,23 @@ export async function applyFleet(
   // "new fleet-level secret") this batched lock write must fire: a
   // recipient-set change with NOTHING ELSE new to mint takes
   // `settleVault`'s reencrypt-only branch (`reconcileVaultRecipients`,
-  // macf#957) — `vault.status === 'written'` there too, but pre-#1230 the
-  // guard below never even reached this call, so a fleet's OWN recipient
-  // change (the exact scenario the record exists to cover) left NOTHING
-  // recording who the vault was re-encrypted to. Compared against
-  // `currentLock` (this run's most-current known lock, reflecting any
-  // per-agent write already applied above in this same run), never the
-  // ORIGINAL `priorLock` param. Steady-state (recipients unchanged AND
-  // nothing else new) still writes nothing — `recipientsChanged` is
-  // `false` and every other term is `false` too, preserving #957's own
+  // macf#957). Compared against `currentLock` (this run's most-current known
+  // lock, reflecting any per-agent write already applied above in this same
+  // run), never the ORIGINAL `priorLock` param. Steady-state (recipients
+  // unchanged AND nothing else new) still writes nothing — `recipientsChanged`
+  // is `false` and every other term is `false` too, preserving #957's own
   // no-churn contract (`apply-fleet.test.ts` "unchanged recipient set: no
   // churn").
+  //
+  // groundnuty/macf#1269 — `recipientsChanged` alone used to be unreachable
+  // on a steady-state fleet: the guard below required `vault.status ===
+  // 'written'` UNCONDITIONALLY, but `settleVault`'s "nothing new to mint"
+  // branch only ever CONFIRMS a count-match (`'skipped'`), never writes —
+  // so a fully-provisioned fleet whose lock had never recorded
+  // `age_recipients` could never satisfy the guard, and the advisory
+  // `age-recipients-narrowing.ts::ageRecipientsRecordAbsentNotice` promising
+  // "the next apply records the set" was false. See
+  // `shouldWriteBatchedFleetLock`'s doc for the fix.
   const recipientsChanged = currentLock?.age_recipients === undefined || !sameAgeRecipientSet(currentLock.age_recipients, recipients);
   // groundnuty/macf#1230 — the SAME directed set-difference
   // `commands/bootstrap-apply.ts`'s preflight refuses on, computed against
@@ -2297,14 +2320,13 @@ export async function applyFleet(
   const removedByOverride = removedAgeRecipients(recipients, currentLock);
   const ageRecipientsRemovedByOverride =
     removedByOverride.length > 0 && overrideAcknowledged(manifest.transport.age_recipients_narrowing_override) ? removedByOverride : undefined;
-  if (
-    vault.status === 'written' &&
-    (Object.keys(pendingCreatedUpdates).length > 0 ||
-      caSecretsForVault !== undefined ||
-      routingClientSecretsForVault !== undefined ||
-      pendingRoutingAppVaultSecrets !== undefined ||
-      recipientsChanged)
-  ) {
+  // groundnuty/macf#1269 — the CA-key / routing-client / router-App-key
+  // fingerprint bag; also feeds `shouldWriteBatchedFleetLock`'s
+  // `hasNewFleetSecret` term below, so both places agree on the same
+  // "something fleet-level was freshly minted this run" fact rather than
+  // re-deriving it twice.
+  const hasNewFleetSecret = caSecretsForVault !== undefined || routingClientSecretsForVault !== undefined || pendingRoutingAppVaultSecrets !== undefined;
+  if (shouldWriteBatchedFleetLock(vault, Object.keys(pendingCreatedUpdates).length > 0, hasNewFleetSecret, recipientsChanged)) {
     // Batched, not per-role: `writeVault` just persisted EVERY `created`
     // agent's secret (+ the CA key, when freshly minted, + the routing-client
     // key, when freshly minted, + the router App's key, when freshly created
@@ -2315,15 +2337,14 @@ export async function applyFleet(
     // `fingerprints.routing_client_key`/`fingerprints.routing_app_key` are
     // ever written (never an incremental per-agent write), matching
     // `pendingCreatedUpdates`'s existing batched-only discipline.
-    const fleetSecrets =
-      caSecretsForVault !== undefined || routingClientSecretsForVault !== undefined || pendingRoutingAppVaultSecrets !== undefined
-        ? vaultFleetSecretsForFingerprint({
-            agents: [],
-            ...(caSecretsForVault !== undefined ? { ca: caSecretsForVault } : {}),
-            ...(routingClientSecretsForVault !== undefined ? { routingClient: routingClientSecretsForVault } : {}),
-            ...(pendingRoutingAppVaultSecrets !== undefined ? { routingApp: pendingRoutingAppVaultSecrets } : {}),
-          })
-        : undefined;
+    const fleetSecrets = hasNewFleetSecret
+      ? vaultFleetSecretsForFingerprint({
+          agents: [],
+          ...(caSecretsForVault !== undefined ? { ca: caSecretsForVault } : {}),
+          ...(routingClientSecretsForVault !== undefined ? { routingClient: routingClientSecretsForVault } : {}),
+          ...(pendingRoutingAppVaultSecrets !== undefined ? { routingApp: pendingRoutingAppVaultSecrets } : {}),
+        })
+      : undefined;
     const composed = composeFleetLock({
       fleet: manifest.metadata.name,
       previous: currentLock,
@@ -2831,7 +2852,19 @@ async function syncControlRepo(controlDir: string, deps: FleetApplyDeps): Promis
  * see {@link reconcileVaultRecipients}'s doc.
  */
 export type VaultRecipientReconcileOutcome =
-  | { readonly status: 'noop' }
+  | {
+      readonly status: 'noop';
+      /**
+       * groundnuty/macf#1269 — TRUE when this `'noop'` came from a genuine
+       * count-match against an EXISTING on-disk vault (nothing to
+       * re-encrypt, but the vault WAS read and DOES reflect the desired
+       * set); FALSE when it came from `counted.status === 'absent'` (no
+       * vault exists at all — there is nothing to have confirmed). Lets
+       * `settleVault`'s caller distinguish "confirmed current" from "nothing
+       * to confirm" without re-deriving the read this function already did.
+       */
+      readonly vaultExists: boolean;
+    }
   | { readonly status: 'reencrypted' }
   | { readonly status: 'refused'; readonly reason: string }
   | { readonly status: 'failed'; readonly reason: string };
@@ -2875,15 +2908,19 @@ async function reconcileVaultRecipients(
   if (counted.status === 'absent') {
     // Nothing provisioned yet this run left un-provisioned — no vault
     // exists to have drifted; the first successful write will use whatever
-    // is currently declared.
-    return { status: 'noop' };
+    // is currently declared. `vaultExists: false` — there is nothing this
+    // run confirmed against (groundnuty/macf#1269).
+    return { status: 'noop', vaultExists: false };
   }
   if (counted.count === desiredRecipients.length) {
     // Count-only match (age's header never reveals recipient IDENTITY
     // without decrypting per-key — see vault-read.ts's module doc) — this
     // IS the "no churn on every apply" steady state, not a claim the sets
-    // are cryptographically confirmed identical.
-    return { status: 'noop' };
+    // are cryptographically confirmed identical. `vaultExists: true` — a
+    // real vault WAS read and DOES already reflect the desired count
+    // (groundnuty/macf#1269 — this is what lets the caller record
+    // `age_recipients` without forcing a re-encrypt).
+    return { status: 'noop', vaultExists: true };
   }
 
   if (counted.count > desiredRecipients.length) {
@@ -2923,6 +2960,61 @@ async function reconcileVaultRecipients(
   }
   log(`Vault: re-encrypted to ${String(desiredRecipients.length)} recipient(s) at ${vaultOutPath}.`);
   return { status: 'reencrypted' };
+}
+
+/**
+ * groundnuty/macf#1269 — TRUE when THIS run's `settleVault` result proves
+ * the vault (if any) already reflects `transport.age_recipients` — either
+ * because `settleVault` just WROTE it (`status: 'written'` — a fresh mint OR
+ * a genuine reencrypt), or because its "nothing new to mint" branch
+ * CONFIRMED a count-match via `reconcileVaultRecipients` without ever
+ * re-encrypting (`status: 'skipped', recipientsConfirmedCurrent: true`).
+ * FALSE for a `'failed'` outcome (nothing was confirmed) and FALSE for the
+ * "no vault exists at all yet" skip (`recipientsConfirmedCurrent`
+ * absent/false) — see `VaultApplyOutcome`'s + `reconcileVaultRecipients`'s
+ * own docs for the two `'skipped'` sub-cases this discriminates between.
+ */
+function vaultReflectsDeclaredRecipients(vault: VaultApplyOutcome): boolean {
+  return vault.status === 'written' || (vault.status === 'skipped' && vault.recipientsConfirmedCurrent === true);
+}
+
+/**
+ * groundnuty/macf#1269 — the batched-`fleet.lock`-write predicate, extracted
+ * to a pure function so its logic is independently, decisively unit-testable
+ * (see `apply-fleet.test.ts`'s "groundnuty/macf#1269" tests) without needing
+ * to drive full `applyFleet` I/O to pin it — a full-I/O assertion cannot tell
+ * "correctly wrote nothing" apart from "incorrectly wrote, but the content
+ * happened to match" (`assert-the-wrong-path.md`).
+ *
+ * Fires whenever the vault reflects the declared recipients this run (see
+ * {@link vaultReflectsDeclaredRecipients}) AND at least one of: a NEW agent
+ * secret was minted this run (`hasNewAgentSecret`), a NEW fleet-level secret
+ * — CA / routing-client / router-App key — was minted this run
+ * (`hasNewFleetSecret`), or the lock's recorded `age_recipients` differs
+ * from the declared set (`recipientsChanged`, groundnuty/macf#1230).
+ *
+ * **Before #1269, the first (vault-reflects-recipients) term required
+ * `vault.status === 'written'` unconditionally.** A steady-state,
+ * fully-provisioned fleet's "nothing new to mint" branch only ever
+ * CONFIRMS a count-match (never re-encrypts, per `reconcileVaultRecipients`'s
+ * own no-churn contract, macf#957) — so `recipientsChanged` alone could
+ * never satisfy the old guard, and the record could never be created
+ * (`age-recipients-narrowing.ts::ageRecipientsRecordAbsentNotice`'s "the
+ * next apply records the set" promise was false for exactly this fleet
+ * shape). `vaultReflectsDeclaredRecipients` widens the accepted evidence to
+ * include that confirmed-current case — WITHOUT ever forcing a re-encrypt
+ * to reach it: the confirmation it accepts is the EXACT SAME evidence
+ * `reconcileVaultRecipients`'s `'noop'` path already establishes for its own
+ * no-churn purposes; this function reuses that evidence, never re-derives
+ * or strengthens it into an encrypt.
+ */
+export function shouldWriteBatchedFleetLock(
+  vault: VaultApplyOutcome,
+  hasNewAgentSecret: boolean,
+  hasNewFleetSecret: boolean,
+  recipientsChanged: boolean,
+): boolean {
+  return vaultReflectsDeclaredRecipients(vault) && (hasNewAgentSecret || hasNewFleetSecret || recipientsChanged);
 }
 
 /**
@@ -2972,7 +3064,12 @@ async function settleVault(
     );
     switch (recipientOutcome.status) {
       case 'noop':
-        return { status: 'skipped' };
+        // groundnuty/macf#1269 — carry `vaultExists` through as
+        // `recipientsConfirmedCurrent`: the caller's batched-lock-write
+        // guard (`shouldWriteBatchedFleetLock`) needs this to record
+        // `age_recipients` on a steady-state fleet, without this branch
+        // ever having re-encrypted anything.
+        return { status: 'skipped', recipientsConfirmedCurrent: recipientOutcome.vaultExists };
       case 'reencrypted':
         return { status: 'written', path: vaultOutPath, versioned: false };
       case 'refused':

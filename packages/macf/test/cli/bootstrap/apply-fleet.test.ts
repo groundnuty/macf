@@ -19,7 +19,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { applyFleet, type FleetApplyDeps } from '../../../src/cli/bootstrap/apply-fleet.js';
+import { applyFleet, shouldWriteBatchedFleetLock, type FleetApplyDeps, type VaultApplyOutcome } from '../../../src/cli/bootstrap/apply-fleet.js';
 import type { FleetAgent, FleetLock, FleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import { parseFleetLock, parseFleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import type { AgentApplyDeps } from '../../../src/cli/bootstrap/apply-agent.js';
@@ -5637,6 +5637,82 @@ agents:
 
       expect(result.agents[0]?.identity.status).toBe('created');
       expect(result.vault.status).toBe('written');
+    });
+
+    // --- groundnuty/macf#1269 — the recipient record can never be created
+    // on a steady-state fleet ---
+    //
+    // Every test ABOVE in this describe block that reaches settleVault's
+    // "nothing new to mint" branch (the ONLY branch reachable on a
+    // steady-state fleet) asserts `result.vault.status` and `reencryptCalled`
+    // — never whether `fleet.lock`'s `age_recipients` field actually got
+    // written. `REUSE_PRIOR_LOCK` (this block's shared prior-lock fixture)
+    // has never carried an `age_recipients` field, so EVERY test above has
+    // silently been running against the exact population #1269 reports:
+    // "the population under test excludes the failing case by construction"
+    // (assert-the-wrong-path.md trigger 3) — a steady-state run whose fixture
+    // mints nothing was exercised by every test here, but none of them
+    // looked at the one field that #1269 says can never get recorded.
+    describe('groundnuty/macf#1269 — the record must be creatable on a run that mints nothing', () => {
+      it('DECISIVE (1/2): a steady-state fleet — this run mints NOTHING, lock has no age_recipients recorded — still gets the record created', async () => {
+        const manifestPath = manifestPathIn();
+        const manifest = manifestWith([CODE_AGENT], ['age1operator', 'age1vm']); // 2 declared
+        let reencryptCalled = false;
+        const deps: FleetApplyDeps = {
+          ...baseDeps(agentDepsFor('code-agent', 'reused', 'app-code-agent', 'install-1'), manifestPath),
+          trustDeps: reuseTrustDeps(),
+          identityKeyPath: '/fake/operator-key.txt',
+          vaultRecipientDeps: {
+            readRecipientCount: () => ({ status: 'counted', count: 2 }), // vault EXISTS and already matches
+            reencrypt: async () => {
+              reencryptCalled = true;
+            },
+          },
+        };
+
+        const result = await applyFleet(manifest, manifestPath, REUSE_PRIOR_LOCK, deps);
+
+        // Same precondition the #957 "unchanged recipient set: no churn"
+        // test pins: nothing minted this run, nothing needed re-encrypting.
+        expect(result.vault.status).toBe('skipped');
+        expect(reencryptCalled).toBe(false);
+
+        // THE decisive assertion: `age_recipients` now exists in the
+        // written lock, despite `settleVault` never having reported
+        // `'written'` this run — the exact record #1269 says can never get
+        // created.
+        expect(existsSync(result.lockPath)).toBe(true);
+        const lock = parseFleetLock(readFileSync(result.lockPath, 'utf-8'));
+        expect(lock.age_recipients).toEqual(['age1operator', 'age1vm']);
+      });
+
+      // Per assert-the-wrong-path.md: (1) alone is satisfiable by a broken
+      // "fix" that just writes fleet.lock unconditionally every run,
+      // regardless of whether anything actually changed — the record would
+      // still get created, and (1) would still pass. Once the recorded set
+      // already matches the declared set, a CORRECT skip and an
+      // INCORRECT-but-content-identical rewrite produce byte-identical
+      // files, so this pair is asserted directly against the extracted
+      // `shouldWriteBatchedFleetLock` predicate (groundnuty/macf#957's
+      // no-churn contract, restated at the decision-point that actually
+      // implements it) rather than through a second `applyFleet` run.
+      it('DECISIVE (2/2): a steady-state fleet whose lock ALREADY records the same set — the batched-write predicate does NOT fire (groundnuty/macf#957 no-churn contract)', () => {
+        const confirmedCurrent: VaultApplyOutcome = { status: 'skipped', recipientsConfirmedCurrent: true };
+        // Nothing minted, recipients unchanged -> no write, no churn:
+        expect(shouldWriteBatchedFleetLock(confirmedCurrent, false, false, false)).toBe(false);
+        // Same vault evidence, but the lock's recorded set genuinely
+        // differs -> the write DOES fire (what test (1) exercises above
+        // through the full `applyFleet` pipeline):
+        expect(shouldWriteBatchedFleetLock(confirmedCurrent, false, false, true)).toBe(true);
+      });
+
+      it('a "nothing confirmed" skip (no vault exists yet) never fires the write on its own, even when recipientsChanged is true — there is nothing to have confirmed the record against', () => {
+        const noVaultYet: VaultApplyOutcome = { status: 'skipped' }; // recipientsConfirmedCurrent omitted
+        expect(shouldWriteBatchedFleetLock(noVaultYet, false, false, true)).toBe(false);
+
+        const failed: VaultApplyOutcome = { status: 'failed', reason: 'boom' };
+        expect(shouldWriteBatchedFleetLock(failed, false, false, true)).toBe(false);
+      });
     });
   });
 
