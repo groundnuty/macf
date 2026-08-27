@@ -108,7 +108,12 @@ The first is a fixture; the second is an entire test environment. **The exclusio
 
 For the vault fix the answer was *reused roles*, and it was. For the fleet e2e it was *a cold scope*, and it was.
 
-**The prospective form — when a prior repair has removed the failure, restore it before testing the fix.** The retrospective question (*what case did this population exclude?*) diagnoses; the prospective act makes the population able to fail again. Worked case: a label defect was hand-repaired mid-incident, so every later verification run would have printed "labels ok" for labels that were already there — proving nothing about the fix. Deleting one label first gave the run something only it could create, and turned "the fix merged" into "the fix works." A fixture that cannot exhibit the failure validates nothing, however green it runs.
+**The prospective form — make the population able to exhibit the failure: restore what a repair removed, or construct what the population never contained.** The retrospective question (*what case did this population exclude?*) diagnoses; the prospective act makes the population able to fail again. It covers all three known cases: **restore** the label a mid-incident hand-repair had put back, so a verification run had something only the fix could create; **construct** a mixed created+reused fixture where every fixture was all-created; **provision** a cold scope where every environment had been warm. A fixture that cannot exhibit the failure validates nothing, however green it runs.
+
+**Construct the population; never modify the mechanism.** A fixture is an *input* to the thing under test, so widening it is legitimate. The cap, the threshold, the predicate — those *are* the thing under test, and bending them to produce a pass is manufacturing the evidence. The pair, from one evening:
+
+- **Legitimate** — delete a label a prior hand-repair had restored, so a run has something only it can create.
+- **Illegitimate** — lower a sweep's cap from 5 so the issue under test appears in its own output.
 
 **And its cheap companion — mutation as habit:** break the fix, re-run, confirm a test notices. **A test that passes with the fix removed is testing something else.** One fix shipped merged-and-green while its emitting call site stayed broken, because its tests asserted the mechanism in general rather than at the site; its replacement was proven load-bearing by disabling it and watching the assertion fail. **The cost is a single deliberately-broken run.**
 
