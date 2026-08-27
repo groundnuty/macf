@@ -53,7 +53,13 @@
  *     untouched by this widening); naming which secret is missing on which
  *     repo is exactly what this issue asks the verdict to render, so a
  *     name-preserving sibling was added beside it rather than reshaping a
- *     function a different, unrelated call site depends on.
+ *     function a different, unrelated call site depends on. Widened again
+ *     by groundnuty/macf#1239: the aggregate "agent-router.yml requires all
+ *     six unconditionally" claim is only true for a fleet whose PINNED
+ *     router version predates the `TAILNET_NEEDED` carve-out
+ *     (macf-actions#75) — see {@link RoutingVerdictPinContext} +
+ *     {@link carveOutCapability} for the honest-unknown-when-undeterminable
+ *     resolution.
  *   - **runners** — {@link runnerVerdictComponent}, over
  *     `result.routing` (the `MACF_TRUSTED_ACTORS` per-repo outcome map).
  *     **Deliberately does NOT treat `'already-present'` as confirmed** — see
@@ -75,7 +81,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { RoutingSecretName, RoutingSecretsPublishResult } from './apply-routing-secrets.js';
-import { ALL_ROUTING_SECRET_NAMES, ROUTING_APP_ID_SECRET_NAME } from './apply-routing-secrets.js';
+import { ALL_ROUTING_SECRET_NAMES, ROUTING_APP_ID_SECRET_NAME, TS_OAUTH_CLIENT_ID_SECRET_NAME, TS_OAUTH_SECRET_SECRET_NAME } from './apply-routing-secrets.js';
 import type { EnsureVariableOutcome } from './ensure-variable.js';
 import type { RemainingDeployReport } from './remaining-deploy.js';
 
@@ -232,6 +238,8 @@ export interface RepoRoutingVerdict {
   readonly missing: readonly RoutingSecretName[];
   /** Secret names whose repo-level leg failed/skipped AND whose org-level visibility could not be determined this run — honest-unknown, never folded into `missing`. Empty unless `state === 'unknown'`. */
   readonly unknownOrgSecrets: readonly RoutingSecretName[];
+  /** TS_OAUTH_* names whose repo-level gap could not be resolved because the TAILNET_NEEDED carve-out's applicability itself could not be determined this run (groundnuty/macf#1239 — see {@link tailnetRequirement}). Honest-unknown, never folded into `missing`. Empty unless `state === 'unknown'` for this reason (a genuinely-missing non-Tailscale secret on the same repo still outranks this — see {@link widenRepoRoutingVerdict}). */
+  readonly unknownPinSecrets: readonly RoutingSecretName[];
 }
 
 /**
@@ -258,16 +266,54 @@ export interface RepoRoutingVerdict {
  * name be classified definitively as satisfied-or-missing) or fails as a
  * whole (`'unknown'`, so every unsatisfied name for that repo is honestly
  * unknown, never guessed).
+ *
+ * **`pinContext` (groundnuty/macf#1239) is applied FIRST, before any
+ * org-level widening.** When {@link tailnetRequirement} determines TS_OAUTH_*
+ * is `'not-required'` for this fleet, a repo-level TS_OAUTH_* gap is not a
+ * gap at all — it never even reaches the org-visibility widening below
+ * (which exists to explain AWAY a gap, not to be the only mechanism that
+ * can dismiss one). When `'unknown'`, the TS_OAUTH_* names move to
+ * {@link RepoRoutingVerdict.unknownPinSecrets} — a THIRD honest-unknown
+ * bucket alongside `unknownOrgSecrets`, so a repo genuinely missing a
+ * NON-Tailscale secret still outranks it (`missing.length > 0` is always
+ * checked first — a real gap is never softened to "unknown" just because it
+ * ALSO carries an unrelated indeterminate TS_OAUTH question, same
+ * weakest-confident-claim precedence `workspaceVerdictComponent` already
+ * uses). Defaults to {@link ROUTING_VERDICT_PIN_CONTEXT_UNSPECIFIED} — the
+ * byte-identical-when-omitted contract every additive optional parameter in
+ * this codebase carries.
  */
-export function widenRepoRoutingVerdict(secrets: RoutingSecretsPublishResult, repo: string, orgListing: OrgSecretsListResult | undefined): RepoRoutingVerdict {
-  const unsatisfied = unsatisfiedRoutingSecretNames(secrets, repo);
-  if (unsatisfied.length === 0) return { repo, state: 'confirmed', missing: [], unknownOrgSecrets: [] };
-  if (orgListing === undefined) return { repo, state: 'not-confirmed', missing: unsatisfied, unknownOrgSecrets: [] };
-  if (orgListing.status === 'unknown') return { repo, state: 'unknown', missing: [], unknownOrgSecrets: unsatisfied };
+export function widenRepoRoutingVerdict(
+  secrets: RoutingSecretsPublishResult,
+  repo: string,
+  orgListing: OrgSecretsListResult | undefined,
+  pinContext: RoutingVerdictPinContext = ROUTING_VERDICT_PIN_CONTEXT_UNSPECIFIED,
+): RepoRoutingVerdict {
+  const rawUnsatisfied = unsatisfiedRoutingSecretNames(secrets, repo);
+  if (rawUnsatisfied.length === 0) return { repo, state: 'confirmed', missing: [], unknownOrgSecrets: [], unknownPinSecrets: [] };
+
+  const requirement = tailnetRequirement(pinContext);
+  const unknownPinSecrets = requirement === 'unknown' ? rawUnsatisfied.filter((name) => TAILNET_SECRET_NAMES.includes(name)) : [];
+  const unsatisfied = rawUnsatisfied.filter((name) => {
+    if (unknownPinSecrets.includes(name)) return false; // honest-unknown, tracked separately
+    if (requirement === 'not-required' && TAILNET_SECRET_NAMES.includes(name)) return false; // provably not required
+    return true;
+  });
+
+  if (unsatisfied.length === 0) {
+    return unknownPinSecrets.length > 0
+      ? { repo, state: 'unknown', missing: [], unknownOrgSecrets: [], unknownPinSecrets }
+      : { repo, state: 'confirmed', missing: [], unknownOrgSecrets: [], unknownPinSecrets: [] };
+  }
+  if (orgListing === undefined) return { repo, state: 'not-confirmed', missing: unsatisfied, unknownOrgSecrets: [], unknownPinSecrets };
+  if (orgListing.status === 'unknown') return { repo, state: 'unknown', missing: [], unknownOrgSecrets: unsatisfied, unknownPinSecrets };
 
   const visible = new Set(orgListing.names);
   const missing = unsatisfied.filter((name) => !visible.has(name));
-  return { repo, state: missing.length > 0 ? 'not-confirmed' : 'confirmed', missing, unknownOrgSecrets: [] };
+  if (missing.length > 0) return { repo, state: 'not-confirmed', missing, unknownOrgSecrets: [], unknownPinSecrets };
+  return unknownPinSecrets.length > 0
+    ? { repo, state: 'unknown', missing: [], unknownOrgSecrets: [], unknownPinSecrets }
+    : { repo, state: 'confirmed', missing: [], unknownOrgSecrets: [], unknownPinSecrets: [] };
 }
 
 /**
@@ -296,6 +342,188 @@ export async function resolveOrgSecretVisibility(
     result[repo] = await deps.listOrgSecretsVisibleToRepo(repo);
   }
   return result;
+}
+
+// --- TAILNET_NEEDED carve-out (groundnuty/macf#1239) ---
+//
+// `macf-actions#75` (merged; ships as `MIN_TAILNET_CARVEOUT_ACTIONS_VERSION`
+// on release) adds a `TAILNET_NEEDED` carve-out to `agent-router.yml`'s
+// routing-secret resolve step: `TS_OAUTH_CLIENT_ID`/`TS_OAUTH_SECRET` become
+// NON-required for a fleet whose routing runner is self-hosted (the
+// Tailscale connect is skipped there — the pre-existing
+// `!contains(<runner labels>, 'self-hosted')` gate). The other four routing
+// secrets stay required UNCONDITIONALLY in every case — only the two
+// Tailscale secrets are ever conditional, and only for a self-hosted fleet.
+//
+// This module's own "agent-router.yml requires all six unconditionally"
+// claim (the aggregate message below, pre-#1239) becomes FALSE the moment a
+// self-hosted fleet's PINNED router version carries the carve-out. The
+// requirement set now follows the fleet's PINNED `versions.actions` value —
+// never the newest release — so a fleet on an older (or undeterminable) pin
+// keeps today's six-secret check.
+
+/** The two routing-secret names the `TAILNET_NEEDED` carve-out can ever relax — never any of the other four. */
+const TAILNET_SECRET_NAMES: readonly RoutingSecretName[] = [TS_OAUTH_CLIENT_ID_SECRET_NAME, TS_OAUTH_SECRET_SECRET_NAME];
+
+/**
+ * The lowest `macf-actions` router version whose routing-secret resolve
+ * step carries the `TAILNET_NEEDED` carve-out — verified against
+ * `groundnuty/macf-actions`'s own `CHANGELOG.md` `[Unreleased]` entry (not
+ * recalled): "becomes v3.5.0 on release". A DELIBERATELY separate constant
+ * from `fleet-manifest.ts`'s `MIN_SELF_HOSTED_CAPABLE_ACTIONS_VERSION` — a
+ * different capability, a different threshold, never conflate the two.
+ */
+export const MIN_TAILNET_CARVEOUT_ACTIONS_VERSION = 'v3.5.0';
+
+/**
+ * Parses `vMAJOR`, `vMAJOR.MINOR`, or `vMAJOR.MINOR.PATCH` into `[major,
+ * minor]` — mirrors `fleet-manifest.ts`'s own (private, unexported)
+ * `parseActionsMajorMinor` byte-for-byte. Duplicated rather than imported:
+ * this module's capability predicate ({@link carveOutCapability}) treats a
+ * bare `vMAJOR` ref DIFFERENTLY than
+ * `fleet-manifest.ts::isSelfHostedCapableActionsVersion` does — see that
+ * function's own doc for why the divergence is intentional, not an
+ * oversight a future de-dup should "fix".
+ */
+function parseActionsMajorMinor(version: string): readonly [number, number | null] | null {
+  const match = /^v(\d+)(?:\.(\d+))?(?:\.\d+)?$/.exec(version);
+  if (!match?.[1]) return null;
+  const minorStr = match[2];
+  return [Number(match[1]), minorStr !== undefined ? Number(minorStr) : null];
+}
+
+/**
+ * Whether a `versions.actions` pin (e.g. `v3.5.0`, `v3.4`, `v3`, `main`)
+ * provably `'carries'` the `TAILNET_NEEDED` carve-out, provably
+ * `'predates'` it, or is `'indeterminate'` — groundnuty/macf#1239's own
+ * "honest unknown" requirement: "if the pinned version cannot be
+ * determined, say unknown — never assume the newest".
+ *
+ * **Deliberately does NOT mirror
+ * `fleet-manifest.ts::isSelfHostedCapableActionsVersion`'s
+ * bare-`vMAJOR`-trusted-forward convention — a bare `vMAJOR` ref here is
+ * `'indeterminate'`, never trusted forward to `'carries'`.** That function
+ * trusts a bare `vMAJOR` ref (e.g. `v3`) forward because ITS "not capable"
+ * branch REFUSES the whole manifest — a false "no" there blocks a
+ * legitimate fleet outright, so a conservative "no" is expensive and
+ * trusting forward is the safer default. HERE the asymmetry is INVERTED: a
+ * false `'carries'` would silently mark a fleet that genuinely still needs
+ * all six secrets as CONFIRMED — precisely the silently-wrong-green-verdict
+ * class groundnuty/macf#1184 (and this issue) exist to close — while an
+ * honest `'indeterminate'` only costs one less-green line. `@v3` is a
+ * MOVING tag that resolves at workflow-run time to whatever `v3.x` is
+ * current; at the time this was written no released `macf-actions` tag
+ * carries the carve-out yet, so the bare STRING `"v3"` cannot decide the
+ * question either way — `major >= 3` would be wrong the instant it's
+ * written and stay wrong until `@v3` itself rolls forward past this
+ * threshold.
+ */
+export function carveOutCapability(version: string): 'carries' | 'predates' | 'indeterminate' {
+  if (version === 'main') return 'carries';
+  const parsed = parseActionsMajorMinor(version);
+  if (!parsed) return 'indeterminate';
+  const [major, minor] = parsed;
+  if (minor === null) return 'indeterminate';
+  // MIN_TAILNET_CARVEOUT_ACTIONS_VERSION is a fixed, fully-pinned
+  // vMAJOR.MINOR.PATCH literal above — its minor is always determinate.
+  const [minMajor, minMinor] = parseActionsMajorMinor(MIN_TAILNET_CARVEOUT_ACTIONS_VERSION)!;
+  return major > minMajor || (major === minMajor && minor >= minMinor!) ? 'carries' : 'predates';
+}
+
+/**
+ * Fleet-wide context {@link routingVerdictComponent} needs to resolve the
+ * `TAILNET_NEEDED` carve-out — both fields are single per-FLEET values,
+ * never per-repo: `routing.runner` is declared once for the whole fleet
+ * (`FleetRoutingSchema`), and `versions.actions` is likewise one
+ * manifest-wide pin (`FleetVersionsSchema`). `selfHostedRunner` MUST be read
+ * from `manifest.routing?.runner.runs_on === 'self-hosted'` — never derived
+ * from whether `FleetApplyResult.routing` happens to be non-empty, which
+ * conflates "declared self-hosted" with "had repos to write MACF_TRUSTED_ACTORS
+ * to this run" (a different fact; `apply-fleet.ts` leaves that map `{}` for
+ * reasons unrelated to this manifest field too).
+ *
+ * `actionsVersion: undefined` means "the manifest never declared
+ * `versions.actions` this run" — genuinely NOT the same as "no pin exists".
+ * The ACTUAL committed pin then follows
+ * `apply-repo-init.ts::resolveActionsPinReconcile`'s
+ * observed-pin-or-`DEFAULT_ACTIONS_VERSION` fallback, which this module has
+ * no visibility into — so it collapses into the SAME honest-unknown bucket
+ * as a determinate-but-unresolvable pin string, never into "assume six are
+ * required" or "assume the carve-out applies".
+ */
+export interface RoutingVerdictPinContext {
+  readonly actionsVersion: string | undefined;
+  readonly selfHostedRunner: boolean;
+}
+
+/**
+ * The default when a caller supplies no {@link RoutingVerdictPinContext} —
+ * `selfHostedRunner: false` means the carve-out question never even arises
+ * (mirrors `widenRepoRoutingVerdict`'s own `orgSecretVisibility = {}`
+ * default), so every pre-#1239 call site (including every pre-#1239 test)
+ * keeps rendering BYTE-IDENTICALLY: TS_OAUTH_* stays inside the
+ * unconditionally-required six. Also the semantically CORRECT fallback for
+ * a fleet that never declares `routing.runner.runs_on: self-hosted` at all
+ * — such a fleet routes on GitHub-hosted runners, which DO attempt the
+ * Tailscale connect, so six really are required (the `macf-fresh` case —
+ * "never declares self-hosted at all").
+ */
+export const ROUTING_VERDICT_PIN_CONTEXT_UNSPECIFIED: RoutingVerdictPinContext = {
+  actionsVersion: undefined,
+  selfHostedRunner: false,
+};
+
+/** `'required'` — six unconditionally (hosted-touching, OR self-hosted on a pin that predates the carve-out). `'not-required'` — TS_OAUTH_* relaxes (self-hosted on a carve-out-carrying pin). `'unknown'` — self-hosted, but the pin's carve-out status could not be determined this run. */
+type TailnetRequirement = 'required' | 'not-required' | 'unknown';
+
+/** groundnuty/macf#1239 — whether TS_OAUTH_* is required THIS run, fleet-wide (see {@link RoutingVerdictPinContext}'s doc for why this is never per-repo). */
+function tailnetRequirement(pinContext: RoutingVerdictPinContext): TailnetRequirement {
+  if (!pinContext.selfHostedRunner) return 'required';
+  if (pinContext.actionsVersion === undefined) return 'unknown';
+  const capability = carveOutCapability(pinContext.actionsVersion);
+  if (capability === 'carries') return 'not-required';
+  if (capability === 'predates') return 'required';
+  return 'unknown';
+}
+
+/**
+ * Human explanation of {@link tailnetRequirement}'s outcome — folded into
+ * `routingVerdictComponent`'s aggregate detail so the verdict STATES which
+ * requirement set applied and why, rather than silently changing its own
+ * rules underneath an unchanged sentence. Deliberately carries NO
+ * issue/PR reference in the returned STRING (this file's own
+ * "citation-guard" convention — comments may cite them, rendered output may
+ * not); `TAILNET_NEEDED` is the router workflow's own env-var name, not a
+ * citation.
+ */
+function tailnetRequirementDescription(pinContext: RoutingVerdictPinContext): string {
+  if (!pinContext.selfHostedRunner) {
+    return 'agent-router.yml requires all six routing secrets unconditionally (this fleet does not declare a self-hosted routing runner)';
+  }
+  if (pinContext.actionsVersion === undefined) {
+    return (
+      'this fleet declares a self-hosted routing runner, but this run declared no versions.actions pin to check against the ' +
+      'TAILNET_NEEDED carve-out — whether TS_OAUTH_* is required cannot be confirmed'
+    );
+  }
+  const capability = carveOutCapability(pinContext.actionsVersion);
+  if (capability === 'carries') {
+    return (
+      `this self-hosted fleet is pinned to macf-actions ${pinContext.actionsVersion}, which carries the TAILNET_NEEDED carve-out — ` +
+      'only four routing secrets are required (TS_OAUTH_* is skipped when the Tailscale connect is skipped)'
+    );
+  }
+  if (capability === 'predates') {
+    return (
+      `this self-hosted fleet is pinned to macf-actions ${pinContext.actionsVersion}, which predates the TAILNET_NEEDED carve-out ` +
+      `(needs at least ${MIN_TAILNET_CARVEOUT_ACTIONS_VERSION}) — agent-router.yml still requires all six routing secrets unconditionally`
+    );
+  }
+  return (
+    `this self-hosted fleet is pinned to macf-actions "${pinContext.actionsVersion}", a floating or unresolvable ref this run could not ` +
+    `check against the TAILNET_NEEDED carve-out threshold (${MIN_TAILNET_CARVEOUT_ACTIONS_VERSION}) — whether TS_OAUTH_* is required ` +
+    'cannot be confirmed'
+  );
 }
 
 /** Per-name detail text for one repo's still-missing secrets — names each secret alongside its underlying cause (the leg's own `reason`), so naming culprits (groundnuty/macf#1241) never drops the diagnostic value the old count-only render at least carried inside its deduped reason list. */
@@ -330,6 +558,7 @@ function formatMissingSecretNames(secrets: RoutingSecretsPublishResult, repo: st
 export function routingVerdictComponent(
   secrets: RoutingSecretsPublishResult,
   orgSecretVisibility: Readonly<Record<string, OrgSecretsListResult>> = {},
+  pinContext: RoutingVerdictPinContext = ROUTING_VERDICT_PIN_CONTEXT_UNSPECIFIED,
 ): FleetVerdictComponent {
   const repos = Object.keys(secrets[ROUTING_APP_ID_SECRET_NAME] ?? {});
   if (repos.length === 0) {
@@ -339,24 +568,32 @@ export function routingVerdictComponent(
     };
   }
 
-  const perRepo = repos.map((repo) => widenRepoRoutingVerdict(secrets, repo, orgSecretVisibility[repo]));
+  const perRepo = repos.map((repo) => widenRepoRoutingVerdict(secrets, repo, orgSecretVisibility[repo], pinContext));
   const stillMissing = perRepo.filter((r) => r.state === 'not-confirmed');
   const stillUnknown = perRepo.filter((r) => r.state === 'unknown');
   if (stillMissing.length === 0 && stillUnknown.length === 0) {
     return { name: 'routing', status: { state: 'confirmed', detail: '' } };
   }
 
+  // groundnuty/macf#1239 — the requirement set is fleet-wide (see
+  // RoutingVerdictPinContext's doc), so this is computed once and reused in
+  // whichever branch(es) below are non-empty; the verdict STATES which
+  // requirement set applied and why, rather than silently changing its own
+  // rules underneath an unchanged sentence.
+  const requirementNote = tailnetRequirementDescription(pinContext);
   const parts: string[] = [];
   if (stillMissing.length > 0) {
     const named = stillMissing.map((r) => `${r.repo}: ${formatMissingSecretNames(secrets, r.repo, r.missing)}`).join(' | ');
     parts.push(
       `${String(stillMissing.length)} of ${String(repos.length)} router-carrying repo(s) are missing at least one required routing secret ` +
-        `at both repo AND org-inherited level (agent-router.yml requires all six unconditionally) — ${named}`,
+        `at both repo AND org-inherited level (${requirementNote}) — ${named}`,
     );
   }
   if (stillUnknown.length > 0) {
-    const named = stillUnknown.map((r) => `${r.repo}: ${r.unknownOrgSecrets.join(', ')}`).join(' | ');
-    parts.push(`${String(stillUnknown.length)} repo(s) could not have org-inherited coverage confirmed this run for — ${named}`);
+    const named = stillUnknown
+      .map((r) => `${r.repo}: ${[...r.unknownOrgSecrets, ...r.unknownPinSecrets].join(', ')}`)
+      .join(' | ');
+    parts.push(`${String(stillUnknown.length)} repo(s) could not have their routing-secret requirement fully confirmed this run (${requirementNote}) — ${named}`);
   }
   return {
     name: 'routing',
