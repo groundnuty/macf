@@ -1,9 +1,8 @@
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import {
   readAgentConfig, agentCertPath, agentKeyPath,
-  caCertPath as caCertPathFor, caKeyPath as caKeyPathFor, caDir,
-  tokenSourceFromConfig,
+  tokenSourceFromConfig, ownerAccountFromRegistry, resolveExistingCaPaths,
 } from '../config.js';
 import { createCA, backupCAKey, recoverCAKey, loadCA, caCertFingerprint } from '@groundnuty/macf-core';
 import { generateAgentCert, generateClientCert } from '@groundnuty/macf-core';
@@ -130,11 +129,19 @@ export async function certsInit(projectDir: string): Promise<void> {
   const token = await generateToken(tokenSourceFromConfig(projectDir, config));
   const client = getVariablesClient(config, token);
 
-  // Per-project CA paths. mkdir with 0o700 — CA key is the most sensitive secret.
-  const projectCaDir = caDir(config.project);
-  mkdirSync(projectCaDir, { recursive: true, mode: 0o700 });
-  const caCertP = caCertPathFor(config.project);
-  const caKeyP = caKeyPathFor(config.project);
+  // macf#1277: resolve the EXISTING CA location first (owner-scoped
+  // conventional, falling back to the pre-#1277 project-scoped legacy
+  // location when only that one already has a CA) — a re-init over a
+  // pre-#1277 fleet's CA must keep operating on the SAME file it always
+  // has, not silently mint a second CA at the new owner-scoped path while
+  // orphaning the one already in live use. A genuinely fresh fleet (no CA
+  // at either tier) resolves to the new owner-scoped conventional path,
+  // which is where `createCA` below will materialize it.
+  const owner = ownerAccountFromRegistry(config.registry);
+  const { certPath: caCertP, keyPath: caKeyP } = resolveExistingCaPaths(owner, config.project);
+  // mkdir with 0o700 — CA key is the most sensitive secret. `dirname` of
+  // whichever tier was resolved, not necessarily the owner-scoped `caDir`.
+  mkdirSync(dirname(caCertP), { recursive: true, mode: 0o700 });
 
   // macf#800: a re-init over an EXISTING CA is the same out-of-band-orphan
   // hazard as `certs rotate` — the fresh CA re-signs the in-workspace agent
@@ -199,9 +206,13 @@ export async function certsRecover(projectDir: string): Promise<void> {
     return;
   }
 
-  // Per-project CA paths. mkdir with 0o700.
-  mkdirSync(caDir(config.project), { recursive: true, mode: 0o700 });
-  const caKeyP = caKeyPathFor(config.project);
+  // macf#1277: recover into whichever tier already holds the CA cert
+  // (owner-scoped conventional, or the pre-#1277 project-scoped legacy
+  // location) — recovering the KEY should pair with wherever the CERT
+  // already lives, not silently relocate it. mkdir with 0o700.
+  const owner = ownerAccountFromRegistry(config.registry);
+  const { keyPath: caKeyP } = resolveExistingCaPaths(owner, config.project);
+  mkdirSync(dirname(caKeyP), { recursive: true, mode: 0o700 });
 
   console.log('Recovering CA key from registry...');
 
@@ -227,8 +238,7 @@ export async function certsRotate(projectDir: string): Promise<void> {
     return;
   }
 
-  const caCertP = caCertPathFor(config.project);
-  const caKeyP = caKeyPathFor(config.project);
+  const { certPath: caCertP, keyPath: caKeyP } = resolveExistingCaPaths(ownerAccountFromRegistry(config.registry), config.project);
   if (!existsSync(caCertP) || !existsSync(caKeyP)) {
     console.error('CA cert or key not found. Run `macf certs init` or `macf certs recover` first.');
     process.exitCode = 1;
@@ -316,8 +326,7 @@ export async function issueRoutingClient(
     );
   }
 
-  const caCertP = caCertPathFor(config.project);
-  const caKeyP = caKeyPathFor(config.project);
+  const { certPath: caCertP, keyPath: caKeyP } = resolveExistingCaPaths(ownerAccountFromRegistry(config.registry), config.project);
   if (!existsSync(caCertP) || !existsSync(caKeyP)) {
     console.error(
       'CA cert or key not found on disk. This command requires a local CA key — ' +

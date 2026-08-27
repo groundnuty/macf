@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { homedir } from 'node:os';
+import type { RegistryConfig } from '@groundnuty/macf-core';
 import { RegistryConfigSchema } from '@groundnuty/macf-core';
 
 // --- Paths ---
@@ -27,20 +28,136 @@ function assertValidProject(project: string): void {
 }
 
 /**
- * Per-project CA directory. One subdirectory per project prevents
- * collisions when multiple MACF projects share a machine.
+ * Same charset guard as {@link assertValidProject}, applied to the
+ * `<owner>` path segment (macf#1277) — a GitHub login is a subset of this
+ * charset, so this is deliberately permissive rather than a strict
+ * GitHub-login validator; its job is filesystem-path safety, not identity
+ * validation.
  */
-export function caDir(project: string): string {
+function assertValidOwner(owner: string): void {
+  if (!isValidProjectName(owner)) {
+    throw new Error(
+      `Invalid owner name "${owner}": must match [a-zA-Z0-9_-]+`,
+    );
+  }
+}
+
+/**
+ * The GitHub-account namespace a registry lives in — `org`→org,
+ * `profile`→user, `repo`→owner. Moved here (from `commands/init.ts`,
+ * macf#1277) so every CA-path consumer (`certs.ts`, `init.ts`,
+ * `routing-doctor.ts`, plus the generated-launcher templates in
+ * `env-files.ts`/`claude-sh.ts`) derives the SAME owner string from the
+ * SAME registry config the SAME way, rather than each re-deriving its own
+ * copy. Mirrors `bootstrap/fleet-deploy.ts`'s `manifest.owner.account` —
+ * this is the standalone-`macf init`-path equivalent, derived from
+ * whichever registry variant was actually resolved for this run.
+ *
+ * `local` registry mode has no owner-account namespace at all (no App, no
+ * per-owner filesystem collision surface — DR-024's local CA lives next to
+ * the registry FILE, not under `~/.macf/certs/`) — callers must dispatch
+ * on `registry.type === 'local'` BEFORE reaching this helper, same as
+ * `tokenSourceFromConfig`'s own contract. The throw below fails loud if
+ * that invariant is ever broken, rather than silently returning a
+ * placeholder owner.
+ */
+export function ownerAccountFromRegistry(registry: RegistryConfig): string {
+  switch (registry.type) {
+    case 'org':
+      return registry.org;
+    case 'profile':
+      return registry.user;
+    case 'repo':
+      return registry.owner;
+    case 'local':
+      throw new Error('ownerAccountFromRegistry: local registry mode has no owner-account namespace to key on');
+  }
+}
+
+/**
+ * Per-owner, per-project CA directory (macf#1277) —
+ * `~/.macf/certs/<owner>/<project>/`. Nested one level deeper than the
+ * pre-#1277 shape ({@link legacyProjectCaDir}) for the SAME reason
+ * `commands/init.ts::defaultAgentKeyPath` was owner-scoped in macf#1214:
+ * a fleet's `<project>` name is not globally unique — one host commonly
+ * provisions fleets from DIFFERENT GitHub owners, and two owners can each
+ * run a fleet of the same name, colliding on one on-disk CA otherwise
+ * (macf#1277's reported incident, one level up from #1214's key
+ * collision). `owner` is a directory NESTING, not an invented encoding —
+ * same convention as `defaultAgentKeyPath`.
+ */
+export function caDir(owner: string, project: string): string {
+  assertValidOwner(owner);
+  assertValidProject(project);
+  return join(MACF_GLOBAL_DIR, 'certs', owner, project);
+}
+
+export function caCertPath(owner: string, project: string): string {
+  return join(caDir(owner, project), 'ca-cert.pem');
+}
+
+export function caKeyPath(owner: string, project: string): string {
+  return join(caDir(owner, project), 'ca-key.pem');
+}
+
+/**
+ * The pre-#1277 project-scoped, OWNER-LESS CA directory:
+ * `~/.macf/certs/<project>/` — the ONLY generation this path has ever had
+ * (unlike the App key, the CA path was already project-scoped before
+ * #1277; there is no flatter pre-project-scoped tier to fall back through
+ * — see macf#1159's landscape table, which found the CA path "fine" at
+ * the time #1157 fleet-scoped the key). Kept as a READ-ONLY back-compat
+ * fallback (macf#1157/#1214's "read-old-write-new" decision, applied here
+ * one level up): an operator's pre-#1277 fleet CA keeps resolving without
+ * a forced migration. Nothing in this codebase ever WRITES here anymore —
+ * every fresh materialization lands at the owner-scoped {@link caDir}.
+ */
+export function legacyProjectCaDir(project: string): string {
   assertValidProject(project);
   return join(MACF_GLOBAL_DIR, 'certs', project);
 }
 
-export function caCertPath(project: string): string {
-  return join(caDir(project), 'ca-cert.pem');
+export function legacyProjectCaCertPath(project: string): string {
+  return join(legacyProjectCaDir(project), 'ca-cert.pem');
 }
 
-export function caKeyPath(project: string): string {
-  return join(caDir(project), 'ca-key.pem');
+export function legacyProjectCaKeyPath(project: string): string {
+  return join(legacyProjectCaDir(project), 'ca-key.pem');
+}
+
+/**
+ * Resolve the EFFECTIVE, EXISTING CA cert+key pair for a project —
+ * existence-only "read-old" resolution (no vault to fingerprint-check
+ * against at this layer; mirrors `commands/init.ts::ingestAndResolveKeyPath`'s
+ * same no-vault, existence-only gating one layer up for the App key).
+ * Prefers the owner-scoped conventional location; falls back to the
+ * pre-#1277 project-scoped legacy location ONLY when the conventional
+ * cert is absent AND a legacy cert is present at the exact anchored path
+ * — never a directory scan. Falls back to the conventional (owner-scoped)
+ * location when NEITHER exists, so a fresh-mint caller has the correct
+ * (new) location to write to; this function itself never writes and never
+ * regenerates anything.
+ *
+ * Used by every operator-facing / generation-time CA reader that has no
+ * vault material to compare against: `commands/certs.ts` (init/recover/
+ * rotate), `commands/init.ts::issueGithubModeAgentCert`,
+ * `commands/routing-doctor.ts`. `bootstrap/fleet-deploy.ts` does NOT use
+ * this — it has vault material available and applies its OWN
+ * fingerprint-gated resolution (mirroring `resolveDefaultKeyPath`'s
+ * fingerprint-gated fallback for the App key), so an unrelated fleet's
+ * stale legacy CA is never silently adopted during unattended `fleet
+ * deploy` materialization.
+ */
+export function resolveExistingCaPaths(owner: string, project: string): { readonly certPath: string; readonly keyPath: string } {
+  const conventionalCert = caCertPath(owner, project);
+  if (existsSync(conventionalCert)) {
+    return { certPath: conventionalCert, keyPath: caKeyPath(owner, project) };
+  }
+  const legacyCert = legacyProjectCaCertPath(project);
+  if (existsSync(legacyCert)) {
+    return { certPath: legacyCert, keyPath: legacyProjectCaKeyPath(project) };
+  }
+  return { certPath: conventionalCert, keyPath: caKeyPath(owner, project) };
 }
 
 /**
