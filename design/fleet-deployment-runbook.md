@@ -258,6 +258,161 @@ registered). Treat all six as independent facts; a summary line claiming
 
 ---
 
+## 4a. Adding an agent to an already-provisioned fleet
+
+**A different happy path from §1–§4 — those provision a fleet from nothing;
+this scales one that already routes.** Everything below only applies once a
+fleet has at least one working agent; a fleet's very first `apply` never
+hits any of it. Live-exercised end to end scaling `macf-trial` from 2 agents
+to 3 in the `macf-experiment` org.
+
+### The click cost is not 2
+
+Adding one agent costs the same 2 browser clicks as any new identity (§3.3
+steps 3–4: gate 1 "Create," gate 2 "Install") **plus one more "Save" click
+for every already-provisioned fleet-level App whose installation doesn't yet
+cover the new agent's repo.** Today there are at most two such Apps:
+
+| Fleet-level App | Declared when | Its expected repo set |
+|---|---|---|
+| `runner-ops` | `routing.runner.runs_on: self-hosted` (§6.5) | every declared agent's repo — grows every time you add one |
+| the router App | `owner.registry` is `type: repo` or `type: profile` (§6.2) | the registry repo (fixed) — still checked, for the same live-membership reason |
+
+So the ceiling is **2 (the new agent's own App) + 0, 1, or 2 more "Save"
+clicks** — never a flat 2. Which of the two fleet-level Apps (if either)
+actually need one depends on this specific run; `apply` computes it fresh
+every time (see "The procedure," step 2) and opens only the gates that are
+actually stale — never one per missing repo, one gate per App names its
+whole missing set. **Because the router App is shared across every fleet in
+an owner scope by default (§6.5, `transport.router_app_scope: 'shared'`),
+that scope-wide install set only grows — the next fleet you scale in the
+same scope inherits whatever coverage already exists, not a clean slate.**
+
+### The procedure
+
+1. **Get the current manifest, then append the new agent — matching the
+   existing list-item indent exactly.** `agents:` entries are 2-space-indented
+   list items (§2's example manifest); appending a new entry indented to
+   match the *fields* of the previous entry (4 spaces) instead of its `- `
+   marker changes what the YAML means, not always with a loud parse error —
+   verify structurally with step 2 immediately after editing, before doing
+   anything else. If you don't already have the fleet's current `fleet.yaml`
+   locally:
+
+   ```bash
+   gh api /repos/<owner>/<fleet>-control/contents/fleet.yaml --jq '.content' | base64 -d > fleet.yaml
+   ```
+
+   Then append an entry shaped exactly like the existing ones (§6.3 field
+   reference):
+
+   ```yaml
+   agents:
+     - role: code-agent
+       profile: engineering
+       repo: my-org/my-fleet-code-agent
+       deploy_path: /home/ubuntu/repos/my-fleet/my-fleet-code-agent
+     - role: writing-agent          # the new entry — same "- " indent as above
+       profile: docs
+       repo: my-org/my-fleet-writing-agent
+       deploy_path: /home/ubuntu/repos/my-fleet/my-fleet-writing-agent
+   ```
+
+2. **Plan with `--vault`/`--identity-key` — not bare `plan`.** This is the
+   one command that shows you the widen-gate *before* you spend a click on
+   it:
+
+   ```bash
+   macf bootstrap plan -f fleet.yaml --vault <path> --identity-key <path>
+   ```
+
+   Read the table for an `install_scope` row. `VERB=UPDATE, CONFIRM=yes`
+   naming `runner-ops` or the router App's handle means that App will reopen
+   its install page this run; the `REASON` column names the exact missing
+   repo, e.g. *"App "my-fleet-runner-ops" is missing repository access to
+   my-org/my-fleet-writing-agent — add exactly this repo under 'Repository
+   access' … then click 'Save.'"* No such row (only `NOOP`s, or the section
+   is silent) means no widen this time.
+
+   **`macf bootstrap apply -f fleet.yaml --dry-run` will NOT show you this
+   row** — its preview is computed before the widen-gate machinery runs, by
+   design (it would otherwise have to reorder `apply`'s own gate flow).
+   `plan` with the vault flags above is the only ahead-of-time view of a
+   pending widen.
+
+3. **Apply for real.** If the fleet declares `routing.runner.runs_on:
+   self-hosted` (§6.5), mint a fresh runner-registration token first (§1 —
+   one-hour TTL, needed again even if you minted one for this fleet before):
+
+   ```bash
+   macf bootstrap apply -f fleet.yaml --vault <path> --identity-key <path> \
+     --runner-token <token>
+   ```
+
+   Approve the plan. The run drives, in order: the new agent's own gate 1 +
+   gate 2 (§3.3 steps 3–4) — **then**, only once every agent identity is
+   confirmed, it reopens gate 2 for each fleet-level App step 2 flagged.
+   **Click "Save" on each one** — never "Install" again, the App already
+   exists — and the CLI polls the same way gate 2 always does (10-minute
+   budget, same cancel/resume semantics as §7.6/§7.7: a cancelled or timed-
+   out widen is safe to retry, a re-run reopens only whatever is still
+   stale). Control-repo labels for the new role are created automatically as
+   part of this same run's control-repo sync — no separate click for that
+   (verified in step 4 of "Verify," below).
+
+4. **Deploy the new agent's workspace** — §3.4, unchanged by anything above.
+
+### What you'll actually hit if you skip step 2, or click too slowly
+
+**The new agent's own self-hosted runner never comes up, while its siblings
+already show a healthy count.** Because the manifest declares
+`routing.runner.runs_on: self-hosted`, `apply` waits for the new repo's
+runner unconditionally, narrating progress as it goes (e.g. `waiting for the
+runner requested THIS run to become usable for "<owner>/<new-agent-repo>" …
+45s/600s elapsed; runner platform reports 0 available`). If the underlying
+platform confirms a genuinely terminal state — not a startup delay, one that
+plain polling will never clear — `apply`'s printed summary carries this
+exact reason text for that repo:
+
+    role/repo "<owner>/<new-agent-repo>": the runner-provisioning platform reports a TERMINAL
+    failure for this repo's runner — FailedUpdateRegistrationToken (Updating registration
+    token failed). This is not a startup delay; polling will not clear it. MACF_TRUSTED_ACTORS
+    was NOT written; this repo continues routing on ubuntu-latest (billed on private repos)
+    until the underlying provisioning problem is fixed (commonly: the fleet's GitHub App is
+    not installed on the repo owner, so no registration token can be minted) and
+    `macf bootstrap apply` is re-run.
+
+That "GitHub App is not installed on the repo owner" line **is** the drift
+step 2's `install_scope` row already named — `runner-ops` (the App that
+mints the registration token) doesn't cover the new repo yet. **The fix is
+step 3's widen click, not a retry of the same `apply` run** — re-running
+`apply` without widening reproduces the identical failure, because nothing
+about the App's install scope changed.
+
+### Verify
+
+```bash
+# 1. No install-scope drift left.
+macf bootstrap plan -f fleet.yaml --vault <path> --identity-key <path>
+# expect: any `install_scope` row reads NOOP, reason text like
+#   App "my-fleet-runner-ops" installation covers every repo the manifest declares (3 expected, 0 missing).
+
+# 2. The new repo has a registered, usable runner (§4 row 5, same command).
+gh api /repos/<owner>/<new-agent-repo>/actions/runners --jq '.total_count'
+# expect: 1 (may still read 0 for a few minutes right after the widen click —
+# that is provisioning latency, not a failure; re-check rather than re-running apply)
+
+# 3. Routing is live for the new repo.
+gh variable get MACF_TRUSTED_ACTORS --repo <owner>/<new-agent-repo>
+# expect: non-empty, includes the new agent's bot login + the owner account login
+
+# 4. The control repo's label queue has the new role.
+gh label list --repo <owner>/<fleet>-control --json name --jq '.[].name'
+# expect: includes the new agent's bare role, e.g. `writing-agent`
+```
+
+---
+
 ## 5. Where `--help` beats this document
 
 The CLI is under active amendment. Before trusting a flag's behavior against
