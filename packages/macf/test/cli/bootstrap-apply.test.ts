@@ -5424,4 +5424,35 @@ describe('the #1184 fleet verdict, wired through formatApplyResult / fleetApplyR
     const json = fleetApplyResultToJson(result, [], { steps: [] }) as { fleet_verdict: { confirmed: boolean } };
     expect(json.fleet_verdict.confirmed).toBe(true);
   });
+
+  // --- groundnuty/macf#1239 — the TAILNET_NEEDED carve-out's pinContext,
+  // wired through the SAME public entrypoints, not just the standalone
+  // fleet-verdict.ts unit. Proves formatApplyResult/fleetApplyResultToJson
+  // actually pass the 8th/7th param through to buildFleetVerdict rather
+  // than silently dropping it. ---
+  it('a pinContext genuinely reaches formatApplyResult/fleetApplyResultToJson: the same result renders confirmed with a carve-out self-hosted context and not-confirmed without one', () => {
+    const repo = 'groundnuty/trial-code';
+    const routingSecrets = {
+      MACF_ROUTING_APP_ID: { [repo]: { status: 'created' } },
+      MACF_ROUTING_APP_KEY: { [repo]: { status: 'created' } },
+      ROUTING_CLIENT_CERT: { [repo]: { status: 'created' } },
+      ROUTING_CLIENT_KEY: { [repo]: { status: 'created' } },
+      TS_OAUTH_CLIENT_ID: { [repo]: { status: 'skipped', reason: 'transport.tailscale_oauth_required not declared' } },
+      TS_OAUTH_SECRET: { [repo]: { status: 'skipped', reason: 'transport.tailscale_oauth_required not declared' } },
+    } as unknown as FleetApplyResult['routingSecrets'];
+    const result = resultWith({ routingSecrets, routing: { [repo]: { status: 'created' } } });
+    const carveOutPin = { actionsVersion: 'v3.5.0', selfHostedRunner: true };
+
+    const withoutPinContext = formatApplyResult(result, [], { steps: [] });
+    expect(withoutPinContext).toContain('NOT confirmed');
+
+    const withPinContext = formatApplyResult(result, [], { steps: [] }, undefined, undefined, undefined, {}, carveOutPin);
+    expect(withPinContext).not.toContain('NOT confirmed');
+
+    const jsonWithout = fleetApplyResultToJson(result, [], { steps: [] }) as { fleet_verdict: { confirmed: boolean } };
+    expect(jsonWithout.fleet_verdict.confirmed).toBe(false);
+
+    const jsonWith = fleetApplyResultToJson(result, [], { steps: [] }, undefined, undefined, {}, carveOutPin) as { fleet_verdict: { confirmed: boolean } };
+    expect(jsonWith.fleet_verdict.confirmed).toBe(true);
+  });
 });
