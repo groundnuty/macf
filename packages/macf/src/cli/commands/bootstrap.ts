@@ -344,6 +344,11 @@ export async function runBootstrapPlan(
             operator_interaction: operatorInteractionToJson(budget),
             advertise_host_drift: advertiseHostDrift.map(advertiseHostDriftEntryToJson),
             operator_inputs: operatorInputs,
+            // groundnuty/macf#1309 — `lock === null` alone can't tell
+            // "never provisioned" apart from "the lock read failed" (a
+            // wrong-scope token, a private control repo, a network hiccup).
+            // See `plan.ts::FleetLockSource`'s doc.
+            fleet_lock_source: observed.lockSource ?? 'unreadable',
             ...(Object.keys(installScopeCoverage).length > 0
               ? { install_scope_coverage: Object.values(installScopeCoverage).map(installScopeCoverageEntryToJson) }
               : {}),
@@ -356,6 +361,8 @@ export async function runBootstrapPlan(
       console.log(formatPlanText(plan));
       console.log('');
       console.log(formatOperatorInteractionLine(budget));
+      console.log('');
+      console.log(`fleet.lock source: ${observed.lockSource ?? 'unreadable'}`);
       console.log('');
       console.log(formatAdvertiseHostDriftLines(advertiseHostDrift).join('\n'));
       if (operatorInputs.length > 0) {
