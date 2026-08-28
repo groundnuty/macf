@@ -113,9 +113,11 @@ export type RoutingClientMintOutcome =
  * never fail `apply`'s exit code; a genuine mint exception is an
  * operator-attention state and MUST (via `applyExitCode`).
  *
- * @param lockHasRoutingClientKey `fleet.lock.fingerprints.routing_client_key
- *   !== undefined` — a PRIOR successful apply already vaulted a routing-client
- *   key for this fleet. Mirrors `apply-fleet.ts`'s own `lockHasCaKey`.
+ * @param lockHasRoutingClientKey `effectiveFleetFingerprints(fleet.lock)?.routing_client_key
+ *   !== undefined` (groundnuty/macf#1310 — reads `fleet_fingerprints`,
+ *   falling back to the deprecated `fingerprints` key for a pre-rename
+ *   lock) — a PRIOR successful apply already vaulted a routing-client key
+ *   for this fleet. Mirrors `apply-fleet.ts`'s own `lockHasCaKey`.
  * @param caMintedThisRun Whether `apply-fleet.ts`'s CA resolve was
  *   `'minted'` THIS run (the only path with a CA private key in memory to
  *   sign the client cert with).

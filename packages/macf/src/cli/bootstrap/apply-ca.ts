@@ -174,8 +174,10 @@ async function readExistingCert(registry: RegistryConfig, varName: string, deps:
  * Decide mint-vs-reuse-vs-refuse. See the module doc for the full decision
  * table. NEVER throws — every failure resolves to `status: 'failed'`.
  *
- * @param lockHasCaKey `fleet.lock.fingerprints.ca_key !== undefined` — a
- *   PRIOR successful apply already vaulted a CA key for this fleet.
+ * @param lockHasCaKey `effectiveFleetFingerprints(fleet.lock)?.ca_key !== undefined`
+ *   (groundnuty/macf#1310 — reads `fleet_fingerprints`, falling back to the
+ *   deprecated `fingerprints` key for a pre-rename lock) — a PRIOR successful
+ *   apply already vaulted a CA key for this fleet.
  * @param recipients `manifest.transport.age_recipients` — the no-recipient
  *   pre-flight input (see module doc).
  */

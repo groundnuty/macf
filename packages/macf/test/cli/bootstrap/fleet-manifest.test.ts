@@ -14,6 +14,7 @@ import {
   buildTrustedActorsValue,
   deriveAppHandle,
   deriveControlRepoName,
+  effectiveFleetFingerprints,
   parseFleetLock,
   parseFleetManifest,
   isSelfHostedCapableActionsVersion,
@@ -694,6 +695,12 @@ describe('deriveControlRepoName — DR-043 Amendment F (macf#857): <fleet>-contr
 });
 
 describe('parseFleetLock', () => {
+  // groundnuty/macf#1310 — this fixture DELIBERATELY uses the DEPRECATED
+  // bare top-level `fingerprints:` key (the shape every already-provisioned
+  // fleet's `fleet.lock` is in right now, including `macf-trial`'s live
+  // artifact the issue quotes) — every test below exercises "an old-key
+  // lock parses correctly" by construction. The per-agent `fingerprints:`
+  // nested under `agents[0]` is the UNRELATED, never-renamed field.
   const VALID_LOCK_YAML = `
 schema_version: 1
 fleet: icsoc-2026
@@ -721,7 +728,12 @@ fingerprints:
       fingerprints: { app_private_key: 'sha256:abc123', client_secret: 'sha256:def456' },
       deployed_version: '0.2.44',
     });
+    // groundnuty/macf#1310 — the raw legacy key is still readable directly
+    // (schema back-compat), but `fleet_fingerprints` (the new key) is
+    // genuinely absent from this YAML — never fabricated by the parse.
     expect(lock.fingerprints).toEqual({ ca_key: 'sha256:feedface' });
+    expect(lock.fleet_fingerprints).toBeUndefined();
+    expect(effectiveFleetFingerprints(lock)).toEqual({ ca_key: 'sha256:feedface' });
   });
 
   it('rejects a wrong schema_version', () => {
@@ -769,6 +781,78 @@ agents: []
     it('rejects an empty-string repo (min(1), same discipline as role/app_id/install_id)', () => {
       const bad = VALID_LOCK_YAML.replace('install_id: "22222222"', 'install_id: "22222222"\n    repo: ""');
       expect(() => parseFleetLock(bad)).toThrow();
+    });
+  });
+
+  // groundnuty/macf#1310 — `fleet_fingerprints` (fleet-level) vs
+  // `fingerprints` (per-agent, unchanged) naming-collision fix. Science's
+  // ruling: "fingerprints at fleet level and fingerprints per agent should
+  // not be the same word." The fleet-level field was renamed; the
+  // deprecated bare key stays schema-legal (read-only) so an
+  // already-provisioned fleet's `fleet.lock` keeps parsing without a
+  // re-apply. See `effectiveFleetFingerprints`'s own doc for the accessor
+  // every reader must go through instead of either key directly.
+  describe('fleet_fingerprints / fingerprints rename (groundnuty/macf#1310)', () => {
+    it('DECISIVE (new key): a lock already on the post-#1310 `fleet_fingerprints` key parses correctly', () => {
+      const yaml = `
+schema_version: 1
+fleet: icsoc-2026
+agents: []
+fleet_fingerprints:
+  ca_key: sha256:feedface
+`;
+      const lock = parseFleetLock(yaml);
+      expect(lock.fleet_fingerprints).toEqual({ ca_key: 'sha256:feedface' });
+      expect(lock.fingerprints).toBeUndefined();
+      expect(effectiveFleetFingerprints(lock)).toEqual({ ca_key: 'sha256:feedface' });
+    });
+
+    it('DECISIVE (old key): a lock still on the deprecated `fingerprints` key parses correctly — reads via effectiveFleetFingerprints', () => {
+      const lock = parseFleetLock(VALID_LOCK_YAML);
+      expect(lock.fingerprints).toEqual({ ca_key: 'sha256:feedface' });
+      expect(lock.fleet_fingerprints).toBeUndefined();
+      expect(effectiveFleetFingerprints(lock)).toEqual({ ca_key: 'sha256:feedface' });
+    });
+
+    it('a lock with NEITHER key present resolves to undefined, never a fabricated {}', () => {
+      const minimal = `
+schema_version: 1
+fleet: minimal-fleet
+agents: []
+`;
+      const lock = parseFleetLock(minimal);
+      expect(effectiveFleetFingerprints(lock)).toBeUndefined();
+    });
+
+    it('a lock carrying BOTH keys (a hand-built/transitional shape) prefers the NEW key — never merges them', () => {
+      const yaml = `
+schema_version: 1
+fleet: icsoc-2026
+agents: []
+fleet_fingerprints:
+  ca_key: sha256:newkey
+fingerprints:
+  ca_key: sha256:oldkey
+`;
+      const lock = parseFleetLock(yaml);
+      expect(effectiveFleetFingerprints(lock)).toEqual({ ca_key: 'sha256:newkey' });
+    });
+
+    // The whole point of the rename: neither fingerprints STRUCTURE can be
+    // mistaken for the other, even when both are populated with disjoint
+    // key sets and disjoint values on the SAME parsed lock.
+    it('the fleet-level and per-agent fingerprints structures are never mistaken for one another', () => {
+      const lock = parseFleetLock(VALID_LOCK_YAML);
+      const fleetLevel = effectiveFleetFingerprints(lock);
+      const perAgent = lock.agents[0]?.fingerprints;
+      expect(fleetLevel).toEqual({ ca_key: 'sha256:feedface' });
+      expect(perAgent).toEqual({ app_private_key: 'sha256:abc123', client_secret: 'sha256:def456' });
+      expect(fleetLevel).not.toEqual(perAgent);
+      // Different keys entirely — "ca_key" is a fleet-level concept and
+      // never appears on the per-agent map, by construction of what each
+      // scope actually establishes (CA/routing-client vs per-agent App
+      // secrets).
+      expect(Object.keys(perAgent ?? {})).not.toContain('ca_key');
     });
   });
 });
