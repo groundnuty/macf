@@ -241,4 +241,30 @@ describe('ageRecipientsRecordAbsent — the third state (groundnuty/macf#1230)',
     expect(notice).not.toContain('next apply records the set');
     expect(notice).toContain('mints no new credentials');
   });
+
+  // groundnuty/macf#1322 — science's ruling: the notice reported the GAP
+  // (comparison impossible) without reporting the RISK (what narrowing does
+  // NOT do, even though it can't be detected). Mutation check: reverting
+  // `ageRecipientsRecordAbsentNotice` to the pre-#1322 text (drop the risk +
+  // remedy sentences, keep only the detection-gap wording) makes this test
+  // fail — proving it exercises the RENDERED text, not just a helper's
+  // return-value shape (per assert-the-wrong-path.md / #1311 / #1318).
+  it('DECISIVE (groundnuty/macf#1322): states what narrowing does NOT do — revoke existing access — not only that detection was impossible', () => {
+    const notice = ageRecipientsRecordAbsentNotice();
+    expect(notice).toContain('does not revoke');
+    expect(notice).toContain('EXISTING vault');
+    expect(notice).toContain('stays readable');
+  });
+
+  it('groundnuty/macf#1322: names the remedy (rotate + re-issue), mirroring ageRecipientsNarrowedReason\'s wording for the detected case — a mechanism without a remedy leaves the reader unable to act (#1290\'s lesson)', () => {
+    const notice = ageRecipientsRecordAbsentNotice();
+    expect(notice).toContain('rotating the CA');
+    expect(notice).toContain('re-issuing');
+  });
+
+  it('groundnuty/macf#1322: never claims the recipient set IS wrong or a removal DID happen — the tool genuinely cannot tell (honest-unknown preserved)', () => {
+    const notice = ageRecipientsRecordAbsentNotice();
+    expect(notice.toLowerCase()).not.toMatch(/a recipient (was|has been) removed/);
+    expect(notice.toLowerCase()).not.toMatch(/access (was|has been) revoked/);
+  });
 });

@@ -178,15 +178,33 @@ export function ageRecipientsRecordAbsent(priorLock: FleetLock | null): boolean 
  * closes that gap (a CONFIRMED-current vault, not just a freshly-written
  * one, now also satisfies the write) — this notice's text was updated in
  * the SAME change to stop promising a fix that depended on it.
+ *
+ * groundnuty/macf#1322 — science's ruling: this text reported the GAP (the
+ * comparison could not run) without reporting the RISK (what an operator is
+ * exposed to while it can't). Proceeding stays correct (`#1230`/`#1260`
+ * already settled that a refusal here would block every pre-`#1252` fleet's
+ * next apply) — but an operator reading only "cannot be checked … Proceeding"
+ * has no reason to believe anything is at stake, and a narrowing edit reads
+ * exactly like a revocation. `#1290`'s lesson applies at a notice, not just
+ * an error: naming the mechanism (removal isn't detected) without naming the
+ * consequence (removal doesn't revoke existing access either) and the
+ * remedy (rotate + re-issue) leaves the reader informed and unable to act.
+ * The added risk/remedy sentences mirror {@link ageRecipientsNarrowedReason}'s
+ * already-established wording for the DETECTED-narrowing case, so an
+ * operator who hits either message reads the same explanation.
  */
 export function ageRecipientsRecordAbsentNotice(): string {
   return (
     'transport.age_recipients cannot be checked for narrowing: this fleet\'s lock records no ' +
     'recipient set, so there is nothing to compare against. Proceeding — but if this run REMOVES ' +
-    'a recipient, that removal is neither detected nor recorded, and re-encryption would not ' +
-    'revoke access to vault copies already held. Any apply that reconciles the vault against the ' +
-    'manifest\'s declared recipients — including a run that mints no new credentials — records the ' +
-    'set and closes the gap.'
+    'a recipient, that removal is neither detected nor recorded here. That gap is about DETECTION, ' +
+    'not about the underlying risk: removing a recipient does not revoke its decrypt access to the ' +
+    'EXISTING vault — re-encrypting protects only future copies, and any prior copy already held ' +
+    '(a backup, a checkout, a laptop) stays readable by it permanently. Real revocation requires ' +
+    'rotating the CA and re-issuing everything the old vault protected. Any apply that reconciles ' +
+    'the vault against the manifest\'s declared recipients — including a run that mints no new ' +
+    'credentials — records the set and closes the detection gap (though never the access already ' +
+    'granted before it did).'
   );
 }
 
