@@ -3257,6 +3257,158 @@ agents:
       expect(result.routing['groundnuty/demo-code']).toEqual({ status: 'already-present' });
     });
 
+    // --- groundnuty/macf#1319 — reconcile a PRESENT-but-diverging
+    // MACF_TRUSTED_ACTORS, end-to-end through applyFleet. The two-agent
+    // manifest here mirrors the live `macf-trial` symptom: adding an agent
+    // scales the desired value, but a PRE-EXISTING repo's Actions variable
+    // still carries the OLD (narrower) actor list until reconciled. ---
+    describe('routing reconciliation (groundnuty/macf#1319 — DR-043 Amendment P row 3 applied to MACF_TRUSTED_ACTORS)', () => {
+      it('DECISIVE case 1: a diverging value is reconciled after confirmation, and the outcome names BOTH the observed and declared values', async () => {
+        const manifestPath = manifestPathIn();
+        const manifest: FleetManifest = { ...manifestWith([CODE_AGENT, SCI_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
+        const updateCalls: Array<{ repo: string; name: string; value: string }> = [];
+        const deps: FleetApplyDeps = {
+          ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+          trustDeps: {
+            ...trustDepsFor({ checkRepoPresence: async (_repo, name) => (name === 'MACF_TRUSTED_ACTORS' ? 'present' : 'absent') }),
+            readRepoVariableValue: async () => 'stale-only-code-agent[bot]',
+            updateRepoVariable: async (repo, name, value) => {
+              updateCalls.push({ repo, name, value });
+              return 'updated';
+            },
+            confirmReconciliation: async () => true,
+          },
+        };
+        const result = await applyFleet(manifest, manifestPath, null, deps);
+
+        // Both agent repos diverge (both start from the same stale fixture
+        // value) and both get reconciled to the SAME manifest-derived value.
+        expect(updateCalls).toHaveLength(2);
+        for (const call of updateCalls) {
+          expect(call.name).toBe('MACF_TRUSTED_ACTORS');
+          // The mutation-decisive assertion: the WRITTEN value is the
+          // DESIRED (manifest-derived) one, never the stale observed one.
+          expect(call.value).not.toBe('stale-only-code-agent[bot]');
+        }
+        expect(result.routing['groundnuty/demo-code']?.status).toBe('updated');
+        expect(result.routing['groundnuty/demo-science']?.status).toBe('updated');
+        const reason = result.routing['groundnuty/demo-code'] && 'reason' in result.routing['groundnuty/demo-code'] ? result.routing['groundnuty/demo-code'].reason : undefined;
+        // The log/reason names BOTH values — an operator reading it can see
+        // what changed, not just that "something" changed.
+        expect(reason).toContain('stale-only-code-agent[bot]');
+        expect(reason).toContain(updateCalls[0]?.value);
+      });
+
+      it('DECISIVE case 2: a value that already MATCHES the declared set is untouched — no write, no churn, not even a confirmation call', async () => {
+        const manifestPath = manifestPathIn();
+        const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
+        let updateCalled = false;
+        let confirmCalled = false;
+        const deps: FleetApplyDeps = {
+          ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+          trustDeps: {
+            ...trustDepsFor({ checkRepoPresence: async (_repo, name) => (name === 'MACF_TRUSTED_ACTORS' ? 'present' : 'absent') }),
+            // Must equal buildTrustedActorsValue's actual output for this
+            // one-agent manifest — same value the create path would have
+            // written, proving "matches" is compared against the REAL
+            // desired value, not a placeholder.
+            readRepoVariableValue: async () => 'demo-fleet-code-agent[bot]',
+            updateRepoVariable: async () => {
+              updateCalled = true;
+              return 'updated';
+            },
+            confirmReconciliation: async () => {
+              confirmCalled = true;
+              return true;
+            },
+          },
+        };
+        const result = await applyFleet(manifest, manifestPath, null, deps);
+
+        expect(result.routing['groundnuty/demo-code']).toEqual({ status: 'already-present' });
+        expect(updateCalled).toBe(false);
+        expect(confirmCalled).toBe(false);
+      });
+
+      it('honest-unknown: a value that cannot be re-read is reported (never overwritten, never assumed current)', async () => {
+        const manifestPath = manifestPathIn();
+        const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
+        let updateCalled = false;
+        const deps: FleetApplyDeps = {
+          ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+          trustDeps: {
+            ...trustDepsFor({ checkRepoPresence: async (_repo, name) => (name === 'MACF_TRUSTED_ACTORS' ? 'present' : 'absent') }),
+            readRepoVariableValue: async () => undefined,
+            updateRepoVariable: async () => {
+              updateCalled = true;
+              return 'updated';
+            },
+            confirmReconciliation: async () => true,
+          },
+        };
+        const result = await applyFleet(manifest, manifestPath, null, deps);
+
+        expect(result.routing['groundnuty/demo-code']?.status).toBe('skipped');
+        expect(updateCalled).toBe(false);
+      });
+
+      it('declined confirmation writes nothing', async () => {
+        const manifestPath = manifestPathIn();
+        const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
+        let updateCalled = false;
+        const deps: FleetApplyDeps = {
+          ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+          trustDeps: {
+            ...trustDepsFor({ checkRepoPresence: async (_repo, name) => (name === 'MACF_TRUSTED_ACTORS' ? 'present' : 'absent') }),
+            readRepoVariableValue: async () => 'stale[bot]',
+            updateRepoVariable: async () => {
+              updateCalled = true;
+              return 'updated';
+            },
+            confirmReconciliation: async () => false,
+          },
+        };
+        const result = await applyFleet(manifest, manifestPath, null, deps);
+
+        expect(result.routing['groundnuty/demo-code']?.status).toBe('declined');
+        expect(updateCalled).toBe(false);
+      });
+
+      it('regression: absent -> create is UNAFFECTED by reconciliation (the two paths are independent)', async () => {
+        const manifestPath = manifestPathIn();
+        const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
+        let updateCalled = false;
+        const deps: FleetApplyDeps = {
+          ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+          trustDeps: {
+            ...trustDepsFor(), // default: checkRepoPresence -> 'absent' for every var
+            readRepoVariableValue: async () => 'should-never-be-read[bot]',
+            updateRepoVariable: async () => {
+              updateCalled = true;
+              return 'updated';
+            },
+            confirmReconciliation: async () => true,
+          },
+        };
+        const result = await applyFleet(manifest, manifestPath, null, deps);
+
+        expect(result.routing['groundnuty/demo-code']).toEqual({ status: 'created' });
+        expect(updateCalled).toBe(false);
+      });
+
+      it('every reconciliation dep OMITTED degrades to exactly today\'s create-only behavior (no crash, no change)', async () => {
+        const manifestPath = manifestPathIn();
+        const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
+        const deps: FleetApplyDeps = {
+          ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+          trustDeps: trustDepsFor({ checkRepoPresence: async (_repo, name) => (name === 'MACF_TRUSTED_ACTORS' ? 'present' : 'absent') }),
+        };
+        const result = await applyFleet(manifest, manifestPath, null, deps);
+
+        expect(result.routing['groundnuty/demo-code']).toEqual({ status: 'already-present' });
+      });
+    });
+
     // --- macf#922 requirement 3 — register-before-route gate ---
 
     it('groundnuty/macf#993: token supplied, runner never appears within the poll window -> MACF_TRUSTED_ACTORS is NOT written for that repo; the gap is reported as "failed" (not "skipped") with a reason, never silent (macf#929: timeoutMs 0 makes the poll a single check — no real wall-clock wait)', async () => {

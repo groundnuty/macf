@@ -1,19 +1,25 @@
 /**
- * Create-only GitHub Actions variable writes — the shared write leaf behind
- * DR-043 Phase 2b (groundnuty/macf#838 Amendment D phase 2): the CA
- * two-place rule (macf#806) and `MACF_TRUSTED_ACTORS` (macf#922; was
- * `MACF_ROUTING_RUNS_ON`, see `apply-routing.ts`'s module doc).
+ * GitHub Actions variable writes — the shared write leaf behind DR-043
+ * Phase 2b (groundnuty/macf#838 Amendment D phase 2): the CA two-place rule
+ * (macf#806) and `MACF_TRUSTED_ACTORS` (macf#922; was `MACF_ROUTING_RUNS_ON`,
+ * see `apply-routing.ts`'s module doc).
  *
- * **Create-only by construction, not by convention.** Every write here is
- * `gh api --method POST` — NEVER `PATCH`. GitHub's variables-create endpoint
- * responds `409 Conflict` when the name already exists, so a caller can never
- * accidentally clobber an existing value through this primitive; the
- * "already exists" case is a distinguishable RESULT (`'exists'`), not success
- * dressed up. This is deliberately NOT `@groundnuty/macf-core`'s
- * `createGitHubClient().writeVariable` — that client is PATCH-then-POST
- * (upsert), built for an AGENT reconciling its own registry entry, and would
- * violate DR-043's "never silently overwrite" posture if reused here.
+ * **Create-only by construction, not by convention — for every write EXCEPT
+ * the one added by groundnuty/macf#1319.** Every write here through
+ * {@link realCreateVariable} is `gh api --method POST` — NEVER `PATCH`.
+ * GitHub's variables-create endpoint responds `409 Conflict` when the name
+ * already exists, so a caller can never accidentally clobber an existing
+ * value through this primitive; the "already exists" case is a
+ * distinguishable RESULT (`'exists'`), not success dressed up. This is
+ * deliberately NOT `@groundnuty/macf-core`'s `createGitHubClient().writeVariable`
+ * — that client is PATCH-then-POST (upsert), built for an AGENT reconciling
+ * its own registry entry, and would violate DR-043's "never silently
+ * overwrite" posture if reused here. {@link realUpdateVariable} (below) is
+ * the ONE deliberate exception — a real `PATCH`, gated entirely by its own
+ * ONE caller (`apply-routing.ts::reconcileTrustedActors`) confirming both
+ * presence AND operator approval first; see that section's own doc.
  *
+
  * `buildCreateVariableArgs` is `PURE` — the "POST, not PATCH" property is
  * pinned by a unit test asserting the literal argv array, not left to a
  * comment that can drift from the implementation (macf#838 Phase 2b review).
@@ -101,6 +107,57 @@ export async function realCreateVariable(pathPrefix: string, name: string, value
 }
 
 export type CreateVariableFn = (pathPrefix: string, name: string, value: string) => Promise<CreateVariableResult>;
+
+// --- Update (overwrite) write (groundnuty/macf#1319 — DR-043 Amendment P
+// row 3 applied to MACF_TRUSTED_ACTORS) ---
+//
+// **The ONLY place this codebase overwrites an EXISTING Actions variable's
+// value.** Every other write primitive in this file is deliberately
+// create-only (see the module doc's "create-only by construction" section) —
+// `realUpdateVariable` exists because #1319 identified ONE variable
+// (`MACF_TRUSTED_ACTORS`) whose value is a PURE FUNCTION OF THE MANIFEST, so
+// overwriting it with the manifest-derived value destroys no operator intent
+// (the ruling: "never-clobber exists to protect operator intent... a
+// manifest-derived variable carries no independent intent"). Nothing else in
+// this codebase calls this function — see `apply-routing.ts::reconcileTrustedActors`,
+// the ONE caller, for the confirmation gate that must run before it does.
+
+export type UpdateVariableResult = 'updated' | 'absent';
+
+/**
+ * Pure — the exact `gh api` argv for an overwrite of an EXISTING variable's
+ * value. `PATCH`, never `POST` — the create-endpoint's 409-on-exists
+ * protection does not apply here; the caller (`reconcileTrustedActors`) is
+ * responsible for confirming BOTH presence and operator approval before ever
+ * calling this. Same leading-`/`-stripping convention as
+ * {@link buildCreateVariableArgs}.
+ */
+export function buildUpdateVariableArgs(pathPrefix: string, name: string, value: string): readonly string[] {
+  const prefix = pathPrefix.replace(/^\//, '');
+  return ['api', `${prefix}/actions/variables/${name}`, '--method', 'PATCH', '-f', `value=${value}`];
+}
+
+/**
+ * Real overwrite. `'absent'` means the API reported a 404 — the variable
+ * vanished between the caller's own presence check and this write (a race,
+ * or a stale read); the caller decides what that means (today:
+ * `reconcileTrustedActors` reports it as `'failed'` rather than guessing).
+ * Any OTHER failure (auth, network, malformed value) throws — never silently
+ * swallowed, same contract as {@link realCreateVariable}.
+ */
+export async function realUpdateVariable(pathPrefix: string, name: string, value: string): Promise<UpdateVariableResult> {
+  try {
+    await execFileAsync('gh', [...buildUpdateVariableArgs(pathPrefix, name, value)], { encoding: 'utf-8' });
+    return 'updated';
+  } catch (err) {
+    const stderr = getStderr(err);
+    if (/HTTP 404|Not Found/i.test(stderr)) return 'absent';
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(`gh api update-variable failed for "${name}" at "${pathPrefix}": ${stderr || msg}`, { cause: err });
+  }
+}
+
+export type UpdateVariableFn = (pathPrefix: string, name: string, value: string) => Promise<UpdateVariableResult>;
 
 // --- Delete-only writes (DR-043 Amendment G — the fleet teardown ladder, groundnuty/macf#867) ---
 //

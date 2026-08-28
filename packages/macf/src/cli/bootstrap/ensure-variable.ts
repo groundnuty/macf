@@ -45,7 +45,31 @@ export type EnsureVariableOutcome =
    * union (e.g. a render function) DOES need a new arm — see
    * `bootstrap-apply.ts::formatVariableLegLine`'s `'pending'` branch.
    */
-  | { readonly status: 'pending'; readonly reason: string };
+  | { readonly status: 'pending'; readonly reason: string }
+  /**
+   * groundnuty/macf#1319 — DR-043 Amendment P row 3 applied to
+   * `MACF_TRUSTED_ACTORS`: a value CONFIRMED PRESENT but diverging from the
+   * fleet's current manifest-derived value, which the operator APPROVED
+   * overwriting this run. The ONLY producer is
+   * `apply-routing.ts::reconcileTrustedActors` — every other
+   * `ensureVariableCreated` consumer (CA legs, routing secrets, the
+   * token-gated/#1195 routing-var paths) stays create-only and never
+   * constructs this variant, so this addition is a pure widening (same
+   * "existing switches over the OTHER variants are unaffected" property
+   * `'pending'`'s own doc above already established for THAT addition).
+   * `reason` names the observed→declared values, never a credential.
+   */
+  | { readonly status: 'updated'; readonly reason: string }
+  /**
+   * groundnuty/macf#1319 — the sibling of `'updated'`: a value CONFIRMED
+   * PRESENT and diverging, where the operator DECLINED to reconcile it this
+   * run (or the confirmation gate itself threw/rejected). NOTHING was
+   * written — same "honest incomplete, does not fail the run" posture
+   * `'skipped'` already carries, kept as its own status so a render/verdict
+   * can tell "never attempted" (`'skipped'`, e.g. an unreadable value) apart
+   * from "attempted, operator said no" (`'declined'`).
+   */
+  | { readonly status: 'declined'; readonly reason: string };
 
 export interface EnsureVariableDeps {
   readonly checkPresence: () => Promise<Presence>;

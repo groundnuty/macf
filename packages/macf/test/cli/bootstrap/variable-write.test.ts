@@ -11,7 +11,7 @@
  * doc comment) and `repo-create.ts`'s `realCreateRepo`.
  */
 import { describe, it, expect } from 'vitest';
-import { buildCreateVariableArgs, buildDeleteVariableArgs } from '../../../src/cli/bootstrap/variable-write.js';
+import { buildCreateVariableArgs, buildDeleteVariableArgs, buildUpdateVariableArgs } from '../../../src/cli/bootstrap/variable-write.js';
 
 describe('buildCreateVariableArgs (pure)', () => {
   it('is a POST, never a PATCH — the load-bearing create-only property', () => {
@@ -96,5 +96,31 @@ describe('buildDeleteVariableArgs (pure) — DR-043 Amendment G (groundnuty/macf
     const args = buildDeleteVariableArgs('repos/o/r', 'NAME');
     expect(args).not.toContain('-f');
     expect(args).not.toContain('-F');
+  });
+});
+
+describe('buildUpdateVariableArgs (pure) — groundnuty/macf#1319 (DR-043 Amendment P row 3 applied to MACF_TRUSTED_ACTORS)', () => {
+  it('is a PATCH, never a POST — the load-bearing overwrite property (opposite of create-only)', () => {
+    const args = buildUpdateVariableArgs('repos/groundnuty/demo', 'MACF_TRUSTED_ACTORS', 'macf-code-agent[bot]');
+    expect(args).toContain('--method');
+    expect(args[args.indexOf('--method') + 1]).toBe('PATCH');
+    expect(args).not.toContain('POST');
+  });
+
+  it('targets .../actions/variables/<name> (the single-resource endpoint, matching delete — NOT the create collection endpoint)', () => {
+    const args = buildUpdateVariableArgs('repos/groundnuty/demo', 'MACF_TRUSTED_ACTORS', 'value');
+    expect(args).toContain('repos/groundnuty/demo/actions/variables/MACF_TRUSTED_ACTORS');
+    expect(args).not.toContain('repos/groundnuty/demo/actions/variables');
+  });
+
+  it('strips a leading slash from a registry-scope prefix, same as buildCreateVariableArgs/buildDeleteVariableArgs', () => {
+    const args = buildUpdateVariableArgs('/repos/groundnuty/demo', 'NAME', 'value');
+    expect(args).toContain('repos/groundnuty/demo/actions/variables/NAME');
+  });
+
+  it('carries ONLY value= — no name= field (the endpoint already names the variable in its path)', () => {
+    const args = buildUpdateVariableArgs('repos/o/r', 'MY_NAME', 'my value with spaces');
+    expect(args).toEqual(['api', 'repos/o/r/actions/variables/MY_NAME', '--method', 'PATCH', '-f', 'value=my value with spaces']);
+    expect(args.join(' ')).not.toContain('name=');
   });
 });

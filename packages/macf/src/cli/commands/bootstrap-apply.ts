@@ -71,6 +71,7 @@ import {
   checkRegistryVariablePresence,
   checkRunnerUsableByRepo,
   readRegistryVariable,
+  readRepoVariable,
 } from '../bootstrap/observer.js';
 import { realCreateRepo } from '../bootstrap/repo-create.js';
 import type { CaApplyDeps } from '../bootstrap/apply-ca.js';
@@ -87,8 +88,8 @@ import {
   TS_OAUTH_CLIENT_ID_ENV_VAR,
   TS_OAUTH_SECRET_ENV_VAR,
 } from '../bootstrap/apply-routing-secrets.js';
-import type { RunnerRegistrationDeps } from '../bootstrap/apply-routing.js';
-import { checkRunnerTokenPreflight, RUNNER_TOKEN_ENV_VAR } from '../bootstrap/apply-routing.js';
+import type { RunnerRegistrationDeps, TrustedActorsDivergence } from '../bootstrap/apply-routing.js';
+import { checkRunnerTokenPreflight, realUpdateRepoVariable, RUNNER_TOKEN_ENV_VAR } from '../bootstrap/apply-routing.js';
 // groundnuty/macf#1272 (DR-043 Amendment P3 execution wiring, operator
 // ruling 2026-08-27) — the delete-verb execution phase. See
 // `apply-delete.ts`'s module doc for the full scope (only `'routing'` is
@@ -949,6 +950,68 @@ function blockingEnterPrompt(promptText: string): Promise<void> {
 }
 
 /**
+ * groundnuty/macf#1319 — the "confirmation at the point they occur" text
+ * this file's own `formatApprovalBanner` already promises for `update`-verb
+ * plan items (`${summary.updates} update(s) requiring confirmation at the
+ * point they occur`) — this is that point, for the ONE update-verb item this
+ * codebase currently implements (`routing:<fleet>:runner`'s `MACF_TRUSTED_ACTORS`
+ * divergence). Science's ruling on #1319: "show `observed` vs `declared`,"
+ * matching `formatDeletionEnumerationLines`'s enumeration standard — never
+ * just a count.
+ */
+export function formatTrustedActorsReconciliationLines(divergences: readonly TrustedActorsDivergence[]): readonly string[] {
+  if (divergences.length === 0) return [];
+  const lines: string[] = [`MACF_TRUSTED_ACTORS diverges from the fleet's current agents on ${String(divergences.length)} repo(s):`];
+  for (const d of divergences) {
+    lines.push(`  • "${d.repo}": observed "${d.observedValue}" → declared "${d.desiredValue}"`);
+  }
+  lines.push('Type "yes" to overwrite ALL of the above with the declared value, anything else to leave every one unchanged: ');
+  return lines;
+}
+
+/**
+ * Real `TrustedActorsReconcileDeps.confirmReconciliation` (groundnuty/
+ * macf#1319). Same `assumeYes`-resolved-once-into-which-closure-gets-wired
+ * shape `realWaitForOperatorBeat` above already establishes, for the same
+ * reason: an unattended (`--yes`) run must never so much as construct a
+ * `readline.Interface`. `--yes` licenses overwriting a manifest-derived
+ * value (constraint 1 of science's ruling: a manifest-derived variable
+ * "carries no independent intent," so the SAME blanket approval that
+ * licenses every OTHER create/update in this run licenses this one too) —
+ * an interactive run without `--yes` gets ONE additional prompt, separate
+ * from `confirmPlan`'s own, because a divergence is only KNOWN once `apply`
+ * re-observes each repo's live value, which happens AFTER `confirmPlan`'s
+ * gate already ran.
+ *
+ * A caller that passes an EMPTY `divergences` array (should not happen —
+ * `reconcileTrustedActors` never calls this with `[]`) resolves `true`
+ * without prompting — vacuously nothing to confirm.
+ */
+function realConfirmRoutingReconciliation(assumeYes: boolean): (divergences: readonly TrustedActorsDivergence[]) => Promise<boolean> {
+  if (assumeYes) return () => Promise.resolve(true);
+  return (divergences: readonly TrustedActorsDivergence[]) => {
+    if (divergences.length === 0) return Promise.resolve(true);
+    process.stderr.write(`\n${formatTrustedActorsReconciliationLines(divergences).join('\n')}\n`);
+    return new Promise((resolve) => {
+      const rl = createInterface({ input: process.stdin, output: process.stderr });
+      const done = (answer: string): void => {
+        rl.close();
+        resolve(answer.trim().toLowerCase() === 'yes');
+      };
+      // Same defence-in-depth `close` branch `blockingEnterPrompt` above
+      // documents: a closed/redirected-EOF stdin resolves `false` (decline —
+      // the SAFE default, matching this gate's "nothing written" floor)
+      // rather than hanging forever on a stream that will never produce
+      // another byte.
+      rl.once('close', () => {
+        done('');
+      });
+      rl.question('', done);
+    });
+  };
+}
+
+/**
  * groundnuty/macf#1272 — the enumeration this file's own blocker required: a
  * `delete`-verb plan item may no longer be summarized only as a count in the
  * operator's last-read-before-"yes" text — the approval MUST name each one,
@@ -1467,7 +1530,20 @@ export function resolveMutateDeps(
     // without re-deriving from the approved plan" caveat as
     // `controlRepoOptions` above.
     agentRepoOptions: { confirmUnarchive: true },
-    trustDeps: { ...REAL_TRUST_DEPS, ...(readVaultCaCert !== undefined ? { readVaultCaCert } : {}) },
+    // groundnuty/macf#1319 — the reconciliation trio, merged in ALONGSIDE
+    // `REAL_TRUST_DEPS`'s existing create-only primitives, never replacing
+    // them. `confirmReconciliation` is built here (not `REAL_TRUST_DEPS`,
+    // a module-level constant) because it depends on THIS call's `assumeYes`
+    // — the same "per-invocation, not baked into the shared constant" reason
+    // `readVaultCaCert` above is merged in here rather than living on
+    // `REAL_TRUST_DEPS` too.
+    trustDeps: {
+      ...REAL_TRUST_DEPS,
+      ...(readVaultCaCert !== undefined ? { readVaultCaCert } : {}),
+      readRepoVariableValue: readRepoVariable,
+      updateRepoVariable: realUpdateRepoVariable,
+      confirmReconciliation: realConfirmRoutingReconciliation(assumeYes ?? false),
+    },
     routingClientDeps: { ...REAL_ROUTING_CLIENT_DEPS, ...(readVaultRoutingClient !== undefined ? { readVaultRoutingClient } : {}) },
     routingSecretsDeps: { ...REAL_ROUTING_SECRETS_PUBLISH_DEPS, ...(readVaultTsOauth !== undefined ? { readVaultTsOauth } : {}) },
     routerAppVaultDeps: { ...(readVaultRouterApp !== undefined ? { readVaultRouterApp } : {}) },
@@ -2076,9 +2152,12 @@ function formatLabelsLine(labels: LabelsOutcome): string {
   }
 }
 
-/** One `<label>: <status>` line, appending `— <reason>` for `failed`/`skipped`/`pending` — the shared render shape for `EnsureVariableOutcome` (macf#838 Amendment D phase 2; `'pending'` added groundnuty/macf#1212 — see that status's own doc in `ensure-variable.ts`). NEVER a value — the type carries none. */
+/** One `<label>: <status>` line, appending `— <reason>` for `failed`/`skipped`/`pending`/`updated`/`declined` — the shared render shape for `EnsureVariableOutcome` (macf#838 Amendment D phase 2; `'pending'` added groundnuty/macf#1212; `'updated'`/`'declined'` added groundnuty/macf#1319 — see each status's own doc in `ensure-variable.ts`). NEVER a credential value — `reason` may narrate a non-secret value (e.g. the actor list `'updated'`/`'declined'` name), but the type carries no credential field. */
 function formatVariableLegLine(label: string, leg: EnsureVariableOutcome): string {
-  const suffix = leg.status === 'failed' || leg.status === 'skipped' || leg.status === 'pending' ? ` — ${leg.reason}` : '.';
+  const suffix =
+    leg.status === 'failed' || leg.status === 'skipped' || leg.status === 'pending' || leg.status === 'updated' || leg.status === 'declined'
+      ? ` — ${leg.reason}`
+      : '.';
   return `  ${label}: ${leg.status.toUpperCase()}${suffix}`;
 }
 

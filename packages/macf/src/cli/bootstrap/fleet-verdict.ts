@@ -630,6 +630,17 @@ export function routingVerdictComponent(
  * the same bucket as `'failed'`/`'skipped'` — #1212's own "pending ≠
  * failed" distinction is preserved through to this render, not erased by
  * it.
+ *
+ * `'updated'`/`'declined'` (groundnuty/macf#1319 — `reconcileTrustedActors`'s
+ * two new outcomes for a repo whose ACTOR LIST diverged from the manifest)
+ * fold into the SAME `stalePresenceRepos` bucket `'already-present'` already
+ * uses, never `confirmedRepos`/`gapRepos`: both outcomes only ever apply to a
+ * repo THIS run's create-only pass classified `'already-present'` in the
+ * first place (see that function's doc), so — same as bare
+ * `'already-present'` — neither one re-observes a LIVE runner for the repo,
+ * only its trusted-actor VALUE. Reconciling (or declining to reconcile)
+ * which actors are trusted says nothing new about whether a runner is
+ * actually registered and online.
  */
 export function runnerVerdictComponent(routing: Readonly<Record<string, EnsureVariableOutcome>>): FleetVerdictComponent | undefined {
   const repos = Object.keys(routing);
@@ -640,7 +651,9 @@ export function runnerVerdictComponent(routing: Readonly<Record<string, EnsureVa
     return { name: 'runners', status: { state: 'confirmed', detail: '' } };
   }
 
-  const stalePresenceRepos = repos.filter((r) => routing[r]?.status === 'already-present');
+  const stalePresenceRepos = repos.filter(
+    (r) => routing[r]?.status === 'already-present' || routing[r]?.status === 'updated' || routing[r]?.status === 'declined',
+  );
   const pendingRepos = repos.filter((r) => routing[r]?.status === 'pending');
   const gapRepos = repos.filter((r) => routing[r]?.status === 'failed' || routing[r]?.status === 'skipped');
 
