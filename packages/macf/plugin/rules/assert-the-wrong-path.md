@@ -99,6 +99,10 @@ Acceptance criteria almost always enumerate what must hold. That is sufficient w
 
 ### Four triggers, four different remedies
 
+**Each trigger states its recurrence** — how many independent arrivals it rests on, and over what span. A trigger whose instances all arrived together is a *candidate* for being an instance of something else rather than a peer; the count prompts that question and the mechanism answers it. Where provenance is not recoverable from the issue trail, the line says **unrecorded** rather than inventing a number.
+
+**Recurrence:** introduced in `#1154`, split from trigger 2 in `#1155`. Rests on the doc's five worked examples above — **one working session, 2026-08-19/20, across five unrelated subsystems.** The number of *independent* arrivals since is **unrecorded**.
+
 **Trigger 1 — circularity: the reference value comes from what it checks.** The verification cannot fail, so it reports agreement and reads as correctness.
 
 - A manifest **scaffolded from live state**, then validated by diffing it **against live state**. Empty by construction. *"Scaffold it, then run plan and see it clean"* is what a careful person writes unprompted — and it proves self-agreement, not correctness.
@@ -106,6 +110,8 @@ Acceptance criteria almost always enumerate what must hold. That is sufficient w
 - Any assertion where the fixture and the expectation are built by the same helper.
 
 **Remedy: forbid the assertion.** There is no right version of it — the shape is the defect.
+
+**Recurrence:** split out of trigger 1 in `#1155` — **same session as trigger 1 (2026-08-19/20)**, not an independent arrival. Instance count since: **unrecorded.**
 
 **Trigger 2 — the spec classifies a state without specifying its observable consequence.** Nothing is circular; the premise is correct, and the leap is to an observable nobody specified.
 
@@ -120,6 +126,8 @@ expect(code).toBe(0); // stale-pin is a skip, not a halt
 > **A spec that classifies a state without specifying its observable consequence invites the test to invent one.**
 
 **Remedy: specify the consequence — do NOT merely forbid the assertion.** Forbidding `toBe(0)` leaves the right value unstated and the next person guesses again. The fix is the spec sentence *"a roll that leaves any agent behind exits `2`"*, which makes the wrong assertion unwritable rather than merely disallowed.
+
+**Recurrence:** `#1236`, refined by `#1242` (prospective form) and `#1251` (mechanism guard). **Two instances, at different scales**, stated in the trigger itself. **Re-arrived independently on 2026-08-27** as `#1311`'s fixture — which wrote the very file whose read was under test — so this is the one trigger with a confirmed arrival after a gap.
 
 **Trigger 3 — the population under test excludes the failing case by construction.** Nothing is circular and the consequence is specified; the assertion is correct for every case it can see. **The case it cannot see is the one the code gets wrong.**
 
@@ -146,6 +154,8 @@ For the vault fix the answer was *reused roles*, and it was. For the fleet e2e i
 - **Illegitimate** — lower a sweep's cap from 5 so the issue under test appears in its own output.
 
 **And its cheap companion — mutation as habit:** break the fix, re-run, confirm a test notices. **A test that passes with the fix removed is testing something else.** One fix shipped merged-and-green while its emitting call site stayed broken, because its tests asserted the mechanism in general rather than at the site; its replacement was proven load-bearing by disabling it and watching the assertion fail. **The cost is a single deliberately-broken run.**
+
+**Recurrence:** `#1257`. **Five instances, ONE session (2026-08-27), two agents** — and per the confound noted above, instances found while hunting instrument failures co-arrive partly because of attention. **This trigger has no confirmed arrival after a gap.** Its case rests on the shared mechanism, not the count.
 
 **Trigger 4 — an empty result from a search space that was empty.** The instrument reported nothing found, and nothing was searched. **The two outputs are identical and their meanings are opposite:**
 
