@@ -11,6 +11,7 @@
  */
 import 'reflect-metadata';
 import { readFileSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
 import { formatDashboard, formatPeerTable, formatHealthDetail, formatStartupReconcile, formatIssuesOneline } from '../lib/format.js';
 import { getOwnRegistration, listPeers } from '../lib/registry.js';
 import { pingAgent } from '../lib/health.js';
@@ -42,8 +43,6 @@ import {
   type GuestProbeFn,
   type GuestResolveFn,
 } from '../../cli/commands/fleet-guests.js';
-
-const command = process.argv[2];
 
 /**
  * Parse a positive-integer env override, falling back to `undefined` (the
@@ -89,7 +88,17 @@ function probeGuestHealth(
   return probePeerHealth({ name: 'guest', info }, { homeProject, federatedCaProjects, varsClient });
 }
 
-async function main(): Promise<void> {
+/**
+ * groundnuty/macf#1332: `command` is read here — at CALL time, inside
+ * `main()` — rather than once at module-load time. This is what lets a test
+ * import this module WITHOUT immediately running a stale, import-time-frozen
+ * command (see the `isMainModule()` guard below), and lets a single test file
+ * call `main()` repeatedly with different `process.argv[2]`/`[3]` values
+ * without needing `vi.resetModules()` between cases. Purely an entry-point
+ * seam — every line of dispatch logic below is unchanged.
+ */
+export async function main(): Promise<void> {
+  const command = process.argv[2];
   const agentName = process.env['MACF_AGENT_NAME'] ?? 'unknown';
   const project = process.env['MACF_PROJECT'] ?? 'MACF';
   const registryConfig = getRegistryConfig();
@@ -328,7 +337,26 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((err: Error) => {
-  console.error(`Error: ${err.message}`);
-  process.exitCode = 1;
-});
+/**
+ * groundnuty/macf#1332: only auto-run when this file is the process entry
+ * point (`node macf-plugin-cli.js <command>`, the SKILL.md-documented
+ * invocation) — not when a test `import()`s this module to call `main()`
+ * directly. Same pattern as `plugin/lib/stale-issue-citations.ts`'s
+ * `isMainModule()`.
+ */
+function isMainModule(): boolean {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    return import.meta.url === pathToFileURL(entry).href;
+  } catch {
+    return false;
+  }
+}
+
+if (isMainModule()) {
+  void main().catch((err: Error) => {
+    console.error(`Error: ${err.message}`);
+    process.exitCode = 1;
+  });
+}
