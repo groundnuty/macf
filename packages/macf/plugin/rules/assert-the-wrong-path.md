@@ -20,7 +20,15 @@ Five instruments observed failing this in one session (2026-08-27/28, three agen
 
 **Mutation is the operation that asks this question mechanically** — break the thing; if the check does not notice, the check was never connected to it. That is why every mutation requirement in this rule is load-bearing rather than ceremonial. **The cost of relying on mutation alone is that it answers late**, after the work is written; asking the question first is free.
 
-**Note the altitude, stated as an open question rather than a restructure:** trigger 3 (*the population excludes the failing case*) and trigger 4 (*an empty result from an empty search space*) both look like instances of this property rather than peers of trigger 1 — in each, the reading was guaranteed. **That framing rests on one session's synthesis and is recorded here to be argued with, not acted on.** The triggers are cited by number across issues and PRs; they are not renumbered.
+**Note the altitude, stated as an open question rather than a restructure:** trigger 3 (*the population excludes the failing case*) and trigger 4 (*an empty result from an empty search space*) both look like instances of this property rather than peers of trigger 1 — **in each, the reading was guaranteed.**
+
+**That argument rests on the shared mechanism, not on when the instances arrived.** The distinction matters, because co-arrival is a weaker signal than it appears:
+
+> **Instances can co-arrive because someone was looking.** A session spent hunting instrument failures surfaces instrument failures together whether or not they share a mechanism. **Co-arrival is a smell, not a finding** — it says *check whether these share a mechanism*; it does not say they do.
+
+**Trigger 4's five instances are exactly that case:** found by looking for instrument failures, so their co-arrival is partly attention. **What makes the subcase reading convincing is that both triggers reduce to the same sentence — and that would hold if the instances had arrived over five months.** The clustering only prompted the question.
+
+**Recorded here to be argued with, not acted on.** The triggers are cited by number across issues and PRs; they are not renumbered.
 
 ---
 
