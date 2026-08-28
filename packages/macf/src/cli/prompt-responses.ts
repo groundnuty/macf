@@ -60,8 +60,38 @@ function seedContent(): string {
 /** Outcome of a `seedPromptResponsesConfig` call, for the caller to report. */
 export type SeedPromptResponsesResult =
   | { readonly action: 'seeded'; readonly path: string }
-  | { readonly action: 'preserved'; readonly path: string; readonly loaded: LoadedPromptResponses }
+  | {
+      readonly action: 'preserved';
+      readonly path: string;
+      readonly loaded: LoadedPromptResponses;
+      readonly missingFromCanonicalSeed: readonly string[];
+    }
   | { readonly action: 'invalid'; readonly path: string; readonly error: string };
+
+/**
+ * Names present in the CLI's shipped `PROMPT_RESPONSES_SEED` that this
+ * workspace's file has no entry for at all (by `name`, whether accepted,
+ * refused, or warned — the point is "was this ever written down here",
+ * not "is it currently active").
+ *
+ * Exists because `seedPromptResponsesConfig` is seed-if-absent /
+ * never-clobber (macf#645 design: the config is operator-curated state,
+ * like `env.telemetry`), so a CLI bump that adds a new canonical entry
+ * (e.g. `rating-survey`, macf#703) does NOTHING for a workspace whose file
+ * predates it — `macf update` only VALIDATES, it never merges. Without this
+ * check, that gap is invisible: the seed evolved correctly, the loader
+ * accepted the (unchanged) file cleanly, and nothing at `macf update` time
+ * says "this workspace is running fewer ceremony matchers than the CLI now
+ * ships." Silent-fallback-hazards.md's own lesson applied to itself — a
+ * detection this cheap should exist, not be discovered by an 8-hour stall.
+ */
+function missingCanonicalSeedNames(loaded: LoadedPromptResponses): readonly string[] {
+  const present = new Set<string>([
+    ...loaded.accepted.map((e) => e.name),
+    ...loaded.refused.map((r) => r.entry.name),
+  ]);
+  return PROMPT_RESPONSES_SEED.entries.map((e) => e.name).filter((name) => !present.has(name));
+}
 
 /**
  * Seed (if absent) or validate (if present) the workspace auto-responder config.
@@ -69,7 +99,9 @@ export type SeedPromptResponsesResult =
  *   - ABSENT → write the canonical seed. `action: 'seeded'`.
  *   - PRESENT + valid → parse + Inv-2-classify (never rewrite). `action:
  *     'preserved'` with the loaded accepted/refused/warned split so the caller
- *     can print loud Inv-2 feedback.
+ *     can print loud Inv-2 feedback, PLUS `missingFromCanonicalSeed` — names
+ *     shipped in the current CLI's seed that this file never picked up
+ *     (macf#703; see `missingCanonicalSeedNames`).
  *   - PRESENT + invalid (bad JSON / schema) → `action: 'invalid'` with the error
  *     message. NEVER throws — a typo'd config must not break `macf update`; the
  *     caller warns loudly and proceeds.
@@ -84,7 +116,7 @@ export function seedPromptResponsesConfig(workspaceDir: string): SeedPromptRespo
   try {
     const raw: unknown = JSON.parse(readFileSync(path, 'utf-8'));
     const loaded = loadPromptResponses(raw);
-    return { action: 'preserved', path, loaded };
+    return { action: 'preserved', path, loaded, missingFromCanonicalSeed: missingCanonicalSeedNames(loaded) };
   } catch (err) {
     // Both a JSON `SyntaxError` and a schema `PromptResponderError` are Error
     // subclasses — surface either message; never throw (a typo'd config must
@@ -126,6 +158,15 @@ export function reportSeedPromptResponses(result: SeedPromptResponsesResult): vo
         console.warn(
           `  Prompts: WARN entry "${w.entry.name}" — signature contains ` +
             `authorization-shaped substring "${w.matched}" (Inv 2 loud-warn; kept, operator-owned risk)`,
+        );
+      }
+      if (result.missingFromCanonicalSeed.length > 0) {
+        console.warn(
+          `  Prompts: this file predates ${result.missingFromCanonicalSeed.length} ceremony matcher(s) ` +
+            `the CLI now ships: ${result.missingFromCanonicalSeed.join(', ')}. Seed-if-absent/never-clobber ` +
+            `means \`macf update\` will NOT add them — copy the entry from the current seed (see ` +
+            `\`macf init\` on a scratch dir, or PROMPT_RESPONSES_SEED in @groundnuty/macf-core) into ` +
+            `.claude/.macf/${PROMPT_RESPONSES_FILENAME} if you want it active here.`,
         );
       }
       return;

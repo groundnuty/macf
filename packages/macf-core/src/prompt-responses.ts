@@ -304,13 +304,65 @@ export function verifyOutcome(afterFrame: string, entry: PromptResponseEntry): V
 
 /**
  * The canonical seed config `macf init` writes when no `prompt-responses.json`
- * exists yet. Two ceremony-ack entries vetted to Inv 2 (neither signature
- * contains a refuse/warn substring). The exact rendered text of a launch prompt
- * can only be confirmed by an OPERATOR live-verify (the prompts don't render in
- * `-p` mode), so a seed that doesn't exactly match a real prompt fails SAFE —
- * the frame falls through to Inv 1 (unknown-prompt alert), never a wrong answer.
+ * exists yet. Ceremony-ack entries vetted to Inv 2 (no signature contains a
+ * refuse/warn substring). The exact rendered text of a launch prompt can only
+ * be confirmed by an OPERATOR live-verify (the prompts don't render in `-p`
+ * mode), so a seed that doesn't exactly match a real prompt fails SAFE — the
+ * frame falls through to Inv 1 (unknown-prompt alert), never a wrong answer.
  * Operators tune the exact `frame_contains` / `option_text` against the real
  * pane, then the ceremony auto-clears.
+ *
+ * **`rating-survey` provenance + scope (macf#703).** `silent-fallback-hazards.md`
+ * Instance 3 sub-shape B asks the auto-responder to clear the "How is Claude
+ * doing this session?" survey (a modal that can swallow a `tmux_wake`
+ * keystroke, same as the dev-channels ceremony) — but the seed's own
+ * live-verify precondition couldn't be met from this session (no interactive
+ * pane to capture). The `frame_contains` / `option_text` below are instead
+ * extracted from Claude Code v2.1.226's shipped strings (`strings` on the
+ * bundled binary): the message renders verbatim as
+ * `How is Claude doing this session? (optional)`, and the options render as
+ * `<key>: <label>` pairs — `1: Bad`, `2: Fine`, `3: Good`, `0: Dismiss` (an
+ * optional `4: Unsure` only when a citation is attached). This is STRONGER
+ * than a guess (the literal strings the binary renders) but WEAKER than a
+ * live-pane capture (the row/column layout Ink chooses at runtime is not
+ * confirmed) — the fail-safe property is what makes shipping it anyway sound:
+ * `optionOnSendLine`'s per-line ordinal binding only matches a line that
+ * BOTH contains "Dismiss" AND starts with the `0` ordinal, so if the options
+ * pack onto one row starting with `1: Bad …` (or any shape other than
+ * "Dismiss" leading its own line), the entry simply never fires — Inv 1,
+ * not a wrong answer. `send: '0'` (Dismiss) is deliberate: "Bad"/"Fine"/
+ * "Good"/"Unsure" are judgment calls the auto-responder must never fabricate
+ * (Inv 2's ceremony-acks-only posture), so the only safe ceremony answer to
+ * an "(optional)" survey is declining it, never rating it. Checked `send: '0'`
+ * against the bash+jq+awk runtime this module is the reference spec for
+ * (`scripts/macf-prompt-watcher.sh`): `jq`'s `//` treats a non-empty STRING
+ * `"0"` as truthy (only `false`/`null` are jq-falsy), bash's `[ -z "$send" ]`
+ * is a length check (non-empty), and the awk matcher's `send ~ /^[0-9]+$/` +
+ * `substr(...) == send` are regex/string operations, never a raw boolean
+ * `if (send)` — so `'0'` is handled identically to `'1'`/`'2'` at every layer.
+ *
+ * **Scope this actually covers — bounded to the watcher's own lifetime, NOT
+ * general mid-session protection.** `macf-prompt-watcher.sh` only runs during
+ * a bounded post-LAUNCH window (default 90s, extendable on prompt-relevant
+ * activity up to a 30-minute total cap — see that script's "DEADLINE MODEL"
+ * header and `first-launch-guidance.ts`'s `DEV_CHANNELS_WATCH_TOTAL_CAP_SECS`)
+ * and self-terminates. The rating survey is not a launch ceremony — it can
+ * appear hours into a long-running session, well outside that window, where
+ * this entry provides NO coverage. What it DOES cover: the survey already
+ * showing on-screen when a fresh watcher starts — most concretely, a
+ * `claude -c` resume that reopens onto a still-pending survey left over from
+ * the PRIOR session. General mid-session coverage of Instance 3 sub-shape B
+ * remains native channels (macf#641) — delivery independent of pane state,
+ * not dependent on the pane being clear.
+ *
+ * **`/login` deliberately has NO seed entry.** The same hazard note asks the
+ * auto-responder to also clear a `/login` modal, but `/login` is a
+ * credential/OAuth flow, not a `send-an-ordinal` menu — there is no ceremony
+ * option to bind Inv 3 to, and auto-touching anything inside a login flow is
+ * exactly what Inv 2's hard-refuse (`trust`/`grant`/`permission`-adjacent)
+ * posture exists to keep off the allowlist. The residual protection for a
+ * `/login` modal is Inv 1's existing alert-on-unknown-prompt path (fires
+ * when the screen `looksPromptLike`), not a new allowlist entry.
  */
 export const PROMPT_RESPONSES_SEED: PromptResponsesConfig = {
   schema_version: PROMPT_RESPONSES_SCHEMA_VERSION,
@@ -327,6 +379,13 @@ export const PROMPT_RESPONSES_SEED: PromptResponsesConfig = {
       frame_contains: ['Resume full session as-is'],
       option_text: 'Resume full session as-is',
       send: '2',
+      max_fires: 1,
+    },
+    {
+      name: 'rating-survey',
+      frame_contains: ['How is Claude doing this session? (optional)'],
+      option_text: 'Dismiss',
+      send: '0',
       max_fires: 1,
     },
   ],
