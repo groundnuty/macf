@@ -98,6 +98,54 @@ describe('runRunnerAudit', () => {
     logSpy.mockRestore();
   });
 
+  it('DECISIVE: genuinely zero runs renders as "NOTHING TO AUDIT / UNTESTED", never "CLEAN ... all self-hosted"', async () => {
+    let printed = '';
+    const logSpy = vi.spyOn(console, 'log').mockImplementation((s: string) => {
+      printed += `${s}\n`;
+    });
+    const deps: RunnerAuditDeps = {
+      listRecentRunIds: async () => [],
+      listRunJobs: async () => [],
+    };
+    const code = await runRunnerAudit({ repos: ['groundnuty/x'] }, deps);
+    expect(code).toBe(0); // clean stays true — this test is about the RENDERED TEXT, not the exit code
+    expect(printed).not.toMatch(/all self-hosted/);
+    expect(printed).toMatch(/NOTHING TO AUDIT/);
+    expect(printed).toMatch(/UNTESTED/);
+    logSpy.mockRestore();
+  });
+
+  it('runs exist but every job seen was the exempt pick-runner dispatcher -> same "NOTHING TO AUDIT" render, not "CLEAN ... all self-hosted"', async () => {
+    let printed = '';
+    const logSpy = vi.spyOn(console, 'log').mockImplementation((s: string) => {
+      printed += `${s}\n`;
+    });
+    const deps: RunnerAuditDeps = {
+      listRecentRunIds: async () => [1],
+      listRunJobs: async () => [job('pick-runner', { runnerGroupName: 'GitHub Actions' })],
+    };
+    const code = await runRunnerAudit({ repos: ['groundnuty/x'] }, deps);
+    expect(code).toBe(0);
+    expect(printed).not.toMatch(/all self-hosted/);
+    expect(printed).toMatch(/NOTHING TO AUDIT/);
+    logSpy.mockRestore();
+  });
+
+  it('a real confirmation (non-exempt job actually checked and found self-hosted) still renders CLEAN ... all self-hosted', async () => {
+    let printed = '';
+    const logSpy = vi.spyOn(console, 'log').mockImplementation((s: string) => {
+      printed += `${s}\n`;
+    });
+    const deps: RunnerAuditDeps = {
+      listRecentRunIds: async () => [1],
+      listRunJobs: async () => [job('route-by-mention', { runnerGroupName: 'macf-runners' })],
+    };
+    const code = await runRunnerAudit({ repos: ['groundnuty/x'] }, deps);
+    expect(code).toBe(0);
+    expect(printed).toMatch(/CLEAN — 1 job\(s\) across 1 run\(s\), all self-hosted\./);
+    logSpy.mockRestore();
+  });
+
   it('citation guard: the human-readable report carries no internal issue numbers or DR names', async () => {
     let printed = '';
     const logSpy = vi.spyOn(console, 'log').mockImplementation((s: string) => {

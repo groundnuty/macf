@@ -22,9 +22,34 @@ export interface RunnerAuditCliOptions {
   readonly maxRuns?: number;
 }
 
+/**
+ * `report.clean` is true whenever zero violations AND zero unknowns were
+ * found — which a genuinely empty population (zero non-exempt jobs seen,
+ * whether because zero runs exist yet, groundnuty/macf#1194's own live
+ * finding on `macf-trial`, or because every run so far only ever executed
+ * the exempt `pick-runner` dispatcher) satisfies vacuously. `clean` itself
+ * stays correct as a pure "nothing contradicted" signal — see
+ * `runner-usage-audit.test.ts`'s explicit "genuinely zero runs -> clean"
+ * pin. What is NOT correct is rendering that vacuous case as `"N job(s)
+ * ... all self-hosted"`: the claim quantifies over `jobsChecked`, and
+ * asserting it over a population of zero is exactly the "confident
+ * negative from the wrong instrument" shape this whole check exists to
+ * avoid (macf#1194's reporter: "I reported 'zero runners in the org' ...
+ * a confident negative from the wrong instrument"). `jobsChecked === 0`
+ * is the precise guard — it is the quantity the claim ranges over, and it
+ * is a strict superset of `runsChecked === 0` (runs with only the exempt
+ * job present also produce it).
+ */
 function formatReport(report: RunnerAuditReport): string {
   const lines: string[] = [];
   if (report.clean) {
+    if (report.jobsChecked === 0) {
+      lines.push(
+        `${report.repo}: NOTHING TO AUDIT — ${String(report.runsChecked)} run(s) checked, 0 non-exempt job(s) found. ` +
+          'Self-hosted enforcement is UNTESTED here, not confirmed clean.',
+      );
+      return lines.join('\n');
+    }
     lines.push(`${report.repo}: CLEAN — ${String(report.jobsChecked)} job(s) across ${String(report.runsChecked)} run(s), all self-hosted.`);
     return lines.join('\n');
   }

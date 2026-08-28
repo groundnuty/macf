@@ -28,6 +28,7 @@ import { runManifestScaffold } from './commands/bootstrap-manifest-scaffold.js';
 import { runRoutingDoctor } from './commands/routing-doctor.js';
 import { runRoutingE2e } from './commands/routing-e2e.js';
 import { runRunnerAudit } from './commands/runner-audit.js';
+import { runRunnerDeclarationCheck } from './commands/runner-declaration-check.js';
 import { runRegistryPrune } from './commands/registry-prune.js';
 import { runRestartSelfCommand } from './commands/restart-self.js';
 import { certsInit, certsRecover, certsRotate, issueRoutingClient } from './commands/certs.js';
@@ -1010,6 +1011,22 @@ routing
   .option('--max-runs <n>', 'How many of the most recent runs to check per repo (default 20)', (v) => Number(v))
   .action(async (opts) => {
     const code = await runRunnerAudit({ repos: opts.repo, json: opts.json, maxRuns: opts.maxRuns });
+    process.exitCode = code;
+  });
+
+routing
+  .command('runner-declaration-check')
+  .description(
+    'Provision-time check: for each --repo, reads the INSTALLED agent-router.yml and reports whether a ' +
+    '"--runs-on self-hosted" declaration can actually reach macf-actions\' pick-runner job (which "with:" inputs ' +
+    'it passes vs what the reusable workflow accepts). Advisory only -- never called by plan/apply, exit code is ' +
+    'non-zero on a confirmed mismatch OR an unreadable installed workflow.',
+  )
+  .option('--repo <owner/repo>', 'Repo to check (repeatable)', (value, previous: string[]) => [...previous, value], [] as string[])
+  .option('--runs-on <value>', 'The fleet\'s declared routing.runner.runs_on value (e.g. "self-hosted")')
+  .option('--json', 'Emit the structured per-repo finding as JSON', false)
+  .action(async (opts) => {
+    const code = await runRunnerDeclarationCheck({ repos: opts.repo, runsOn: opts.runsOn, json: opts.json });
     process.exitCode = code;
   });
 
