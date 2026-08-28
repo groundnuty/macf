@@ -445,6 +445,49 @@ describe('runnerVerdictComponent', () => {
     expect(c?.status.detail).toContain('pending');
     expect(c?.status.detail).not.toContain('NO confirmed'); // the failed/skipped wording must not also fire
   });
+
+  // --- groundnuty/macf#1323 — the `requirement` param resolves the
+  // "empty routing map" ambiguity: `{}` means "N/A" only when the
+  // declaration itself never required a runner; it means "the requirement
+  // is unmet" when it did and no token was ever supplied. ---
+  describe('requirement param (groundnuty/macf#1323)', () => {
+    it('default (omitted) — byte-identical to pre-#1323: empty routing map -> undefined', () => {
+      expect(runnerVerdictComponent({})).toBeUndefined();
+    });
+
+    it("empty routing map + requirement 'not-required' -> undefined, unchanged", () => {
+      expect(runnerVerdictComponent({}, { status: 'not-required' })).toBeUndefined();
+    });
+
+    it("empty routing map + requirement 'ok' -> undefined (declared + token present + genuinely nothing observed this run is out of THIS issue's scope)", () => {
+      expect(runnerVerdictComponent({}, { status: 'ok' })).toBeUndefined();
+    });
+
+    // --- decisive pair ---
+
+    it("DECISIVE: empty routing map + requirement 'failed' -> not-confirmed, never UNKNOWN, naming the reason", () => {
+      const c = runnerVerdictComponent({}, { status: 'failed', reason: 'manifest declares routing.runner (runs_on: "self-hosted") but no runner registration token was supplied' });
+      expect(c).toBeDefined();
+      expect(c?.name).toBe('runners');
+      expect(c?.status.state).toBe('not-confirmed');
+      expect(c?.status.state).not.toBe('unknown');
+      expect(c?.status.detail).toContain('no runner registration token was supplied');
+    });
+
+    it("DECISIVE (paired): a LIVE-confirmed runner outranks a 'failed' requirement — never contradicts groundnuty/macf#1195's observe-before-refuse write", () => {
+      const c = runnerVerdictComponent({ 'o/a': { status: 'created' } }, { status: 'failed', reason: 'no runner registration token was supplied' });
+      expect(c?.status.state).toBe('confirmed');
+    });
+
+    it("a genuinely-failed per-repo leg (repos.length > 0) is UNCHANGED by requirement — the per-repo observation already outranks the manifest-level guess", () => {
+      const withoutRequirement = runnerVerdictComponent({ 'o/a': { status: 'failed', reason: 'no usable runner registered' } });
+      const withFailedRequirement = runnerVerdictComponent(
+        { 'o/a': { status: 'failed', reason: 'no usable runner registered' } },
+        { status: 'failed', reason: 'no runner registration token was supplied' },
+      );
+      expect(withFailedRequirement).toEqual(withoutRequirement);
+    });
+  });
 });
 
 // --- workspaceVerdictComponent ---

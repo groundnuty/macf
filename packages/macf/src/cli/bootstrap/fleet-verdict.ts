@@ -84,6 +84,7 @@ import type { RoutingSecretName, RoutingSecretsPublishResult } from './apply-rou
 import { ALL_ROUTING_SECRET_NAMES, ROUTING_APP_ID_SECRET_NAME, TS_OAUTH_CLIENT_ID_SECRET_NAME, TS_OAUTH_SECRET_SECRET_NAME } from './apply-routing-secrets.js';
 import type { EnsureVariableOutcome } from './ensure-variable.js';
 import type { RemainingDeployReport } from './remaining-deploy.js';
+import type { RunnerRequirementOutcome } from './apply-routing.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -604,10 +605,27 @@ export function routingVerdictComponent(
 /**
  * Runner component — over `result.routing` (`MACF_TRUSTED_ACTORS`'s
  * per-repo outcome map; `apply-fleet.ts` leaves it `{}` whenever
- * `routing.runner` isn't declared `runs_on: self-hosted`, so an empty map
- * here means "not applicable," not "checked and failed" — returns
- * `undefined` in that case: this fleet never asked for self-hosted
- * routing, so there is nothing to report missing).
+ * `routing.runner` isn't declared `runs_on: self-hosted` — but ALSO
+ * whenever it IS declared self-hosted and this run simply confirmed zero
+ * agent repos to write to (e.g. no `--runner-token` was supplied, so
+ * nothing was ever attempted for ANY repo — groundnuty/macf#1323). An
+ * empty map is therefore ambiguous on its own: "not applicable" and
+ * "the declared requirement is unmet" both render as `{}`. `requirement`
+ * (`FleetApplyResult.runnerRequirement`, groundnuty/macf#1323) resolves the
+ * ambiguity — it is derived from the manifest + token alone, never from
+ * whether `routing` happens to have entries, so it can tell the two `{}`
+ * cases apart. Defaults to `{ status: 'not-required' }` — the
+ * byte-identical-when-omitted contract every additive optional parameter
+ * in this codebase carries (every pre-#1323 call site, including every
+ * pre-#1323 test, keeps returning `undefined` for `routing = {}`).
+ *
+ * `requirement.status === 'failed'` with `repos.length === 0` returns a
+ * genuine `'not-confirmed'` component (never `'unknown'` — the operator's
+ * own "the failure of our runner should be loud" ruling, groundnuty/
+ * macf#993, extends here: a declared-but-unmet requirement is a confirmed
+ * gap, not an indeterminate one) instead of `undefined` — this is the
+ * fix's whole point: a self-hosted fleet with no registration token no
+ * longer vanishes from the verdict.
  *
  * **`'already-present'` is deliberately NOT `'confirmed'`.**
  * `ensureVariableCreated` is create-only: `'already-present'` means an
@@ -642,9 +660,23 @@ export function routingVerdictComponent(
  * which actors are trusted says nothing new about whether a runner is
  * actually registered and online.
  */
-export function runnerVerdictComponent(routing: Readonly<Record<string, EnsureVariableOutcome>>): FleetVerdictComponent | undefined {
+export function runnerVerdictComponent(
+  routing: Readonly<Record<string, EnsureVariableOutcome>>,
+  requirement: RunnerRequirementOutcome = { status: 'not-required' },
+): FleetVerdictComponent | undefined {
   const repos = Object.keys(routing);
-  if (repos.length === 0) return undefined;
+  if (repos.length === 0) {
+    // groundnuty/macf#1323 — a declared-but-unmet requirement is a
+    // confirmed gap even though NO repo was ever observed (there was
+    // nothing to observe: the token precondition blocked every attempt
+    // before any repo-level check could run). Checked BEFORE the
+    // `undefined` fallback below — `'not-required'`/`'ok'` still
+    // return `undefined` here, unchanged.
+    if (requirement.status === 'failed') {
+      return { name: 'runners', status: { state: 'not-confirmed', detail: requirement.reason } };
+    }
+    return undefined;
+  }
 
   const confirmedRepos = repos.filter((r) => routing[r]?.status === 'created');
   if (confirmedRepos.length === repos.length) {

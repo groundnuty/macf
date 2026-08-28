@@ -22,6 +22,7 @@ import {
   runnerNeverRegisteredReason,
   runnerPermissionDeniedReason,
   runnerProvisioningTerminalFailureReason,
+  runnerRequirementOutcome,
   runnerStillProvisioningReason,
   runnerTokenPollExhaustedReason,
   RUNNER_TOKEN_ENV_VAR,
@@ -1628,5 +1629,43 @@ describe('checkRunnerTokenPreflight (macf#932)', () => {
     expect(failure?.message).toContain(RUNNER_TOKEN_FLAG);
     expect(failure?.message).toContain(RUNNER_TOKEN_ENV_VAR);
     expect(failure?.message).toContain('gh api -X POST /orgs/<org>/actions/runners/registration-token --jq .token');
+  });
+});
+
+describe('runnerRequirementOutcome (groundnuty/macf#1323)', () => {
+  it("'not-required' when routing.runner is not declared at all", () => {
+    expect(runnerRequirementOutcome(undefined, undefined)).toEqual({ status: 'not-required' });
+  });
+
+  it("'not-required' when runs_on is declared but is NOT \"self-hosted\"", () => {
+    expect(runnerRequirementOutcome({ runner: { runs_on: 'ubuntu-latest', warm: 1 } }, undefined)).toEqual({ status: 'not-required' });
+  });
+
+  it("'ok' when self-hosted is declared and a non-empty token IS resolved", () => {
+    expect(runnerRequirementOutcome({ runner: { runs_on: 'self-hosted', warm: 1 } }, 'ghr-sentinel-token')).toEqual({ status: 'ok' });
+  });
+
+  // --- decisive pair (issue #1323's own acceptance criterion) ---
+
+  it('DECISIVE: self-hosted declared + no token -> failed, naming the reason', () => {
+    const outcome = runnerRequirementOutcome({ runner: { runs_on: 'self-hosted', warm: 1 } }, undefined);
+    expect(outcome.status).toBe('failed');
+    expect(outcome).toEqual({ status: 'failed', reason: noRunnerTokenReason() });
+  });
+
+  it('DECISIVE (paired): hosted-declared + no token -> unchanged (not-required, never failed)', () => {
+    expect(runnerRequirementOutcome({ runner: { runs_on: 'ubuntu-latest', warm: 1 } }, undefined)).toEqual({ status: 'not-required' });
+  });
+
+  it('failed on an empty-string token too — matches checkRunnerTokenPreflight\'s own empty-is-no-token rule', () => {
+    const outcome = runnerRequirementOutcome({ runner: { runs_on: 'self-hosted', warm: 1 } }, '');
+    expect(outcome).toEqual({ status: 'failed', reason: noRunnerTokenReason() });
+  });
+
+  it('never drifts from checkRunnerTokenPreflight\'s own gate condition — same applicability, same message', () => {
+    const routing = { runner: { runs_on: 'self-hosted' as const, warm: 1 } };
+    const preflight = checkRunnerTokenPreflight(routing, undefined);
+    const outcome = runnerRequirementOutcome(routing, undefined);
+    expect(outcome).toEqual({ status: 'failed', reason: preflight?.message });
   });
 });
