@@ -404,7 +404,8 @@ _pane_frame() {
 # stripped `env -i` one. This is the SAME hazard class as any other
 # locale-sensitive text match; the fix is "don't quantify a multibyte glyph
 # in a regex", not "always export LANG" (which this script does not control).
-readonly PANE_READY_SEP_MARK="$(printf '─%.0s' $(seq 1 10))"
+PANE_READY_SEP_MARK="$(printf '─%.0s' $(seq 1 10))"
+readonly PANE_READY_SEP_MARK
 readonly PANE_READY_INPUT_RE='^[[:space:]]*❯'
 _pane_ready() {
   local frame="$1" i j
