@@ -2185,6 +2185,34 @@ function routingSummaryLines(result: FleetApplyResult): string[] {
 }
 
 /**
+ * The runner-token REQUIREMENT's own render (groundnuty/macf#1323) —
+ * complements `routingSummaryLines` above, which renders NOTHING at all
+ * when `result.routing` is `{}` (the exact gap `result.runnerRequirement`
+ * exists to close: a self-hosted fleet with no `--runner-token` may never
+ * get as far as observing a single repo, so `routingSummaryLines` alone
+ * would stay silent on a genuinely unmet declaration). `[]` for
+ * `'not-required'` — same "nothing was promised, say nothing" convention
+ * `routingSummaryLines` already uses.
+ *
+ * **The `'failed'` line is deliberately SUPPRESSED once `result.routing`
+ * has ANY entries** — same "a live per-repo observation outranks this
+ * manifest-level guess" reasoning `applyExitCode`'s `runnerRequirementBad`
+ * uses (groundnuty/macf#1195: a repo whose runner is ALREADY confirmed
+ * usable writes successfully even with no token). Without this guard, a
+ * healthy re-apply would print "Runner requirement: FAILED" directly above
+ * `routingSummaryLines`' own "o/a: CREATED" line — a contradiction in the
+ * SAME transcript. `'ok'` carries no such risk (it is never a negative
+ * claim) and always renders regardless of `routing`'s shape.
+ */
+function runnerRequirementSummaryLines(result: FleetApplyResult): string[] {
+  const req = result.runnerRequirement;
+  if (req.status === 'not-required') return [];
+  if (req.status === 'ok') return ['Runner requirement: OK — a runner-registration token was supplied.'];
+  if (Object.keys(result.routing).length > 0) return [];
+  return [`Runner requirement: FAILED — ${req.reason}`];
+}
+
+/**
  * Routing-client mint + per-repo secret-deploy render (groundnuty/macf#920
  * gap 2). Never a credential value — `result.routingClient.mint` is the
  * redacted `RedactedRoutingClientMint` (status/reason only, never cert/key
@@ -2312,7 +2340,11 @@ function buildFleetVerdict(
   orgSecretVisibility: Readonly<Record<string, OrgSecretsListResult>> = {},
   pinContext: RoutingVerdictPinContext = ROUTING_VERDICT_PIN_CONTEXT_UNSPECIFIED,
 ): FleetVerdict {
-  const runnerComponent = runnerVerdictComponent(result.routing);
+  // groundnuty/macf#1323 — `result.runnerRequirement` resolves the
+  // ambiguity `runnerVerdictComponent`'s own doc names: `result.routing`
+  // reads `{}` both when this fleet never declared self-hosted AND when it
+  // did but no repo was ever attempted (e.g. a missing `--runner-token`).
+  const runnerComponent = runnerVerdictComponent(result.routing, result.runnerRequirement);
   return determineFleetVerdict([
     routingVerdictComponent(result.routingSecrets, orgSecretVisibility, pinContext),
     ...(runnerComponent !== undefined ? [runnerComponent] : []),
@@ -2356,6 +2388,8 @@ export function formatApplyResult(
   parts.push('', ...caSummaryLines(result));
   const routingLines = routingSummaryLines(result);
   if (routingLines.length > 0) parts.push('', ...routingLines);
+  const runnerRequirementLines = runnerRequirementSummaryLines(result);
+  if (runnerRequirementLines.length > 0) parts.push('', ...runnerRequirementLines);
   parts.push('', ...routingClientSummaryLines(result));
   const actionsPinLines = actionsPinSummaryLines(result);
   if (actionsPinLines.length > 0) parts.push('', ...actionsPinLines);
@@ -2598,6 +2632,11 @@ export function fleetApplyResultToJson(
     // phase 2).
     ca: { resolve: { ...result.ca.resolve }, registry_leg: { ...result.ca.registryLeg }, repo_legs: { ...result.ca.repoLegs } },
     routing: { ...result.routing },
+    // groundnuty/macf#1323 — ALWAYS present (never omitted, unlike
+    // `remaining_deploy`'s omit-when-empty convention): a script consuming
+    // `--json` needs a stable key to check regardless of whether this
+    // fleet declared self-hosted at all. Carries no credential field.
+    runner_requirement: { ...result.runnerRequirement },
     // `result.routingClient.mint` is ALREADY the redacted `RedactedRoutingClientMint`
     // (status/reason only — see `apply-fleet.ts::redactRoutingClientMint`);
     // `certLegs`/`keyLegs` are `EnsureVariableOutcome`s, which carry no
@@ -2678,8 +2717,16 @@ export function fleetApplyResultToJson(
  *   agent needs operator attention (failed/drift/skipped-unverified/
  *   repo-init-failed), OR the runner-ops App needs operator attention
  *   (groundnuty/macf#943 — same failed/drift/skipped-unverified bar as an
- *   agent), OR the vault write failed, OR ANY agent's deploy-phase attempt
- *   failed (macf#1013 requirement 4 — "partial failure exits non-zero";
+ *   agent), OR the declared self-hosted runner requirement is unmet AND
+ *   `result.routing` never observed a single repo this run
+ *   (groundnuty/macf#1323 — `runnerRequirementBad`; deliberately does NOT
+ *   fire when `result.routing` has ANY entries, however produced — a live
+ *   per-repo observation always outranks this manifest-level guess, per
+ *   groundnuty/macf#1195's "the runners exist, nothing looked" correction;
+ *   `routingBad` immediately above already fails the run when that live
+ *   observation is itself a genuine gap), OR the vault write failed, OR
+ *   ANY agent's deploy-phase attempt failed (macf#1013 requirement 4 —
+ *   "partial failure exits non-zero";
  *   `deployResults` defaults to `[]`, matching "the deploy phase was never
  *   attempted" — see `anyDeployFailed`'s own doc), OR the version-reconcile
  *   phase HALTED (DR-043 Amendment L, macf#1045 — a bad release during the
@@ -2855,6 +2902,30 @@ export function applyExitCode(
   // missing-`--runner-token` refusal; #993 only widened WHICH outcomes the
   // gate reports as `'failed'` rather than changing this check itself.
   const routingBad = Object.values(result.routing).some((leg) => leg.status === 'failed');
+  // groundnuty/macf#1323 — the runner-token REQUIREMENT's own leg (see
+  // `FleetApplyResult.runnerRequirement`'s doc): `routingBad` immediately
+  // above can ONLY see a failure when `result.routing` has entries, which
+  // it never does on a run that confirmed zero repos to write
+  // `MACF_TRUSTED_ACTORS` to (e.g. a self-hosted fleet with no
+  // `--runner-token` — nothing was ever attempted for ANY repo). This
+  // check catches THAT gap — but deliberately ONLY when `result.routing`
+  // is `{}`. `Object.keys(...).length === 0` is the guard, not
+  // `runnerRequirement.status === 'failed'` alone: groundnuty/macf#1195
+  // made `publishTrustedActorsGated` WRITE the var successfully for a repo
+  // whose runner is ALREADY confirmed usable, even with no token supplied
+  // this run ("the runners exist. Nothing looked." — that fix's own
+  // operator quote). Gating on `runnerRequirement.status === 'failed'`
+  // alone would silently reintroduce that exact regression one layer up: a
+  // healthy, already-provisioned self-hosted fleet re-applied without a
+  // freshly-minted (1-hour-TTL) token would exit `1` even though
+  // `result.routing` reads `'created'`/`'already-present'` for every repo
+  // — the verdict would say "runners confirmed" while the exit code says
+  // "failed," the exact cross-surface disagreement #1151's own comment
+  // warns against. A live per-repo observation in `result.routing` is
+  // always MORE informed than this manifest-level guess and must win;
+  // `routingBad` above already fails the run correctly when that
+  // observation is itself a genuine gap.
+  const runnerRequirementBad = result.runnerRequirement.status === 'failed' && Object.keys(result.routing).length === 0;
   // DR-043 §D5 "routing-client re-mint" (groundnuty/macf#920 gap 2) — same
   // 'skipped' vs 'failed' distinction `caBad` above already applies to CA
   // resolve. A `'skipped'` MINT is the EXPECTED steady state on an ordinary
@@ -2902,6 +2973,7 @@ export function applyExitCode(
     result.vault.status === 'failed' ||
     caBad ||
     routingBad ||
+    runnerRequirementBad ||
     routingClientBad ||
     routingSecretsBad ||
     routingBundleBad ||

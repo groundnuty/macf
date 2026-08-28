@@ -498,6 +498,45 @@ export function checkRunnerTokenPreflight(
   return { code: RUNNER_TOKEN_MISSING_CODE, message: noRunnerTokenReason() };
 }
 
+// --- The runner-requirement's OWN leg (groundnuty/macf#1323) ---
+
+/**
+ * `{@link checkRunnerTokenPreflight}`'s finding, given a permanent home on
+ * `FleetApplyResult` — independent of `result.routing` (the PER-REPO
+ * `MACF_TRUSTED_ACTORS` write outcome), which is `{}` whenever this run
+ * confirmed zero agent repos to write to (see `apply-fleet.ts`'s
+ * `nonProvisionedRepos`/`confirmedRepos` derivation). Through #1323, a
+ * missing token surfaced ONLY as a `console.error` WARNING in
+ * `runBootstrapApply` — never represented on the result at all — so a run
+ * whose routing leg happened to have no confirmed repos this round could
+ * still exit `0` while the manifest's OWN self-hosted declaration was
+ * genuinely unmet. `'not-required'` when `routing.runner` isn't declared
+ * self-hosted (mirrors `routing`'s own `{}` — nothing was promised, so
+ * nothing to report); `'ok'` when it is declared AND a token was resolved;
+ * `'failed'` when it is declared and no token was resolved — this LAST case
+ * is unconditional on any live observation (the same "manifest-level fact,
+ * not a per-repo detection result" framing {@link noRunnerTokenReason}'s own
+ * doc already establishes) and therefore ALWAYS surfaces, regardless of how
+ * many repos this run happened to confirm.
+ */
+export type RunnerRequirementOutcome =
+  | { readonly status: 'not-required' }
+  | { readonly status: 'ok' }
+  | { readonly status: 'failed'; readonly reason: string };
+
+/**
+ * The always-resolvable runner-requirement leg (groundnuty/macf#1323) —
+ * see {@link RunnerRequirementOutcome}'s doc. Pure; zero I/O; deliberately
+ * re-derives {@link checkRunnerTokenPreflight}'s EXACT gate condition (never
+ * a second, independently-drifting copy of "is this declared self-hosted") so
+ * the two can never disagree about whether the requirement applies.
+ */
+export function runnerRequirementOutcome(routing: FleetRouting | undefined, runnerToken: string | undefined): RunnerRequirementOutcome {
+  if (routing?.runner === undefined || routing.runner.runs_on !== 'self-hosted') return { status: 'not-required' };
+  const preflight = checkRunnerTokenPreflight(routing, runnerToken);
+  return preflight === undefined ? { status: 'ok' } : { status: 'failed', reason: preflight.message };
+}
+
 /**
  * The reason text for a runner-registration token WAS supplied but
  * {@link pollForUsableRunner}'s bounded window expired before `repo` became

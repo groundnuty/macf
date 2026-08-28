@@ -4526,6 +4526,11 @@ function resultWith(overrides: Partial<FleetApplyResult> = {}): FleetApplyResult
     // tests below override to exercise failure/skip shapes.
     ca: { resolve: { status: 'reused', certFingerprint: 'deadbeef'.repeat(8) }, registryLeg: { status: 'already-present' }, repoLegs: {} },
     routing: {},
+    // groundnuty/macf#1323 default: NOT-REQUIRED (no self-hosted runner
+    // declared) — matches `routing: {}`'s own "nothing declared" default
+    // immediately above. Individual tests below override to exercise the
+    // 'ok'/'failed' shapes.
+    runnerRequirement: { status: 'not-required' },
     // groundnuty/macf#920 gap 2 default: mint SKIPPED (steady-state re-run —
     // matches `ca`'s own REUSED default above), no repos to publish to.
     // Individual tests below override to exercise minted/failed-leg shapes.
@@ -4749,6 +4754,45 @@ describe('formatApplyResult / fleetApplyResultToJson / applyExitCode (pure)', ()
     ).toBe(0);
   });
 
+  // --- groundnuty/macf#1323 — a missing runner token fails the runner LEG
+  // (never the whole run — see the sibling `applyFleet` test below for
+  // "other legs still complete"), independent of `routing`'s own per-repo
+  // check, which is blind to this precisely because `routing` has NOTHING
+  // to be `'failed'` on a run that confirmed zero repos to write to.
+
+  it('applyExitCode: 1 when the manifest declares self-hosted, no runner token was resolved, AND result.routing observed zero repos this run', () => {
+    const result = resultWith({
+      routing: {},
+      runnerRequirement: { status: 'failed', reason: 'manifest declares routing.runner (runs_on: "self-hosted") but no runner registration token was supplied' },
+    });
+    expect(applyExitCode(result)).toBe(1);
+  });
+
+  it('applyExitCode: 0 when runs_on is hosted (or undeclared) — runnerRequirement stays not-required, unaffected (the paired half of the decisive pair)', () => {
+    // resultWith's own default already carries `runnerRequirement: { status: 'not-required' }` —
+    // asserted explicitly here so a future change to that default cannot
+    // silently make this test vacuous.
+    const result = resultWith({});
+    expect(result.runnerRequirement).toEqual({ status: 'not-required' });
+    expect(applyExitCode(result)).toBe(0);
+  });
+
+  it("applyExitCode: 0 (REGRESSION GUARD, groundnuty/macf#1195) when runnerRequirement reads 'failed' but result.routing ALREADY shows a live-confirmed runner — a manifest-level guess must never outrank a live per-repo write", () => {
+    const result = resultWith({
+      routing: { 'x/y': { status: 'created' } },
+      runnerRequirement: { status: 'failed', reason: 'manifest declares routing.runner (runs_on: "self-hosted") but no runner registration token was supplied' },
+    });
+    expect(applyExitCode(result)).toBe(0);
+  });
+
+  it("applyExitCode: 1 (unchanged) when runnerRequirement is 'failed' AND result.routing ALSO genuinely failed for the same repo — routingBad already covers this, runnerRequirementBad is redundant-but-consistent, not double-counted incorrectly", () => {
+    const result = resultWith({
+      routing: { 'x/y': { status: 'failed', reason: 'no usable runner registered' } },
+      runnerRequirement: { status: 'failed', reason: 'manifest declares routing.runner (runs_on: "self-hosted") but no runner registration token was supplied' },
+    });
+    expect(applyExitCode(result)).toBe(1);
+  });
+
   // --- groundnuty/macf#954 — the routing-client mint's three-way status
   // distinction (minted / skipped-benign / failed-exception) and its
   // exit-code consequence. Before this fix, a `deps.mint` exception collapsed
@@ -4902,6 +4946,53 @@ describe('formatApplyResult / fleetApplyResultToJson / applyExitCode (pure)', ()
     );
     expect(text).toMatch(/groundnuty\/x: FAILED — no self-hosted runner is confirmed registered/);
     expect(text).not.toMatch(/groundnuty\/x: SKIPPED/);
+  });
+
+  // --- groundnuty/macf#1323 — the runner-requirement's own render, the
+  // exact case `routingSummaryLines` above renders NOTHING for: `routing`
+  // is `{}` (nothing was ever attempted for any repo), so ONLY this new
+  // line can name the unmet declaration at all.
+  describe('runnerRequirementSummaryLines, wired through formatApplyResult (groundnuty/macf#1323)', () => {
+    it('not-required (default) -> no "Runner requirement" line at all', () => {
+      expect(formatApplyResult(resultWith({}))).not.toMatch(/Runner requirement/);
+    });
+
+    it("'ok' -> a positive line, always rendered regardless of routing's shape", () => {
+      const text = formatApplyResult(resultWith({ runnerRequirement: { status: 'ok' } }));
+      expect(text).toMatch(/Runner requirement: OK/);
+    });
+
+    it("DECISIVE: 'failed' + routing empty -> names the reason, since routingSummaryLines alone would stay silent", () => {
+      expect(formatApplyResult(resultWith({ routing: {} }))).not.toMatch(/Routing \(MACF_TRUSTED_ACTORS\)/);
+      const text = formatApplyResult(
+        resultWith({
+          routing: {},
+          runnerRequirement: { status: 'failed', reason: 'no runner registration token was supplied — apply cannot REGISTER a new runner without one' },
+        }),
+      );
+      expect(text).toMatch(/Runner requirement: FAILED — no runner registration token was supplied/);
+    });
+
+    it("DECISIVE (paired): 'failed' + routing NON-empty -> the FAILED line is suppressed, never contradicts routingSummaryLines' own per-repo truth (groundnuty/macf#1195 regression guard)", () => {
+      const text = formatApplyResult(
+        resultWith({
+          routing: { 'groundnuty/x': { status: 'created' } },
+          runnerRequirement: { status: 'failed', reason: 'no runner registration token was supplied' },
+        }),
+      );
+      expect(text).not.toMatch(/Runner requirement: FAILED/);
+      expect(text).toMatch(/groundnuty\/x: CREATED/);
+    });
+  });
+
+  it('fleetApplyResultToJson always carries runner_requirement, never omitted', () => {
+    const notRequired = fleetApplyResultToJson(resultWith({})) as { runner_requirement: { status: string } };
+    expect(notRequired.runner_requirement).toEqual({ status: 'not-required' });
+
+    const failed = fleetApplyResultToJson(
+      resultWith({ runnerRequirement: { status: 'failed', reason: 'no runner registration token was supplied' } }),
+    ) as { runner_requirement: { status: string; reason?: string } };
+    expect(failed.runner_requirement).toEqual({ status: 'failed', reason: 'no runner registration token was supplied' });
   });
 
   it('formatApplyResult renders a PENDING routing leg with its reason, distinct from FAILED — groundnuty/macf#1212', () => {
@@ -5698,5 +5789,63 @@ describe('the #1184 fleet verdict, wired through formatApplyResult / fleetApplyR
 
     const jsonWith = fleetApplyResultToJson(result, [], { steps: [] }, undefined, undefined, {}, carveOutPin) as { fleet_verdict: { confirmed: boolean } };
     expect(jsonWith.fleet_verdict.confirmed).toBe(true);
+  });
+
+  // --- groundnuty/macf#1323 — a missing runner token, on a self-hosted
+  // fleet that confirmed zero repos this run, must make the "runners" area
+  // of the verdict read NOT-CONFIRMED — never UNKNOWN, and never silently
+  // absent (`buildFleetVerdict`'s `runnerComponent !== undefined` filter
+  // previously dropped this case from `verdict.components` ENTIRELY,
+  // which is worse than UNKNOWN: not even present to skim).
+  describe('groundnuty/macf#1323 — a missing runner token surfaces in the fleet verdict, not just as a console warning', () => {
+    it('DECISIVE: self-hosted declared, no token, routing observed zero repos -> verdict NOT confirmed, "runners" named NOT-CONFIRMED (not UNKNOWN, not absent)', () => {
+      const result = resultWith({
+        routing: {},
+        runnerRequirement: {
+          status: 'failed',
+          reason: 'manifest declares routing.runner (runs_on: "self-hosted") but no runner registration token was supplied — apply cannot REGISTER a new runner without one',
+        },
+      });
+
+      const text = formatApplyResult(result, [], { steps: [] });
+      expect(text).toContain('Fleet verdict');
+      expect(text).toContain('NOT confirmed');
+      expect(text).toMatch(/runners: NOT CONFIRMED/);
+      expect(text).not.toMatch(/runners: UNKNOWN/);
+      expect(text).toContain('no runner registration token was supplied');
+
+      const json = fleetApplyResultToJson(result, [], { steps: [] }) as {
+        fleet_verdict: { confirmed: boolean; components: readonly { name: string; state: string }[] };
+      };
+      expect(json.fleet_verdict.confirmed).toBe(false);
+      const runners = json.fleet_verdict.components.find((c) => c.name === 'runners');
+      expect(runners?.state).toBe('not-confirmed');
+    });
+
+    it('DECISIVE (paired): hosted-declared (or undeclared) + no token -> the "runners" area is absent from the verdict, unchanged from today', () => {
+      const result = resultWith({}); // runnerRequirement defaults to not-required, routing defaults to {}
+      const json = fleetApplyResultToJson(result, [], { steps: [] }) as {
+        fleet_verdict?: { components: readonly { name: string }[] };
+      };
+      expect(json.fleet_verdict?.components.some((c) => c.name === 'runners')).toBe(false);
+    });
+
+    it('REGRESSION GUARD (groundnuty/macf#1195): a live-confirmed runner keeps "runners" CONFIRMED even with no token this run — the verdict and applyExitCode must never disagree', () => {
+      const result = resultWith({
+        routing: { 'groundnuty/trial-code': { status: 'created' } },
+        runnerRequirement: { status: 'failed', reason: 'no runner registration token was supplied' },
+      });
+      const json = fleetApplyResultToJson(result, [], { steps: [] }) as {
+        fleet_verdict?: { components: readonly { name: string; state: string }[] };
+      };
+      // Narrowed to the "runners" component specifically — this fixture's
+      // `routingSecrets` (unrelated to this regression) still defaults to
+      // "no router-carrying repos observed", which independently renders
+      // the SEPARATE "routing" component as its own honest 'unknown'; that
+      // is not what this test is guarding against.
+      const runners = json.fleet_verdict?.components.find((c) => c.name === 'runners');
+      expect(runners?.state).toBe('confirmed');
+      expect(applyExitCode(result)).toBe(0);
+    });
   });
 });

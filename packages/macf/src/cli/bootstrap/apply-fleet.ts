@@ -278,13 +278,14 @@ import {
 import type { CaApplyDeps, CaApplyOutcome, CaPublishResult, CaResolveOutcome } from './apply-ca.js';
 import { publishCaCertLegs, redactCaResolve, resolveCaCert, skippedCaPublish } from './apply-ca.js';
 import type { EnsureVariableOutcome } from './ensure-variable.js';
-import type { RunnerRegistrationDeps, RunnerTokenPollOptions, TrustedActorsReconcileDeps } from './apply-routing.js';
+import type { RunnerRegistrationDeps, RunnerRequirementOutcome, RunnerTokenPollOptions, TrustedActorsReconcileDeps } from './apply-routing.js';
 import {
   formatProvisionedRunnerWaitProgress,
   formatRunnerPollProgress,
   publishTrustedActorsForProvisioned,
   publishTrustedActorsGated,
   reconcileTrustedActors,
+  runnerRequirementOutcome,
 } from './apply-routing.js';
 import type { RunnerPlatformResult, RunnerPlatformStatusResult } from './runner-platform.js';
 import {
@@ -807,6 +808,30 @@ export interface FleetApplyResult {
    */
   readonly routing: Readonly<Record<string, EnsureVariableOutcome>>;
   /**
+   * groundnuty/macf#1323 — the runner-token REQUIREMENT's own leg, ALWAYS
+   * present (never contingent on `routing` above having any entries).
+   * `routing` is `{}` whenever this run confirmed zero agent repos to write
+   * to — which let a self-hosted fleet with no registration token exit `0`
+   * on a run that never got as far as observing a single repo, because
+   * NOTHING on the result said the declaration itself was unmet (the
+   * pre-#1323 `checkRunnerTokenPreflight` warning is a `console.error` only,
+   * never represented here). This field is derived from the MANIFEST +
+   * TOKEN alone (see {@link runnerRequirementOutcome}) — it can never be
+   * `{}`-shaped-empty the way a per-repo record can. `'not-required'` when
+   * `routing.runner` isn't declared self-hosted (same "nothing was
+   * promised" case `routing` reports as `{}`); `'ok'` when declared AND a
+   * token was resolved; `'failed'` when declared and no token was resolved
+   * — checked by `commands/bootstrap-apply.ts::applyExitCode`, but ONLY
+   * fails the run when `routing` ALSO has zero entries: a live per-repo
+   * write in `routing` (created/already-present/failed/…) is always a
+   * MORE INFORMED signal than this manifest-level guess (groundnuty/
+   * macf#1195 — a repo whose runner is already confirmed usable writes
+   * successfully even with no token) and must win. This field closes the
+   * gap where NEITHER surface said anything; it never overrides `routing`'s
+   * own, more-precise per-repo verdict.
+   */
+  readonly runnerRequirement: RunnerRequirementOutcome;
+  /**
    * groundnuty/macf#943 (DR-043 Amendment I2) — the runner-provisioning
    * contract's `POST /runners` outcome per confirmed agent repo. Empty `{}`
    * when `routing.runner` is not declared OR `runs_on` isn't `"self-hosted"`
@@ -1182,6 +1207,15 @@ function abortedFleetApplyResult(manifestPath: string, priorLock: FleetLock | nu
       repoLegs: {},
     },
     routing: {},
+    // groundnuty/macf#1323 — a genuinely `'failed'` requirement is NOT
+    // recomputed here (this helper never received `manifest.routing`/
+    // `deps.runnerToken`, only the caller's abort `reason` string) — but
+    // an early abort ALREADY forces `applyExitCode`'s `hardFailure` via
+    // `runnerOps.status === 'failed'` above, so this neutral default never
+    // masks a run that would otherwise have read as successful. Mirrors
+    // `routing: {}` immediately above: "nothing was observed this run,"
+    // not "nothing is required."
+    runnerRequirement: { status: 'not-required' },
     runnerProvision: {},
     routingClient: {
       mint: { status: 'skipped', reason: `${reason} — see controlRepo above.` },
@@ -2702,6 +2736,28 @@ export async function applyFleet(
     );
   }
 
+  // groundnuty/macf#1323 — the runner-token REQUIREMENT's own leg, ALWAYS
+  // resolvable regardless of how many entries `routing` above actually has
+  // (see `RunnerRequirementOutcome`'s doc on `FleetApplyResult` for the
+  // exact silent gap this closes: `routing` is `{}` whenever
+  // `nonProvisionedRepos` is empty, which previously left a self-hosted
+  // fleet with no registration token reporting NOTHING here at all).
+  // Derived from `manifest.routing` + `deps.runnerToken` alone — the SAME
+  // two inputs `checkRunnerTokenPreflight`'s pre-gate-1 CLI warning already
+  // reads (that warning is UNCHANGED, still fires before any consent gate
+  // opens) — this is the SAME finding, given a permanent place on the
+  // result. `commands/bootstrap-apply.ts::applyExitCode` only lets a
+  // `'failed'` here flip the run's exit code when `routing` is ALSO `{}` —
+  // a repo whose runner-usability WAS confirmed live this run (with or
+  // without a token, groundnuty/macf#1195) is a more informed signal than
+  // this manifest-level guess and must win; that guard is repeated here so
+  // the live transcript narration never contradicts what the final summary
+  // says.
+  const runnerRequirement = runnerRequirementOutcome(manifest.routing, deps.runnerToken);
+  if (runnerRequirement.status === 'failed' && Object.keys(routing).length === 0) {
+    deps.log(`Runner requirement: FAILED — ${runnerRequirement.reason}`);
+  }
+
   // groundnuty/macf#1319 — DR-043 Amendment P row 3, applied to
   // MACF_TRUSTED_ACTORS: a repo whose variable the create-only pass above
   // left as `'already-present'` may still DIVERGE from the fleet's current
@@ -2870,6 +2926,7 @@ export async function applyFleet(
     identityChanges,
     ca,
     routing: routingFinal,
+    runnerRequirement,
     runnerProvision: runnerProvisionResults,
     routingClient,
     routingSecrets: routingSecretsPublish,
