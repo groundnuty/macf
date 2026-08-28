@@ -1147,10 +1147,15 @@ describe('orphan rows say "not deleted" + carry a link, on BOTH the plan and app
   // explains WHY in plain language (no internal citation — macf#1061's
   // "explain, don't cite" rule for user-facing output), carries the same
   // search hint #1281 already writes for the analogous unresolvable-App-URL
-  // case, and states the condition is self-limiting — it resolves on the
-  // fleet's next `apply` (which then records `repo` for this role going
-  // forward).
-  it('DECISIVE (2/2): a lock that PREDATES the field (no repo key at all) → the orphan row names the ROLE, explains why, and is self-limiting — never a fabricated link', () => {
+  // case, and states the self-limiting scope PRECISELY: verified against
+  // `composeFleetLock` (fleet-lock.ts) — an already-undeclared role's lock
+  // entry is carried forward untouched by every future apply (nothing ever
+  // recomputes its `repo`), so THIS row can never gain a name. What is
+  // self-limiting is the CLASS: a role still declared today already has
+  // its repo recorded, so a FUTURE removal names it exactly. The row must
+  // not claim this instance will resolve itself — that would be a false
+  // promise the operator could catch out on the very next apply.
+  it('DECISIVE (2/2): a lock that PREDATES the field (no repo key at all) → the orphan row names the ROLE, explains why, and scopes "self-limiting" to the CLASS, never promising this row resolves — no fabricated link', () => {
     const manifest = baseManifest();
     const observed: ObservedState = {
       lock: lockWithRole('dropped-agent'), // no repo — the pre-#1296 shape
@@ -1172,9 +1177,12 @@ describe('orphan rows say "not deleted" + carry a link, on BOTH the plan and app
     expect(repoItem?.reason).not.toMatch(/\bmacf#\d+\b|\bgroundnuty\/macf#\d+\b/);
     // Carries the #1281-style search hint.
     expect(repoItem?.reason).toMatch(/search your github/i);
-    // States the condition is self-limiting.
+    // States the gap is self-limiting AS A CLASS ("still declared today"
+    // roles are covered going forward) — but does NOT promise THIS row
+    // (an already-undeclared role) will ever resolve on its own.
     expect(repoItem?.reason.toLowerCase()).toContain('self-limiting');
-    expect(repoItem?.reason.toLowerCase()).toContain('next time this fleet');
+    expect(repoItem?.reason).toMatch(/never recover/i);
+    expect(repoItem?.reason).toMatch(/still declared today/i);
     // Never a fabricated/derived link.
     expect(repoItem?.reason).not.toMatch(/https:\/\/github\.com\/\S+\/settings/);
   });

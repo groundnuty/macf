@@ -400,6 +400,30 @@ describe('githubRegistryObserver + computePlan — groundnuty/macf#1313 (row-4 r
     expect(text).not.toMatch(/https:\/\/github\.com\/\S+\/settings/);
   });
 
+  // The above test's `formatPlanText` assertions sit BEHIND item-level
+  // assertions in the same `it` — a failure there (e.g. under the mutation
+  // documented below) throws before the text-level checks ever run, so it
+  // alone does not demonstrate a RENDERED-OUTPUT failure, only an item-shape
+  // one (`assert-the-wrong-path.md`). This test asserts ONLY on
+  // `formatPlanText`'s string output, using phrasing that ONLY the repo-
+  // orphan branch this fix adds can produce — the App-orphan row for the
+  // SAME role never says any of it. Under the "break the unrecorded-repo
+  // path" mutation, THIS is the assertion that fails, and it fails reading
+  // rendered text, not a raw `PlanItem`.
+  it('DECISIVE 1/2b: the RENDERED plan TEXT alone carries repo-row-specific language the App-orphan row never produces', async () => {
+    installGhRouter();
+    const manifest = baseManifest();
+    const manifestPath = tempManifestPath();
+    writeFleetLock(join(manifestPath, '..', 'fleet.lock'), lockWith({ role: 'writing-agent', app_id: 'app-writing', install_id: 'install-writing' }));
+
+    const observed = await githubRegistryObserver(manifest, manifestPath);
+    const plan = computePlan(manifest, observed);
+    const text = formatPlanText(plan);
+    expect(text).toMatch(/unrecorded/i);
+    expect(text).toMatch(/search your github/i);
+    expect(text).toMatch(/self-limiting/i);
+  });
+
   // --- Decisive pair, member 2 (must not regress) -------------------------
 
   it('DECISIVE 2/2: role in lock, repo RECORDED in the lock (post-#1296) and confirmed live on GitHub → the RENDERED plan names it exactly with its real settings URL', async () => {
@@ -471,19 +495,24 @@ describe('githubRegistryObserver + computePlan — groundnuty/macf#1313 (row-4 r
 
   // --- Mutation check: break the unrecorded-repo path, name what fails ---
   //
-  // Empirically verified (not merely asserted): reverting `plan.ts`'s row-4
-  // repo block to its pre-#1313 shape — gating the WHOLE branch on
-  // `obs?.repo === 'present'` regardless of `lockedRepo` — and re-running
-  // this suite fails "DECISIVE 1/2" above (the rendered plan/text assertions
-  // that a repo-orphan item exists and names `writing-agent`), because
-  // `observer.ts` can never observe a pre-#1296 lock's row-4 repo as
-  // anything but `'unknown'` (there is no name to check), so the gate never
-  // opens. It does NOT fail "DECISIVE 2/2" — that member exercises the
-  // recorded-name path, unaffected by the mutation. This is the concrete,
-  // rendered-output test #1311's lesson calls for: a helper-level
-  // (`orphanResourceUrl`) or hand-built-fixture test cannot distinguish the
-  // pre-fix code from the fix, because both compute the SAME `orphanResourceUrl`
-  // return value once a `PlanItem` is already being built — the defect was
-  // that the item was never built in the first place. Mutation reverted
-  // after confirming; this test is the durable regression guard going forward.
+  // Empirically verified (not merely asserted): mutating `plan.ts`'s row-4
+  // repo block's `if (lockedRepo === undefined)` to `if (false &&
+  // lockedRepo === undefined)` — reproducing the pre-#1313 shape, where the
+  // whole branch was gated on `obs?.repo === 'present'` regardless of
+  // `lockedRepo` — and re-running this suite fails BOTH "DECISIVE 1/2" (the
+  // item-level `repoItem?.verb` assertion) AND "DECISIVE 1/2b" (the
+  // formatPlanText-ONLY assertion, which reads rendered text exclusively —
+  // per `assert-the-wrong-path.md`, an item-level assertion failing first in
+  // the SAME `it` would not by itself prove a rendered-output failure, which
+  // is why 1/2b exists as its own test). Both fail because `observer.ts`
+  // can never observe a pre-#1296 lock's row-4 repo as anything but
+  // `'unknown'` (there is no name to check), so the gate never opens. The
+  // mutation does NOT fail "DECISIVE 2/2" — that member exercises the
+  // recorded-name path, unaffected. This is the concrete, rendered-output
+  // test #1311's lesson calls for: a helper-level (`orphanResourceUrl`) or
+  // hand-built-fixture test cannot distinguish the pre-fix code from the
+  // fix, because both compute the SAME `orphanResourceUrl` return value
+  // once a `PlanItem` is already being built — the defect was that the item
+  // was never built in the first place. Mutation reverted after confirming;
+  // these tests are the durable regression guard going forward.
 });

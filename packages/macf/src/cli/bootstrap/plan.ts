@@ -2541,11 +2541,22 @@ export function computePlan(
     // name) — never a derived/guessed name (`fleet-manifest.ts`'s
     // `repo: z.string().min(1)` is operator-specified, not a convention
     // `apply` could recompute — see `orphanResourceUrl`'s own doc for why
-    // a derived name was refused twice already, #1281/#1272). This
-    // condition is self-limiting: it fires only for a lock written before
-    // #1296 and disappears the next time this fleet's `apply` runs
-    // (`composeFleetLock` then records `repo` for this role going forward,
-    // same as any other role).
+    // a derived name was refused twice already, #1281/#1272).
+    //
+    // **Self-limiting is a CLASS property, not an INSTANCE one — verified
+    // against `composeFleetLock` (fleet-lock.ts), not assumed.** That
+    // function's own §D3 no-prune loop only recomputes a role's `repo` when
+    // the caller supplies an `agentUpdates[role]` entry for it THIS run;
+    // `apply-fleet.ts` only ever builds that entry for roles still in
+    // `manifest.agents`. A role that is ALREADY undeclared (this branch's
+    // precondition) is therefore carried forward via the "untouched this
+    // run" path FOREVER — no future `apply` will ever add a `repo` to THIS
+    // role's lock entry. What re-applying fixes is the CLASS: any role
+    // still declared TODAY has its `repo` recorded by every future apply
+    // (whether or not it changes), so if THAT role is removed later, its
+    // own row-4 entry will already carry `repo` and take the named branch
+    // below instead. The reason text says this precisely — it does NOT
+    // promise this specific row will ever gain a name.
     const lockedRepo = lockAgentsByRole.get(role)?.repo;
     if (lockedRepo === undefined) {
       items.push({
@@ -2554,13 +2565,15 @@ export function computePlan(
         verb: 'orphan',
         reason:
           `A repo was provisioned by this tool for "${role}" (recorded in fleet.lock) but "${role}" is no ` +
-          'longer declared. The repo NAME itself is unrecorded, not absent — this lock predates this tool ' +
-          "recording repo names for roles like this one, so this tool cannot confirm the repo live or name " +
-          'its settings page. NOTHING WAS DELETED — apply never auto-removes it, under any flag (recreating ' +
-          `a repo loses its history; un-archiving is 0 clicks). Search your GitHub ` +
+          'longer declared. The repo NAME itself is unrecorded, not absent — this predates this tool ' +
+          'recording repo names, and this exact row can never recover it: an undeclared role\'s fleet.lock ' +
+          'entry is carried forward untouched by every future apply, never re-checked. NOTHING WAS DELETED ' +
+          '— apply never auto-removes it, under any flag (recreating a repo loses its history; un-archiving ' +
+          `is 0 clicks). Search your GitHub ` +
           `${manifest.owner.type === 'org' ? `organization "${manifest.owner.account}"` : 'account'}'s repo list ` +
-          `for one it created for role "${role}". Self-limiting: this resolves the next time this fleet's ` +
-          '`apply` runs (the repo name is recorded going forward).',
+          `for one it created for role "${role}". This gap is self-limiting as a CLASS, not for this role: ` +
+          'any role still declared today already has its repo name recorded, so if it is removed in the ' +
+          'future, that removal\'s own row will name the repo exactly.',
         confirm_required: false,
       });
     } else if (obs?.repo === 'present') {
