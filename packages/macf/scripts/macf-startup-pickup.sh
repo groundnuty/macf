@@ -132,22 +132,87 @@
 # while the prompt is silently swallowed — the silent-fallback shape
 # (silent-fallback-hazards.md). Two independent defenses, because the
 # ordering of "prompt renders" vs "hook sends" is a hypothesis, not a
-# verified fact — either could happen first:
-#   (1) PRE-SEND: poll the pane (bounded by READY_TIMEOUT below) and don't
-#       even attempt a submit while it visibly shows a blocking ceremony
-#       menu (numbered-option cursor / (y/n) confirm) — mirrors
-#       macf-prompt-watcher.sh's `_looks_prompt_like`.
+# verified fact — either could happen first.
+#
+# ALLOWLIST, NOT BLOCKLIST (macf#802 review, post-PR#845): the FIRST shipped
+# version of the pre-send check (`_pane_blocked`) mirrored
+# macf-prompt-watcher.sh's ceremony-menu heuristic — hold while the frame
+# looks like a KNOWN blocking shape (`❯ N.` numbered menu / `(y/n)` confirm),
+# else submit. Follow-up review found that heuristic is a likely PRODUCTION
+# NO-OP for the exact prompt it exists to catch: byte-level inspection of the
+# installed Claude Code binary (2.1.226) found no numbered-select renderer at
+# all — every observed select/confirm option renders as `❯` immediately
+# followed by a LABEL, never a digit (the folder-trust dialog is a labelled
+# confirm component, not a `❯ 1.` menu). A blocklist's fail direction is
+# CATASTROPHIC on a miss: an unrecognized dialog reads as "not blocked" and
+# the hook submits INTO it, where the pickup text or its Enter could land on
+# "No, exit". So the gate is INVERTED here: submit ONLY when the pane
+# affirmatively shows Claude Code's own free-form INPUT LINE, never merely
+# "doesn't look like a dialog I recognize". An allowlist miss (a ready-line
+# shape this hook doesn't yet know) fails BENIGN — hold + phase-2 warn — the
+# opposite of a blocklist miss. This trades a rare, silent, catastrophic
+# failure for a benign, loud one, permanently, by construction.
+#
+# The ready-line signature (`_pane_ready`) was pinned against a LIVE
+# `capture-pane -p -J` of real, running Claude Code sessions on this fleet
+# (not a synthetic construction) — the standing input box renders as a
+# `─`-drawn separator line, then a line starting with `❯` (blank when idle,
+# free text when something is typed/queued — both observed live), then a
+# closing `─` separator. This 3-line chrome was observed IDENTICALLY across
+# an idle session, a busy/spinner session, and a session with queued text —
+# stable across state. The KNOWN ceremony shapes this hook must NOT treat as
+# ready (folder-trust / dev-channels) are reconstructed from the #802 static-
+# binary-inspection evidence above, not a live capture of an actual dialog
+# (triggering one live on a shared multi-agent host was judged too invasive
+# to attempt) — carried as the best evidence available, not as proven; see
+# the test file for the same caveat inline. Architecturally, this is a
+# defensible negative even so: a modal ceremony prompt exists specifically to
+# INTERRUPT free-text entry, so it is expected to replace the standing input
+# chrome rather than coexist with it — if that assumption is ever wrong, the
+# gate's fail direction (hold + warn) is still the benign one.
+#
+# TRICHOTOMY (macf#802 review) — the pane-observation outcome is 3-valued,
+# not 2-valued, and conflating rows 2 and 3 below is itself a hazard the
+# review flagged explicitly:
+#   - ready line PRESENT               → submit now.
+#   - ready line ABSENT, pane OBSERVED → hold (bounded by READY_TIMEOUT),
+#                                         phase-2 warn on timeout.
+#   - pane UNOBSERVABLE (no tmux reachable, capture fails, empty frame)
+#                                       → fail OPEN, submit immediately —
+#                                         identical to this hook's pre-#802
+#                                         baseline. Holding here buys
+#                                         nothing: the post-send verify below
+#                                         reads the SAME pane and is equally
+#                                         blind, so refusing to submit would
+#                                         only convert "can't tell" into
+#                                         "silently never picks up work" for
+#                                         every non-tmux / observability-
+#                                         degraded environment.
+#
+# Two independent checks, because the ordering of "prompt renders" vs "hook
+# sends" is a hypothesis, not a verified fact — either could happen first:
+#   (1) PRE-SEND: poll the pane (bounded by READY_TIMEOUT below) per the
+#       trichotomy above.
 #   (2) POST-SEND: a result-invariant check (Pattern C,
 #       silent-fallback-hazards.md — content-diff via `capture-pane`, NOT
 #       `#{session_activity}`, which does not reliably reflect activity).
-#       Capture before + after the submit; if the pane content is
-#       unchanged, the send didn't visibly land — one bounded retry, then
-#       give up loud rather than silently.
+#       Capture before + after the submit; if the pane content is unchanged,
+#       OR it changed into a frame that is no longer ready (a dialog may have
+#       interrupted right after send), the send is not treated as proven —
+#       one bounded retry, then give up loud rather than silently.
 # Either check alone would miss the ordering it doesn't cover; together they
-# hold under both. If the pane can't be observed at all (no tmux reachable,
-# capture fails), both checks fail open — same fail-open posture as every
-# other gate in this script — and the submit proceeds/records success
-# without a diff to compare against.
+# hold under both.
+#
+# LOG-FILE BACKSTOP (Follow-up B, macf#802 review — the same gap #778 already
+# closed for macf-prompt-watcher.sh): a WARNING's only channel here is
+# SessionStart STDOUT, which is read only if a fresh turn fires — and a
+# genuinely swallowed submit is the very mechanism meant to fire that turn,
+# so the report's own delivery is defeated by the bug it reports. Every
+# WARNING below is ALSO appended to a `startup-pickup.log` file (same
+# `MACF_LOG_PATH`-derived directory convention as macf-prompt-watcher.sh's
+# `prompt-watcher.log`) so the failure is visible even when no turn ever
+# reads the SessionStart context that carried it. Best-effort: a log-write
+# failure is swallowed, never escalated (this hook still never blocks).
 #
 # Overrides:
 #   MACF_NO_STARTUP_PICKUP=1                    — skip entirely, no query, no
@@ -302,32 +367,117 @@ VERIFY_DELAY="${MACF_STARTUP_PICKUP_VERIFY_DELAY_SECS:-1}"
 # `|| true` on both branches: a capture failure (no server, stale pane, no
 # tmux binary) is read as "can't tell" everywhere this is called, never as
 # an error — same fail-open posture as the rest of this script.
+#
+# `-J` (groundnuty/macf#778's fix, applied here too): without it, tmux
+# renders a logical line that exceeds the pane's column width as MULTIPLE
+# physical rows, so a regex that expects the input-box chrome on adjacent
+# LOGICAL lines can see it split across adjacent PHYSICAL rows instead (or,
+# for a long single line, miss a pattern that spans the wrap boundary). `-J`
+# joins wrapped rows back into the logical line tmux tracked internally
+# before wrapping, matching what `_pane_ready` below assumes.
 _pane_frame() {
   if [[ -n "${TMUX_PANE:-}" ]]; then
-    tmux capture-pane -t "$TMUX_PANE" -p 2>/dev/null || true
+    tmux capture-pane -t "$TMUX_PANE" -p -J 2>/dev/null || true
   else
-    tmux capture-pane -p 2>/dev/null || true
+    tmux capture-pane -p -J 2>/dev/null || true
   fi
 }
 
-# _pane_blocked <frame> → 0 if the frame looks like a blocking ceremony
-# prompt (numbered-menu cursor or a (y/n) confirm) that would swallow a
-# free-text submit instead of accepting it as input. Mirrors
-# macf-prompt-watcher.sh's `_looks_prompt_like` (same two signatures);
-# intentionally duplicated, not sourced — see the file header.
-_pane_blocked() {
-  printf '%s' "$1" | grep -qE '❯[[:space:]]*[0-9]+[.)]' && return 0
-  printf '%s' "$1" | grep -qE '\((y/n|y/N|Y/n)\)|\[(y/N|Y/n|y/n)\]' && return 0
+# _pane_ready <frame> → 0 if the frame affirmatively shows Claude Code's own
+# standing free-form input box: a `─`-drawn separator line, then a line
+# starting with `❯` (blank when idle, free text when queued/typed — both
+# forms observed live), then a closing `─` separator, within a short bounded
+# lookahead (tolerates a multi-line input box, which was not itself observed
+# live but is a real Claude Code feature via Shift+Enter). See the file
+# header "ALLOWLIST, NOT BLOCKLIST" section for why this replaces a
+# known-blocking-shape blocklist, and for the evidence tier behind the
+# positive shape (a live capture) vs. the negative/ceremony shapes this is
+# deliberately NOT keying on (reconstructed evidence, not a live capture).
+#
+# PANE_READY_SEP_MARK is a FIXED STRING (grep -F), never a `{n,}`-quantified
+# regex over the multibyte `─` — verified empirically that a bash `[[ =~ ]]`
+# interval quantifier applied directly to a multibyte UTF-8 character is
+# LOCALE-DEPENDENT and silently fails to match under the C/POSIX locale
+# (`env -i` with no LANG/LC_ALL — exactly the shape a hook's spawned process
+# is not guaranteed to avoid). A literal substring match has no such
+# dependency: confirmed matching identically under both a UTF-8 locale and a
+# stripped `env -i` one. This is the SAME hazard class as any other
+# locale-sensitive text match; the fix is "don't quantify a multibyte glyph
+# in a regex", not "always export LANG" (which this script does not control).
+PANE_READY_SEP_MARK="$(printf '─%.0s' $(seq 1 10))"
+readonly PANE_READY_SEP_MARK
+readonly PANE_READY_INPUT_RE='^[[:space:]]*❯'
+_pane_ready() {
+  local frame="$1" i j
+  local -a lines
+  mapfile -t lines <<<"$frame"
+  local n=${#lines[@]}
+  for ((i = 0; i < n; i++)); do
+    printf '%s' "${lines[i]}" | grep -qF -- "$PANE_READY_SEP_MARK" || continue
+    for ((j = i + 1; j < n && j <= i + 6; j++)); do
+      if printf '%s' "${lines[j]}" | grep -qF -- "$PANE_READY_SEP_MARK"; then
+        break # box closed without an input line in between — not this box
+      fi
+      if [[ "${lines[j]}" =~ $PANE_READY_INPUT_RE ]]; then
+        return 0
+      fi
+    done
+  done
   return 1
 }
 
-# _submit_when_ready <prompt> — the gated submit. Phase 1 (pre-send) waits
-# out a KNOWN-shaped blocking prompt, bounded by READY_TIMEOUT; phase 2
-# (post-send) verifies the pane actually changed after sending, with one
-# bounded retry, because the ordering of "prompt renders" vs "hook sends"
-# is unverified — phase 1 alone cannot catch a prompt that renders AFTER
-# the pre-send check passed. Always returns 0 (never treated as a script
-# fault) but is LOUD — not silent — when a submit could not be verified.
+# _log_warn <message> — best-effort log-file backstop (Follow-up B, macf#802
+# review). See the file header "LOG-FILE BACKSTOP" section: a WARNING's only
+# other channel is SessionStart STDOUT, read only if a fresh turn fires — and
+# a genuinely swallowed submit is the very mechanism meant to fire that turn.
+# Mirrors macf-prompt-watcher.sh's `MACF_LOG_PATH`-derived log directory
+# convention (same #778 lineage) so both scripts' forensic logs live
+# alongside each other. Never escalates a write failure — this hook still
+# never blocks the session on ANYTHING, including its own diagnostics.
+#
+# Every branch below guards its OWN variable with `:-` before falling
+# through to the next — under this script's `set -uo pipefail`, a nested
+# default expression that references a second possibly-unset variable
+# WITHOUT its own `:-` guard (`${A:-$B}` with both unset) is itself an
+# unbound-variable error, not a graceful fallback. Caught by this file's own
+# test suite running with a deliberately minimal env (no HOME, no
+# XDG_STATE_HOME) — the exact shape a stripped harness or container exposes
+# that an operator's login shell never would.
+_log_warn() {
+  local log_dir log_file ts
+  if [[ -n "${MACF_LOG_PATH:-}" ]]; then
+    log_dir="$(dirname "$MACF_LOG_PATH")"
+  elif [[ -n "${XDG_STATE_HOME:-}" ]]; then
+    log_dir="$XDG_STATE_HOME/macf"
+  elif [[ -n "${HOME:-}" ]]; then
+    log_dir="$HOME/.local/state/macf"
+  else
+    return 0 # nowhere sane to log — best-effort, give up quietly
+  fi
+  log_file="$log_dir/startup-pickup.log"
+  mkdir -p "$log_dir" 2>/dev/null || return 0
+  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo '?')"
+  printf '[macf-startup-pickup] %s [WARN] %s\n' "$ts" "$1" >>"$log_file" 2>/dev/null || true
+}
+
+# _warn <message> — print to stdout (SessionStart context, the pre-existing
+# channel) AND the log-file backstop above, so the failure is visible even
+# when no turn ever reads the context that carried it.
+_warn() {
+  printf '\n[macf-startup-pickup] WARNING: %s\n' "$1"
+  _log_warn "$1"
+}
+
+# _submit_when_ready <prompt> — the gated submit, per the file header
+# TRICHOTOMY: pre-send, hold while the pane is OBSERVED but not yet ready
+# (bounded by READY_TIMEOUT); proceed immediately once ready OR once the
+# pane is UNOBSERVABLE (fail open — see the file header for why holding
+# there buys nothing). Post-send verifies the pane actually changed AND is
+# still (or again) ready, with one bounded retry, because the ordering of
+# "prompt renders" vs "hook sends" is unverified — the pre-send check alone
+# cannot catch a dialog that renders AFTER it passed. Always returns 0
+# (never treated as a script fault) but is LOUD — not silent — when a submit
+# could not be verified.
 _submit_when_ready() {
   local prompt="$1" before after attempt
 
@@ -342,11 +492,18 @@ _submit_when_ready() {
   SECONDS=0
   while :; do
     before="$(_pane_frame)"
-    if [[ -z "$before" ]] || ! _pane_blocked "$before"; then
+    if [[ -z "$before" ]]; then
+      # UNOBSERVABLE (trichotomy row 3) — fail open, same as this hook's
+      # pre-#802 baseline. The post-send verify below reads the same pane
+      # and is equally blind, so holding here would only convert "can't
+      # tell" into "silently never picks up work" for this environment.
+      break
+    fi
+    if _pane_ready "$before"; then
       break
     fi
     if [[ "$SECONDS" -ge "$READY_TIMEOUT" ]]; then
-      printf '\n[macf-startup-pickup] WARNING: pane still showed a startup ceremony prompt after %ss — skipped the auto-submit to avoid it landing on the wrong menu (groundnuty/macf#802). Pending work is listed above; pick it up manually, or wait for the #703 auto-responder to clear the prompt and re-run /macf-issues.\n' "$READY_TIMEOUT"
+      _warn "pane still does not show a ready input line after ${READY_TIMEOUT}s — skipped the auto-submit to avoid it landing on a startup ceremony prompt (groundnuty/macf#802). Pending work is listed above; pick it up manually, or wait for the #703 auto-responder to clear the prompt and re-run /macf-issues."
       return 0
     fi
     sleep "$READY_INTERVAL"
@@ -356,12 +513,14 @@ _submit_when_ready() {
     "$TMUX_SUBMIT" "" "$prompt" || true
     sleep "$VERIFY_DELAY"
     after="$(_pane_frame)"
-    # A pane that now LOOKS blocked is never success, even if its content
-    # differs from $before — that shape is "a new/different ceremony prompt
-    # swallowed the send", not "the send landed". Retry before treating a
-    # content-diff as proof; a diff into a still-blocked pane is exactly the
-    # false-positive a raw diff alone would miss.
-    if [[ -n "$after" ]] && _pane_blocked "$after"; then
+    # A pane that is now NOT ready is never proof of success, even if its
+    # content differs from $before — that shape is "a dialog interrupted
+    # right after the send", not "the send landed on a clear input line".
+    # Retry before treating a content-diff as proof; a diff into a
+    # not-ready pane is exactly the false-positive a raw diff alone would
+    # miss. An UNOBSERVABLE after-frame ($after empty) is handled below,
+    # same as the pre-send trichotomy: treated as a pass, not a hold.
+    if [[ -n "$after" ]] && ! _pane_ready "$after"; then
       before="$after"
       continue
     fi
@@ -370,7 +529,7 @@ _submit_when_ready() {
     fi
     before="$after"
   done
-  printf '\n[macf-startup-pickup] WARNING: could not confirm the auto-submit landed — the pane still looks unchanged, or now shows another blocking prompt, after %d attempt(s) (groundnuty/macf#802). The prompt may have been swallowed by a startup menu that rendered after the readiness check passed. Pending work is listed above; pick it up manually.\n' "$attempt"
+  _warn "could not confirm the auto-submit landed — the pane still looks unchanged, or is no longer showing a ready input line, after ${attempt} attempt(s) (groundnuty/macf#802). The prompt may have been interrupted by a dialog that rendered after the readiness check passed. Pending work is listed above; pick it up manually."
 }
 
 # 9. Build the DETAILED submit prompt (macf#816) — the operator wants the

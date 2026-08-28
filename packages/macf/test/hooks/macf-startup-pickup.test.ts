@@ -663,18 +663,43 @@ describe('macf-startup-pickup.sh (SessionStart hook, groundnuty/macf#768)', () =
   });
 
   describe('(g) readiness + verify gate — the pickup prompt no longer gets silently swallowed by a startup ceremony prompt (groundnuty/macf#802)', () => {
-    // Real #703-shaped ceremony prompts (dev-channels ack, folder-trust) —
-    // a numbered-option cursor line is what `_pane_blocked` matches.
+    // groundnuty/macf#802 review: the FIRST shipped gate (PR #845) matched a
+    // KNOWN blocking shape (`❯ N.` numbered menu) and submitted unless it
+    // saw one — a blocklist. Follow-up review found real Claude Code (2.1.226,
+    // byte-level binary inspection) has NO numbered-select renderer at all —
+    // every select/confirm option renders as `❯` + a LABEL, never a digit —
+    // so that blocklist was a likely production no-op for the exact prompt
+    // it existed to catch. The gate below is INVERTED: submit ONLY when the
+    // pane affirmatively shows the standing input box.
+    //
+    // SEP/READY_* are PINNED TO A LIVE `capture-pane -p -J` of real, running
+    // Claude Code sessions on this fleet (not synthesized to match the
+    // implementation) — the standing input box renders as a `─` separator,
+    // a `❯`-prefixed line (blank idle / free text queued — both observed
+    // live), then a closing `─` separator, identically whether idle or busy.
+    //
+    // BLOCKED_* are RECONSTRUCTED from the #802 issue thread's static-binary
+    // evidence (a labelled confirm/select component, `❯` + label, never a
+    // digit) — not a live capture of an actual ceremony dialog (triggering
+    // one live on a shared multi-agent host was judged too invasive). Best
+    // evidence available, not proven; see the script's own header for the
+    // same caveat stated in the same terms.
+    const SEP = '─'.repeat(40);
+    const READY_IDLE = [SEP, '❯ ', SEP].join('\n');
+    const READY_QUEUED = [SEP, '❯ pick up pending issues', SEP].join('\n');
+    const BUSY_WORKING = ['* Imagining… (1m 5s · ↓ 8.4k tokens)', SEP, '❯ ', SEP].join('\n');
     const BLOCKED_DEV_CHANNELS = [
-      '❯ 1. I am using this for local development',
-      '  2. Exit',
-      '  Enter to confirm · Esc to cancel',
+      'This project uses development channels.',
+      '',
+      '❯ I am using this for local development',
+      '  Exit',
     ].join('\n');
-    const BLOCKED_TRUST_FOLDER = ['❯ 1. Yes, I trust this folder', '  2. No, exit'].join('\n');
-    // Not blocking-shaped — Claude's free-form input cursor has no numbered
-    // option after the ❯, so `_pane_blocked` reads it as clear.
-    const CLEAR_IDLE = '❯ ';
-    const CLEAR_ACTIVE = '⠋ Working on it...';
+    const BLOCKED_TRUST_FOLDER = [
+      'Do you trust the files in this folder?',
+      '',
+      '❯ Yes, I trust this folder',
+      '  No, continue without these permissions',
+    ].join('\n');
 
     // Tiny overrides so these tests run in well under a second instead of
     // exercising the real ~90s default budget.
@@ -684,7 +709,7 @@ describe('macf-startup-pickup.sh (SessionStart hook, groundnuty/macf#768)', () =
       MACF_STARTUP_PICKUP_VERIFY_DELAY_SECS: '0.1',
     };
 
-    it('pane shows a blocking ceremony prompt for the whole window → skips the submit, warns loud instead of swallowing it', () => {
+    it('DECISIVE (1/2): pane never shows a ready input line for the whole window → skips the submit, warns loud instead of swallowing it', () => {
       const r = runHook({
         pluginOutput: PENDING_OUTPUT,
         pluginOnelineOutput: '#1: fix the thing',
@@ -695,16 +720,21 @@ describe('macf-startup-pickup.sh (SessionStart hook, groundnuty/macf#768)', () =
       expect(r.submitInvocation).toBeNull();
       expect(r.submitCallCount).toBe(0);
       expect(r.stdout).toContain('WARNING');
-      expect(r.stdout).toContain('startup ceremony prompt');
+      expect(r.stdout).toContain('does not show a ready input line');
       expect(r.stdout).toContain('groundnuty/macf#802');
     });
 
-    it('pane is blocked then clears within the window → waits it out, then submits exactly once', () => {
+    it('DECISIVE (2/2): pane is not-ready then becomes ready within the window → waits it out, then submits exactly once and observably lands', () => {
+      // Pre-send poll sees two non-ready captures, then READY_IDLE (breaks
+      // the poll, submits). Post-send capture is BUSY_WORKING — different
+      // content from READY_IDLE (proves the pane visibly reacted) AND still
+      // ready-shaped (the standing input box persists through busy state,
+      // exactly as observed live) — genuine landing, not a coincidental diff.
       const r = runHook({
         pluginOutput: PENDING_OUTPUT,
         pluginOnelineOutput: '#1: fix the thing',
         env: { MACF_AGENT_ROLE: 'code-agent', ...FAST_TIMING },
-        tmuxFrames: [BLOCKED_DEV_CHANNELS, BLOCKED_DEV_CHANNELS, CLEAR_IDLE, CLEAR_ACTIVE],
+        tmuxFrames: [BLOCKED_DEV_CHANNELS, BLOCKED_DEV_CHANNELS, READY_IDLE, BUSY_WORKING],
       });
       expect(r.status).toBe(0);
       expect(r.submitCallCount).toBe(1);
@@ -714,14 +744,26 @@ describe('macf-startup-pickup.sh (SessionStart hook, groundnuty/macf#768)', () =
       expect(r.stdout).not.toContain('WARNING');
     });
 
-    it('pane content stays static after the submit (never visibly reacts) → retries once, then warns instead of silently declaring success', () => {
+    it('a pane already showing queued/typed text in the input box also counts as ready (not just the blank-idle shape)', () => {
       const r = runHook({
         pluginOutput: PENDING_OUTPUT,
         pluginOnelineOutput: '#1: fix the thing',
         env: { MACF_AGENT_ROLE: 'code-agent', ...FAST_TIMING },
-        // Never changes, never blocked — the pre-send check passes
+        tmuxFrames: [READY_QUEUED, BUSY_WORKING],
+      });
+      expect(r.status).toBe(0);
+      expect(r.submitCallCount).toBe(1);
+      expect(r.stdout).not.toContain('WARNING');
+    });
+
+    it('HONEST-UNKNOWN: pane content stays static after the submit (never visibly reacts) → retries once, then states the outcome as unknown rather than declaring success', () => {
+      const r = runHook({
+        pluginOutput: PENDING_OUTPUT,
+        pluginOnelineOutput: '#1: fix the thing',
+        env: { MACF_AGENT_ROLE: 'code-agent', ...FAST_TIMING },
+        // Ready from the first capture — the pre-send check passes
         // immediately, but the post-send verify never sees a diff.
-        tmuxFrames: [CLEAR_IDLE],
+        tmuxFrames: [READY_IDLE],
       });
       expect(r.status).toBe(0);
       expect(r.submitCallCount).toBe(2); // one bounded retry, then give up
@@ -730,15 +772,15 @@ describe('macf-startup-pickup.sh (SessionStart hook, groundnuty/macf#768)', () =
       expect(r.stdout).toContain('groundnuty/macf#802');
     });
 
-    it('the pane shows a DIFFERENT blocking prompt right after the submit → not mistaken for success just because content differs', () => {
+    it('HONEST-UNKNOWN: the pane is interrupted by a non-ready dialog right after the submit → not mistaken for success just because content differs', () => {
       const r = runHook({
         pluginOutput: PENDING_OUTPUT,
         pluginOnelineOutput: '#1: fix the thing',
         env: { MACF_AGENT_ROLE: 'code-agent', ...FAST_TIMING },
-        // Pre-send check passes on CLEAR_IDLE; the post-send capture lands
-        // on a NEW blocking prompt whose content differs from CLEAR_IDLE —
-        // a raw content-diff alone would misread this as "delivered".
-        tmuxFrames: [CLEAR_IDLE, BLOCKED_TRUST_FOLDER, BLOCKED_TRUST_FOLDER],
+        // Pre-send check passes on READY_IDLE; the post-send capture lands
+        // on a NEW dialog whose content differs from READY_IDLE — a raw
+        // content-diff alone would misread this as "delivered".
+        tmuxFrames: [READY_IDLE, BLOCKED_TRUST_FOLDER, BLOCKED_TRUST_FOLDER],
       });
       expect(r.status).toBe(0);
       expect(r.submitCallCount).toBe(2);
@@ -746,7 +788,7 @@ describe('macf-startup-pickup.sh (SessionStart hook, groundnuty/macf#768)', () =
       expect(r.stdout).toContain('could not confirm the auto-submit landed');
     });
 
-    it('no tmux reachable at all (capture always fails) → fails OPEN, immediate unconditional submit (pre-#802 behavior preserved)', () => {
+    it('UNOBSERVABLE (trichotomy row 3): no tmux reachable at all (capture always fails) → fails OPEN, immediate unconditional submit (pre-#802 behavior preserved)', () => {
       const r = runHook({
         pluginOutput: PENDING_OUTPUT,
         pluginOnelineOutput: '#1: fix the thing',
