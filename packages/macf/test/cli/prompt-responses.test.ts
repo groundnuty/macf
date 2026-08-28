@@ -40,9 +40,9 @@ describe('seedPromptResponsesConfig — absent', () => {
     expect(existsSync(path)).toBe(true);
 
     const raw: unknown = JSON.parse(readFileSync(path, 'utf-8'));
-    // Valid + Inv-2 clean seed with the two ceremony entries.
+    // Valid + Inv-2 clean seed with the canonical ceremony entries.
     const loaded = loadPromptResponses(raw);
-    expect(loaded.accepted.map((e) => e.name)).toEqual(['dev-channels', 'resume-summary']);
+    expect(loaded.accepted.map((e) => e.name)).toEqual(['dev-channels', 'resume-summary', 'rating-survey']);
     expect(loaded.refused).toHaveLength(0);
     expect(loaded.warned).toHaveLength(0);
     // Carries an operator `_comment` note.
@@ -111,5 +111,73 @@ describe('seedPromptResponsesConfig — present (never clobber)', () => {
 
     const result = seedPromptResponsesConfig(workspace);
     expect(result.action).toBe('invalid');
+  });
+
+  it('flags canonical seed entries this file predates (macf#703)', () => {
+    // Shapes a real pre-#703 live workspace: only the original two entries
+    // the seed shipped before `rating-survey` was added.
+    const path = workspacePromptResponsesPath(workspace);
+    mkdirSync(join(workspace, '.claude', '.macf'), { recursive: true });
+    writeFileSync(
+      path,
+      JSON.stringify({
+        schema_version: '1',
+        entries: [
+          {
+            name: 'dev-channels',
+            frame_contains: ['I am using this for local development'],
+            option_text: 'I am using this for local development',
+            send: '1',
+            max_fires: 1,
+          },
+          {
+            name: 'resume-summary',
+            frame_contains: ['Resume full session as-is'],
+            option_text: 'Resume full session as-is',
+            send: '2',
+            max_fires: 1,
+          },
+        ],
+      }),
+    );
+
+    const result = seedPromptResponsesConfig(workspace);
+    expect(result.action).toBe('preserved');
+    if (result.action === 'preserved') {
+      expect(result.missingFromCanonicalSeed).toEqual(['rating-survey']);
+    }
+  });
+
+  it('reports no missing entries when the file already carries every canonical name', () => {
+    // A freshly-seeded file, re-validated on the next `macf update` — should
+    // never flag itself as missing its own contents.
+    seedPromptResponsesConfig(workspace);
+    const result = seedPromptResponsesConfig(workspace);
+    expect(result.action).toBe('preserved');
+    if (result.action === 'preserved') {
+      expect(result.missingFromCanonicalSeed).toEqual([]);
+    }
+  });
+
+  it('does not flag a canonical name the operator refused via Inv-2 as missing', () => {
+    // If an operator's own entry happens to collide in name with a canonical
+    // one and gets Inv-2-refused, that's a present-but-dangerous entry, not
+    // an absent one — `missingFromCanonicalSeed` must not double-count it.
+    const path = workspacePromptResponsesPath(workspace);
+    mkdirSync(join(workspace, '.claude', '.macf'), { recursive: true });
+    writeFileSync(
+      path,
+      JSON.stringify({
+        schema_version: '1',
+        entries: [{ name: 'rating-survey', frame_contains: ['delete all'], option_text: 'yes', send: '1' }],
+      }),
+    );
+
+    const result = seedPromptResponsesConfig(workspace);
+    expect(result.action).toBe('preserved');
+    if (result.action === 'preserved') {
+      expect(result.loaded.refused.map((r) => r.entry.name)).toEqual(['rating-survey']);
+      expect(result.missingFromCanonicalSeed).toEqual(['dev-channels', 'resume-summary']);
+    }
   });
 });

@@ -49,6 +49,26 @@ const DEV_FRAME = [
   '  2. Cancel',
 ].join('\n');
 
+/**
+ * A plausible rating-survey frame — the "Dismiss" option (send: '0') leading
+ * its own rendered line, per the seed's `rating-survey` entry (macf#703).
+ */
+const RATING_FRAME_DISMISS_OWN_LINE = [
+  'How is Claude doing this session? (optional)',
+  '1: Bad   2: Fine   3: Good',
+  '0: Dismiss',
+].join('\n');
+
+/**
+ * The OTHER plausible rendering — every option packed onto one row headed by
+ * ordinal 1, not 0. `rating-survey`'s `send: '0'` must NOT fire here (Inv 3):
+ * the line the option text lives on does not start with the `0` ordinal.
+ */
+const RATING_FRAME_PACKED_ROW = [
+  'How is Claude doing this session? (optional)',
+  '1: Bad   2: Fine   3: Good   0: Dismiss',
+].join('\n');
+
 describe('schema', () => {
   it('parses a full valid entry + applies max_fires default', () => {
     const parsed = PromptResponseEntrySchema.parse({
@@ -270,9 +290,13 @@ describe('verify the RIGHT outcome — verifyOutcome', () => {
 });
 
 describe('canonical seed', () => {
-  it('has schema_version + two ceremony entries', () => {
+  it('has schema_version + three ceremony entries', () => {
     expect(PROMPT_RESPONSES_SEED.schema_version).toBe(PROMPT_RESPONSES_SCHEMA_VERSION);
-    expect(PROMPT_RESPONSES_SEED.entries.map((e) => e.name)).toEqual(['dev-channels', 'resume-summary']);
+    expect(PROMPT_RESPONSES_SEED.entries.map((e) => e.name)).toEqual([
+      'dev-channels',
+      'resume-summary',
+      'rating-survey',
+    ]);
   });
 
   it('validates against the schema', () => {
@@ -283,11 +307,39 @@ describe('canonical seed', () => {
     const loaded = loadPromptResponses(PROMPT_RESPONSES_SEED);
     expect(loaded.refused).toHaveLength(0);
     expect(loaded.warned).toHaveLength(0);
-    expect(loaded.accepted).toHaveLength(2);
+    expect(loaded.accepted).toHaveLength(3);
+  });
+
+  it('every seed entry classifies ok individually (catches a naming slip)', () => {
+    for (const entry of PROMPT_RESPONSES_SEED.entries) {
+      expect(classifyPromptSignature(entry)).toBe('ok');
+    }
   });
 
   it('the dev-channels seed matches its realistic frame', () => {
     const seed = PROMPT_RESPONSES_SEED.entries[0]!;
     expect(entryMatchesFrame(DEV_FRAME, seed)).toBe(true);
+  });
+
+  describe('rating-survey seed (macf#703 — binary-extracted, not live-pane-verified)', () => {
+    const seed = PROMPT_RESPONSES_SEED.entries.find((e) => e.name === 'rating-survey')!;
+
+    it('matches when the Dismiss option leads its own rendered line', () => {
+      expect(entryMatchesFrame(RATING_FRAME_DISMISS_OWN_LINE, seed)).toBe(true);
+      expect(matchPromptFrame(RATING_FRAME_DISMISS_OWN_LINE, [seed])).toEqual({ kind: 'match', entry: seed });
+    });
+
+    it('does NOT match when every option packs onto one row headed by ordinal 1 (fails safe)', () => {
+      expect(entryMatchesFrame(RATING_FRAME_PACKED_ROW, seed)).toBe(false);
+      // No ordinal binds to "Dismiss" here, so the caller falls through to
+      // Inv 1 — the frame still looks prompt-like via the numbered options
+      // (guarded elsewhere); the load-bearing assertion is: never a 'match'.
+      const result = matchPromptFrame(RATING_FRAME_PACKED_ROW, [seed]);
+      expect(result.kind).not.toBe('match');
+    });
+
+    it('does not fire on unrelated text mentioning "Dismiss" without the survey message', () => {
+      expect(entryMatchesFrame('0: Dismiss this notification', seed)).toBe(false);
+    });
   });
 });
