@@ -32,7 +32,7 @@
  * condition this issue is about; writing one would silently rebuild
  * #1292's own blind spot one level up.
  */
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -126,7 +126,22 @@ const LOCK_STEADY_STATE: FleetLock = {
   schema_version: 1,
   fleet: 'demo-fleet',
   agents: [
-    { role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' },
+    // groundnuty/macf#1310 corollary — `code-agent`'s fingerprints live
+    // ONLY in `fleet.lock` (never the manifest). Pre-#1309, an absent
+    // local lock made `secretFingerprintItem` read `obs?.fingerprints ??
+    // {}` as EMPTY for every declared agent too, not just extra roles —
+    // reporting a false `create` ("no fingerprints recorded ... has not
+    // been provisioned yet") for an agent the SAME live control-repo lock
+    // already recorded three fingerprints for. DECISIVE 2/2 below asserts
+    // this now reads `noop`, sourced through the identical fallback this
+    // file's `writing-agent` assertions exercise -- one resolver, two
+    // symptoms, same fix.
+    {
+      role: 'code-agent',
+      app_id: 'app-code-agent',
+      install_id: 'install-1',
+      fingerprints: { app_private_key: 'sha256:a', client_secret: 'sha256:b', webhook_secret: 'sha256:c' },
+    },
     { role: 'science-agent', app_id: 'app-science-agent', install_id: 'install-2' },
   ],
 };
@@ -139,6 +154,16 @@ interface PlanJson {
 describe('runBootstrapPlan — fleet.lock live-control-repo fallback (groundnuty/macf#1309)', () => {
   const dirs: string[] = [];
   let logSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    // groundnuty/macf#1309 review fix — without this, `mockExecFile.mock.calls`
+    // accumulates across `it()` blocks (vitest does not auto-reset a
+    // `vi.fn()` between tests), so a LATER test's call-count assertion was
+    // silently counting calls made by EARLIER tests in this file, not just
+    // its own. Each test's call-count assertion must reflect ONLY that
+    // test's own invocation.
+    vi.clearAllMocks();
+  });
 
   afterEach(() => {
     logSpy?.mockRestore();
@@ -208,6 +233,16 @@ describe('runBootstrapPlan — fleet.lock live-control-repo fallback (groundnuty
     expect(json.plan.some((i) => i.target.includes('code-agent') && i.verb === 'orphan')).toBe(false);
     expect(json.plan.some((i) => i.kind === 'agent' && i.target === 'agent:code-agent')).toBe(false);
     expect(json.fleet_lock_source).toBe('control-repo');
+
+    // groundnuty/macf#1310 corollary (see LOCK_STEADY_STATE's doc) — the
+    // SAME resolved lock feeds a DECLARED agent's per-field observation,
+    // not just row 4's extraRoles loop. `code-agent`'s three recorded
+    // fingerprints must read as `noop` ("N fingerprint(s) recorded"),
+    // never the false `create` ("no fingerprints recorded ... has not
+    // been provisioned yet") a null/absent lock would have produced.
+    const codeAgentSecrets = json.plan.find((i) => i.kind === 'secret_fingerprint' && i.target === 'agent:code-agent:secrets');
+    expect(codeAgentSecrets?.verb).toBe('noop');
+    expect(codeAgentSecrets?.reason).toContain('3 fingerprint(s) recorded in fleet.lock');
   });
 
   // --- No extra API cost on the common path -------------------------------
