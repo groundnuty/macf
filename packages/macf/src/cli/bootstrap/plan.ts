@@ -2554,10 +2554,10 @@ export function computePlan(
         verb: 'orphan',
         reason:
           `A repo was provisioned by this tool for "${role}" (recorded in fleet.lock) but "${role}" is no ` +
-          'longer declared. The repo NAME itself is unrecorded, not absent — this lock predates repo ' +
-          'recording (groundnuty/macf#1296), so this tool cannot confirm the repo live or name its settings ' +
-          'page. NOTHING WAS DELETED — apply never auto-removes it, under any flag (recreating a repo loses ' +
-          `its history; un-archiving is 0 clicks). Search your GitHub ` +
+          'longer declared. The repo NAME itself is unrecorded, not absent — this lock predates this tool ' +
+          "recording repo names for roles like this one, so this tool cannot confirm the repo live or name " +
+          'its settings page. NOTHING WAS DELETED — apply never auto-removes it, under any flag (recreating ' +
+          `a repo loses its history; un-archiving is 0 clicks). Search your GitHub ` +
           `${manifest.owner.type === 'org' ? `organization "${manifest.owner.account}"` : 'account'}'s repo list ` +
           `for one it created for role "${role}". Self-limiting: this resolves the next time this fleet's ` +
           '`apply` runs (the repo name is recorded going forward).',

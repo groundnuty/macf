@@ -1144,10 +1144,12 @@ describe('orphan rows say "not deleted" + carry a link, on BOTH the plan and app
   // groundnuty/macf#1313 — per science's ruling, this row NAMES THE ROLE
   // (the one thing this tool knows) rather than staying silent or
   // fabricating a link. It states the name is unrecorded (not absent),
-  // cites WHY (this lock predates #1296), carries the same search hint
-  // #1281 already writes for the analogous unresolvable-App-URL case, and
-  // states the condition is self-limiting — it resolves on the fleet's
-  // next `apply` (which then records `repo` for this role going forward).
+  // explains WHY in plain language (no internal citation — macf#1061's
+  // "explain, don't cite" rule for user-facing output), carries the same
+  // search hint #1281 already writes for the analogous unresolvable-App-URL
+  // case, and states the condition is self-limiting — it resolves on the
+  // fleet's next `apply` (which then records `repo` for this role going
+  // forward).
   it('DECISIVE (2/2): a lock that PREDATES the field (no repo key at all) → the orphan row names the ROLE, explains why, and is self-limiting — never a fabricated link', () => {
     const manifest = baseManifest();
     const observed: ObservedState = {
@@ -1162,10 +1164,12 @@ describe('orphan rows say "not deleted" + carry a link, on BOTH the plan and app
     // Names the role.
     expect(repoItem?.reason).toContain('dropped-agent');
     // States the name is unrecorded — explicitly NOT "absent" (science's
-    // own contrast: "unrecorded, not absent") — and cites why (#1296).
+    // own contrast: "unrecorded, not absent") — and explains why, in plain
+    // language, never an internal issue-number citation (macf#1061).
     expect(repoItem?.reason).toContain('unrecorded');
     expect(repoItem?.reason).toContain('not absent');
-    expect(repoItem?.reason).toContain('#1296');
+    expect(repoItem?.reason).toMatch(/predates this tool recording repo names/i);
+    expect(repoItem?.reason).not.toMatch(/\bmacf#\d+\b|\bgroundnuty\/macf#\d+\b/);
     // Carries the #1281-style search hint.
     expect(repoItem?.reason).toMatch(/search your github/i);
     // States the condition is self-limiting.
