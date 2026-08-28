@@ -2,6 +2,28 @@
 
 **Before writing a test assertion, ask: *would this assertion fail if the code were wrong?*** An assertion on the **outcome** frequently would not — because the broken implementation produces the right outcome too, for the wrong reason.
 
+## The general form: could this check have come out differently?
+
+**The question above is the test-assertion case of one property.** It applies to every instrument, not only to assertions:
+
+> **An instrument whose result is independent of the thing measured is not an instrument.** Before trusting a check — a test, a grep, an API call, a fixture, a mock — ask **could this have come out differently?** If no, the reading was guaranteed before the system was consulted.
+
+Five instruments observed failing this in one session (2026-08-27/28, three agents), each of which *reported* successfully:
+
+| the instrument | why its result was guaranteed |
+|---|---|
+| `GET /orgs/<name>` where the account is a **User** | 404 by construction — identical from every credential, forever |
+| `grep` against a path that does not exist | identical whether the string is present or absent |
+| a fixture that **writes** the file whose read is under test | identical whether the read path is broken |
+| a mock on `console.error` where the code writes `process.stderr` | identical whether anything is emitted at all |
+| a substring match (`realDeleteRepo` matching `realDeleteRepoVariable`) | matches a name that was never the target |
+
+**Mutation is the operation that asks this question mechanically** — break the thing; if the check does not notice, the check was never connected to it. That is why every mutation requirement in this rule is load-bearing rather than ceremonial. **The cost of relying on mutation alone is that it answers late**, after the work is written; asking the question first is free.
+
+**Note the altitude, stated as an open question rather than a restructure:** trigger 3 (*the population excludes the failing case*) and trigger 4 (*an empty result from an empty search space*) both look like instances of this property rather than peers of trigger 1 — in each, the reading was guaranteed. **That framing rests on one session's synthesis and is recorded here to be argued with, not acted on.** The triggers are cited by number across issues and PRs; they are not renumbered.
+
+---
+
 This is `verify-before-claim.md` **§5b** with a different subject. That section asks *"would this output look different if my claim were false?"* about evidence an agent quotes; a test assertion is evidence about code, so the same question becomes the one above. Same discipline, different surface.
 
 ---
