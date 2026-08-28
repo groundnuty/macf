@@ -260,6 +260,52 @@ registered). Treat all six as independent facts; a summary line claiming
 
 ## 4a. Adding an agent to an already-provisioned fleet
 
+> ### ⚠️ KNOWN GAP — the new agent cannot route to its predecessors until you fix one variable by hand
+>
+> **Adding an agent leaves it trusted only on its own repo.** `apply` writes
+> `MACF_TRUSTED_ACTORS` **only when the variable is absent** (create-only), so the
+> new agent's repo gets the full actor list while every pre-existing repo keeps
+> its old, shorter one. The result is a **one-directional routing break**: the new
+> agent can be routed *to*, and cannot route *out*.
+>
+> **Measured on `macf-trial` after a 2→3 scale-up (2026-08-27):**
+>
+> ```
+> trial-code-agent      2 actors — the new agent ABSENT
+> trial-science-agent   2 actors — the new agent ABSENT
+> trial-writing-agent   3 actors — the new agent PRESENT
+> ```
+>
+> **`macf bootstrap plan` detects this and says so**, reporting an `update` whose
+> reason reads *"NOT IMPLEMENTED BY APPLY … create-only … does NOT overwrite a
+> PRESENT-but-diverging value."* **So the plan is honest and the fleet is broken;
+> nothing is silently wrong, but nothing fixes it either.**
+>
+> **What to do after step 2 completes, for EVERY pre-existing agent repo:**
+>
+> ```sh
+> # 1. What does the manifest declare? (one <fleet>-<role>-agent[bot] per agent)
+> grep -E '^  - role:' fleet.yaml
+>
+> # 2. What does each repo actually trust?
+> for r in <repo-1> <repo-2> ...; do
+>   printf '%s: ' "$r"
+>   gh api "repos/<owner>/$r/actions/variables/MACF_TRUSTED_ACTORS" --jq .value
+> done
+>
+> # 3. Set any repo whose list is short to the FULL space-separated set
+> gh variable set MACF_TRUSTED_ACTORS --repo <owner>/<repo> \
+>   --body "<fleet>-code-agent[bot] <fleet>-science-agent[bot] <fleet>-<new-role>-agent[bot]"
+> ```
+>
+> **Verify with `macf bootstrap plan`: it should report `0 update`.** While it
+> still reports one, the break is live.
+>
+> **Tracked as `groundnuty/macf#1319`**, which makes `apply` reconcile the
+> variable as a confirmed `update` rather than skipping it. **This section loses
+> this box when that lands** — check whether `#1319` is closed before following
+> the manual steps.
+
 **A different happy path from §1–§4 — those provision a fleet from nothing;
 this scales one that already routes.** Everything below only applies once a
 fleet has at least one working agent; a fleet's very first `apply` never
