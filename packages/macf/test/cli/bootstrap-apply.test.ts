@@ -2704,6 +2704,65 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       expect(errs.join('\n')).not.toContain(AGE_RECIPIENTS_NARROWED_CODE);
     });
 
+    // groundnuty/macf#1322 — science's ruling on a question raised from a
+    // live `apply` log: the record-absent notice reported the GAP (the
+    // comparison could not run) without reporting the RISK (what narrowing
+    // does NOT do even though it can't be seen). Decisive pair below: (1)
+    // record absent -> the notice fires AND names the risk, and the run
+    // still proceeds (exit status unchanged); (2) record present with
+    // nothing removed -> the REAL narrowing check ran and found nothing, so
+    // the record-absent notice must NOT fire at all. Bound at the call site
+    // (not just the pure `ageRecipientsRecordAbsentNotice` unit) so this is
+    // evidence the wiring in `bootstrap-apply.ts` actually surfaces the text,
+    // not just that the helper CAN produce it.
+    it('DECISIVE (groundnuty/macf#1322) leg 1: record absent -> the notice on stderr states the risk + remedy, and the run proceeds with an unchanged exit status', async () => {
+      // `ageRecipientsRecordAbsentNotice()` reaches the terminal via
+      // `process.stderr.write` directly (bootstrap-apply.ts's call site),
+      // NOT `console.error` — the `errs` fixture above only mocks the
+      // latter, so it never sees this text. Spy on the raw stream instead,
+      // same idiom the "pre-approval stderr render" test above uses.
+      const rawWrites: string[] = [];
+      const writeSpy = vi
+        .spyOn(process.stderr, 'write')
+        .mockImplementation((chunk: string | Uint8Array) => {
+          rawWrites.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf-8'));
+          return true;
+        });
+      try {
+        const file = writeManifest(); // no fleet.lock written at all — record absent
+        const code = await runBootstrapApply({ file, yes: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) }, fakeMutateDeps(file));
+        // Control flow is untouched by the notice — this is the SAME exit
+        // status a clean apply with no age_recipients concern at all produces.
+        expect(code).toBe(0);
+        const output = rawWrites.join('');
+        expect(output).toContain('cannot be checked for narrowing');
+        expect(output).toContain('Proceeding');
+        expect(output).toContain('does not revoke');
+        expect(output).toContain('rotating the CA');
+      } finally {
+        writeSpy.mockRestore();
+      }
+    });
+
+    it('DECISIVE (groundnuty/macf#1322) leg 2: record present with nothing removed -> SILENT (the real narrowing check ran; no record-absent notice)', async () => {
+      const rawWrites: string[] = [];
+      const writeSpy = vi
+        .spyOn(process.stderr, 'write')
+        .mockImplementation((chunk: string | Uint8Array) => {
+          rawWrites.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf-8'));
+          return true;
+        });
+      try {
+        const file = writeManifest(); // FLEET_YAML default — declares only recipient A
+        writePriorLock(file, [AGE_RECIPIENT_A]); // recorded set == desired set — nothing removed
+        const code = await runBootstrapApply({ file, yes: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) }, fakeMutateDeps(file));
+        expect(code).toBe(0);
+        expect(rawWrites.join('')).not.toContain('cannot be checked for narrowing');
+      } finally {
+        writeSpy.mockRestore();
+      }
+    });
+
     it('a same-size SWAP (drop B, add C) is STILL refused — proves the preflight wiring carries the set-difference predicate through, not a length check', async () => {
       const file = writeManifest(FLEET_YAML_WITH_TWO_AGE_RECIPIENTS.replace(AGE_RECIPIENT_B, AGE_RECIPIENT_C)); // declares A and C
       writePriorLock(file, [AGE_RECIPIENT_A, AGE_RECIPIENT_B]); // recorded has A and B
