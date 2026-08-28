@@ -301,7 +301,12 @@ jobs:
       # historically — npm packed the private monorepo-root package
       # instead of the intended sub-package, failing with EPRIVATE.
       # See v0.2.0-rc.0 failed publish run for the diagnostic.
+      # Each publish step's own exit code IS the acceptance signal (macf#1297)
+      # -- an `id` here is what lets the acceptance-summary + availability
+      # steps below read `outcome` per package without re-fetching the
+      # registry to find out what already happened.
       - name: Publish @groundnuty/macf-core (first, consumers depend on it)
+        id: publish_core
         env:
           DRY_RUN: ${{ github.event.inputs.dry-run }}
         run: |
@@ -312,6 +317,7 @@ jobs:
           fi
 
       - name: Publish @groundnuty/macf (CLI)
+        id: publish_cli
         env:
           DRY_RUN: ${{ github.event.inputs.dry-run }}
         run: |
@@ -322,6 +328,7 @@ jobs:
           fi
 
       - name: Publish @groundnuty/macf-channel-server
+        id: publish_channel_server
         env:
           DRY_RUN: ${{ github.event.inputs.dry-run }}
         run: |
@@ -331,61 +338,171 @@ jobs:
             npm publish --workspace=@groundnuty/macf-channel-server --provenance --access public
           fi
 
-      # Per macf#214 step 2: `npm publish --provenance` exits 0 even
-      # when attestation generation silently skipped (historically
-      # possible with missing `id-token: write` or wrong OIDC scope).
-      # Cross-check against the registry's published metadata so that
-      # class of failure surfaces as a workflow error instead of a
-      # silently-broken publish.
+      # macf#1297: this step used to conflate two different questions —
       #
-      # Skipped on dry-run (no real publish to verify) and on the
-      # NPM_TOKEN bootstrap path (token-only publishes don't generate
-      # provenance attestations — only OIDC publishes do; tokens are
-      # the chicken-and-egg fallback before OIDC-trust can be set up).
-      - name: Verify provenance attestations on published versions
-        if: github.event.inputs.dry-run != 'true' && steps.auth.outputs.npm_token_available != 'true'
+      #   ACCEPTANCE     did npm accept the publish?      IMMEDIATE, known
+      #                                                    from the publish
+      #                                                    step's own exit
+      #                                                    code, above.
+      #   AVAILABILITY   can the registry SERVE it yet?   EVENTUALLY
+      #                                                    CONSISTENT, only
+      #                                                    knowable by
+      #                                                    fetching.
+      #
+      # A ~15s fetch-retry budget (5 tries x 3s) treated a not-yet-visible
+      # fetch as a failed publish -- the inverted silent-fallback shape,
+      # failure reported for success. That fired on v0.2.58 (~90s observed
+      # registry lag on the third package -- see #776's comment thread).
+      #
+      # Split into two steps below:
+      #   1. "Publish acceptance summary" -- reads each publish step's own
+      #      `outcome` (no registry access at all) and names, per package,
+      #      ACCEPTED / REJECTED / NOT ATTEMPTED. This is also the
+      #      partial-publish-awareness signal silent-fallback-hazards.md
+      #      Instance 9 calls for: when a publish step fails mid-sequence,
+      #      the packages before it already landed and the ones after it
+      #      never ran -- DR-022 Amendment L's bump-version recovery needs
+      #      exactly this list to be decidable.
+      #   2. "Verify registry availability + provenance" -- a BOUNDED
+      #      fetch-retry (attempt-count bound, never a CI/job timeout —
+      #      see #1295, which hit the identical shape on release.sh's side
+      #      and settled on this same budget) that reports lag as lag, and
+      #      only fails the job on a GENUINE defect: a package that IS
+      #      available but was published without the provenance attestation
+      #      it was supposed to carry (macf#214).
+      #
+      # A REJECTED package already fails the job via its own publish
+      # step's exit code, unchanged by this split — that safety net was
+      # never the conflated part.
+      - name: Publish acceptance summary (per-package, from each publish step's own result)
+        if: ${{ !cancelled() && github.event.inputs.dry-run != 'true' }}
+        continue-on-error: true # diagnostic only -- never the failure gate; see comment above
         env:
           VERSION: ${{ steps.version.outputs.version }}
+          OUTCOME_CORE: ${{ steps.publish_core.outcome }}
+          OUTCOME_CLI: ${{ steps.publish_cli.outcome }}
+          OUTCOME_CHANNEL_SERVER: ${{ steps.publish_channel_server.outcome }}
         run: |
-          set -e
-          # The registry serves package metadata at
-          # https://registry.npmjs.org/<scope>/<name>/<version>. The
-          # `dist.attestations` field is present and non-empty when
-          # provenance attestations were generated by --provenance.
-          # If the field is absent or empty, npm published the
-          # tarball but the attestation generation silently skipped.
-          for pkg in macf-core macf macf-channel-server; do
-            FULL="@groundnuty/${pkg}"
-            URL="https://registry.npmjs.org/${FULL}/${VERSION}"
-            # Allow a few seconds for registry replication after publish.
-            for try in 1 2 3 4 5; do
-              if META=$(curl -sfL "$URL"); then break; fi
-              sleep 3
-            done
-            if [[ -z "${META:-}" ]]; then
-              echo "::error::Could not fetch ${URL} after 5 retries"
-              exit 1
+          set -euo pipefail
+          ANY_REJECTED=0
+          for entry in \
+            "@groundnuty/macf-core:${OUTCOME_CORE}" \
+            "@groundnuty/macf:${OUTCOME_CLI}" \
+            "@groundnuty/macf-channel-server:${OUTCOME_CHANNEL_SERVER}"
+          do
+            pkg="${entry%%:*}"
+            outcome="${entry#*:}"
+            case "$outcome" in
+              success)
+                echo "ACCEPTED       ${pkg}@${VERSION} -- npm accepted this publish (from the publish step's own exit code)."
+                ;;
+              skipped)
+                echo "NOT ATTEMPTED  ${pkg}@${VERSION} -- never published this run (an earlier package's publish step failed first)."
+                ;;
+              *)
+                echo "REJECTED       ${pkg}@${VERSION} -- npm rejected this publish (publish step outcome=${outcome})."
+                ANY_REJECTED=1
+                ;;
+            esac
+          done
+          if [ "$ANY_REJECTED" = "1" ]; then
+            echo "::error::At least one package was REJECTED by npm this run. See the ACCEPTED / NOT ATTEMPTED / REJECTED lines above for exactly which packages landed -- that is what makes DR-022 Amendment L's bump-version recovery decidable (silent-fallback-hazards.md Instance 9)."
+          fi
+
+      - name: Verify registry availability + provenance (bounded; a lag is NOT a publish failure)
+        if: ${{ !cancelled() && github.event.inputs.dry-run != 'true' }}
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          OUTCOME_CORE: ${{ steps.publish_core.outcome }}
+          OUTCOME_CLI: ${{ steps.publish_cli.outcome }}
+          OUTCOME_CHANNEL_SERVER: ${{ steps.publish_channel_server.outcome }}
+          NPM_TOKEN_AVAILABLE: ${{ steps.auth.outputs.npm_token_available }}
+        run: |
+          set -euo pipefail
+          # Bound is asserted by ATTEMPT COUNT, never by the job/CI
+          # timeout (#1295 flagged exactly this: a timeout-derived bound
+          # weakens silently if the timeout is ever raised for an
+          # unrelated reason, and `exit 124` is indistinguishable from
+          # infra flake). 8 attempts, 5s/10s/20s/40s/60s-capped backoff
+          # (~4m15s worst case) matches release.sh's `wait_for_npm_version`
+          # (#1295) -- one release-verify convention, not two.
+          MAX_TRIES=8
+          BASE_SECS=5
+          CAP_SECS=60
+
+          ANY_PROVENANCE_MISSING=0
+          for entry in \
+            "@groundnuty/macf-core:${OUTCOME_CORE}" \
+            "@groundnuty/macf:${OUTCOME_CLI}" \
+            "@groundnuty/macf-channel-server:${OUTCOME_CHANNEL_SERVER}"
+          do
+            pkg="${entry%%:*}"
+            outcome="${entry#*:}"
+
+            if [ "$outcome" != "success" ]; then
+              echo "SKIP  ${pkg}@${VERSION} -- not accepted this run (publish step outcome=${outcome}); nothing to check availability of."
+              continue
             fi
-            # `attestations` is an OBJECT (not array) — check for the
-            # provenance.url subfield, which is set when provenance
-            # was generated. `jq -e` exits non-zero on null/missing.
+
+            URL="https://registry.npmjs.org/${pkg}/${VERSION}"
+            META=""
+            attempt=1
+            while [ "$attempt" -le "$MAX_TRIES" ]; do
+              if META="$(curl -sfL "$URL" 2>/dev/null)"; then
+                break
+              fi
+              META=""
+              if [ "$attempt" -lt "$MAX_TRIES" ]; then
+                delay=$((BASE_SECS * (1 << (attempt - 1))))
+                if [ "$delay" -gt "$CAP_SECS" ]; then
+                  delay="$CAP_SECS"
+                fi
+                echo "LAG  ${pkg}@${VERSION} not yet visible on the registry (attempt ${attempt}/${MAX_TRIES}) -- npm already ACCEPTED this publish (see the acceptance summary above); this is replication lag, not a failure. Retrying in ${delay}s..."
+                sleep "$delay"
+              fi
+              attempt=$((attempt + 1))
+            done
+
+            if [ -z "$META" ]; then
+              echo "::warning::AVAILABILITY UNCONFIRMED for ${pkg}@${VERSION} after ${MAX_TRIES} attempts -- npm already ACCEPTED this publish, so this is NOT a publish failure. Confirm manually once convenient: npm view ${pkg}@${VERSION}"
+              continue
+            fi
+
+            if [ "$attempt" -gt 1 ]; then
+              echo "AVAILABLE  ${pkg}@${VERSION} on the registry (after ${attempt}/${MAX_TRIES} attempts -- some replication lag, as expected)."
+            else
+              echo "AVAILABLE  ${pkg}@${VERSION} on the registry (first attempt, no lag)."
+            fi
+
+            if [ "$NPM_TOKEN_AVAILABLE" = "true" ]; then
+              echo "  (provenance check skipped -- this run used the NPM_TOKEN bootstrap path, which does not generate attestations)"
+              continue
+            fi
+
+            # macf#214: npm publish --provenance has historically exited 0
+            # while silently skipping attestation generation (missing
+            # id-token:write, wrong OIDC scope). This is a GENUINE defect,
+            # distinct from lag -- the package IS available above, so
+            # absence here means "published without the provenance we
+            # required", not "not yet visible".
+            #
             # Attestation shape (verified 2026-05-20 against the registry):
             #   dist.attestations = {
             #     url: "https://registry.npmjs.org/-/npm/v1/attestations/<scope>%2f<pkg>@<version>",
             #     provenance: { predicateType: "https://slsa.dev/provenance/v1" }
             #   }
-            # Earlier version of this script checked `.dist.attestations.provenance.url`
-            # which is NOT the canonical path (provenance has predicateType, not url) —
-            # the URL lives at `.dist.attestations.url` top-level. Fixed 2026-05-20
-            # after v0.2.32 publish succeeded but post-publish verify falsely failed.
-            if ! echo "$META" | jq -e '.dist.attestations.url' >/dev/null; then
-              echo "::error::${FULL}@${VERSION} published without provenance attestation"
-              echo "::error::dist.attestations field: $(echo "$META" | jq -c '.dist.attestations // null')"
-              exit 1
+            if echo "$META" | jq -e '.dist.attestations.url' >/dev/null 2>&1; then
+              ATT_URL=$(echo "$META" | jq -r '.dist.attestations.url')
+              echo "  provenance attestation present: ${ATT_URL}"
+            else
+              echo "::error::PROVENANCE MISSING for ${pkg}@${VERSION} -- the package IS available on the registry, but npm published it without a provenance attestation (dist.attestations: $(echo "$META" | jq -c '.dist.attestations // null')). This is a genuine failure, not a lag -- see macf#214."
+              ANY_PROVENANCE_MISSING=1
             fi
-            ATT_URL=$(echo "$META" | jq -r '.dist.attestations.url')
-            echo "✓ ${FULL}@${VERSION} provenance attestation present: ${ATT_URL}"
           done
+
+          if [ "$ANY_PROVENANCE_MISSING" = "1" ]; then
+            exit 1
+          fi
 
       - name: Summary
         if: always()
