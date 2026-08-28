@@ -1281,8 +1281,15 @@ export async function readCallerActionsPin(repo: string): Promise<string | undef
  * `fingerprints` are lock-sourced exactly like a declared agent's (no
  * additional `gh api` call beyond {@link resolveObservedFleetLock}'s own
  * at-most-one — `lock` is already fully resolved, in memory, by the time
- * this loop runs), and `repo` stays `'unknown'` forever (`FleetLockAgentSchema`
- * records no repo name for ANY role, so there is nothing to check).
+ * this loop runs). **`repo` (groundnuty/macf#1313 correction)**: a lock
+ * entry written before groundnuty/macf#1296 has no `repo` field at all —
+ * nothing to check, `repo` stays `'unknown'` — but a lock entry that DOES
+ * record one (post-#1296) now gets the SAME one live {@link checkRepoExists}
+ * call the manifest-agent branch above uses, so this loop is no longer
+ * strictly zero-`gh`-calls once a fleet's lock starts recording row-4
+ * repo names (exactly one extra call per such role — see
+ * `observer-row4-observation.test.ts`'s call-count test, which pins the
+ * still-zero-calls case for the no-`repo`-recorded shape unchanged).
  * `routingTrustedActors` is READ regardless of whether `manifest.routing?.runner`
  * is declared (previously gated on it) — the row-4 trigger case
  * (`routing.runner` DROPPED) is precisely when a stale value matters; see
@@ -1384,13 +1391,28 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
   // function's own module doc states for a manifest-declared role — a
   // lock-recorded-but-undeclared role is no more/less confirmable live than
   // a lock-recorded-and-declared one). `fingerprints` is a straight lock
-  // copy, same as the declared-agent branch. `repo` has NO lock-recorded
-  // source at all — `FleetLockAgentSchema` carries no `repo` field (only a
-  // manifest-declared `FleetAgent.repo` does, and this role has no manifest
-  // entry) — so there is no repo NAME to check, let alone a live read to
-  // attempt: it stays `'unknown'` for good, never a guessed `'absent'`
-  // (Amendment A's honest-unknown floor — an observation that cannot be
-  // made must never launder into a confident one).
+  // copy, same as the declared-agent branch.
+  //
+  // `repo` — groundnuty/macf#1296 added an OPTIONAL `repo` field to
+  // `FleetLockAgentSchema`, populated by `composeFleetLock` going forward;
+  // a lock written BEFORE that change carries none. **groundnuty/macf#1313
+  // fix**: when `lockEntry.repo` IS recorded, this loop now live-checks it
+  // with the SAME {@link checkRepoExists} the manifest-agent branch above
+  // uses. Before this fix, `repo` was hardcoded `'unknown'`
+  // UNCONDITIONALLY here (correct for the pre-#1296 case, but ALSO applied
+  // when a lock DID record the name) — which made `plan.ts`'s
+  // `obs?.repo === 'present'` gate for the row-4 repo-orphan item
+  // unreachable even for a lock that recorded it, so the operator's most
+  // expensive orphan class (Amendment G: recreating a repo loses its
+  // history) was silently invisible in EVERY case, not only the pre-#1296
+  // one. When `lockEntry.repo` is `undefined`, there is still no NAME to
+  // check — `repo` stays `'unknown'` exactly as before, never a guessed
+  // `'absent'` (Amendment A's honest-unknown floor: an observation that
+  // cannot be made must never launder into a confident one). `plan.ts` now
+  // decides its ROLE-naming, no-URL orphan branch off `lockEntry.repo ===
+  // undefined` directly (the LOCK field, not this `Presence` read) — see
+  // that module's row-4 repo block for why a live check can't gate a
+  // branch that, by definition, has no name to check.
   const manifestRoles = new Set(manifest.agents.map((a) => a.role));
   // Fleet-level pseudo-roles (`'runner-ops'` / `'router'`) are recorded in
   // `fleet.lock.agents` by design (`apply-runner-ops.ts::RUNNER_OPS_ROLE` /
@@ -1410,7 +1432,7 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
       appId: lockEntry.app_id,
       install: 'present',
       installId: lockEntry.install_id,
-      repo: 'unknown',
+      repo: lockEntry.repo !== undefined ? await checkRepoExists(lockEntry.repo) : 'unknown',
       fingerprints: lockEntry.fingerprints ?? {},
       deployedVersion: lockEntry.deployed_version,
     };

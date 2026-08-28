@@ -2520,22 +2520,51 @@ export function computePlan(
       });
     }
     // Repos: orphan (un-archive is 0 clicks; recreate loses history).
-    if (obs?.repo === 'present') {
-      // groundnuty/macf#1296 — `lockEntry.repo` is `undefined` for any lock
-      // written before this change (the field didn't exist yet); `obs?.repo
-      // === 'present'` above is an independent Presence signal (observer.ts)
-      // and never implies the repo NAME is known — the two must not be
-      // conflated (`FleetLockAgentSchema`'s own doc: undefined is unknown,
-      // never a fact derived from something else being true).
-      const lockedRepo = lockAgentsByRole.get(role)?.repo;
+    //
+    // groundnuty/macf#1313 — this branch splits on whether `fleet.lock`
+    // RECORDS the repo NAME (`lockedRepo`), not on `obs?.repo`'s Presence.
+    // A lock written before groundnuty/macf#1296 has no `repo` field at
+    // all — there is no name to hand `checkRepoExists`, so `obs?.repo` can
+    // only ever read `'unknown'` for this role (see `observer.ts`'s row-4
+    // loop) — gating on `obs?.repo === 'present'` alone (the pre-fix shape)
+    // made this ENTIRE branch unreachable for every pre-#1296 lock, which
+    // is exactly what made the operator's live orphaned repo on
+    // `macf-trial` invisible (#1313's reported bug): row 4 orphaned the
+    // App but never the (per Amendment G, costlier-to-lose) repo.
+    //
+    // Per science's ruling on #1313: the row can name the ROLE even when
+    // it cannot name the repo — the uncertainty is the repo NAME, never
+    // the identity of the orphaned thing. So the `lockedRepo === undefined`
+    // branch below fires UNCONDITIONALLY, mirroring how the App-orphan
+    // branch above already trusts the lock's mere existence rather than a
+    // live check (there is no live check this tool CAN perform without a
+    // name) — never a derived/guessed name (`fleet-manifest.ts`'s
+    // `repo: z.string().min(1)` is operator-specified, not a convention
+    // `apply` could recompute — see `orphanResourceUrl`'s own doc for why
+    // a derived name was refused twice already, #1281/#1272). This
+    // condition is self-limiting: it fires only for a lock written before
+    // #1296 and disappears the next time this fleet's `apply` runs
+    // (`composeFleetLock` then records `repo` for this role going forward,
+    // same as any other role).
+    const lockedRepo = lockAgentsByRole.get(role)?.repo;
+    if (lockedRepo === undefined) {
+      items.push({
+        kind: 'repo',
+        target: `agent:${role}:repo`,
+        verb: 'orphan',
+        reason:
+          `A repo was provisioned by this tool for "${role}" (recorded in fleet.lock) but "${role}" is no ` +
+          'longer declared. The repo NAME itself is unrecorded, not absent — this lock predates repo ' +
+          'recording (groundnuty/macf#1296), so this tool cannot confirm the repo live or name its settings ' +
+          'page. NOTHING WAS DELETED — apply never auto-removes it, under any flag (recreating a repo loses ' +
+          `its history; un-archiving is 0 clicks). Search your GitHub ` +
+          `${manifest.owner.type === 'org' ? `organization "${manifest.owner.account}"` : 'account'}'s repo list ` +
+          `for one it created for role "${role}". Self-limiting: this resolves the next time this fleet's ` +
+          '`apply` runs (the repo name is recorded going forward).',
+        confirm_required: false,
+      });
+    } else if (obs?.repo === 'present') {
       const url = orphanResourceUrl('repo', fleetName, role, manifest.owner, lockedRepo);
-      const howToFind =
-        lockedRepo !== undefined
-          ? `If it should go away, archive or delete it yourself on its GitHub settings page: ${url}.`
-          : `If it should go away, archive or delete it yourself on its GitHub settings page: ${url} ` +
-            `(this tool cannot name that page — fleet.lock predates recording which repo a no-longer-declared ` +
-            `role used; search your GitHub ${manifest.owner.type === 'org' ? `organization "${manifest.owner.account}"` : 'account'}'s ` +
-            `repo list for one it created for role "${role}").`;
       items.push({
         kind: 'repo',
         target: `agent:${role}:repo`,
@@ -2543,10 +2572,17 @@ export function computePlan(
         reason:
           `The repo for "${role}" was provisioned by this tool (recorded in fleet.lock) but "${role}" is no ` +
           'longer declared. NOTHING WAS DELETED — apply never auto-removes it, under any flag (recreating a ' +
-          `repo loses its history; un-archiving is 0 clicks). ${howToFind}`,
+          `repo loses its history; un-archiving is 0 clicks). If it should go away, archive or delete it ` +
+          `yourself on its GitHub settings page: ${url}.`,
         confirm_required: false,
       });
     }
+    // else: `lockedRepo` IS recorded but `obs?.repo` reads 'absent'
+    // (confirmed gone — nothing to orphan) or 'unknown' (a live read
+    // couldn't confirm either way this run) — no item, exactly the same
+    // honest-unknown floor the App-orphan branch above applies to its own
+    // `obs?.app === 'unknown'` case: an unconfirmed presence earns no claim
+    // in either direction.
     // Secrets: delete, with the value's source named at plan time (Amendment
     // P3 — cheap to revive: a re-supply, ~0 cost if vault-held). One item
     // per recorded fingerprint, sorted for deterministic ordering.
