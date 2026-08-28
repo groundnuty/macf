@@ -18,6 +18,30 @@ Five instruments observed failing this in one session (2026-08-27/28, three agen
 | a mock on `console.error` where the code writes `process.stderr` | identical whether anything is emitted at all |
 | a substring match (`realDeleteRepo` matching `realDeleteRepoVariable`) | matches a name that was never the target |
 
+### The second question: was the pipeline lossless?
+
+**The question above catches an instrument that was never connected to the system. It does not catch a connected instrument whose reading is corrupted on the way to being cited.**
+
+```
+guaranteed reading   "could this check have come out differently?"        ← epistemic:
+                                                                            is the instrument
+                                                                            connected at all
+corrupted reading    "did anything between the MEASUREMENT and the
+                      CITATION have the power to alter the value?"        ← mechanical:
+                                                                            is the pipeline
+                                                                            lossless
+```
+
+**Neither implies the other.** The worked case (2026-08-28): `ls -la | grep … | cut -c30-120` reported a file as **`8835`** bytes; it is **`18835`**. **`cut -c` sliced the leading digit off the size column** — a transform added for readability that silently edited the data.
+
+**This class is harder to catch than a guaranteed reading, not easier.** A guaranteed reading is *always* wrong, so it fails on the first case anyone examines. A character-offset truncation is *usually* right — it bites only when a column crosses the offset.
+
+> **Systematic corruption gets noticed. Intermittent corruption gets cited.** The pipeline that produced `8835` had worked correctly on dozens of commands before it.
+
+**And the corrupted value was plausible.** `8835` is an ordinary byte count; nothing about it announced a missing digit. **A guaranteed reading invites the question; a plausible wrong value closes it.**
+
+**The mechanical rule:** `cut -c` is for prose. **A value you intend to cite is extracted by field — `awk '{print $5}'`, `--jq`, `grep -c`, `wc -l` — never by character offset.** Applies equally to `head -c`, a fixed-width `printf`, and any truncation applied for display that a number then travels through.
+
 **Mutation is the operation that asks this question mechanically** — break the thing; if the check does not notice, the check was never connected to it. That is why every mutation requirement in this rule is load-bearing rather than ceremonial. **The cost of relying on mutation alone is that it answers late**, after the work is written; asking the question first is free.
 
 **Note the altitude, stated as an open question rather than a restructure:** trigger 3 (*the population excludes the failing case*) and trigger 4 (*an empty result from an empty search space*) both look like instances of this property rather than peers of trigger 1 — **in each, the reading was guaranteed.**
