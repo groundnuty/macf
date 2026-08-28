@@ -32,7 +32,7 @@ vi.mock('node:child_process', async (importOriginal) => {
 
 const { execFile: mockExecFile } = await import('node:child_process');
 const { githubRegistryObserver } = await import('../../../src/cli/bootstrap/observer.js');
-const { computePlan } = await import('../../../src/cli/bootstrap/plan.js');
+const { computePlan, formatPlanText } = await import('../../../src/cli/bootstrap/plan.js');
 const { writeFleetLock } = await import('../../../src/cli/bootstrap/fleet-lock.js');
 
 /** One route: match on the joined `gh` argv, respond with a fixed stdout (or throw a stderr-carrying error). */
@@ -50,6 +50,19 @@ interface GhRoute {
  * default keeps every unrelated read (CA vars, secrets, actions pin,
  * archived bit, control repo) on its ordinary confirmed-present path
  * without this test needing to enumerate every single one.
+ *
+ * groundnuty/macf#1313 fix: `stderrOnFail` now attaches `.stderr` to the
+ * rejected Error ITSELF (mirroring real `child_process.execFile`'s
+ * documented error shape), not just the discarded second callback
+ * argument. `execFileAsync` here is `promisify(execFile)` over a plain
+ * `vi.fn()` mock with no `[util.promisify.custom]` — Node's default
+ * promisify wrapper rejects with the callback's first (`err`) argument
+ * verbatim and drops any additional arguments, so `getStderr(err)` (which
+ * reads `err.stderr`) previously always saw `undefined` for every
+ * `stderrOnFail` route in this file, even though the field has existed
+ * since this file's original #1271 commit — it was simply never exercised
+ * by a test until #1313 needed to simulate a confirmed-404 / unreadable
+ * `checkRepoExists` read.
  */
 function installGhRouter(routes: readonly GhRoute[] = []): void {
   vi.mocked(mockExecFile).mockImplementation((_cmd: unknown, args: unknown, _opts: unknown, cb: unknown) => {
@@ -58,7 +71,8 @@ function installGhRouter(routes: readonly GhRoute[] = []): void {
     for (const route of routes) {
       if (!route.match(argv)) continue;
       if (route.stderrOnFail !== undefined) {
-        callback(new Error('gh failed'), { stdout: '', stderr: route.stderrOnFail });
+        const err = Object.assign(new Error('gh failed'), { stdout: '', stderr: route.stderrOnFail });
+        callback(err, { stdout: '', stderr: route.stderrOnFail });
       } else {
         callback(null, { stdout: route.stdout ?? '', stderr: '' });
       }
@@ -138,8 +152,17 @@ describe('githubRegistryObserver — row-4 observation wiring (groundnuty/macf#1
     expect(appItem?.verb).toBe('orphan');
     const secretItem = plan.items.find((i) => i.kind === 'secret_fingerprint' && i.target === 'agent:dropped-agent:secret_fingerprint:app_private_key');
     expect(secretItem?.verb).toBe('delete');
-    // repo stays unknown -> no repo-class item for this role at all.
-    expect(plan.items.find((i) => i.kind === 'repo' && i.target === 'agent:dropped-agent:repo')).toBeUndefined();
+    // groundnuty/macf#1313 — the observed repo Presence stays 'unknown'
+    // (nothing changed there; asserted above), but `computePlan` STILL
+    // emits a repo-orphan item for this role, naming it rather than
+    // staying silent (the pre-fix behavior this test used to pin as
+    // correct — it was actually the bug #1313 reported: the orphaned repo
+    // was invisible on every pre-#1296 lock).
+    const repoItem = plan.items.find((i) => i.kind === 'repo' && i.target === 'agent:dropped-agent:repo');
+    expect(repoItem?.verb).toBe('orphan');
+    expect(repoItem?.reason).toContain('dropped-agent');
+    expect(repoItem?.reason).toContain('unrecorded');
+    expect(repoItem?.reason).not.toMatch(/https:\/\/github\.com\/\S+\/settings/);
     // Never a coarse "report-extra" for a lock-recorded role — it decomposed.
     expect(plan.items.find((i) => i.kind === 'agent' && i.target === 'agent:dropped-agent')).toBeUndefined();
   });
@@ -310,4 +333,186 @@ describe('githubRegistryObserver — row-4 observation wiring (groundnuty/macf#1
     const observed = await githubRegistryObserver(manifest, manifestPath);
     expect(observed.routingTrustedActors).toBe('demo-fleet-code-agent[bot]');
   });
+});
+
+/**
+ * groundnuty/macf#1313 — "row 4 orphans an App but never a repo" LIVE, via
+ * the REAL `githubRegistryObserver` feeding the REAL `computePlan`, per
+ * `assert-the-wrong-path.md`: a hand-built `ObservedState` fixture proves
+ * nothing about reachability (groundnuty/macf#1311's own lesson — this
+ * EXACT "lock predates repo recording" shape passed every `plan.test.ts`
+ * unit test while remaining completely unreachable on a live `macf-trial`
+ * run, because `githubRegistryObserver`'s row-4 loop hardcoded `repo:
+ * 'unknown'` regardless of what `fleet.lock` recorded — see that file's
+ * fix in this same PR). This describe block is the durable regression
+ * guard for BOTH halves of the fix: the unrecorded-name branch firing
+ * unconditionally in `plan.ts`, AND `observer.ts`'s row-4 loop actually
+ * live-checking a RECORDED repo name instead of hardcoding `'unknown'`.
+ */
+describe('githubRegistryObserver + computePlan — groundnuty/macf#1313 (row-4 repo-orphan visibility), LIVE path', () => {
+  const dirs: string[] = [];
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+  });
+
+  function tempManifestPath(): string {
+    const dir = mkdtempSync(join(tmpdir(), 'macf-bootstrap-row4-1313-'));
+    dirs.push(dir);
+    return join(dir, 'fleet.yaml');
+  }
+
+  function lockWith(extra: FleetLockAgent): FleetLock {
+    return {
+      schema_version: 1,
+      fleet: 'demo-fleet',
+      agents: [{ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' }, extra],
+    };
+  }
+
+  // --- Decisive pair, member 1 (this issue's reported bug) ---------------
+
+  it('DECISIVE 1/2: role in lock, repo ABSENT FROM THE LOCK (pre-#1296) → the RENDERED plan orphans it naming the ROLE, never a repo name', async () => {
+    installGhRouter();
+    const manifest = baseManifest();
+    const manifestPath = tempManifestPath();
+    // No `repo` key at all on this entry — the pre-#1296 shape every
+    // existing fleet.lock has until it next re-applies.
+    writeFleetLock(join(manifestPath, '..', 'fleet.lock'), lockWith({ role: 'writing-agent', app_id: 'app-writing', install_id: 'install-writing' }));
+
+    const observed = await githubRegistryObserver(manifest, manifestPath);
+    // Nothing to live-check without a name — stays honestly 'unknown'.
+    expect(observed.agents['writing-agent']?.repo).toBe('unknown');
+
+    const plan = computePlan(manifest, observed);
+    const repoItem = plan.items.find((i) => i.kind === 'repo' && i.target === 'agent:writing-agent:repo');
+    expect(repoItem?.verb).toBe('orphan');
+    expect(repoItem?.reason).toContain('writing-agent');
+    expect(repoItem?.reason).toContain('unrecorded');
+    expect(repoItem?.reason).not.toMatch(/https:\/\/github\.com\/\S+\/settings/);
+    // The RENDERED, operator-facing plan text — not just the raw item.
+    const text = formatPlanText(plan);
+    expect(text).toContain('writing-agent');
+    expect(text).not.toMatch(/https:\/\/github\.com\/\S+\/settings/);
+  });
+
+  // The above test's `formatPlanText` assertions sit BEHIND item-level
+  // assertions in the same `it` — a failure there (e.g. under the mutation
+  // documented below) throws before the text-level checks ever run, so it
+  // alone does not demonstrate a RENDERED-OUTPUT failure, only an item-shape
+  // one (`assert-the-wrong-path.md`). This test asserts ONLY on
+  // `formatPlanText`'s string output, using phrasing that ONLY the repo-
+  // orphan branch this fix adds can produce — the App-orphan row for the
+  // SAME role never says any of it. Under the "break the unrecorded-repo
+  // path" mutation, THIS is the assertion that fails, and it fails reading
+  // rendered text, not a raw `PlanItem`.
+  it('DECISIVE 1/2b: the RENDERED plan TEXT alone carries repo-row-specific language the App-orphan row never produces', async () => {
+    installGhRouter();
+    const manifest = baseManifest();
+    const manifestPath = tempManifestPath();
+    writeFleetLock(join(manifestPath, '..', 'fleet.lock'), lockWith({ role: 'writing-agent', app_id: 'app-writing', install_id: 'install-writing' }));
+
+    const observed = await githubRegistryObserver(manifest, manifestPath);
+    const plan = computePlan(manifest, observed);
+    const text = formatPlanText(plan);
+    expect(text).toMatch(/unrecorded/i);
+    expect(text).toMatch(/search your github/i);
+    expect(text).toMatch(/self-limiting/i);
+  });
+
+  // --- Decisive pair, member 2 (must not regress) -------------------------
+
+  it('DECISIVE 2/2: role in lock, repo RECORDED in the lock (post-#1296) and confirmed live on GitHub → the RENDERED plan names it exactly with its real settings URL', async () => {
+    installGhRouter([{ match: (argv) => argv === 'api repos/groundnuty/trial-writing-agent', stdout: '{}' }]);
+    const manifest = baseManifest();
+    const manifestPath = tempManifestPath();
+    writeFleetLock(
+      join(manifestPath, '..', 'fleet.lock'),
+      lockWith({ role: 'writing-agent', app_id: 'app-writing', install_id: 'install-writing', repo: 'groundnuty/trial-writing-agent' }),
+    );
+
+    const observed = await githubRegistryObserver(manifest, manifestPath);
+    // Proves the OTHER half of the #1313 fix: `observer.ts` no longer
+    // hardcodes 'unknown' when the lock DOES record a name — it live-checks it.
+    expect(observed.agents['writing-agent']?.repo).toBe('present');
+
+    const plan = computePlan(manifest, observed);
+    const repoItem = plan.items.find((i) => i.kind === 'repo' && i.target === 'agent:writing-agent:repo');
+    expect(repoItem?.verb).toBe('orphan');
+    expect(repoItem?.reason).toContain('https://github.com/groundnuty/trial-writing-agent/settings');
+    const text = formatPlanText(plan);
+    expect(text).toContain('https://github.com/groundnuty/trial-writing-agent/settings');
+  });
+
+  // --- Plus coverage -------------------------------------------------------
+
+  it('repo RECORDED in the lock but genuinely absent on GitHub (confirmed 404) → no orphan at all — nothing to warn about', async () => {
+    installGhRouter([{ match: (argv) => argv === 'api repos/groundnuty/gone-writing-agent', stderrOnFail: 'HTTP 404: Not Found' }]);
+    const manifest = baseManifest();
+    const manifestPath = tempManifestPath();
+    writeFleetLock(
+      join(manifestPath, '..', 'fleet.lock'),
+      lockWith({ role: 'writing-agent', app_id: 'app-writing', install_id: 'install-writing', repo: 'groundnuty/gone-writing-agent' }),
+    );
+
+    const observed = await githubRegistryObserver(manifest, manifestPath);
+    expect(observed.agents['writing-agent']?.repo).toBe('absent');
+
+    const plan = computePlan(manifest, observed);
+    expect(plan.items.find((i) => i.kind === 'repo' && i.target === 'agent:writing-agent:repo')).toBeUndefined();
+  });
+
+  it('repo RECORDED in the lock but presence unreadable this run (non-404 failure) → stays "unknown", no orphan — the honest-unknown floor, never silently upgraded to a claim', async () => {
+    installGhRouter([{ match: (argv) => argv === 'api repos/groundnuty/unreadable-writing-agent', stderrOnFail: 'gh: connection reset by peer' }]);
+    const manifest = baseManifest();
+    const manifestPath = tempManifestPath();
+    writeFleetLock(
+      join(manifestPath, '..', 'fleet.lock'),
+      lockWith({ role: 'writing-agent', app_id: 'app-writing', install_id: 'install-writing', repo: 'groundnuty/unreadable-writing-agent' }),
+    );
+
+    const observed = await githubRegistryObserver(manifest, manifestPath);
+    expect(observed.agents['writing-agent']?.repo).toBe('unknown');
+
+    const plan = computePlan(manifest, observed);
+    expect(plan.items.find((i) => i.kind === 'repo' && i.target === 'agent:writing-agent:repo')).toBeUndefined();
+  });
+
+  it('a DECLARED role never produces a row-4 repo orphan, regardless of live repo state', async () => {
+    installGhRouter();
+    const manifest = baseManifest(); // declares only 'code-agent'
+    const manifestPath = tempManifestPath();
+    writeFleetLock(join(manifestPath, '..', 'fleet.lock'), { schema_version: 1, fleet: 'demo-fleet', agents: [{ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' }] });
+
+    const observed = await githubRegistryObserver(manifest, manifestPath);
+    const plan = computePlan(manifest, observed);
+    expect(plan.items.some((i) => i.kind === 'repo' && i.verb === 'orphan')).toBe(false);
+  });
+
+  // --- Mutation check: break the unrecorded-repo path, name what fails ---
+  //
+  // Empirically verified (not merely asserted): mutating `plan.ts`'s row-4
+  // repo block's `if (lockedRepo === undefined)` to `if (false &&
+  // lockedRepo === undefined)` — reproducing the pre-#1313 shape, where the
+  // whole branch was gated on `obs?.repo === 'present'` regardless of
+  // `lockedRepo` — and re-running this suite fails BOTH "DECISIVE 1/2" (the
+  // item-level `repoItem?.verb` assertion) AND "DECISIVE 1/2b" (the
+  // formatPlanText-ONLY assertion, which reads rendered text exclusively —
+  // per `assert-the-wrong-path.md`, an item-level assertion failing first in
+  // the SAME `it` would not by itself prove a rendered-output failure, which
+  // is why 1/2b exists as its own test). Both fail because `observer.ts`
+  // can never observe a pre-#1296 lock's row-4 repo as anything but
+  // `'unknown'` (there is no name to check), so the gate never opens. The
+  // mutation does NOT fail "DECISIVE 2/2" — that member exercises the
+  // recorded-name path, unaffected. This is the concrete, rendered-output
+  // test #1311's lesson calls for: a helper-level (`orphanResourceUrl`) or
+  // hand-built-fixture test cannot distinguish the pre-fix code from the
+  // fix, because both compute the SAME `orphanResourceUrl` return value
+  // once a `PlanItem` is already being built — the defect was that the item
+  // was never built in the first place. Mutation reverted after confirming;
+  // these tests are the durable regression guard going forward.
 });

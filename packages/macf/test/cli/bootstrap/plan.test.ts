@@ -825,10 +825,10 @@ describe('computePlan — row 4 (DR-043 Amendment P3, groundnuty/macf#1229): neg
     for (const m of matches) expect(m.verb).toBe(verb);
   });
 
-  it('live presence unconfirmable ("unknown") → neither delete nor orphan — the honest-unknown floor (Amendment A)', () => {
+  it('live presence unconfirmable ("unknown") on a lock that RECORDS the repo name → neither delete nor orphan for either class — the honest-unknown floor (Amendment A)', () => {
     const manifest = baseManifest();
     const observed: ObservedState = {
-      lock: lockWithRole('unsure-agent'),
+      lock: lockWithRole('unsure-agent', 'groundnuty/icsoc-2026-unsure-agent'),
       agents: { 'unsure-agent': { app: 'unknown', install: 'unknown', repo: 'unknown', fingerprints: {} } },
       caRegistry: 'unknown',
       caRepos: {},
@@ -836,6 +836,35 @@ describe('computePlan — row 4 (DR-043 Amendment P3, groundnuty/macf#1229): neg
     };
     const plan = computePlan(manifest, observed);
     expect(plan.items.some((i) => i.target.startsWith('agent:unsure-agent:'))).toBe(false);
+  });
+
+  // groundnuty/macf#1313 — the App class stays silent on its own "unknown"
+  // (unchanged, asserted above); the repo class does NOT get that same
+  // silence when the repo NAME is unrecorded (pre-#1296 lock) — there is no
+  // live check this tool can even attempt without a name, so `obs?.repo`
+  // being 'unknown' can never distinguish "genuinely can't confirm" from
+  // "this branch never had anything to confirm in the first place". Per
+  // science's ruling: the row still names the ROLE (the one thing this tool
+  // DOES know) rather than staying silent about the costlier-to-lose
+  // resource class (Amendment G).
+  it('groundnuty/macf#1313 — a repo-name-UNRECORDED role still orphans the repo, naming the ROLE, even when app/install/repo are ALL "unknown"', () => {
+    const manifest = baseManifest();
+    const observed: ObservedState = {
+      lock: lockWithRole('unnamed-repo-agent'), // no `repo` key — the pre-#1296 shape
+      agents: { 'unnamed-repo-agent': { app: 'unknown', install: 'unknown', repo: 'unknown', fingerprints: {} } },
+      caRegistry: 'unknown',
+      caRepos: {},
+      controlRepoPresence: 'absent',
+    };
+    const plan = computePlan(manifest, observed);
+    // App/install stay silent — Amendment A's floor is untouched for that class.
+    expect(plan.items.some((i) => i.kind === 'app' && i.target === 'agent:unnamed-repo-agent:app')).toBe(false);
+    // The repo class fires anyway, naming the role, never the repo.
+    const repoItem = plan.items.find((i) => i.kind === 'repo' && i.target === 'agent:unnamed-repo-agent:repo');
+    expect(repoItem?.verb).toBe('orphan');
+    expect(repoItem?.reason).toContain('unnamed-repo-agent');
+    expect(repoItem?.reason).toContain('unrecorded');
+    expect(repoItem?.reason).not.toMatch(/https:\/\/github\.com\/\S+\/settings/);
   });
 
   it('a declared resource is untouched by row 4 — the extraRoles computation only ever considers roles NOT in the manifest', () => {
@@ -1069,7 +1098,7 @@ describe('orphan rows say "not deleted" + carry a link, on BOTH the plan and app
     expect(formatPlanText(plan)).not.toMatch(/ORPHAN/);
   });
 
-  it('a repo orphan and an App orphan get class-correct URLs in the RENDERED plan reason — repo is "unknown", App is a real, resolvable link', () => {
+  it('a repo orphan and an App orphan get class-correct treatment in the RENDERED plan reason — repo names the ROLE with no link, App is a real, resolvable link', () => {
     const manifest = baseManifest();
     const observed: ObservedState = {
       lock: lockWithRole('dropped-agent'),
@@ -1082,7 +1111,8 @@ describe('orphan rows say "not deleted" + carry a link, on BOTH the plan and app
     const appItem = plan.items.find((i) => i.kind === 'app' && i.verb === 'orphan');
     const repoItem = plan.items.find((i) => i.kind === 'repo' && i.verb === 'orphan');
     expect(appItem?.reason).toContain('https://github.com/settings/apps/icsoc-2026-dropped-agent/advanced');
-    expect(repoItem?.reason).toContain('unknown');
+    expect(repoItem?.reason).toContain('unrecorded');
+    expect(repoItem?.reason).toContain('dropped-agent');
     // Never a guessed repo-settings link — a wrong link is worse than none.
     expect(repoItem?.reason).not.toMatch(/https:\/\/github\.com\/\S+\/settings/);
   });
@@ -1111,7 +1141,21 @@ describe('orphan rows say "not deleted" + carry a link, on BOTH the plan and app
     expect(formatPlanText(plan)).toContain('https://github.com/groundnuty/icsoc-2026-dropped-agent/settings');
   });
 
-  it('DECISIVE (2/2): a lock that PREDATES the field (no repo key at all) → the orphan row stays "unknown", no fabricated link', () => {
+  // groundnuty/macf#1313 — per science's ruling, this row NAMES THE ROLE
+  // (the one thing this tool knows) rather than staying silent or
+  // fabricating a link. It states the name is unrecorded (not absent),
+  // explains WHY in plain language (no internal citation — macf#1061's
+  // "explain, don't cite" rule for user-facing output), carries the same
+  // search hint #1281 already writes for the analogous unresolvable-App-URL
+  // case, and states the self-limiting scope PRECISELY: verified against
+  // `composeFleetLock` (fleet-lock.ts) — an already-undeclared role's lock
+  // entry is carried forward untouched by every future apply (nothing ever
+  // recomputes its `repo`), so THIS row can never gain a name. What is
+  // self-limiting is the CLASS: a role still declared today already has
+  // its repo recorded, so a FUTURE removal names it exactly. The row must
+  // not claim this instance will resolve itself — that would be a false
+  // promise the operator could catch out on the very next apply.
+  it('DECISIVE (2/2): a lock that PREDATES the field (no repo key at all) → the orphan row names the ROLE, explains why, and scopes "self-limiting" to the CLASS, never promising this row resolves — no fabricated link', () => {
     const manifest = baseManifest();
     const observed: ObservedState = {
       lock: lockWithRole('dropped-agent'), // no repo — the pre-#1296 shape
@@ -1122,7 +1166,24 @@ describe('orphan rows say "not deleted" + carry a link, on BOTH the plan and app
     };
     const plan = computePlan(manifest, observed);
     const repoItem = plan.items.find((i) => i.kind === 'repo' && i.verb === 'orphan');
-    expect(repoItem?.reason).toContain('unknown');
+    // Names the role.
+    expect(repoItem?.reason).toContain('dropped-agent');
+    // States the name is unrecorded — explicitly NOT "absent" (science's
+    // own contrast: "unrecorded, not absent") — and explains why, in plain
+    // language, never an internal issue-number citation (macf#1061).
+    expect(repoItem?.reason).toContain('unrecorded');
+    expect(repoItem?.reason).toContain('not absent');
+    expect(repoItem?.reason).toMatch(/predates this tool recording repo names/i);
+    expect(repoItem?.reason).not.toMatch(/\bmacf#\d+\b|\bgroundnuty\/macf#\d+\b/);
+    // Carries the #1281-style search hint.
+    expect(repoItem?.reason).toMatch(/search your github/i);
+    // States the gap is self-limiting AS A CLASS ("still declared today"
+    // roles are covered going forward) — but does NOT promise THIS row
+    // (an already-undeclared role) will ever resolve on its own.
+    expect(repoItem?.reason.toLowerCase()).toContain('self-limiting');
+    expect(repoItem?.reason).toMatch(/never recover/i);
+    expect(repoItem?.reason).toMatch(/still declared today/i);
+    // Never a fabricated/derived link.
     expect(repoItem?.reason).not.toMatch(/https:\/\/github\.com\/\S+\/settings/);
   });
 
