@@ -258,6 +258,8 @@ import type { CaApplyDeps } from './apply-ca.js';
 import type { RunnerUsability } from './observer.js';
 import type { FleetRouting } from './fleet-manifest.js';
 import type { RunnerPlatformStatusResult } from './runner-platform.js';
+import type { UpdateVariableResult } from './variable-write.js';
+import { realUpdateVariable } from './variable-write.js';
 
 /** The GitHub Actions variable name the v3 router reads (`agent-router.yml`'s `pick-runner` job) — matches `observer.ts`'s read of the same name (macf#922). */
 export const TRUSTED_ACTORS_VAR = 'MACF_TRUSTED_ACTORS';
@@ -1283,4 +1285,228 @@ export async function publishTrustedActorsForProvisioned(
     }
   }
   return out;
+}
+
+// --- groundnuty/macf#1319 — "adding an agent leaves it untrusted by its
+// predecessors": DR-043 Amendment P row 3, applied to MACF_TRUSTED_ACTORS ---
+//
+// **The gap this closes.** `writeTrustedActorsVar` (above) is create-only by
+// design — a `'present'` value is left COMPLETELY untouched, no matter how
+// stale. That is correct for a variable an OPERATOR may have hand-set. It is
+// WRONG for `MACF_TRUSTED_ACTORS`: its value is a pure function of the
+// manifest's agent roster (`buildTrustedActorsValue`), so an operator adding
+// a fourth agent to a three-agent fleet expects every repo's actor list to
+// grow to four — but the pre-existing three repos each already have a
+// `'present'` value, so the create-only write never touches them. Live
+// symptom (macf#1319): scaling `macf-trial` 2→3 wrote the full 3-actor list
+// onto the NEW repo and left the two EXISTING ones at 2 — `writing-agent` can
+// be routed TO and cannot route OUT, a one-directional break on a fleet that
+// reports itself provisioned.
+//
+// **Science's ruling on #1319, binding for this section's shape:**
+//
+//   "Never-clobber exists to protect operator intent. A manifest-derived
+//   variable carries no independent intent — its value is derivable, so
+//   writing the derived value destroys nothing. If the operator wanted a
+//   different value they would change the manifest, which is what declaring
+//   a desired state means."
+//
+// Three constraints the ruling makes binding on this implementation:
+//
+//   1. **Derived-ness is DECLARED, never inferred.** This section exists
+//      because `MACF_TRUSTED_ACTORS`'s write path (this file) explicitly
+//      calls {@link reconcileTrustedActors} — a property encoded IN CODE, at
+//      the one call site that owns this variable, never a runtime judgement
+//      ("does this look manifest-derived?") applied generically to every
+//      create-only write. No other variable in this codebase — the CA legs
+//      (`apply-ca.ts`), the six routing secrets (`apply-routing-secrets.ts`)
+//      — is touched by this change; every one of them stays create-only,
+//      because nothing calls a reconcile function for them. Any FUTURE
+//      variable that wants this treatment must say so explicitly, the same
+//      way this one does, by calling this pattern at its own write site —
+//      never by widening a shared presence-check to "diverging + looks
+//      derived → reconcile."
+//   2. **Reconciliation is a visible, CONFIRMED action — never a silent
+//      overwrite.** `reconcileTrustedActors` computes every divergent repo
+//      BEFORE writing any of them, and gates ALL of the writes behind ONE
+//      `confirmReconciliation` call that receives the full list — `observed`
+//      vs `declared`, per repo — mirroring `apply-delete.ts`'s deletion-
+//      consent shape (`bootstrap-apply.ts::formatDeletionEnumerationLines`):
+//      enumerate the targets, don't just report a count. A declined (or
+//      throwing) confirmation writes NOTHING — every divergent repo reports
+//      `'declined'`, not a partial write.
+//   3. **The failure direction stays honest.** A repo whose CURRENT value
+//      cannot be re-read (any read failure) is reported `'skipped'`
+//      (honest-unknown) and is NEVER included in the confirmation batch —
+//      "unobservable" is not "safe to overwrite," matching row 4's floor
+//      elsewhere in this codebase (`plan.ts`'s own `observedTrustedActors
+//      === undefined` handling).
+//
+// **Deliberately out of scope.** This section does NOT re-check runner
+// usability (`RunnerRegistrationDeps.checkRunnerUsableByRepo`) before
+// reconciling a PRESENT value — a repo whose `MACF_TRUSTED_ACTORS` is already
+// present is, by construction, a repo that has been routing self-hosted
+// since an earlier run; correcting WHICH actors it trusts is orthogonal to
+// whether its runner is currently usable (the register-before-route gate
+// exists to protect the FIRST write, not every subsequent one).
+
+/**
+ * One repo whose `MACF_TRUSTED_ACTORS` is CONFIRMED PRESENT but diverges from
+ * the fleet's current manifest-derived value — the confirmation-gate input
+ * for {@link reconcileTrustedActors}. Carries both values so a renderer (or a
+ * test) can show `observed` vs `declared` without a second read.
+ */
+export interface TrustedActorsDivergence {
+  readonly repo: string;
+  readonly observedValue: string;
+  readonly desiredValue: string;
+}
+
+/**
+ * groundnuty/macf#1319 — the reconciliation deps, ADDITIONAL to
+ * {@link RoutingApplyDeps}'s existing create-only primitives. All three
+ * fields are OPTIONAL: a caller that doesn't wire them (every pre-#1319
+ * `trustDeps` fixture) gets a reconciliation pass that safely no-ops (see
+ * {@link reconcileTrustedActors}'s own doc) rather than a compile break or a
+ * runtime crash — the same "test override is additive, omission is safe"
+ * posture `ProvisionedRunnerWaitDeps.checkRunnerPlatformStatus` already
+ * establishes one section up.
+ */
+export interface TrustedActorsReconcileDeps {
+  /**
+   * Live read of a repo's CURRENT `MACF_TRUSTED_ACTORS` value. `undefined` on
+   * ANY failure (missing var, no access, `gh` absent) — the same
+   * honest-collapse contract `observer.ts::readRepoVariable` already
+   * documents for this exact read. A repo this returns `undefined` for is
+   * NEVER included in the confirmation batch and is reported `'skipped'`
+   * (constraint 3 above).
+   */
+  readonly readRepoVariableValue?: (repo: string, name: string) => Promise<string | undefined>;
+  /**
+   * The ONE write primitive in this codebase that overwrites an EXISTING
+   * variable's value (`variable-write.ts::realUpdateVariable`, a real
+   * `PATCH`). Never called except for a repo BOTH confirmed diverging AND
+   * covered by an APPROVED {@link confirmReconciliation} call.
+   */
+  readonly updateRepoVariable?: (repo: string, name: string, value: string) => Promise<UpdateVariableResult>;
+  /**
+   * The confirmation gate constraint 2 above requires — ONE call per apply
+   * run, receiving EVERY divergent repo at once (never per-repo), so
+   * operator approval is a single, auditable decision covering the whole
+   * reconciliation batch, the same shape `bootstrap-apply.ts::MutateApplyDeps.confirmPlan`
+   * already uses for deletion consent. `false` (declined) or a thrown/
+   * rejected call means NOTHING is written for ANY divergent repo this run.
+   */
+  readonly confirmReconciliation?: (divergences: readonly TrustedActorsDivergence[]) => Promise<boolean>;
+}
+
+/**
+ * DR-043 Amendment P row 3, applied to `MACF_TRUSTED_ACTORS` (groundnuty/
+ * macf#1319). Reconciles every repo in `presentRepos` (repos this run's
+ * create-only pass — {@link publishTrustedActorsGated} /
+ * {@link publishTrustedActorsForProvisioned} — already confirmed
+ * `'already-present'`, i.e. genuinely present, never a guess) whose current
+ * value diverges from `desiredValue` (`buildTrustedActorsValue`'s output).
+ *
+ * Per repo, in order:
+ *   1. Read the CURRENT value. Read failure → `'skipped'` (honest-unknown;
+ *      NEVER included in the confirmation batch — constraint 3).
+ *   2. Matches `desiredValue` → `'already-present'`. NO write, NO churn, NOT
+ *      included in the confirmation batch — this is the decisive case that
+ *      distinguishes "reconcile diverging values" from "always overwrite."
+ *   3. Diverges → added to the batch passed to `deps.confirmReconciliation`.
+ *
+ * The confirmation call happens ONCE, after every repo has been classified —
+ * never per-repo — so a `false`/thrown result means every divergent repo in
+ * THIS run reports `'declined'` (nothing written) rather than a partial
+ * write where some repos landed before the operator's answer was known.
+ *
+ * `undefined` for any of the three optional deps degrades to a full no-op
+ * (`{}` — every `presentRepos` entry simply absent from the result, which
+ * `apply-fleet.ts`'s caller then leaves at its PRE-reconcile status,
+ * `'already-present'`) — a caller that hasn't wired the new deps sees
+ * EXACTLY today's create-only behavior, never a crash.
+ *
+ * NEVER throws.
+ */
+export async function reconcileTrustedActors(
+  desiredValue: string,
+  presentRepos: readonly string[],
+  deps: TrustedActorsReconcileDeps,
+): Promise<Readonly<Record<string, EnsureVariableOutcome>>> {
+  if (deps.readRepoVariableValue === undefined || deps.updateRepoVariable === undefined || deps.confirmReconciliation === undefined) {
+    return {};
+  }
+  const readValue = deps.readRepoVariableValue;
+  const updateValue = deps.updateRepoVariable;
+  const confirm = deps.confirmReconciliation;
+
+  const out: Record<string, EnsureVariableOutcome> = {};
+  const divergences: TrustedActorsDivergence[] = [];
+  for (const repo of presentRepos) {
+    let observedValue: string | undefined;
+    try {
+      observedValue = await readValue(repo, TRUSTED_ACTORS_VAR);
+    } catch {
+      observedValue = undefined;
+    }
+    if (observedValue === undefined) {
+      out[repo] = {
+        status: 'skipped',
+        reason:
+          `${TRUSTED_ACTORS_VAR} on "${repo}" is confirmed present but its current value could not be re-read — ` +
+          'never reconciled (honest-unknown floor: a value this run cannot observe is not safe to overwrite).',
+      };
+      continue;
+    }
+    if (observedValue === desiredValue) {
+      out[repo] = { status: 'already-present' };
+      continue;
+    }
+    divergences.push({ repo, observedValue, desiredValue });
+  }
+
+  if (divergences.length === 0) return out;
+
+  let approved: boolean;
+  try {
+    approved = await confirm(divergences);
+  } catch {
+    approved = false;
+  }
+
+  for (const d of divergences) {
+    if (!approved) {
+      out[d.repo] = {
+        status: 'declined',
+        reason:
+          `${TRUSTED_ACTORS_VAR} on "${d.repo}" observed "${d.observedValue}" diverges from the fleet's current ` +
+          `agents ("${d.desiredValue}") — reconciliation declined this run; value left unchanged.`,
+      };
+      continue;
+    }
+    try {
+      const result = await updateValue(d.repo, TRUSTED_ACTORS_VAR, d.desiredValue);
+      out[d.repo] =
+        result === 'updated'
+          ? {
+              status: 'updated',
+              reason: `${TRUSTED_ACTORS_VAR} on "${d.repo}" reconciled: observed "${d.observedValue}" → declared "${d.desiredValue}".`,
+            }
+          : {
+              status: 'failed',
+              reason:
+                `${TRUSTED_ACTORS_VAR} on "${d.repo}" vanished between the presence check and the reconcile write ` +
+                '(a race, or a stale read) — refusing to guess; investigate the current value manually.',
+            };
+    } catch (err) {
+      out[d.repo] = { status: 'failed', reason: `${TRUSTED_ACTORS_VAR} on "${d.repo}" reconcile write threw — ${errMessage(err)}` };
+    }
+  }
+  return out;
+}
+
+/** Real repo-scope overwrite — `variable-write.ts::realUpdateVariable` against `repos/<owner>/<repo>`, mirroring `apply-ca.ts::realCreateRepoVariable`'s create-side wrapper shape and `apply-delete.ts::realDeleteRepoVariable`'s delete-side one. The ONLY production caller is `reconcileTrustedActors` via `TrustedActorsReconcileDeps.updateRepoVariable` (wired at `bootstrap-apply.ts`'s `resolveMutateDeps`). */
+export function realUpdateRepoVariable(repo: string, name: string, value: string): Promise<UpdateVariableResult> {
+  return realUpdateVariable(`repos/${repo}`, name, value);
 }

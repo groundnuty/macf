@@ -278,8 +278,14 @@ import {
 import type { CaApplyDeps, CaApplyOutcome, CaPublishResult, CaResolveOutcome } from './apply-ca.js';
 import { publishCaCertLegs, redactCaResolve, resolveCaCert, skippedCaPublish } from './apply-ca.js';
 import type { EnsureVariableOutcome } from './ensure-variable.js';
-import type { RunnerRegistrationDeps, RunnerTokenPollOptions } from './apply-routing.js';
-import { formatProvisionedRunnerWaitProgress, formatRunnerPollProgress, publishTrustedActorsForProvisioned, publishTrustedActorsGated } from './apply-routing.js';
+import type { RunnerRegistrationDeps, RunnerTokenPollOptions, TrustedActorsReconcileDeps } from './apply-routing.js';
+import {
+  formatProvisionedRunnerWaitProgress,
+  formatRunnerPollProgress,
+  publishTrustedActorsForProvisioned,
+  publishTrustedActorsGated,
+  reconcileTrustedActors,
+} from './apply-routing.js';
 import type { RunnerPlatformResult, RunnerPlatformStatusResult } from './runner-platform.js';
 import {
   checkRunnerPlatformStatus,
@@ -348,8 +354,14 @@ export interface FleetApplyDeps {
    * route check is routing-specific, not something `apply-ca.ts`'s CA
    * ceremony uses, so keeping it out of `CaApplyDeps` avoids widening that
    * module's own tests/fixtures for an unrelated concern (macf#922).
+   *
+   * `TrustedActorsReconcileDeps` (groundnuty/macf#1319) is intersected in
+   * the SAME way — its three fields are all OPTIONAL, so every pre-#1319
+   * `trustDeps` fixture in this codebase's tests keeps compiling unchanged;
+   * omitting them makes `reconcileTrustedActors` a safe no-op (see that
+   * function's own doc).
    */
-  readonly trustDeps: CaApplyDeps & RunnerRegistrationDeps;
+  readonly trustDeps: CaApplyDeps & RunnerRegistrationDeps & TrustedActorsReconcileDeps;
   /**
    * DR-043 §D5 "routing-client re-mint" (groundnuty/macf#920) — the
    * mint-or-skip + vault-restore deps for the macf-actions router's mTLS
@@ -2690,6 +2702,39 @@ export async function applyFleet(
     );
   }
 
+  // groundnuty/macf#1319 — DR-043 Amendment P row 3, applied to
+  // MACF_TRUSTED_ACTORS: a repo whose variable the create-only pass above
+  // left as `'already-present'` may still DIVERGE from the fleet's current
+  // manifest-derived value (the exact live symptom: scaling a fleet's agent
+  // roster writes the new list onto a NEW repo but never touches the
+  // PRE-EXISTING ones, because create-only leaves a present value fully
+  // untouched no matter how stale). `reconcileTrustedActors` is the ONLY
+  // place this codebase overwrites an existing variable's value, and only
+  // for THIS one variable — see that function's own doc for why (science's
+  // ruling on #1319: derived-ness is DECLARED, at this one call site, never
+  // inferred generically). Gated on the SAME `runs_on === 'self-hosted'`
+  // condition `routingRest`/`routingProvisioned` above already use — a
+  // fleet that never declares self-hosted routing has no `MACF_TRUSTED_ACTORS`
+  // write path to reconcile at all.
+  const alreadyPresentRoutingRepos = Object.entries(routing)
+    .filter(([, leg]) => leg.status === 'already-present')
+    .map(([repo]) => repo);
+  const routingReconciled: Readonly<Record<string, EnsureVariableOutcome>> =
+    manifest.routing?.runner !== undefined && manifest.routing.runner.runs_on === 'self-hosted' && alreadyPresentRoutingRepos.length > 0
+      ? await reconcileTrustedActors(buildTrustedActorsValue(manifest.metadata.name, manifest.agents), alreadyPresentRoutingRepos, deps.trustDeps)
+      : {};
+  for (const [repo, leg] of Object.entries(routingReconciled)) {
+    if (leg.status === 'updated' || leg.status === 'declined' || leg.status === 'failed' || leg.status === 'skipped') {
+      deps.log(`Routing var reconcile (${repo}): ${leg.status} — ${leg.reason}`);
+    }
+  }
+  // `routingReconciled` only ever carries entries for repos already present
+  // in `routing` (its input is `alreadyPresentRoutingRepos`, derived FROM
+  // `routing`), so this merge can only REFINE an existing `'already-present'`
+  // entry into `'already-present'` (unchanged) / `'updated'` / `'declined'` /
+  // `'skipped'` / `'failed'` — never introduce or drop a repo key.
+  const routingFinal: Readonly<Record<string, EnsureVariableOutcome>> = { ...routing, ...routingReconciled };
+
   // groundnuty/macf#1249 — apply OWNS the committed `fleet.yaml`, not just
   // its FIRST commit. `provisionControlRepo`'s `absent` branch already
   // writes+commits it as the control repo's first act (Amendment F); a
@@ -2824,7 +2869,7 @@ export async function applyFleet(
     vault,
     identityChanges,
     ca,
-    routing,
+    routing: routingFinal,
     runnerProvision: runnerProvisionResults,
     routingClient,
     routingSecrets: routingSecretsPublish,
