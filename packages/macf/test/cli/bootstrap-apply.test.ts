@@ -1098,9 +1098,11 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     const lock = parseFleetLock(readFileSync(join(dir, 'fleet.lock'), 'utf-8'));
     expect(lock.agents.map((a) => a.role).sort()).toEqual(['code-agent', 'router', 'science-agent']);
     // The CA key's fingerprint lands in fleet.lock's FLEET-level
-    // `fingerprints.ca_key` — the SOLE place it is ever written (see
-    // apply-fleet.ts's module doc) — never the raw key value.
-    expect(lock.fingerprints?.['ca_key']).toBeDefined();
+    // `fleet_fingerprints.ca_key` (renamed from the bare `fingerprints` —
+    // groundnuty/macf#1310, disambiguating it from the per-agent
+    // `agents[i].fingerprints` map below) — the SOLE place it is ever
+    // written (see apply-fleet.ts's module doc) — never the raw key value.
+    expect(lock.fleet_fingerprints?.['ca_key']).toBeDefined();
     expect(JSON.stringify(lock)).not.toContain(SENTINEL_CA_KEY_PEM);
   });
 

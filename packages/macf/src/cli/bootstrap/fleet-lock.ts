@@ -36,7 +36,7 @@
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import type { FleetLock, FleetLockAgent, FleetVersions, ScopeCredentialMarker } from './fleet-manifest.js';
-import { FLEET_LOCK_SCHEMA_VERSION, FleetLockSchema, parseFleetLock } from './fleet-manifest.js';
+import { FLEET_LOCK_SCHEMA_VERSION, FleetLockSchema, effectiveFleetFingerprints, parseFleetLock } from './fleet-manifest.js';
 
 /**
  * Non-secret SHA-256 fingerprint of a secret value, `sha256:<hex>` — matches
@@ -122,8 +122,10 @@ export interface ComposeFleetLockInput {
   /**
    * Fleet-level secrets established/reconfirmed THIS run (the CA key, the
    * dedicated per-fleet router App's key, the routing-client cert/key, ...)
-   * — name → RAW value, fingerprinted + merged over `previous.fingerprints`
-   * the same way per-agent secrets are. NOT Tailscale OAuth — that
+   * — name → RAW value, fingerprinted + merged over the previous lock's
+   * effective fleet-level fingerprints (`effectiveFleetFingerprints`,
+   * `fleet-manifest.ts`, groundnuty/macf#1310) the same way per-agent
+   * secrets are. NOT Tailscale OAuth — that
    * credential is operator-supplied and read-only from `apply`'s
    * perspective (Amendment C); `apply` never establishes or fingerprints a
    * value it never mints.
@@ -384,7 +386,16 @@ export function composeFleetLock(input: ComposeFleetLockInput): ComposeFleetLock
   }
   agents.sort((a, b) => a.role.localeCompare(b.role));
 
-  const fingerprints = mergeFingerprints(input.previous?.fingerprints, input.fleetSecrets);
+  // groundnuty/macf#1310 — read the OLD key (via `effectiveFleetFingerprints`,
+  // which falls back to the deprecated `fingerprints` when `previous` predates
+  // the rename), write the NEW one only. This is the "a rename must read the
+  // old key and write the new one" contract (#1252's undefined-vs-absent
+  // lesson, applied to a key rename instead of a missing field): a fleet
+  // whose lock still carries the legacy key gets its values carried forward
+  // and merged exactly as before, but the composed lock below never emits
+  // the legacy key again — the migration happens transparently the next
+  // time this fleet is (re-)applied.
+  const fleetFingerprints = mergeFingerprints(effectiveFleetFingerprints(input.previous), input.fleetSecrets);
   const versions = mergeVersions(input.previous?.versions, input.versions);
   const scopeCredentials = mergeScopeCredentials(input.previous?.scope_credentials, input.scopeCredentials);
   const ageRecipients = mergeAgeRecipients(input.previous?.age_recipients, input.ageRecipients);
@@ -398,7 +409,7 @@ export function composeFleetLock(input: ComposeFleetLockInput): ComposeFleetLock
     fleet: input.fleet,
     agents,
     ...(versions !== undefined ? { versions } : {}),
-    ...(fingerprints !== undefined ? { fingerprints } : {}),
+    ...(fleetFingerprints !== undefined ? { fleet_fingerprints: fleetFingerprints } : {}),
     ...(scopeCredentials !== undefined ? { scope_credentials: scopeCredentials } : {}),
     ...(ageRecipients !== undefined ? { age_recipients: ageRecipients } : {}),
     ...(ageRecipientsRemovedByOverride !== undefined ? { age_recipients_removed_by_override: ageRecipientsRemovedByOverride } : {}),
@@ -479,7 +490,7 @@ export function serializeFleetLock(lock: FleetLock): string {
     fleet: string;
     agents: FleetLockAgent[];
     versions?: Partial<FleetVersions>;
-    fingerprints?: Record<string, string>;
+    fleet_fingerprints?: Record<string, string>;
     scope_credentials?: ScopeCredentialMarker[];
     age_recipients?: string[];
     age_recipients_removed_by_override?: string[];
@@ -489,7 +500,16 @@ export function serializeFleetLock(lock: FleetLock): string {
     agents: [...validated.agents].sort((a, b) => a.role.localeCompare(b.role)).map(orderedAgent),
   };
   if (validated.versions !== undefined) ordered.versions = validated.versions;
-  if (validated.fingerprints !== undefined) ordered.fingerprints = sortRecord(validated.fingerprints);
+  // groundnuty/macf#1310 — read EITHER key (a caller could feed this
+  // function a hand-built object that still only carries the deprecated
+  // `fingerprints` key; this is the boundary that never trusts an
+  // unvalidated shape onto disk, so it upgrades on the way out too), write
+  // `fleet_fingerprints` ONLY. The legacy key is deliberately absent from
+  // this `ordered` allowlist — the same allowlist shape #1260's own
+  // regression pin exists for — so a lock re-serialized through this
+  // function always finishes migrated, never carrying both keys at once.
+  const fleetFingerprints = effectiveFleetFingerprints(validated);
+  if (fleetFingerprints !== undefined) ordered.fleet_fingerprints = sortRecord(fleetFingerprints);
   if (validated.scope_credentials !== undefined) {
     ordered.scope_credentials = [...validated.scope_credentials].sort((a, b) => a.role.localeCompare(b.role)).map(orderedScopeCredential);
   }

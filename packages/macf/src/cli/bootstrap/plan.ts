@@ -1602,10 +1602,62 @@ function formatVaultCaSuffix(vaultCa: VaultCaObservation | undefined): string {
   return ` [vault: ${String(present)}/${String(total)} CA fields present]`;
 }
 
+/**
+ * groundnuty/macf#1310 — whether the lock-derived fingerprint count and the
+ * vault-derived presence count DISAGREE about this agent's provisioning, in
+ * the flat, unambiguous way the live incident actually showed: `fleet.lock`
+ * says zero fingerprints recorded (reads as "not provisioned") while the
+ * vault reports EVERY expected secret field present (reads as "fully
+ * provisioned"), or the mirror image. Each probe is honest on its own —
+ * this function is the assertion that they cannot BOTH be true, so a caller
+ * never has to notice the contradiction by eye in a concatenated sentence.
+ *
+ * Deliberately narrow: a PARTIAL vault presence (say 4 of 6 fields) is
+ * genuinely ambiguous on its own (mid-provisioning, or a lock that simply
+ * hasn't caught up with a partially-written vault) and is NOT a
+ * contradiction this function flags — only the two flat extremes are
+ * unambiguous enough to call out as a headline finding rather than a
+ * plausible partial state. `undefined`/`'unknown'` vault status is not a
+ * contradiction either — there is nothing to disagree WITH.
+ */
+function fingerprintProvisioningContradiction(lockCount: number, vault: VaultAgentObservation | undefined): boolean {
+  if (vault === undefined || vault.status !== 'confirmed') return false;
+  const { present, total } = countVaultAgentPresence(vault.presence);
+  if (total === 0) return false;
+  if (lockCount === 0 && present === total) return true;
+  if (lockCount > 0 && present === 0) return true;
+  return false;
+}
+
 function secretFingerprintItem(agent: FleetAgent, obs: ObservedAgentState | undefined): PlanItem {
   const fingerprints = obs?.fingerprints ?? {};
   const count = Object.keys(fingerprints).length;
   const vaultSuffix = formatVaultAgentSuffix(obs?.vault);
+  // groundnuty/macf#1310 — two independent probes (fleet.lock's recorded
+  // count, the vault's confirmed presence) feed this reason text.
+  // Concatenating them (the pre-#1310 shape below) silently asserts they
+  // AGREE; when they flatly don't, say so as the HEADLINE rather than
+  // burying it as decoration after "not provisioned yet" — the disagreement
+  // itself is the most informative fact available (science-agent's ruling
+  // on #1310: "a diagnostic format that can only concatenate can only
+  // express agreement"). `confirm_required: true` so this never renders as
+  // a routine create/noop the operator can skim past; the verb is left as
+  // the lock's raw (low-confidence) reading, same Amendment-A "default
+  // toward create, flag the confidence" posture `presenceVerb` already
+  // uses for a plain Presence: 'unknown' — never a NEW verb value invented
+  // for this one case.
+  if (fingerprintProvisioningContradiction(count, obs?.vault)) {
+    return {
+      kind: 'secret_fingerprint',
+      target: `agent:${agent.role}:secrets`,
+      verb: count === 0 ? 'create' : 'noop',
+      reason:
+        `fleet.lock and the vault DISAGREE about "${agent.role}"'s provisioning — ` +
+        `fleet.lock records ${String(count)} fingerprint(s)${vaultSuffix}. Resolve the disagreement ` +
+        `(re-run \`apply\` to let it reconcile, or inspect both sources directly) before trusting either reading.`,
+      confirm_required: true,
+    };
+  }
   if (count === 0) {
     return {
       kind: 'secret_fingerprint',

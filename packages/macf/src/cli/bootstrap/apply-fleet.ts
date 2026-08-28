@@ -208,7 +208,7 @@ import { dirname, join } from 'node:path';
 import { caCertFingerprint } from '@groundnuty/macf-core';
 import type { TokenSource } from '@groundnuty/macf-core';
 import type { FleetAgent, FleetLock, FleetLockAgent, FleetManifest } from './fleet-manifest.js';
-import { buildTrustedActorsValue, deriveAppHandle, deriveControlRepoName } from './fleet-manifest.js';
+import { buildTrustedActorsValue, deriveAppHandle, deriveControlRepoName, effectiveFleetFingerprints } from './fleet-manifest.js';
 import type { AgentApplyDeps, AgentApplyOutcome, InstallRejection } from './apply-agent.js';
 import { applyAgentIdentity, applyIdentity, cleanupScratchPem, writeScratchPem } from './apply-agent.js';
 import type { Presence } from './plan.js';
@@ -2282,7 +2282,7 @@ export async function applyFleet(
   // agent's outcome) — `lockHasCaKey` reflects a PRIOR run's success only
   // (see `apply-ca.ts::resolveCaCert`'s doc); nothing written earlier in
   // THIS run's loop can set it.
-  const lockHasCaKey = currentLock?.fingerprints?.['ca_key'] !== undefined;
+  const lockHasCaKey = effectiveFleetFingerprints(currentLock)?.['ca_key'] !== undefined;
   const caResolve: CaResolveOutcome = await resolveCaCert(
     manifest.metadata.name,
     manifest.owner.registry,
@@ -2308,7 +2308,7 @@ export async function applyFleet(
   // memory to sign the client cert with (`apply-routing-client.ts`'s "mint
   // gating" doc). Folds into the SAME `settleVault` call as agents + CA
   // below — never a second vault write (Amendment D).
-  const lockHasRoutingClientKey = currentLock?.fingerprints?.['routing_client_key'] !== undefined;
+  const lockHasRoutingClientKey = effectiveFleetFingerprints(currentLock)?.['routing_client_key'] !== undefined;
   const routingClientMint: RoutingClientMintOutcome = await mintRoutingClient(
     caResolve.status === 'minted' ? caResolve.certPem : undefined,
     caResolve.status === 'minted' ? caResolve.keyPem : undefined,

@@ -668,6 +668,19 @@ export const FLEET_LOCK_SCHEMA_VERSION = 1;
  * detection); the vault holds the sealed value; the lock holds the mapping
  * between them.
  *
+ * **This is the PER-AGENT scope, not the fleet-level one** — see
+ * {@link FleetLockSchema.fleet_fingerprints}'s doc (groundnuty/macf#1310)
+ * for the sibling field this one must never be confused with. The two used
+ * to share the bare name `fingerprints` at two different nesting depths
+ * (this one under each `agents[]` entry, the other at the lock's top
+ * level) — a real naming collision a reader could trip on even though the
+ * two were never actually read from the wrong place in this codebase (the
+ * live #1310 incident's root cause turned out to be #1309's lock-fallback
+ * gap, not a wrong-home lookup). This field keeps its name (already
+ * disambiguated by nesting — `agents[i].fingerprints`, never bare); the
+ * fleet-level sibling was the one renamed.
+ *
+
  * `repo` (groundnuty/macf#1296) — the `owner/repo` this role's identity was
  * provisioned against, `FleetAgent.repo`'s value at the time `apply`
  * established/reconfirmed this role. **OPTIONAL, and every existing fleet's
@@ -750,13 +763,42 @@ export const FleetLockSchema = z
     fleet: z.string().min(1),
     agents: z.array(FleetLockAgentSchema),
     versions: FleetVersionsSchema.partial().strict().optional(),
-    // Fleet-level fingerprints not tied to one agent (CA key, routing-client
-    // cert/key, ...). NOT "the shared macf-routing App" (stale as of
-    // groundnuty/macf#1074 — the routing App is now a DEDICATED per-fleet
-    // identity, recorded like any other role in `agents[]` above, role
-    // `'router'` — see `apply-router-app.ts`). TS OAuth is operator-provided
-    // and lives only in the vault (Amendment C) — `apply` never fingerprints
-    // a value it never mints.
+    /**
+     * Fleet-level fingerprints not tied to one agent (CA key, routing-client
+     * cert/key, ...). NOT "the shared macf-routing App" (stale as of
+     * groundnuty/macf#1074 — the routing App is now a DEDICATED per-fleet
+     * identity, recorded like any other role in `agents[]` above, role
+     * `'router'` — see `apply-router-app.ts`). TS OAuth is operator-provided
+     * and lives only in the vault (Amendment C) — `apply` never fingerprints
+     * a value it never mints.
+     *
+     * **Renamed from the bare `fingerprints` (groundnuty/macf#1310)** — the
+     * old name collided with {@link FleetLockAgentSchema.fingerprints}'s
+     * PER-AGENT map (same word, different scope, different nesting depth):
+     * a naming collision that invited a reader to look in the wrong home
+     * even though no code in this repo ever actually did (science-agent's
+     * #1310 ruling: "fix the lookup, and disambiguate the names... should
+     * not be the same word"). Read via {@link effectiveFleetFingerprints},
+     * never this field or the legacy one directly — that helper falls back
+     * to {@link fingerprints} (below) for a lock written before this
+     * rename, so an already-provisioned fleet's fingerprints keep reading
+     * correctly with no re-apply required.
+     */
+    fleet_fingerprints: z.record(z.string(), z.string()).optional(),
+    /**
+     * @deprecated groundnuty/macf#1310 — the pre-rename name for
+     * {@link fleet_fingerprints}. Kept here, optional, SOLELY so a lock
+     * written by a pre-#1310 `apply` still parses (this schema is
+     * `.strict()` — an unrecognized key would otherwise fail the whole
+     * parse). Never read directly (use {@link effectiveFleetFingerprints})
+     * and never written by this codebase going forward — `composeFleetLock`
+     * / `serializeFleetLock` both write `fleet_fingerprints` only, even
+     * when composing over a `previous` lock that still carries this legacy
+     * key (`#1252`'s "a rename must read the old key and write the new
+     * one" — the values migrate to the new key the next time this fleet's
+     * lock is recomposed; the file is never left half-migrated across two
+     * keys).
+     */
     fingerprints: z.record(z.string(), z.string()).optional(),
     // groundnuty/macf#1162 — see `ScopeCredentialMarkerSchema`'s doc. Added
     // as a NEW optional field, no `FLEET_LOCK_SCHEMA_VERSION` bump: an
@@ -826,6 +868,31 @@ export const FleetLockSchema = z
 
 export type FleetLockAgent = z.infer<typeof FleetLockAgentSchema>;
 export type FleetLock = z.infer<typeof FleetLockSchema>;
+
+/**
+ * The effective fleet-level fingerprint map (groundnuty/macf#1310) —
+ * **never** the per-agent one (that lives at `lock.agents[i].fingerprints`
+ * and has no legacy-key concern; see {@link FleetLockAgentSchema}'s doc for
+ * why the two must not be confused). Prefers the current
+ * {@link FleetLockSchema.fleet_fingerprints} key; falls back to the
+ * deprecated {@link FleetLockSchema.fingerprints} key for a lock written
+ * before this rename. `undefined` when NEITHER key is recorded — a fleet
+ * that has never minted a fleet-level secret (CA key / routing-client
+ * cert-key / router App key), or no lock at all.
+ *
+ * Every reader of fleet-level fingerprints MUST go through this function
+ * rather than accessing either key directly — that is the entire point of
+ * the rename: a future re-serialize always writes `fleet_fingerprints`
+ * only (never the legacy key — see `fleet-lock.ts::composeFleetLock` /
+ * `serializeFleetLock`), so a reader still checking the old key alone would
+ * see its fingerprints silently "disappear" the moment this fleet's lock is
+ * next recomposed, even though nothing was lost.
+ */
+export function effectiveFleetFingerprints(
+  lock: Pick<FleetLock, 'fleet_fingerprints' | 'fingerprints'> | null | undefined,
+): Record<string, string> | undefined {
+  return lock?.fleet_fingerprints ?? lock?.fingerprints;
+}
 
 /**
  * Parse + validate a `fleet.lock` document from its raw text. `fleet.lock` is

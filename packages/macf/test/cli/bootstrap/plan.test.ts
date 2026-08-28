@@ -1701,6 +1701,188 @@ describe('vault-derived facts (DR-043 Amendment D phase 3) — purely additive o
   });
 });
 
+// --- groundnuty/macf#1310 — lock-vs-vault provisioning contradiction ---
+//
+// #1310's live incident: `secret_fingerprint` reported "no fingerprints
+// recorded in fleet.lock — agent has not been provisioned yet" in the SAME
+// sentence as "[vault: 6/6 secret fields present]" — its own refutation,
+// unnoticed because the message was ASSEMBLED from two independently-honest
+// probes that nothing ever checked against each other. The fix is a
+// message-builder assertion (science-agent's ruling), not a new lookup —
+// the lookup itself (`obs?.fingerprints`, per-agent) was already correct;
+// the actual root cause of the ORIGINAL live incident was #1309's lock
+// control-repo fallback, separately fixed. This describes the residual,
+// general defense: whenever the two probes flatly disagree, say so as the
+// HEADLINE, whatever caused it.
+describe('computePlan — secret_fingerprint lock-vs-vault contradiction (groundnuty/macf#1310)', () => {
+  function agentItem(items: readonly PlanItem[], role: string): PlanItem | undefined {
+    return itemFor(items, 'secret_fingerprint', `agent:${role}:secrets`);
+  }
+
+  const fullVaultPresence = {
+    appId: { present: true, fingerprint: 'sha256:1' },
+    installId: { present: true, fingerprint: 'sha256:2' },
+    clientId: { present: true, fingerprint: 'sha256:3' },
+    clientSecret: { present: true, fingerprint: 'sha256:4' },
+    webhookSecret: { present: true, fingerprint: 'sha256:5' },
+    privateKey: { present: true, fingerprint: 'sha256:6' },
+  };
+  const emptyVaultPresence = {
+    appId: { present: false },
+    installId: { present: false },
+    clientId: { present: false },
+    clientSecret: { present: false },
+    webhookSecret: { present: false },
+    privateKey: { present: false },
+  };
+
+  // Decisive pair item 3: contradictory inputs (lock says un-provisioned,
+  // vault says 6/6) → flagged, and the reason does NOT emit the
+  // pre-#1310 self-refuting concatenation.
+  it('DECISIVE (3a): lock says un-provisioned (0 fingerprints) + vault reports 6/6 present → flags the disagreement as the headline, confirm_required, never the self-refuting sentence', () => {
+    const manifest = baseManifest();
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      agents: {
+        'code-agent': {
+          app: 'unknown',
+          install: 'unknown',
+          repo: 'unknown',
+          fingerprints: {},
+          vault: { status: 'confirmed', presence: fullVaultPresence },
+        },
+      },
+    };
+    const plan = computePlan(manifest, observed);
+    const item = agentItem(plan.items, 'code-agent');
+    expect(item?.confirm_required).toBe(true);
+    expect(item?.reason).toMatch(/^fleet\.lock and the vault DISAGREE/);
+    expect(item?.reason).not.toContain('agent has not been provisioned yet');
+  });
+
+  // Mirror direction — lock says provisioned, vault says nothing is there.
+  it('DECISIVE (3b): lock records fingerprints + vault reports 0/6 present → ALSO flagged (mirror direction)', () => {
+    const manifest = baseManifest();
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      agents: {
+        'code-agent': {
+          app: 'unknown',
+          install: 'unknown',
+          repo: 'unknown',
+          fingerprints: { client_secret: 'sha256:aa' },
+          vault: { status: 'confirmed', presence: emptyVaultPresence },
+        },
+      },
+    };
+    const plan = computePlan(manifest, observed);
+    const item = agentItem(plan.items, 'code-agent');
+    expect(item?.confirm_required).toBe(true);
+    expect(item?.reason).toMatch(/^fleet\.lock and the vault DISAGREE/);
+  });
+
+  // Decisive pair item 4: consistent inputs → emits normally, unflagged —
+  // pins that the new check does not fire on the ordinary, honest cases.
+  it('DECISIVE (4a): consistent inputs — lock un-provisioned + vault ALSO reports 0/6 — emits the ordinary reason, NOT flagged', () => {
+    const manifest = baseManifest();
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      agents: {
+        'code-agent': {
+          app: 'unknown',
+          install: 'unknown',
+          repo: 'unknown',
+          fingerprints: {},
+          vault: { status: 'confirmed', presence: emptyVaultPresence },
+        },
+      },
+    };
+    const plan = computePlan(manifest, observed);
+    const item = agentItem(plan.items, 'code-agent');
+    expect(item?.confirm_required).toBe(false);
+    expect(item?.reason).toContain('no fingerprints recorded in fleet.lock — agent has not been provisioned yet');
+    expect(item?.reason).toContain('[vault: 0/6 secret fields present]');
+  });
+
+  it('DECISIVE (4b): consistent inputs — lock provisioned + vault ALSO reports 6/6 — emits the ordinary noop reason, NOT flagged', () => {
+    const manifest = baseManifest();
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      agents: {
+        'code-agent': {
+          app: 'unknown',
+          install: 'unknown',
+          repo: 'unknown',
+          fingerprints: { client_secret: 'sha256:aa', webhook_secret: 'sha256:bb', app_private_key: 'sha256:cc' },
+          vault: { status: 'confirmed', presence: fullVaultPresence },
+        },
+      },
+    };
+    const plan = computePlan(manifest, observed);
+    const item = agentItem(plan.items, 'code-agent');
+    expect(item?.confirm_required).toBe(false);
+    expect(item?.verb).toBe('noop');
+    expect(item?.reason).toContain('fingerprint(s) recorded in fleet.lock');
+  });
+
+  // Not a contradiction — a PARTIAL vault presence is genuinely ambiguous
+  // (mid-provisioning, or a lock simply not yet caught up) and must NOT be
+  // flagged; this is the pre-existing regression test in the "vault-derived
+  // facts" block above (4/6 partial), restated here as an explicit pin
+  // against over-eager flagging.
+  it('a PARTIAL vault presence (neither 0 nor total) is NOT flagged as a contradiction, even against a 0-count lock', () => {
+    const manifest = baseManifest();
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      agents: {
+        'code-agent': {
+          app: 'unknown',
+          install: 'unknown',
+          repo: 'unknown',
+          fingerprints: {},
+          vault: {
+            status: 'confirmed',
+            presence: { ...emptyVaultPresence, appId: { present: true, fingerprint: 'sha256:1' } },
+          },
+        },
+      },
+    };
+    const plan = computePlan(manifest, observed);
+    const item = agentItem(plan.items, 'code-agent');
+    expect(item?.confirm_required).toBe(false);
+  });
+
+  it('an UNKNOWN vault status is never treated as a contradiction — there is nothing confirmed to disagree with', () => {
+    const manifest = baseManifest();
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      agents: {
+        'code-agent': {
+          app: 'unknown',
+          install: 'unknown',
+          repo: 'unknown',
+          fingerprints: {},
+          vault: { status: 'unknown', reason: 'vault file not found' },
+        },
+      },
+    };
+    const plan = computePlan(manifest, observed);
+    const item = agentItem(plan.items, 'code-agent');
+    expect(item?.confirm_required).toBe(false);
+  });
+
+  it('no vault observation at all is never treated as a contradiction (vault-free plan run, phase-2 default)', () => {
+    const manifest = baseManifest();
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      agents: { 'code-agent': { app: 'unknown', install: 'unknown', repo: 'unknown', fingerprints: {} } },
+    };
+    const plan = computePlan(manifest, observed);
+    const item = agentItem(plan.items, 'code-agent');
+    expect(item?.confirm_required).toBe(false);
+  });
+});
+
 // --- DR-043 §D5 recipient-set reconciliation (groundnuty/macf#957) ---
 
 describe('computePlan — vault_recipients item (DR-043 §D5 recipient reconciliation, macf#957)', () => {

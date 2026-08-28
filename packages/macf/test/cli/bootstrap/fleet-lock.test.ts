@@ -277,17 +277,63 @@ describe('composeFleetLock — re-apply against a previous lock (no-prune, §D3 
     expect(identityChanges).toEqual([]);
   });
 
-  it('fleet-level fingerprints merge the same way: prior CA key fingerprint preserved, new fleet secret added', () => {
+  // groundnuty/macf#1310 DECISIVE (1/2): `previous` above declares its
+  // fleet-level fingerprint under the DEPRECATED bare `fingerprints` key
+  // (the shape every already-provisioned fleet's lock is in right now) —
+  // composing over it must still read the old CA-key fingerprint AND
+  // migrate the merged result onto the NEW `fleet_fingerprints` key, never
+  // losing the value and never emitting the old key again. This is the
+  // "a rename must read the old key and write the new one" contract
+  // (`#1252`'s undefined-vs-absent lesson, applied to a key rename).
+  it('fleet-level fingerprints merge the same way: prior CA key fingerprint preserved, new fleet secret added — reading the DEPRECATED `fingerprints` key, writing the NEW `fleet_fingerprints` key', () => {
     const { lock } = composeFleetLock({
       fleet: 'demo-fleet',
       previous,
       agentUpdates: {},
       fleetSecrets: { routing_app_key: 'routing-pem' },
     });
-    expect(lock.fingerprints).toEqual({
+    expect(lock.fleet_fingerprints).toEqual({
       ca_key: secretFingerprint('old-ca-key'),
       routing_app_key: secretFingerprint('routing-pem'),
     });
+    // Never re-emits the legacy key alongside the new one — a rewritten
+    // lock finishes fully migrated, not carrying both.
+    expect('fingerprints' in lock).toBe(false);
+  });
+
+  // groundnuty/macf#1310 DECISIVE (2/2): the mirror case — `previous`
+  // already uses the NEW `fleet_fingerprints` key (a lock written by a
+  // post-#1310 `apply`) — composing over it reads correctly with no
+  // fallback needed.
+  it('fleet-level fingerprints read correctly from a lock ALREADY on the new `fleet_fingerprints` key (post-#1310 shape)', () => {
+    const previousNewKey: FleetLock = {
+      schema_version: 1,
+      fleet: 'demo-fleet',
+      agents: [],
+      fleet_fingerprints: { ca_key: secretFingerprint('old-ca-key') },
+    };
+    const { lock } = composeFleetLock({
+      fleet: 'demo-fleet',
+      previous: previousNewKey,
+      agentUpdates: {},
+      fleetSecrets: { routing_app_key: 'routing-pem' },
+    });
+    expect(lock.fleet_fingerprints).toEqual({
+      ca_key: secretFingerprint('old-ca-key'),
+      routing_app_key: secretFingerprint('routing-pem'),
+    });
+  });
+
+  it('a fleet whose lock carries BOTH keys (a hand-built/transitional shape) prefers the NEW key, never silently merging the two', () => {
+    const previousBothKeys: FleetLock = {
+      schema_version: 1,
+      fleet: 'demo-fleet',
+      agents: [],
+      fleet_fingerprints: { ca_key: secretFingerprint('new-key-ca') },
+      fingerprints: { ca_key: secretFingerprint('old-key-ca') },
+    };
+    const { lock } = composeFleetLock({ fleet: 'demo-fleet', previous: previousBothKeys, agentUpdates: {} });
+    expect(lock.fleet_fingerprints?.['ca_key']).toBe(secretFingerprint('new-key-ca'));
   });
 
   it('versions merge field-by-field: fresh actions overrides, previous macf (absent from fresh) is preserved', () => {
@@ -378,6 +424,13 @@ describe('composeFleetLock — age_recipients_removed_by_override (groundnuty/ma
 });
 
 describe('serializeFleetLock', () => {
+  // groundnuty/macf#1310 — this fixture DELIBERATELY declares its
+  // fleet-level fingerprints under the DEPRECATED bare `fingerprints` key
+  // (the shape every already-provisioned fleet's `fleet.lock` is in right
+  // now), so every test in this block exercises "reads the old key" by
+  // construction. The per-agent `fingerprints` on `science-agent` below is
+  // the UNRELATED, never-renamed per-agent field — same word, different
+  // object, see `FleetLockAgentSchema`'s doc.
   const lock: FleetLock = {
     schema_version: 1,
     fleet: 'demo-fleet',
@@ -401,29 +454,46 @@ describe('serializeFleetLock', () => {
   it('sorts agents[] by role and each fingerprints map by key, regardless of input order', () => {
     const parsed = JSON.parse(serializeFleetLock(lock)) as {
       agents: { role: string; fingerprints?: Record<string, string> }[];
-      fingerprints: Record<string, string>;
+      fleet_fingerprints: Record<string, string>;
     };
     expect(parsed.agents.map((a) => a.role)).toEqual(['code-agent', 'science-agent']);
     expect(Object.keys(parsed.agents[0]?.fingerprints ?? {})).toEqual([]);
     expect(Object.keys(parsed.agents[1]?.fingerprints ?? {})).toEqual(['a_secret', 'z_secret']);
-    expect(Object.keys(parsed.fingerprints)).toEqual(['a_key', 'z_key']);
+    expect(Object.keys(parsed.fleet_fingerprints)).toEqual(['a_key', 'z_key']);
   });
 
   it('is idempotent: serializing twice from the same input produces byte-identical output', () => {
     expect(serializeFleetLock(lock)).toBe(serializeFleetLock(lock));
   });
 
-  it('round-trips through parseFleetLock unchanged', () => {
+  // groundnuty/macf#1310 DECISIVE — `lock` above declares its fleet-level
+  // fingerprints under the DEPRECATED `fingerprints` key; round-tripping
+  // through serialize+parse must both preserve the values AND land them on
+  // the NEW `fleet_fingerprints` key — the "read old, write new" contract.
+  it('round-trips through parseFleetLock, MIGRATED onto the new `fleet_fingerprints` key — the deprecated key never reappears', () => {
     const roundTripped = parseFleetLock(serializeFleetLock(lock));
     expect(roundTripped.fleet).toBe(lock.fleet);
     expect(roundTripped.agents).toHaveLength(2);
-    expect(roundTripped.fingerprints).toEqual({ a_key: 'sha256:aa', z_key: 'sha256:zz' });
+    expect(roundTripped.fleet_fingerprints).toEqual({ a_key: 'sha256:aa', z_key: 'sha256:zz' });
+    expect(roundTripped.fingerprints).toBeUndefined();
   });
 
-  it('omits versions/fingerprints keys entirely when absent (never emits an empty {} placeholder)', () => {
+  it('omits versions/fleet_fingerprints keys entirely when absent (never emits an empty {} placeholder)', () => {
     const minimal: FleetLock = { schema_version: 1, fleet: 'x', agents: [] };
     const parsed = JSON.parse(serializeFleetLock(minimal)) as Record<string, unknown>;
     expect('versions' in parsed).toBe(false);
+    expect('fleet_fingerprints' in parsed).toBe(false);
+    expect('fingerprints' in parsed).toBe(false);
+  });
+
+  // groundnuty/macf#1310 — `serializeFleetLock` is the boundary a caller
+  // could feed a hand-built object through (its own module doc); confirms
+  // it upgrades a lock that ONLY ever had the legacy key, with no
+  // `composeFleetLock` step in between.
+  it('a hand-built lock carrying ONLY the deprecated `fingerprints` key still serializes onto `fleet_fingerprints`', () => {
+    const legacyOnly: FleetLock = { schema_version: 1, fleet: 'x', agents: [], fingerprints: { ca_key: 'sha256:legacy' } };
+    const parsed = JSON.parse(serializeFleetLock(legacyOnly)) as Record<string, unknown>;
+    expect(parsed['fleet_fingerprints']).toEqual({ ca_key: 'sha256:legacy' });
     expect('fingerprints' in parsed).toBe(false);
   });
 
@@ -526,6 +596,74 @@ describe('writeFleetLock (thin I/O leaf)', () => {
       writeFleetLock(path, lock);
       const raw = JSON.parse(readFileSync(path, 'utf-8')) as { agents: Record<string, unknown>[] };
       expect('repo' in (raw.agents[0] ?? {})).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // groundnuty/macf#1310 DECISIVE — same "assert the WRITTEN FILE, not the
+  // composer's return value" discipline #1296's own decisive test above
+  // established, applied to the fleet-level rename: (1) a lock composed
+  // over a PRIOR lock still on the deprecated `fingerprints` key reaches
+  // disk under the NEW `fleet_fingerprints` key, with the legacy key
+  // ABSENT from the raw bytes (never both at once). This is the test the
+  // brief's own mutation check targets: dropping `ordered.fleet_fingerprints
+  // = ...` from `serializeFleetLock` (fleet-lock.ts) makes this fail (raw
+  // parsed JSON has no "fleet_fingerprints" key) — confirmed manually,
+  // matching the #1296 precedent's own verification style. A composer-
+  // altitude assertion on `composeFleetLock`'s return value would NOT
+  // catch that mutation (`composeFleetLock` already produces the right
+  // field; the drop happens in `serializeFleetLock`'s own hand-built
+  // allowlist) — the exact #1260 defect shape this issue's own AC names.
+  it('DECISIVE: a fleet-level fingerprint reaches the WRITTEN FILE on disk under "fleet_fingerprints", migrated off a prior "fingerprints"-keyed lock', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'macf-fleet-lock-test-'));
+    try {
+      const path = join(dir, 'fleet.lock');
+      const priorOnLegacyKey: FleetLock = {
+        schema_version: 1,
+        fleet: 'demo-fleet',
+        agents: [],
+        fingerprints: { ca_key: secretFingerprint('old-ca-key') },
+      };
+      const { lock } = composeFleetLock({
+        fleet: 'demo-fleet',
+        previous: priorOnLegacyKey,
+        agentUpdates: {},
+      });
+      writeFleetLock(path, lock);
+      const raw = JSON.parse(readFileSync(path, 'utf-8')) as Record<string, unknown>;
+      expect(raw['fleet_fingerprints']).toEqual({ ca_key: secretFingerprint('old-ca-key') });
+      expect('fingerprints' in raw).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // groundnuty/macf#1310 — the whole point of the rename: the two
+  // `fingerprints` STRUCTURES (fleet-level, now `fleet_fingerprints`; and
+  // per-agent, still `agents[i].fingerprints`) must never be mistaken for
+  // one another even when a fleet has BOTH populated with disjoint key
+  // sets. Asserted explicitly against the raw written bytes.
+  it('neither fingerprints structure is mistaken for the other on disk — fleet-level and per-agent stay on separate keys with disjoint values', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'macf-fleet-lock-test-'));
+    try {
+      const path = join(dir, 'fleet.lock');
+      const { lock } = composeFleetLock({
+        fleet: 'demo-fleet',
+        previous: null,
+        agentUpdates: { 'code-agent': { appId: '1', installId: '2', secrets: { client_secret: 'agent-secret' } } },
+        fleetSecrets: { ca_key: 'fleet-ca-pem' },
+      });
+      writeFleetLock(path, lock);
+      const raw = JSON.parse(readFileSync(path, 'utf-8')) as {
+        fleet_fingerprints?: Record<string, string>;
+        agents: { role: string; fingerprints?: Record<string, string> }[];
+      };
+      expect(raw.fleet_fingerprints).toEqual({ ca_key: secretFingerprint('fleet-ca-pem') });
+      expect(raw.agents[0]?.fingerprints).toEqual({ client_secret: secretFingerprint('agent-secret') });
+      // Disjoint key SETS and disjoint VALUES — no cross-contamination.
+      expect(raw.fleet_fingerprints).not.toEqual(raw.agents[0]?.fingerprints);
+      expect('fingerprints' in raw).toBe(false); // the legacy top-level key never appears
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
