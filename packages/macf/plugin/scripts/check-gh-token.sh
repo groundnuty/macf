@@ -90,6 +90,44 @@ fi
 GH_TOKEN_VALUE="${GH_TOKEN:-}"
 TOKEN_PREFIX="${GH_TOKEN_VALUE:0:4}"
 if [[ -z "$GH_TOKEN_VALUE" ]] || [[ ! "$GH_TOKEN_VALUE" =~ ^ghs_[A-Za-z0-9._-]+$ ]]; then
+  # groundnuty/macf#1360 — branch on the discriminator this hook ALREADY has.
+  # A `ghs_` prefix that fails the full-shape check is almost never an
+  # attribution trap: `ghs_` IS a bot installation token by definition. It is
+  # far more likely that THIS COPY of the validator is stale — a widened
+  # pattern that never reached this workspace. Saying "you would post as the
+  # USER" while printing `GH_TOKEN prefix: ghs_` contradicts the evidence on
+  # screen, and prescribes the one remedy that cannot help: regenerating a
+  # token that was already valid. That cost the auditor two sessions and two
+  # wrong diagnoses before anyone suspected the validator.
+  if [[ "$TOKEN_PREFIX" == "ghs_" ]]; then
+    cat >&2 <<ERR
+BLOCKED by MACF attribution-trap hook — but your token is probably FINE and THIS SCRIPT is probably STALE.
+
+Command: ${COMMAND}
+GH_TOKEN prefix: ghs_ (a bot installation token — NOT the attribution trap)
+This copy's pattern: ^ghs_[A-Za-z0-9._-]+\$
+
+Your token carries the bot prefix but did not match the pattern above. A
+`ghs_` token is a bot installation token by definition, so the likely cause
+is that this workspace's copy of check-gh-token.sh predates a widening of
+that pattern (gh-token v2.x mints a ~383-char \`ghs_<app>_<JWT>\` containing
+dots and hyphens; see groundnuty/macf#827 and #1360).
+
+Fix — refresh the DISTRIBUTED SCRIPTS first, then retry. Do NOT regenerate
+the token; that is not the problem:
+
+  macf update            # or, for a non-init'd workspace:
+  macf rules refresh --dir .
+
+If the pattern above already accepts your token's shape and it still blocks,
+THEN the token is genuinely malformed — refresh it via the fail-loud helper
+as described in .claude/rules/gh-token-refresh.md.
+
+Override (ONLY for intentional user-attributed ops):
+  export MACF_SKIP_TOKEN_CHECK=1
+ERR
+    exit 2
+  fi
   cat >&2 <<ERR
 BLOCKED by MACF attribution-trap hook: this command would post as the USER, not the BOT.
 
