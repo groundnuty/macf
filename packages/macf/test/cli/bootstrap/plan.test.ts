@@ -27,6 +27,7 @@ import {
   orphanResourceUrl,
   planItemApplyCoverage,
   scopeCredentialNotice,
+  SKIPPED_SECTION_REASONS,
   summarizePlan,
   UNKNOWN_REASONS,
   type ControlRepoRouterCoverage,
@@ -1298,7 +1299,7 @@ describe('computePlan — deterministic ordering', () => {
 });
 
 describe('computePlan — skippedSections (declared-but-deferred sections, no silent caps)', () => {
-  it('is empty when collaborators is not declared', () => {
+  it('is empty when collaborators/shared are not declared', () => {
     const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
     expect(plan.skippedSections).toEqual([]);
   });
@@ -1346,6 +1347,53 @@ describe('computePlan — skippedSections (declared-but-deferred sections, no si
     const plan = computePlan(manifest, EMPTY_OBSERVED);
     const lines = formatSkippedLines(plan.skippedSections);
     expect(lines).toEqual(['collaborators: SKIPPED (reconcile not implemented in v1)']);
+  });
+
+  // groundnuty/macf#1355 — `shared:` is the second PRESENCE-GATED section
+  // (same optional-section shape `collaborators` already established). This
+  // is the issue's decisive test pair AND its own closing criterion: a
+  // manifest DECLARING `shared.ts_oauth` names it, verbatim, in the
+  // RENDERED plan text; a manifest OMITTING `shared` entirely produces no
+  // line, no noise for that section — byte-identical to a manifest that
+  // never mentions it (`plan.skippedSections` stays `[]`, not merely
+  // "shared absent from a longer array").
+  describe('shared (groundnuty/macf#1355)', () => {
+    it('names shared.routing_app / shared.ts_oauth in the rendered plan text when the section is declared', () => {
+      const manifest = baseManifest({ shared: { routing_app: 'acme-routing', ts_oauth: 'acme-ts-oauth' } });
+      const plan = computePlan(manifest, EMPTY_OBSERVED);
+      expect(plan.skippedSections).toEqual([{ section: 'shared', reason: SKIPPED_SECTION_REASONS.shared }]);
+
+      const rendered = formatPlanText(plan);
+      expect(rendered).toContain('shared: SKIPPED');
+      expect(rendered).toContain('shared.routing_app');
+      expect(rendered).toContain('shared.ts_oauth');
+      expect(rendered).toContain('#1161');
+    });
+
+    it('produces no line, no noise in the rendered plan when shared is omitted entirely — byte-identical to today', () => {
+      const withShared = computePlan(baseManifest({ shared: { routing_app: 'x', ts_oauth: 'y' } }), EMPTY_OBSERVED);
+      const withoutShared = computePlan(baseManifest(), EMPTY_OBSERVED);
+
+      expect(formatPlanText(withShared)).toContain('shared: SKIPPED');
+      expect(formatPlanText(withoutShared)).not.toContain('shared:');
+      expect(withoutShared.skippedSections).toEqual([]);
+    });
+  });
+
+  // groundnuty/macf#1355 — `defaults.app_manifest` / `agents[].profile` are
+  // DELIBERATELY NOT disclosed via this mechanism (see `plan.ts`'s
+  // `SKIPPED_SECTION_REASONS` doc for why: both are REQUIRED fields, so an
+  // unconditional entry would violate the SAME "byte-identical when
+  // declaring none" contract the `shared` tests above pin). This is a
+  // regression guard against silently re-adding them the way an earlier
+  // draft of this change did.
+  it('does NOT surface defaults.app_manifest / agents[].profile — both are mandatory-and-inert, a schema-level gap, not a per-run disclosure', () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
+    const rendered = formatPlanText(plan);
+    expect(rendered).not.toContain('defaults.app_manifest');
+    expect(rendered).not.toContain('agents[].profile');
+    expect(plan.skippedSections.some((s) => s.section === 'defaults.app_manifest')).toBe(false);
+    expect(plan.skippedSections.some((s) => s.section === 'agents[].profile')).toBe(false);
   });
 });
 
