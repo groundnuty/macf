@@ -1145,6 +1145,17 @@ describe('plugin hooks.json single-source (DR-039 Decision 2)', () => {
     expect(sessionStart).toContain(pluginRootHookCommand('check-framework-surface.sh'));
   });
 
+  // ── groundnuty/macf#664 — resumed-session agent-identity hook ────────────
+  it('registers emit-agent-identity.sh on SessionStart, via ${CLAUDE_PLUGIN_ROOT}/scripts/, matcher-less (fires on resume/clear/compact/fork too, not just startup — the entire point of #664)', () => {
+    const parsed = readPluginHooksJson();
+    const sessionStart = parsed.hooks['SessionStart'] ?? [];
+    const entry = sessionStart.find((e) =>
+      e.hooks.some((h) => h.command === pluginRootHookCommand('emit-agent-identity.sh')),
+    );
+    expect(entry, 'expected an emit-agent-identity.sh SessionStart entry').toBeDefined();
+    expect(entry?.matcher).toBeUndefined();
+  });
+
   it('registers check-git-sweep.sh on PreToolUse with matcher Bash, via ${CLAUDE_PLUGIN_ROOT}/scripts/', () => {
     const parsed = readPluginHooksJson();
     const preToolUse = parsed.hooks['PreToolUse'] ?? [];
