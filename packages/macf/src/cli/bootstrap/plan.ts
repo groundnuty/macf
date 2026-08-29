@@ -127,6 +127,12 @@ import { validateInstallRepositoryScope } from './install-scope.js';
 // `runnerPlatformItem` both call, so the two surfaces never describe the
 // same resolved value in two independently-drifting sentences.
 import { describeRunnerPlatformEndpointResolution, type RunnerPlatformEndpointResolution } from './runner-platform.js';
+// groundnuty/macf#1335 — the ONLY consumer of the already-observed-based
+// entry point; `evaluateRunnerDeclarationReach` (content-based, live-read
+// wrapper `checkRunnerDeclarationReach`) stays the standalone `macf routing
+// runner-declaration-check` CLI's own import, never `plan.ts`'s — see that
+// function's doc for why plan deliberately uses the sibling.
+import { evaluateRunnerDeclarationReachFromObservation, type RunnerDeclarationFinding } from './runner-declaration-reach.js';
 // groundnuty/macf#1220 / #1129 / #1229 / DR-043 Amendment P2 — row 3 of the
 // reconciler verb matrix (`update` never COMPUTED for a REUSED resource).
 // `install-scope-coverage.ts` value-imports `type { Presence }` from THIS
@@ -212,6 +218,26 @@ export interface ObservedAgentState {
    * reads.
    */
   readonly actionsPin?: string;
+  /**
+   * The installed router caller's `with:` block key set — groundnuty/macf#1335,
+   * the observation half `runner-declaration-reach.ts`'s
+   * `evaluateRunnerDeclarationReachFromObservation` needs to decide whether
+   * this repo's `routing.runner.runs_on: self-hosted` declaration can reach
+   * the router, WITHOUT a second live read of the same file:
+   * `observer.ts::githubRegistryObserver` already reads
+   * `.github/workflows/agent-router.yml` once per agent for `actionsPin`
+   * above — this field is extracted from that SAME read, never a parallel
+   * `gh api` call (a parallel read of a fact this run already observed is
+   * exactly the hazard this issue's own thread warns against). `undefined`
+   * collapses the SAME two causes `actionsPin` already collapses into one
+   * signal (file unreadable, or no macf-actions `uses:` line found) — the
+   * pure decision function treats `undefined` here as `'unknown'`, NEVER
+   * `'not-honoured'` and NEVER "consistent" (this issue's own explicit
+   * honest-unknown requirement). An empty array (`[]`) is a REAL, meaningful
+   * reading distinct from `undefined` — the `uses:` line WAS found and it
+   * carries NO `with:` block at all (a stale pre-v3 caller).
+   */
+  readonly routerWithKeys?: readonly string[];
   /**
    * Vault-derived secret-field presence for this agent (DR-043 Amendment D
    * phase 3, `vault-read.ts::queryVaultAgentPresence`) — `undefined` when
@@ -615,6 +641,36 @@ export interface FleetPlan {
    * silent until the marker happens to land in `fleet.lock`.
    */
   readonly scopeCredentials: readonly ScopeCredentialNotice[];
+  /**
+   * groundnuty/macf#1335 — surfaces WITHOUT being asked whether each
+   * declared agent repo's `routing.runner.runs_on: self-hosted` declaration
+   * can actually reach the installed router's `pick-runner` decision (the
+   * detection half of #1194 the standalone `macf routing
+   * runner-declaration-check` CLI, #1334, left unwired: an operator-run-only
+   * command is not a guarantee). One entry per agent repo where
+   * `manifest.routing?.runner?.runs_on === 'self-hosted'` — a fleet that
+   * never declares self-hosted, or declares anything else, contributes
+   * NOTHING here (same "hosted is an accepted choice, no row, no noise" gate
+   * `evaluateRunnerDeclarationReachFromObservation`'s own `'not-applicable'`
+   * verdict already encodes — this field only ever holds the OTHER three
+   * verdicts: `'unknown'` / `'not-honoured'` / `'honoured'`). ALWAYS present
+   * on the TYPE (empty array when nothing applies — same convention as
+   * {@link installScopeDrift}); `--json` omits the key entirely when empty,
+   * same byte-identical-output convention every sibling notice array above
+   * follows.
+   *
+   * **Never blocks, never fails the run** — this is a report, not a refusal
+   * or a confirm-required item: it is not a `PlanItem` (no verb, nothing for
+   * `apply` to action), just like `installScopeDrift` is not one either. A
+   * fleet whose runners are demonstrably live and working (the register-
+   * before-route gate — {@link routingItem}'s own `observed.routingRunnerRegistered`
+   * check) is reported here exactly the same as any other self-hosted
+   * declaration would be — a manifest-level guess about what the router CAN
+   * convey is orthogonal to whether a runner is ALREADY live and answering
+   * real work; this field never outranks that live observation, it only
+   * ever adds a named fact alongside it.
+   */
+  readonly runnerDeclarationMismatches: readonly RunnerDeclarationFinding[];
 }
 
 /**
@@ -2699,6 +2755,27 @@ export function computePlan(
     installScopeDrift.push({ role: agent.role, appHandle, observed: observedSelection, message });
   }
 
+  // groundnuty/macf#1335 — surfaces a `routing.runner.runs_on: self-hosted`
+  // declaration the INSTALLED router cannot convey, without being asked (the
+  // detection half of #1194 the standalone #1334 CLI left unwired). Pure —
+  // consumes `observed.agents[role].actionsPin`/`.routerWithKeys`, fields
+  // `observer.ts::githubRegistryObserver` already populated from its OWN
+  // single per-agent read; NO second read happens here. `declaredRunsOn` is
+  // read straight from the manifest (`--runs-on` is never a thing this path
+  // takes — the standalone CLI's own flag stays exactly what it was, this
+  // is a SEPARATE, manifest-sourced call). Only verdicts other than
+  // `'not-applicable'` are pushed — a hosted (or undeclared) fleet
+  // contributes zero entries, same "no row, no noise" gate the verdict
+  // itself already encodes.
+  const declaredRunsOn = manifest.routing?.runner?.runs_on;
+  const runnerDeclarationMismatches: RunnerDeclarationFinding[] = [];
+  for (const agent of manifest.agents) {
+    const obs = observed.agents[agent.role];
+    const finding = evaluateRunnerDeclarationReachFromObservation(agent.repo, declaredRunsOn, obs?.actionsPin, obs?.routerWithKeys);
+    if (finding.verdict === 'not-applicable') continue;
+    runnerDeclarationMismatches.push(finding);
+  }
+
   return {
     fleet: fleetName,
     items,
@@ -2708,6 +2785,7 @@ export function computePlan(
     registryRepoScopeNotices: registryRepoScopeNotice !== undefined ? [registryRepoScopeNotice] : [],
     installScopeDrift,
     scopeCredentials,
+    runnerDeclarationMismatches,
   };
 }
 
@@ -2891,6 +2969,36 @@ export function formatInstallScopeDriftLines(drift: readonly InstallScopeDrift[]
  */
 export function formatScopeCredentialLines(notices: readonly ScopeCredentialNotice[]): readonly string[] {
   return notices.map((n) => `scope_credential: NOTICE — ${n.message}`);
+}
+
+/**
+ * groundnuty/macf#1335 — one line per {@link RunnerDeclarationFinding} in
+ * {@link FleetPlan.runnerDeclarationMismatches} (already excludes
+ * `'not-applicable'` — `computePlan` filters it before this array is ever
+ * built). Tagged with the SAME verdict vocabulary the standalone `macf
+ * routing runner-declaration-check` CLI uses (`NOT HONOURED` / `UNKNOWN` /
+ * `UNCERTAIN`) — one source of truth for what these words mean, whether the
+ * operator reads a `plan` render or runs that command directly.
+ */
+export function formatRunnerDeclarationLines(findings: readonly RunnerDeclarationFinding[]): readonly string[] {
+  return findings.map((f) => `runner_declaration: ${runnerDeclarationTag(f.verdict)} — ${f.message}`);
+}
+
+function runnerDeclarationTag(verdict: RunnerDeclarationFinding['verdict']): string {
+  switch (verdict) {
+    case 'not-honoured':
+      return 'NOT HONOURED';
+    case 'unknown':
+      return 'UNKNOWN';
+    case 'honoured':
+      return 'UNCERTAIN';
+    case 'not-applicable':
+      // Never reached — `computePlan` filters this verdict out before it
+      // ever reaches `FleetPlan.runnerDeclarationMismatches`; kept here so
+      // this switch stays exhaustive over `RunnerDeclarationVerdict` rather
+      // than relying on that invariant silently.
+      return 'N/A';
+  }
 }
 
 // --- Operator interaction budget (groundnuty/macf#880, DR-044 Decision 6) ---
@@ -3152,6 +3260,10 @@ export function formatPlanText(plan: FleetPlan): string {
   if (scopeCredentialLines.length > 0) {
     parts.push('', ...scopeCredentialLines);
   }
+  const runnerDeclarationLines = formatRunnerDeclarationLines(plan.runnerDeclarationMismatches);
+  if (runnerDeclarationLines.length > 0) {
+    parts.push('', ...runnerDeclarationLines);
+  }
   return parts.join('\n');
 }
 
@@ -3194,6 +3306,12 @@ export function fleetPlanToJson(plan: FleetPlan): unknown {
     ...(plan.installScopeDrift.length > 0 ? { install_scope_drift: plan.installScopeDrift.map((i) => ({ ...i })) } : {}),
     // groundnuty/macf#1162 — SAME omitted-when-empty convention, same reason.
     ...(plan.scopeCredentials.length > 0 ? { scope_credentials: plan.scopeCredentials.map((i) => ({ ...i })) } : {}),
+    // groundnuty/macf#1335 — SAME omitted-when-empty convention, same reason:
+    // a fleet that never declares `routing.runner.runs_on: self-hosted` (or
+    // whose declaration IS honoured) keeps a byte-identical pre-#1335 shape.
+    ...(plan.runnerDeclarationMismatches.length > 0
+      ? { runner_declaration_mismatches: plan.runnerDeclarationMismatches.map((f) => ({ ...f })) }
+      : {}),
   };
 }
 
