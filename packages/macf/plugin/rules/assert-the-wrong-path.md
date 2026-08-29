@@ -32,6 +32,27 @@ bootstrap-apply.ts  unimplementedByApply          7   ← a control: this file i
 
 > **A zero is discharged by a sibling that would have matched, not by the file's size.**
 
+**And when the question is *"is this THING ever guarded?"* rather than *"does this CLASS live here?"*, the subject is its own best control.** Two measurements of one identifier — how often it is USED, and how often it is TESTED:
+
+```
+secret                 uses   emptiness/conditional tests
+ROUTING_CLIENT_CERT       8                             0
+the other six             4                             0
+```
+
+**The non-zero use count is what makes the zero mean something.** A file where these were never referenced would make *"no guards"* vacuous; **8 uses and 0 tests is a claim about one identifier, measured twice.**
+
+> **A sibling control assumes the sibling is analogous. A self-control cannot fail to be analogous to itself.**
+
+**Two absence-questions, two controls:**
+
+```
+"does this CLASS live in this file?"   →  a SIBLING that would have matched
+"is this THING ever guarded?"          →  the thing's OWN use count
+```
+
+**Prefer the self-control wherever the question admits it** — it carries no analogy assumption. Fall back to a sibling when the subject would legitimately appear zero times either way, which is the class-membership case above.
+
 **And the sibling check is better because both outcomes are informative:**
 
 ```
