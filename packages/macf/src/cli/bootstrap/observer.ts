@@ -340,6 +340,71 @@ export async function checkRepoSecretPresence(repo: string, name: string): Promi
 }
 
 /**
+ * One repo's observed Actions-secret NAME list (groundnuty/macf#1336) —
+ * `names` carries `{name, created_at, updated_at}`'s `name` field ONLY;
+ * GitHub's secrets API is write-only (same floor {@link checkRepoSecretPresence}'s
+ * own doc states), so this type structurally cannot carry a value — there is
+ * no field for one. `'unknown'` is Amendment A's honest-unknown floor: a
+ * repo this run could not confirm visible, or whose secrets listing failed
+ * for any reason, is `'unknown'` — `routing-secret-parity.ts`'s aggregation
+ * NEVER treats an `'unknown'` repo as agreeing with either side of a
+ * present/absent split (see that module's own doc).
+ */
+export type RepoSecretNamesObservation =
+  | { readonly status: 'confirmed'; readonly names: ReadonlySet<string> }
+  | { readonly status: 'unknown'; readonly reason: string };
+
+/**
+ * Read-only repo-scoped Actions-SECRETS LIST (groundnuty/macf#1336) — lists
+ * every secret NAME configured on a repo in ONE call, the batch sibling of
+ * {@link checkRepoSecretPresence}'s single-name read. `routing-secret-parity.ts`'s
+ * per-repo asymmetry sweep needs presence for 6 tracked names per repo; one
+ * list call here is cheaper than 6 single-name reads
+ * (`checkRepoSecretPresence` × 6) and, like that read, this endpoint is
+ * write-only — GitHub returns only `{name, created_at, updated_at}` per
+ * entry, NEVER a value; this function reads (and this module's own type
+ * carries) `.name` ONLY.
+ *
+ * Same live-read shape `fleet-verdict.ts::realListOrgSecretsVisibleToRepo`
+ * already establishes for the ORG-secrets sibling endpoint
+ * (`--paginate` + `--jq '.secrets[].name'` + newline-split stdout, never a
+ * `JSON.parse` of a nested array) — reused here for the REPO-secrets
+ * endpoint rather than inventing a second parsing convention. `--paginate`
+ * is load-bearing for the identical reason that module's doc gives: a repo
+ * with more than 30 secrets (the default page size) would otherwise read as
+ * falsely truncated past page 1.
+ *
+ * Callers MUST only invoke this once the repo's own existence is
+ * independently confirmed `'present'` (macf#1026's gated-visibility
+ * discipline — same floor `resolveAgentRepoState` already enforces for its
+ * own CA/routing-client presence trio; this function does not re-derive
+ * that itself). NEVER throws — ANY failure (network/auth/gh/permission)
+ * degrades to `'unknown'` with a diagnostic reason. Unlike
+ * {@link checkRepoSecretPresence}'s single-name read, this function does NOT
+ * treat a 404 as confident-empty: a 404/403 on the COLLECTION endpoint for
+ * an already-confirmed-visible repo is unusual enough (a scope/permission
+ * gap, not "genuinely zero secrets" — an empty repo returns
+ * `{total_count: 0, secrets: []}`, HTTP 200) that inventing a confident
+ * "absent" for every tracked name from it would risk a false split/uniform
+ * verdict — Amendment A's honest-unknown floor.
+ */
+export async function listRepoSecretNames(repo: string): Promise<RepoSecretNamesObservation> {
+  try {
+    const { stdout } = await execFileAsync('gh', ['api', '--paginate', `repos/${repo}/actions/secrets`, '--jq', '.secrets[].name'], {
+      encoding: 'utf-8',
+    });
+    const names = stdout
+      .split('\n')
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+    return { status: 'confirmed', names: new Set(names) };
+  } catch (err) {
+    const stderr = getStderr(err);
+    return { status: 'unknown', reason: `gh api repos/${repo}/actions/secrets failed: ${stderr || 'unknown error'}` };
+  }
+}
+
+/**
  * Injectable seam for {@link resolveAgentRepoState} — same "pure composition
  * over injected deps, testable without `execFile`" shape
  * {@link checkRunnerUsableByRepo}'s `RunnerUsabilityDeps` already establishes
@@ -1344,6 +1409,14 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
   // publish step uses (`RoutingClientApplyDeps.checkRepoSecretPresence`), so
   // plan and apply agree on presence by construction.
   const routingClientRepos: Record<string, Presence> = {};
+  // groundnuty/macf#1336 — every routing secret's per-repo NAME-list
+  // observation, the input `routing-secret-parity.ts::findRoutingSecretAsymmetries`
+  // compares across the fleet's agent repos. Kept SEPARATE from `caRepos`/
+  // `routingClientRepos` above (which each check ONE representative
+  // variable/secret as a proxy for "has this repo received its identity")
+  // because the asymmetry sweep needs ALL SIX tracked secret names per repo,
+  // not a single proxy — see that module's own doc.
+  const routingSecretRepos: Record<string, RepoSecretNamesObservation> = {};
   // groundnuty/macf#1128 — already-provisioned-fleet install-scope drift
   // detection: ONE `GET /orgs/{org}/installations` call (never per-agent —
   // the listing already enumerates every App on the org in one shot),
@@ -1384,6 +1457,16 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
     // module's control-repo observation already uses (below) — one reader
     // per fact, not a second `{archived}` primitive.
     const repoArchivedMeta = await checkRepoArchivedState(agent.repo);
+    // groundnuty/macf#1336 — same macf#1026 gated-visibility discipline
+    // `repoState`'s own CA/routing-client trio already applies: only listed
+    // live once THIS run has independently confirmed the repo itself
+    // `'present'`; otherwise `'unknown'` with `repoState`'s own diagnostic
+    // reason (never a guessed absence for a repo this token may not even be
+    // entitled to see).
+    const routingSecretNames: RepoSecretNamesObservation =
+      repoState.repo === 'present'
+        ? await listRepoSecretNames(agent.repo)
+        : { status: 'unknown', reason: repoState.reason ?? 'repo presence unconfirmed this run' };
     agents[agent.role] = {
       app: lockEntry ? 'present' : 'unknown',
       appId: lockEntry?.app_id,
@@ -1400,6 +1483,7 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
     };
     caRepos[agent.repo] = repoState.caRepo;
     routingClientRepos[agent.repo] = repoState.routingClientRepo;
+    routingSecretRepos[agent.repo] = routingSecretNames;
   }
 
   // groundnuty/macf#1271 (disclosed by #1270's own body) — row 4 of the
@@ -1559,6 +1643,7 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
     caRegistry,
     caRepos,
     routingClientRepos,
+    routingSecretRepos,
     routingTrustedActors,
     routingRunnerRegistered,
     routingRunnerHandover,

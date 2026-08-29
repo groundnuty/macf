@@ -16,6 +16,7 @@ import {
   formatOrphanLines,
   formatPlanText,
   formatRegistryScopeLines,
+  formatRoutingSecretAsymmetryLines,
   formatScopeCredentialLines,
   formatSkippedLines,
   formatUnimplementedLines,
@@ -35,13 +36,20 @@ import {
   type Presence,
 } from '../../../src/cli/bootstrap/plan.js';
 import { RUNNER_TOKEN_ENV_VAR, RUNNER_TOKEN_FLAG } from '../../../src/cli/bootstrap/apply-routing.js';
-import { TS_OAUTH_CLIENT_ID_FLAG, TS_OAUTH_SECRET_FLAG } from '../../../src/cli/bootstrap/apply-routing-secrets.js';
+import {
+  TS_OAUTH_CLIENT_ID_FLAG,
+  TS_OAUTH_CLIENT_ID_SECRET_NAME,
+  TS_OAUTH_SECRET_FLAG,
+  TS_OAUTH_SECRET_SECRET_NAME,
+} from '../../../src/cli/bootstrap/apply-routing-secrets.js';
 import { REGISTRY_SCOPE_UNSATISFIABLE_CODE } from '../../../src/cli/bootstrap/registry-scope-preflight.js';
 import { validateInstallRepositoryScope } from '../../../src/cli/bootstrap/install-scope.js';
 import type { RunnerPlatformEndpointSource } from '../../../src/cli/bootstrap/runner-platform.js';
 import { installScopeCoverageDriftMessage, type InstallScopeCoverageEntry } from '../../../src/cli/bootstrap/install-scope-coverage.js';
 import { RUNNER_OPS_ROLE } from '../../../src/cli/bootstrap/apply-runner-ops.js';
 import { ROUTER_APP_ROLE } from '../../../src/cli/bootstrap/apply-router-app.js';
+import { ROUTING_CLIENT_CERT_SECRET_NAME } from '../../../src/cli/bootstrap/apply-routing-client.js';
+import type { RepoSecretNamesObservation } from '../../../src/cli/bootstrap/observer.js';
 
 /** A minimal, valid, 2-agent manifest — no optional sections. */
 function baseManifest(overrides: Partial<FleetManifest> = {}): FleetManifest {
@@ -3004,6 +3012,140 @@ describe('computePlan scopeCredentials — router App scope-level provenance not
     expect(declared.message).not.toBe(undeclared.message);
     expect(declared.originFleet).toBe('origin-fleet');
     expect(undeclared.originFleet).toBeUndefined();
+  });
+});
+
+// --- groundnuty/macf#1336 — per-repo routing-secret asymmetry: a fleet-level
+// NOOP (`tsOauthItem`) hides a repo-level split. The DECISIVE PAIR here is
+// asserted against `formatPlanText`'s RENDERED output (not just
+// `plan.routingSecretAsymmetries`'s return value) — per `assert-the-wrong-path.md`,
+// the mutation test that matters is one that fails when the wiring from
+// `observed.routingSecretRepos` through `computePlan` through `formatPlanText`
+// breaks, not merely when the underlying pure function's own logic breaks
+// (that's `routing-secret-parity.test.ts`'s job). `baseManifest()`'s two
+// agent repos are the "some repos" / "all repos" fixture throughout. ---
+describe('computePlan routingSecretAsymmetries — per-repo routing-secret split (groundnuty/macf#1336)', () => {
+  const [SCIENCE_REPO, CODE_REPO] = baseManifest().agents.map((a) => a.repo) as [string, string];
+
+  function confirmed(...names: readonly string[]): RepoSecretNamesObservation {
+    return { status: 'confirmed', names: new Set(names) };
+  }
+
+  it('is empty (and the key omitted from --json, and no line in the rendered text) when nothing was observed', () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
+    expect(plan.routingSecretAsymmetries).toEqual([]);
+    const json = fleetPlanToJson(plan) as Record<string, unknown>;
+    expect('routing_secret_asymmetries' in json).toBe(false);
+    expect(formatPlanText(plan)).not.toContain('routing_secret:');
+  });
+
+  it('DECISIVE 1/2: TS_OAUTH present on SOME repos -> the RENDERED plan text names which repo lacks it', () => {
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      routingSecretRepos: {
+        [SCIENCE_REPO]: confirmed(TS_OAUTH_CLIENT_ID_SECRET_NAME, TS_OAUTH_SECRET_SECRET_NAME),
+        [CODE_REPO]: confirmed(), // the newer/colder repo — neither secret
+      },
+    };
+    const plan = computePlan(baseManifest(), observed);
+    expect(plan.routingSecretAsymmetries).toHaveLength(2); // both TS_OAUTH_CLIENT_ID and TS_OAUTH_SECRET split the same way
+    const text = formatPlanText(plan);
+    expect(text).toContain('routing_secret: WARNING');
+    expect(text).toContain(TS_OAUTH_CLIENT_ID_SECRET_NAME);
+    expect(text).toContain(CODE_REPO); // the ABSENT repo is named
+    const json = fleetPlanToJson(plan) as { routing_secret_asymmetries: readonly { secretName: string; absentRepos: readonly string[] }[] };
+    expect(json.routing_secret_asymmetries.find((f) => f.secretName === TS_OAUTH_CLIENT_ID_SECRET_NAME)?.absentRepos).toEqual([CODE_REPO]);
+  });
+
+  it('DECISIVE 2/2: TS_OAUTH present on ALL repos -> the rendered plan text carries NO asymmetry line — uniform is the satisfied state', () => {
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      routingSecretRepos: {
+        [SCIENCE_REPO]: confirmed(TS_OAUTH_CLIENT_ID_SECRET_NAME, TS_OAUTH_SECRET_SECRET_NAME),
+        [CODE_REPO]: confirmed(TS_OAUTH_CLIENT_ID_SECRET_NAME, TS_OAUTH_SECRET_SECRET_NAME),
+      },
+    };
+    const plan = computePlan(baseManifest(), observed);
+    expect(plan.routingSecretAsymmetries).toEqual([]);
+    expect(formatPlanText(plan)).not.toContain('routing_secret:');
+  });
+
+  it('DECISIVE 2/2 (sibling): TS_OAUTH present on NONE of the repos -> NO asymmetry line — uniform absence is undeclared, not a drift, and must not render identically to a genuine split', () => {
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      routingSecretRepos: {
+        [SCIENCE_REPO]: confirmed(),
+        [CODE_REPO]: confirmed(),
+      },
+    };
+    const plan = computePlan(baseManifest(), observed);
+    expect(plan.routingSecretAsymmetries).toEqual([]);
+    expect(formatPlanText(plan)).not.toContain('routing_secret:');
+  });
+
+  it('a repo whose secret list could not be read renders `unknown` (via the finding\'s unknownRepos) — never silently "consistent" with the confirmed repos', () => {
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      routingSecretRepos: {
+        [SCIENCE_REPO]: confirmed(TS_OAUTH_CLIENT_ID_SECRET_NAME),
+        [CODE_REPO]: { status: 'unknown', reason: 'this token cannot see "groundnuty/icsoc-2026-experiment" (HTTP 404)' },
+      },
+    };
+    const plan = computePlan(baseManifest(), observed);
+    // Only ONE confirmed repo (present) — nothing to compare against, so no
+    // split is reported. But the unreadable repo must not be silently
+    // absorbed as "confirmed absent" or "confirmed present" either — assert
+    // that directly against the underlying observation the render is built
+    // from, not just the (empty, in this branch) findings array.
+    expect(plan.routingSecretAsymmetries).toEqual([]);
+    expect(observed.routingSecretRepos?.[CODE_REPO]?.status).toBe('unknown');
+  });
+
+  it('ROUTING_CLIENT_CERT gets the SAME per-repo asymmetry treatment as TS_OAUTH — this is not a TS_OAUTH-only check', () => {
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      routingSecretRepos: {
+        [SCIENCE_REPO]: confirmed(ROUTING_CLIENT_CERT_SECRET_NAME),
+        [CODE_REPO]: confirmed(),
+      },
+    };
+    const plan = computePlan(baseManifest(), observed);
+    expect(plan.routingSecretAsymmetries.map((f) => f.secretName)).toContain(ROUTING_CLIENT_CERT_SECRET_NAME);
+    expect(formatPlanText(plan)).toContain(ROUTING_CLIENT_CERT_SECRET_NAME);
+  });
+
+  it('a repo the fleet does not own is not consulted — an unrelated repo present in `routingSecretRepos` but absent from the manifest never surfaces', () => {
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      routingSecretRepos: {
+        [SCIENCE_REPO]: confirmed(TS_OAUTH_CLIENT_ID_SECRET_NAME, TS_OAUTH_SECRET_SECRET_NAME),
+        [CODE_REPO]: confirmed(TS_OAUTH_CLIENT_ID_SECRET_NAME, TS_OAUTH_SECRET_SECRET_NAME),
+        'groundnuty/some-other-fleet-repo': confirmed(), // not one of this fleet's declared agents
+      },
+    };
+    const plan = computePlan(baseManifest(), observed);
+    expect(plan.routingSecretAsymmetries).toEqual([]); // both DECLARED repos are uniform; the extra repo must never be consulted
+  });
+
+  it('the rendered output never contains a secret VALUE — only names and repo identifiers', () => {
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      routingSecretRepos: {
+        [SCIENCE_REPO]: confirmed(TS_OAUTH_CLIENT_ID_SECRET_NAME),
+        [CODE_REPO]: confirmed(),
+      },
+    };
+    const plan = computePlan(baseManifest(), observed);
+    const text = formatPlanText(plan);
+    expect(text).not.toMatch(/ghs_|ghp_|gho_|ghu_|-----BEGIN/);
+  });
+
+  it('formatRoutingSecretAsymmetryLines — one line per entry, "routing_secret: WARNING — <message>"', () => {
+    expect(
+      formatRoutingSecretAsymmetryLines([
+        { secretName: TS_OAUTH_CLIENT_ID_SECRET_NAME, presentRepos: ['a'], absentRepos: ['b'], unknownRepos: [], message: 'the split text' },
+      ]),
+    ).toEqual(['routing_secret: WARNING — the split text']);
   });
 });
 

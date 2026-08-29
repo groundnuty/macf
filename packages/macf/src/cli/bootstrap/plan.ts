@@ -140,6 +140,18 @@ import { evaluateRunnerDeclarationReachFromObservation, type RunnerDeclarationFi
 // one-directional-runtime-dependency shape this file documents repeatedly
 // for `apply-routing.js`/`apply-router-app.js`/`runner-platform.js` above.
 import type { InstallScopeCoverageEntry } from './install-scope-coverage.js';
+// groundnuty/macf#1336 — `observer.ts` already `import type`s `Presence`/
+// `ObservedState`/etc FROM this module (existing, unchanged); a type-only
+// import back for its `RepoSecretNamesObservation` is the SAME
+// acyclic-at-runtime shape every sibling import in this block establishes
+// (both directions erased entirely by `verbatimModuleSyntax` — no runtime
+// edge either way).
+import type { RepoSecretNamesObservation } from './observer.js';
+// groundnuty/macf#1336 — `routing-secret-parity.ts` only ever `import type`s
+// `Presence` from THIS module (same one-directional-runtime-dependency
+// shape `apply-routing-secrets.js`/`install-scope-coverage.js` above already
+// establish), so this value import creates no runtime cycle.
+import { findRoutingSecretAsymmetries, type RoutingSecretAsymmetry } from './routing-secret-parity.js';
 // groundnuty/macf#1281 — reuses `app-identity-removal.ts`'s OWN
 // org/user-branching App-Advanced-tab URL (the exact convention this issue's
 // AC says to read first, not reinvent) for a row-4 App-orphan item's
@@ -351,6 +363,21 @@ export interface ObservedState {
    * explicit `'unknown'` (see `computePlan`'s call site).
    */
   readonly routingClientRepos?: Readonly<Record<string, Presence>>;
+  /**
+   * Per-agent-repo routing-secret NAME-LIST observation (groundnuty/macf#1336),
+   * keyed by `agent.repo` — the input `routing-secret-parity.ts::findRoutingSecretAsymmetries`
+   * compares across the fleet's repos for EACH of the six routing secrets
+   * (`ROUTING_CLIENT_CERT`/`ROUTING_CLIENT_KEY`/`MACF_ROUTING_APP_ID`/
+   * `MACF_ROUTING_APP_KEY`/`TS_OAUTH_CLIENT_ID`/`TS_OAUTH_SECRET`), not just
+   * the single representative secret `routingClientRepos` above checks.
+   * Sourced from `observer.ts::listRepoSecretNames` — presence-only (NAMES
+   * only; GitHub's secrets API never returns a value, and this type has no
+   * field for one). Optional so every pre-#1336 hand-built `ObservedState`
+   * test fixture keeps compiling — an absent entry for a repo reads
+   * identically to an explicit `'unknown'` (see
+   * `routing-secret-parity.ts::secretPresenceFor`).
+   */
+  readonly routingSecretRepos?: Readonly<Record<string, RepoSecretNamesObservation>>;
   /**
    * Vault-derived per-project CA key/cert presence (DR-043 Amendment D phase
    * 3) — same undefined-vs-observed convention as {@link ObservedAgentState.vault}.
@@ -671,6 +698,18 @@ export interface FleetPlan {
    * ever adds a named fact alongside it.
    */
   readonly runnerDeclarationMismatches: readonly RunnerDeclarationFinding[];
+  /**
+   * groundnuty/macf#1336 — zero-to-N per-secret findings, one per routing
+   * secret genuinely SPLIT across the fleet's agent repos (present on some,
+   * absent on others — see `routing-secret-parity.ts::findRoutingSecretAsymmetries`'s
+   * doc for the full three-way verdict; only the split branch ever produces
+   * an entry here). ALWAYS present on the TYPE (empty array when every
+   * tracked secret is uniform or unconfirmed — same "always present, empty
+   * when nothing applies" convention as {@link skippedSections} /
+   * {@link installScopeDrift}); `--json` omits the key entirely when empty,
+   * same convention every sibling notice array above follows.
+   */
+  readonly routingSecretAsymmetries: readonly RoutingSecretAsymmetry[];
 }
 
 /**
@@ -2776,6 +2815,17 @@ export function computePlan(
     runnerDeclarationMismatches.push(finding);
   }
 
+  // groundnuty/macf#1336 — the per-repo routing-secret asymmetry sweep:
+  // pure, over ALREADY-OBSERVED `observed.routingSecretRepos` data (no I/O
+  // here, matching this function's own invariant). `repos` is the fleet's
+  // OWN declared agent repos, never a live enumeration of the owner's other
+  // repos — see `findRoutingSecretAsymmetries`'s doc for why that alone
+  // guarantees a repo the fleet does not own is never consulted.
+  const routingSecretAsymmetries = findRoutingSecretAsymmetries(
+    manifest.agents.map((a) => a.repo),
+    observed.routingSecretRepos ?? {},
+  );
+
   return {
     fleet: fleetName,
     items,
@@ -2786,6 +2836,7 @@ export function computePlan(
     installScopeDrift,
     scopeCredentials,
     runnerDeclarationMismatches,
+    routingSecretAsymmetries,
   };
 }
 
@@ -2999,6 +3050,17 @@ function runnerDeclarationTag(verdict: RunnerDeclarationFinding['verdict']): str
       // than relying on that invariant silently.
       return 'N/A';
   }
+}
+
+/**
+ * groundnuty/macf#1336 — one line per {@link RoutingSecretAsymmetry}.
+ * `WARNING` (not `NOTICE`) — same reasoning `formatInstallScopeDriftLines`
+ * already states for its own choice: this is a LIVE observed fact about an
+ * EXISTING split (some repos already have the secret, some don't), not a
+ * manifest-derived heads-up about a future state.
+ */
+export function formatRoutingSecretAsymmetryLines(asymmetries: readonly RoutingSecretAsymmetry[]): readonly string[] {
+  return asymmetries.map((a) => `routing_secret: WARNING — ${a.message}`);
 }
 
 // --- Operator interaction budget (groundnuty/macf#880, DR-044 Decision 6) ---
@@ -3264,6 +3326,10 @@ export function formatPlanText(plan: FleetPlan): string {
   if (runnerDeclarationLines.length > 0) {
     parts.push('', ...runnerDeclarationLines);
   }
+  const routingSecretAsymmetryLines = formatRoutingSecretAsymmetryLines(plan.routingSecretAsymmetries);
+  if (routingSecretAsymmetryLines.length > 0) {
+    parts.push('', ...routingSecretAsymmetryLines);
+  }
   return parts.join('\n');
 }
 
@@ -3311,6 +3377,12 @@ export function fleetPlanToJson(plan: FleetPlan): unknown {
     // whose declaration IS honoured) keeps a byte-identical pre-#1335 shape.
     ...(plan.runnerDeclarationMismatches.length > 0
       ? { runner_declaration_mismatches: plan.runnerDeclarationMismatches.map((f) => ({ ...f })) }
+      : {}),
+    // groundnuty/macf#1336 — SAME omitted-when-empty convention, same reason:
+    // byte-identical `--json` output for a fleet with no genuinely SPLIT
+    // routing secret this run.
+    ...(plan.routingSecretAsymmetries.length > 0
+      ? { routing_secret_asymmetries: plan.routingSecretAsymmetries.map((i) => ({ ...i })) }
       : {}),
   };
 }
