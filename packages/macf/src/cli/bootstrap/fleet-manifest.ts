@@ -716,6 +716,50 @@ export const FleetLockAgentSchema = z
   .strict();
 
 /**
+ * groundnuty/macf#1330 — the LAST-APPROVED age recipient set for ONE
+ * federated collaborator (`project` matches {@link FleetCollaboratorSchema.project},
+ * `#786`'s home-project identifier). Sibling to {@link FleetLockAgentSchema},
+ * added the same additive-optional way `repo` was in `#1300` — but keyed by
+ * `project`, not `role`: a collaborator is a peer fleet, never one of this
+ * fleet's own agents.
+ *
+ * **Why this lives on the LOCK, not `FleetCollaboratorSchema` (the manifest)
+ * — settled on `#1330`, not this codebase's own inference.** A peer's
+ * recipient set is not something this fleet DECLARES (the manifest is
+ * intent — what the operator wants); it is something this fleet is TOLD and
+ * must REMEMBER (the lock is fact — what was last observed/approved). The
+ * eventual live value ({@link FleetCollaboratorSchema}'s own doc notes
+ * `collaborators:` reconciliation is day-2, not yet implemented — `plan.ts`'s
+ * `skipped_sections`) comes from asking the peer over the authenticated
+ * channel (`#789`, not live yet); this field is what PINS that answer once
+ * approved, so a re-ask can be compared against something durable instead of
+ * trusted blind every time. `#1330`'s ruling: *"the CHANNEL supplies the
+ * peer's CURRENT set (fresh, authenticated, unpinned); fleet.lock pins the
+ * LAST-APPROVED set (what we agreed to, recorded); the guard fires on the
+ * DIFF between them."* See `federated-age-recipients.ts` for that guard.
+ *
+ * `age_recipients` here follows the SAME `[]`-is-a-real-empty-set /
+ * absent-is-unknown convention {@link FleetLockSchema.age_recipients}
+ * already establishes for THIS fleet's own set — scoped per collaborator:
+ * NO ENTRY for a project in {@link FleetLockSchema.collaborators} means
+ * "never federated (or never approved) yet, nothing recorded" (honest
+ * unknown — `#1330`'s AC, mirroring `#1252`'s rule); an entry WITH
+ * `age_recipients: []` means "recorded, and the peer had zero recipients at
+ * last approval" (a real, comparable fact, not a gap). PUBLIC keys — safe to
+ * commit verbatim, same posture the top-level `age_recipients` field
+ * already takes (`#1330`'s own AC: "the recipient set is public key
+ * material... a reader may assume the same sensitivity" as the adjacent
+ * `ca_bundle`, so this doc states it explicitly).
+ */
+export const FleetLockCollaboratorSchema = z
+  .object({
+    project: z.string().min(1),
+    age_recipients: z.array(z.string().min(1)),
+  })
+  .strict();
+export type FleetLockCollaborator = z.infer<typeof FleetLockCollaboratorSchema>;
+
+/**
  * groundnuty/macf#1162 — provenance-only marker for a credential this fleet
  * holds a LOCAL COPY of rather than one it minted/confirmed itself (today:
  * only the router App's `'vault-reused'` cross-fleet-shared-scope outcome —
@@ -863,6 +907,34 @@ export const FleetLockSchema = z
      * ordered list).
      */
     age_recipients_removed_by_override: z.array(z.string().min(1)).optional(),
+    /**
+     * groundnuty/macf#1330 — the last-approved age recipient set PER
+     * FEDERATED PEER (`FleetLockCollaboratorSchema`, keyed by `project`) —
+     * distinct from {@link age_recipients} immediately above (which records
+     * THIS fleet's OWN set). See that schema's doc for why the value lives
+     * here (fact, observed/approved) rather than on `FleetCollaboratorSchema`
+     * in `fleet.yaml` (intent, declared) — `#1330`'s ruling: the manifest
+     * cannot declare a peer's keys because this fleet does not choose them.
+     *
+     * `undefined` when this fleet has never federated (or never approved a
+     * federation for) any peer — distinct from `[]`, which this field never
+     * takes at the array level (an empty array here would mean "federated
+     * zero peers," a state indistinguishable from "never touched"; `#1330`
+     * follows `scope_credentials`'s own "omit rather than write a vacuous
+     * empty collection" convention for that reason). Per-entry, EACH
+     * collaborator's `age_recipients` DOES carry the real `[]`-vs-absent
+     * distinction — see `FleetLockCollaboratorSchema`'s own doc.
+     *
+     * Sorted by `project` for {@link serializeFleetLock}'s determinism
+     * contract (unlike {@link age_recipients}, where POSITION within one
+     * peer's set is real information and is preserved — but the ORDER OF
+     * PEERS carries no such meaning, same reasoning `scope_credentials`
+     * sorting by `role` already applies at this array's sibling level).
+     *
+     * Added as a NEW optional field, no `FLEET_LOCK_SCHEMA_VERSION` bump —
+     * same precedent `scope_credentials` / `age_recipients` already set.
+     */
+    collaborators: z.array(FleetLockCollaboratorSchema).optional(),
   })
   .strict();
 
