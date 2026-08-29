@@ -784,6 +784,62 @@ agents: []
     });
   });
 
+  // groundnuty/macf#1330 — FleetLockSchema gains an optional `collaborators`
+  // array, the LAST-APPROVED age recipient set per federated peer (see
+  // `FleetLockCollaboratorSchema`'s own doc for why this lives on the lock,
+  // not `FleetCollaboratorSchema` in the manifest).
+  describe('collaborators (groundnuty/macf#1330 — federated peer recipient sets)', () => {
+    it('parses a lock declaring a federated collaborator with a recorded set', () => {
+      const withCollaborator = `${VALID_LOCK_YAML}collaborators:\n  - project: ppam-2026\n    age_recipients:\n      - age1a\n      - age1b\n`;
+      const lock = parseFleetLock(withCollaborator);
+      expect(lock.collaborators).toEqual([{ project: 'ppam-2026', age_recipients: ['age1a', 'age1b'] }]);
+    });
+
+    // DECISIVE: every existing fleet's lock predates this field — a lock
+    // with no `collaborators:` key at all must parse with the field
+    // UNDEFINED, never a fabricated empty array. `#1252`'s exact lesson,
+    // restated for the federated case per `#1330`'s own AC.
+    it('DECISIVE: a lock with no "collaborators" key parses fine, with collaborators undefined — never fabricated', () => {
+      const lock = parseFleetLock(VALID_LOCK_YAML);
+      expect(lock.collaborators).toBeUndefined();
+      expect('collaborators' in lock).toBe(false);
+    });
+
+    // DECISIVE: an entry's age_recipients: [] is a REAL, recorded fact (this
+    // peer had zero recipients at last approval) — distinct from the entry
+    // being absent entirely (unknown). Must parse, not be rejected or
+    // silently coerced.
+    it('DECISIVE: a collaborator entry with an explicit empty age_recipients parses as a real recorded fact, not a schema violation', () => {
+      const withEmpty = `${VALID_LOCK_YAML}collaborators:\n  - project: ppam-2026\n    age_recipients: []\n`;
+      const lock = parseFleetLock(withEmpty);
+      expect(lock.collaborators).toEqual([{ project: 'ppam-2026', age_recipients: [] }]);
+    });
+
+    it('rejects a collaborator entry missing age_recipients entirely (required, not optional — unlike the entry\'s own presence in the array)', () => {
+      const missing = `${VALID_LOCK_YAML}collaborators:\n  - project: ppam-2026\n`;
+      expect(() => parseFleetLock(missing)).toThrow();
+    });
+
+    it('rejects a collaborator entry with an empty-string project (min(1), same discipline as agents[].role)', () => {
+      const bad = `${VALID_LOCK_YAML}collaborators:\n  - project: ""\n    age_recipients: []\n`;
+      expect(() => parseFleetLock(bad)).toThrow();
+    });
+
+    it('rejects an unknown key inside a collaborator entry (typo protection, same .strict() discipline as every other lock sub-schema)', () => {
+      const bad = `${VALID_LOCK_YAML}collaborators:\n  - project: ppam-2026\n    age_recipients: []\n    ca_bundle: "not-a-lock-field"\n`;
+      expect(() => parseFleetLock(bad)).toThrow();
+    });
+
+    it('parses multiple federated peers, each with its own independently-recorded set', () => {
+      const multi = `${VALID_LOCK_YAML}collaborators:\n  - project: ppam-2026\n    age_recipients:\n      - age1a\n  - project: other-fleet\n    age_recipients: []\n`;
+      const lock = parseFleetLock(multi);
+      expect(lock.collaborators).toEqual([
+        { project: 'ppam-2026', age_recipients: ['age1a'] },
+        { project: 'other-fleet', age_recipients: [] },
+      ]);
+    });
+  });
+
   // groundnuty/macf#1310 — `fleet_fingerprints` (fleet-level) vs
   // `fingerprints` (per-agent, unchanged) naming-collision fix. Science's
   // ruling: "fingerprints at fleet level and fingerprints per agent should
