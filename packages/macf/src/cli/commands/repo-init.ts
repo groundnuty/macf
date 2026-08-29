@@ -9,7 +9,7 @@ import { resolveActionsRefToFullTag, isImmutableActionsTag } from '../version-re
 import { detectStaleDist } from '../build-info.js';
 import { findCliPackageRoot } from '../rules.js';
 import { assertRouterWorkflowWellFormed } from './repo-init-router-guard.js';
-import { ROUTING_BUNDLE_SECRET_NAME } from '../bootstrap/apply-routing-secrets.js';
+import { ALL_ROUTING_SECRET_NAMES, ROUTING_BUNDLE_SECRET_NAME } from '../bootstrap/apply-routing-secrets.js';
 
 export interface RepoInitOptions {
   readonly repo?: string;
@@ -394,18 +394,48 @@ export function generateWorkflow(
     lines.push(`      project: ${v3Inputs.project}`);
     lines.push(`      registry-api-path: ${v3Inputs.registryApiPath}`);
   }
-  // groundnuty/macf#1112: `secrets: inherit` does not cross a GitHub org/
-  // enterprise scope boundary (confirmed live on macf#1111 — an org-owned
-  // fleet's caller failed at secret evaluation before any step ran). A
-  // bundle-capable pin gets the single `MACF_ROUTING_BUNDLE` secret
-  // instead — the caller's interface then never depends on the callee's
-  // secret set, so a future secret addition on the callee side can't break
-  // an already-generated caller the way explicit-six passing would. Every
-  // other pin (pre-bundle v3.x, or legacy v1.x/v2.x) keeps the existing
-  // `secrets: inherit` form unchanged — additive, not a replacement.
+  // groundnuty/macf#1112 / #1338: `secrets: inherit` does not cross a GitHub
+  // org/enterprise scope boundary. Confirmed twice now — live on macf#1111
+  // (an org-owned fleet's caller failed at secret evaluation before any
+  // step ran) AND again on macf#1338 against every currently-released
+  // `macf-actions` v3.x tag (v3.0.0 through v3.4.2, verified live via `gh
+  // api repos/groundnuty/macf-actions/tags` — there is no v3.5.0 yet) —
+  // and confirmed against GitHub's own current docs (fetched live, not
+  // from training data): "Workflows that call reusable workflows in the
+  // same organization or enterprise can use the `inherit` keyword to
+  // implicitly pass the secrets." A provisioned fleet's agent repos live
+  // in the fleet's own org, never `groundnuty` (where `macf-actions`
+  // lives), so `inherit` is unconditionally the wrong form for a v3+
+  // caller today.
+  //
+  // A bundle-capable pin (>= MIN_BUNDLE_CAPABLE_ACTIONS_VERSION, not yet
+  // released) gets the single `MACF_ROUTING_BUNDLE` secret — the caller's
+  // interface then never depends on the callee's secret set, so a future
+  // secret addition on the callee side can't break an already-generated
+  // caller the way explicit-six passing would.
+  //
+  // Every currently-released v3.x tag's `workflow_call.secrets` block has
+  // been the SAME six required names since v3.0.0 (verified live across
+  // v3.0.0 and v3.4.2) — passing them EXPLICITLY by name is unrestricted
+  // by org boundary (only the `inherit` shorthand is org-scoped, per the
+  // docs quote above) and needs no macf-actions release beyond what's
+  // already shipped. This is the fallback for every v3+ pin below the
+  // bundle threshold — i.e. every v3+ pin that exists today.
+  //
+  // v1.x/v2.x (legacy, permanent-Stage-2 substrate pins per the operator's
+  // 2026-04-27 directive) are UNCHANGED — they're used exclusively by
+  // same-org (`groundnuty`) substrate workspaces, where `inherit` already
+  // works, and their `workflow_call.secrets` sets differ from the v3.x
+  // six (v1.x: `AGENT_SSH_KEY` + 2; v2.x: 4 — verified live), so blindly
+  // emitting the v3 six-name form for them would be wrong.
   if (isBundleCapableActionsVersion(actionsVersion)) {
     lines.push('    secrets:');
     lines.push(`      ${ROUTING_BUNDLE_SECRET_NAME}: \${{ secrets.${ROUTING_BUNDLE_SECRET_NAME} }}`);
+  } else if (v3Inputs && isV3PlusActionsVersion(actionsVersion)) {
+    lines.push('    secrets:');
+    for (const name of ALL_ROUTING_SECRET_NAMES) {
+      lines.push(`      ${name}: \${{ secrets.${name} }}`);
+    }
   } else {
     lines.push('    secrets: inherit');
   }

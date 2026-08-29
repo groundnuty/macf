@@ -5,6 +5,7 @@ import { mkdirSync, rmSync, existsSync, readFileSync, writeFileSync, chmodSync }
 import { tmpdir } from 'node:os';
 import { parse as parseYaml } from 'yaml';
 import { generateWorkflow, generateAgentConfig, patchAgentConfig, createLabel, repoInit, isV3PlusActionsVersion, isBundleCapableActionsVersion } from '../../src/cli/commands/repo-init.js';
+import { ALL_ROUTING_SECRET_NAMES } from '../../src/cli/bootstrap/apply-routing-secrets.js';
 
 function tempDir(): string {
   const dir = join(tmpdir(), `macf-repo-init-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -77,11 +78,16 @@ describe('generateWorkflow', () => {
     expect(yaml).toContain('\n    with:\n');
     expect(yaml).toContain('\n      project: macf\n');
     expect(yaml).toContain('\n      registry-api-path: /repos/groundnuty/groundnuty\n');
-    expect(yaml).toContain('secrets: inherit');
+    // groundnuty/macf#1338: a v3+ pin with v3Inputs emits the explicit
+    // six-name secrets form, NOT `secrets: inherit` — see the
+    // "generateWorkflow — explicit six-secret emission" describe block
+    // below for the decisive coverage; this test only pins the ordering.
+    expect(yaml).toContain('    secrets:');
+    expect(yaml).toContain('      ROUTING_CLIENT_CERT: ${{ secrets.ROUTING_CLIENT_CERT }}');
     // well-formed YAML: no tabs; with: nested under route: between uses: and secrets:
     expect(yaml).not.toContain('\t');
     expect(yaml.indexOf('with:')).toBeGreaterThan(yaml.indexOf('uses:'));
-    expect(yaml.indexOf('with:')).toBeLessThan(yaml.indexOf('secrets: inherit'));
+    expect(yaml.indexOf('with:')).toBeLessThan(yaml.indexOf('    secrets:'));
   });
 
   it('treats the bare v3 tag as v3+ (with: block present)', () => {
@@ -487,9 +493,14 @@ describe('generateWorkflow — MACF_ROUTING_BUNDLE emission (groundnuty/macf#111
     expect(Object.keys(parsedBefore.jobs.route.secrets as object)).toHaveLength(1);
   });
 
-  it('pre-bundle v3.x pins keep emitting secrets: inherit, unchanged', () => {
+  it('pre-bundle v3.x pins emit the explicit six-secret form, NOT secrets: inherit (groundnuty/macf#1338)', () => {
+    // `secrets: inherit` is scoped by GitHub to "the same organization or
+    // enterprise" (live docs, fetched 2026-08-29) — it does NOT cross an
+    // org boundary, which is the case for every provisioned fleet. See the
+    // "generateWorkflow — explicit six-secret emission" describe block
+    // below for the decisive coverage.
     const yaml = generateWorkflow('v3.4.2', v3Inputs);
-    expect(yaml).toContain('secrets: inherit');
+    expect(yaml).not.toContain('secrets: inherit');
     expect(yaml).not.toContain('MACF_ROUTING_BUNDLE');
   });
 
@@ -505,6 +516,101 @@ describe('generateWorkflow — MACF_ROUTING_BUNDLE emission (groundnuty/macf#111
 
   it("'main' pin is treated as bundle-capable (dev branch always-current)", () => {
     const yaml = generateWorkflow('main', v3Inputs);
+    const parsed = parseYaml(yaml) as { jobs: { route: { secrets: unknown } } };
+    expect(Object.keys(parsed.jobs.route.secrets as object)).toEqual(['MACF_ROUTING_BUNDLE']);
+  });
+});
+
+// groundnuty/macf#1338 — a present repo secret reported as "not provided
+// while calling" on every live fleet's first-ever router run. Mechanism,
+// confirmed live (not from training data): `secrets: inherit` is scoped by
+// GitHub to "the same organization or enterprise" (fetched from
+// https://docs.github.com/en/actions/using-workflows/reusing-workflows,
+// 2026-08-29 — the phrase appears twice, once under "Using inputs and
+// secrets in a reusable workflow" and once under "Passing inputs and
+// secrets to a reusable workflow"); a provisioned fleet's agent repos
+// live in the fleet's own org, never `groundnuty` (where `macf-actions`
+// lives), so `inherit` fails the `route:` job's secret EVALUATION before
+// any step runs — exactly the observed annotation. `#1112`'s bundle fix
+// (above) only activates at `MIN_BUNDLE_CAPABLE_ACTIONS_VERSION`
+// (`v3.5.0`), and no macf-actions release at or above that version has
+// ever shipped (`gh api repos/groundnuty/macf-actions/tags` — the latest
+// tag is `v3.4.2`, verified live 2026-08-29), so every currently-usable
+// v3+ pin fell all the way through to the broken `inherit` fallback. The
+// fix: emit the explicit six-name form instead of `inherit` for every
+// v3+ pin below the bundle threshold — verified live against v3.0.0's AND
+// v3.4.2's `workflow_call.secrets` block (`gh api
+// repos/groundnuty/macf-actions/contents/.github/workflows/agent-router.yml?ref=<tag>`)
+// that the SAME six required names have been stable across the entire
+// v3.x line released so far, and that explicit named secret-passing
+// (unlike the `inherit` shorthand) carries no org-boundary restriction
+// per the same live docs fetch.
+describe('generateWorkflow — explicit six-secret emission for a v3+ non-bundle pin (groundnuty/macf#1338)', () => {
+  const v3Inputs = { project: 'trial-code-agent', registryApiPath: '/repos/macf-experiment/trial-code-agent' };
+
+  // Per `assert-the-wrong-path.md` Trigger 1 (circularity): asserting
+  // against `ALL_ROUTING_SECRET_NAMES` here would prove only that
+  // `generateWorkflow` agrees with `apply-routing-secrets.ts`'s OWN
+  // constant — both sides of the assertion would move together if that
+  // constant ever drifted (a dropped/renamed/added name), and the test
+  // would keep reporting "correct". This literal is deliberately NOT
+  // imported from production code — it is the exact key set independently
+  // read off the LIVE `workflow_call.secrets` block via `gh api
+  // repos/groundnuty/macf-actions/contents/.github/workflows/agent-router.yml?ref=v3.4.2`
+  // (2026-08-29; re-confirmed against `v3.0.0` too, see the sibling test
+  // below), a second, independent source of truth this test can catch
+  // `ALL_ROUTING_SECRET_NAMES` drifting away from.
+  const V3_4_2_LIVE_REQUIRED_SECRETS = [
+    'ROUTING_CLIENT_CERT',
+    'ROUTING_CLIENT_KEY',
+    'TS_OAUTH_CLIENT_ID',
+    'TS_OAUTH_SECRET',
+    'MACF_ROUTING_APP_ID',
+    'MACF_ROUTING_APP_KEY',
+  ] as const;
+
+  it('DECISIVE: a v3+ non-bundle pin passes EXACTLY the six names v3.4.2\'s own workflow_call.secrets declares — not a hand-written list', () => {
+    const yaml = generateWorkflow('v3.4.2', v3Inputs);
+    const parsed = parseYaml(yaml) as { jobs: { route: { secrets: unknown } } };
+    const secretsBlock = parsed.jobs.route.secrets as Record<string, string>;
+    expect(Object.keys(secretsBlock).sort()).toEqual([...V3_4_2_LIVE_REQUIRED_SECRETS].sort());
+    expect(Object.keys(secretsBlock)).toHaveLength(6);
+    for (const name of V3_4_2_LIVE_REQUIRED_SECRETS) {
+      expect(secretsBlock[name]).toBe(`\${{ secrets.${name} }}`);
+    }
+    // Sanity: the independently-sourced literal above and the production
+    // constant the generator actually reads from DO currently agree — if
+    // they ever diverge, this line (not the DECISIVE assertions above) is
+    // the one that should fail, naming which side moved.
+    expect([...ALL_ROUTING_SECRET_NAMES].sort()).toEqual([...V3_4_2_LIVE_REQUIRED_SECRETS].sort());
+  });
+
+  it('never emits secrets: inherit or the bundle secret for a v3+ non-bundle pin', () => {
+    const yaml = generateWorkflow('v3.4.2', v3Inputs);
+    expect(yaml).not.toContain('secrets: inherit');
+    expect(yaml).not.toContain('MACF_ROUTING_BUNDLE');
+  });
+
+  it('a fleet without v3 routing (no v3Inputs) is UNCHANGED — no six-name block invented', () => {
+    // The mirror half of the decisive pair: a caller that never gets v3
+    // inputs (a v1.x/v2.x pin, or a v3 pin with no project/registry
+    // resolved) must not suddenly grow a six-name secrets block it never
+    // had before this fix.
+    const yaml = generateWorkflow('v3.4.2'); // no v3Inputs
+    expect(yaml).toContain('secrets: inherit');
+    for (const name of ALL_ROUTING_SECRET_NAMES) {
+      expect(yaml).not.toContain(`${name}:`);
+    }
+  });
+
+  it('applies to a v3.0.0 pin too — the six-name contract has been stable since v3.0.0', () => {
+    const yaml = generateWorkflow('v3.0.0', v3Inputs);
+    const parsed = parseYaml(yaml) as { jobs: { route: { secrets: unknown } } };
+    expect(Object.keys(parsed.jobs.route.secrets as object).sort()).toEqual([...ALL_ROUTING_SECRET_NAMES].sort());
+  });
+
+  it('a bundle-capable pin still wins over the explicit-six fallback (v3.5.0 unaffected by this fix)', () => {
+    const yaml = generateWorkflow('v3.5.0', v3Inputs);
     const parsed = parseYaml(yaml) as { jobs: { route: { secrets: unknown } } };
     expect(Object.keys(parsed.jobs.route.secrets as object)).toEqual(['MACF_ROUTING_BUNDLE']);
   });
