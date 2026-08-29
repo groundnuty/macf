@@ -44,6 +44,31 @@ the other six             4                             0
 
 > **A sibling control assumes the sibling is analogous. A self-control cannot fail to be analogous to itself.**
 
+### A ruling on an absence is a zero too
+
+**The forms above apply to a `grep -c`. They apply identically to a decision** — because *"X does not exist"* is a zero, and a zero needs its search space established no matter who states it.
+
+**Worked example (2026-08-29).** A gap was reported as *"`macf fleet status` has no `-f`, so no manifest-scoped status exists"*, ruled a real gap, filed, and implemented — **and `macf bootstrap status -f` had shipped weeks earlier.** The enumeration that would have caught it was one `macf bootstrap --help`.
+
+**The failure is split across two roles and neither half is optional:**
+
+```
+the ASKER owns the FRAMING    enumerate the family X would live in, before asking
+the RULER owns ONE boundary   "what search space is this absence drawn from?"
+                              — asked, not researched
+```
+
+> **A ruling is only as scoped as the evidence the asker presents.** A reviewer cannot discharge a zero nobody showed them was a zero — **and the asker chooses what is shown, often selecting the evidence that supports a conclusion already formed.**
+
+**The ruler's half costs one question, not a re-investigation.** The distinction that keeps this from collapsing the division of labour:
+
+```
+deep verification   redoing the asker's work           NOT the reviewer's job
+a boundary check    one `--help`, one `git grep`       IS the reviewer's job
+```
+
+**A contrasting case the same day:** a second ruling on the same surface was **correct** because the reviewer opened the generator source before ruling. **Same session, same hour, same kind of question — the only difference was whether the artifact was read.** That is `check-before-propose.md §1` at the ruling boundary.
+
 **Two absence-questions, two controls:**
 
 ```
