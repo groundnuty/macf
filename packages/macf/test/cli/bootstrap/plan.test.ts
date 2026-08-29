@@ -9,8 +9,10 @@ import type { FleetLock, FleetManifest } from '../../../src/cli/bootstrap/fleet-
 import {
   APPLY_UNIMPLEMENTED_REASONS,
   computePlan,
+  controlRepoRouterCoverageNotices,
   countAppsToCreate,
   fleetPlanToJson,
+  formatControlRepoRouterCoverageLines,
   formatInstallScopeDriftLines,
   formatOperatorInteractionLine,
   formatOrphanLines,
@@ -27,6 +29,7 @@ import {
   scopeCredentialNotice,
   summarizePlan,
   UNKNOWN_REASONS,
+  type ControlRepoRouterCoverage,
   type InstallScopeDrift,
   type ObservedAgentState,
   type ObservedState,
@@ -2493,12 +2496,17 @@ describe('computePlan — registryScopeIssues (macf#999 requirement 3: "plan sta
     const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
     const json = fleetPlanToJson(plan) as Record<string, unknown>;
     expect('registry_scope_issues' in json).toBe(false);
-    // Every other key is exactly what pre-#999 `fleetPlanToJson` produced —
-    // pinned individually rather than via one giant frozen full-object
-    // literal, so an unrelated future change to plan-item reason text
-    // doesn't turn this into a brittle snapshot test.
+    // Every other key is exactly what pre-#999 `fleetPlanToJson` produced,
+    // PLUS `control_repo_router_coverage` (groundnuty/macf#1348) — that
+    // notice is a standing, unconditional-for-any-valid-manifest disclosure
+    // (see `controlRepoRouterCoverageNotices`'s doc), so unlike every other
+    // omit-when-empty key here it is NOT absent even for this minimal
+    // baseManifest()/EMPTY_OBSERVED fixture. Pinned individually rather than
+    // via one giant frozen full-object literal, so an unrelated future
+    // change to plan-item reason text doesn't turn this into a brittle
+    // snapshot test.
     expect(Object.keys(json).sort()).toEqual(
-      ['fleet', 'plan', 'schema_version', 'skipped_sections', 'summary', 'unimplemented_by_apply'].sort(),
+      ['control_repo_router_coverage', 'fleet', 'plan', 'schema_version', 'skipped_sections', 'summary', 'unimplemented_by_apply'].sort(),
     );
   });
 
@@ -3162,6 +3170,66 @@ describe('computePlan routingSecretAsymmetries — per-repo routing-secret split
     const finding = plan.routingSecretAsymmetries.find((f) => f.secretName === TS_OAUTH_CLIENT_ID_SECRET_NAME);
     expect(finding?.absentRepos).toEqual([CONTROL_REPO]);
     expect(formatPlanText(plan)).toContain(CONTROL_REPO);
+  });
+});
+
+describe('computePlan controlRepoRouterCoverage — the control repo is a possible CA-cert/routing-client write target plan cannot resolve (groundnuty/macf#1348)', () => {
+  const CONTROL_REPO = 'groundnuty/icsoc-2026-control';
+
+  it('THE DECISIVE CASE: names the control repo and states the reason — a live apply-run outcome, not something plan can determine', () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
+    expect(plan.controlRepoRouterCoverage).toHaveLength(1);
+    const notice = plan.controlRepoRouterCoverage[0];
+    expect(notice?.repo).toBe(CONTROL_REPO);
+    expect(notice?.message).toContain(CONTROL_REPO);
+    expect(notice?.message).toMatch(/CA cert/);
+    expect(notice?.message).toMatch(/routing-client secret/);
+    expect(notice?.message).toMatch(/apply-run outcome/);
+  });
+
+  it('never claims apply WILL write there — "may", never "will receive"/"will be written"/"will get"', () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
+    const notice = plan.controlRepoRouterCoverage[0];
+    expect(notice?.message).toMatch(/\bmay\b/);
+    expect(notice?.message).not.toMatch(/\bwill (also )?(receive|be written|get)\b/);
+  });
+
+  it('is unaffected by observed state — this is a manifest-derived possibility, not a live drift finding', () => {
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      controlRepoPresence: 'present',
+      caRepos: { 'groundnuty/icsoc-2026-science-agent': 'present', 'groundnuty/icsoc-2026-experiment': 'present' },
+    };
+    const plan = computePlan(baseManifest(), observed);
+    expect(plan.controlRepoRouterCoverage).toHaveLength(1);
+    expect(plan.controlRepoRouterCoverage[0]?.repo).toBe(CONTROL_REPO);
+  });
+
+  it('formatPlanText carries a control_repo_coverage NOTICE line (not WARNING — manifest-derived heads-up, not a live observed fact)', () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
+    const text = formatPlanText(plan);
+    expect(text).toContain('control_repo_coverage: NOTICE');
+    expect(text).toContain(CONTROL_REPO);
+  });
+
+  it('fleetPlanToJson includes control_repo_router_coverage with the same repo/message shape', () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
+    const json = fleetPlanToJson(plan) as { control_repo_router_coverage?: readonly ControlRepoRouterCoverage[] };
+    expect(json.control_repo_router_coverage).toEqual(plan.controlRepoRouterCoverage.map((i) => ({ ...i })));
+  });
+
+  it('controlRepoRouterCoverageNotices(undefined) → [] — the decisive-pair "no control repo" arm; a hardcoded builder that ignores its argument fails this', () => {
+    expect(controlRepoRouterCoverageNotices(undefined)).toEqual([]);
+  });
+
+  it('formatControlRepoRouterCoverageLines([]) → [] — no line, no noise', () => {
+    expect(formatControlRepoRouterCoverageLines([])).toEqual([]);
+  });
+
+  it('formatControlRepoRouterCoverageLines — one line per entry, "control_repo_coverage: NOTICE — <message>"', () => {
+    expect(formatControlRepoRouterCoverageLines([{ repo: CONTROL_REPO, message: 'the coverage text' }])).toEqual([
+      'control_repo_coverage: NOTICE — the coverage text',
+    ]);
   });
 });
 
