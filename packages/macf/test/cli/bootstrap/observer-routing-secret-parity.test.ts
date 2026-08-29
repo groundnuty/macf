@@ -95,6 +95,15 @@ describe('githubRegistryObserver — routing-secret NAME-list wiring (groundnuty
         match: (argv) => argv.includes('trial-writing-agent/actions/secrets'),
         stdout: '', // zero secrets on the newer/colder repo
       },
+      // Explicit route for the control repo (not the generic fallback) —
+      // `computePlan` now compares across `routerCarryingRepos(manifest)`,
+      // which includes it; giving it its own deliberate response (rather
+      // than relying on the router's unmatched-call fallback body) keeps
+      // this fixture's outcome designed, not incidental.
+      {
+        match: (argv) => argv.includes('macf-trial-control/actions/secrets'),
+        stdout: `${TS_OAUTH_CLIENT_ID_SECRET_NAME}\n${TS_OAUTH_SECRET_SECRET_NAME}\n`,
+      },
     ]);
     const manifest = baseManifest();
     const observed = await githubRegistryObserver(manifest, manifestPath);
@@ -109,14 +118,43 @@ describe('githubRegistryObserver — routing-secret NAME-list wiring (groundnuty
     expect(text).toContain('routing_secret: WARNING');
     expect(text).toContain(TS_OAUTH_CLIENT_ID_SECRET_NAME);
     expect(text).toContain('macf-experiment/trial-writing-agent'); // the ABSENT repo is named
+    expect(text).not.toContain('macf-experiment/macf-trial-control'); // the control repo HAS it here — must not be misnamed as absent
   });
 
-  it('DECISIVE 2/2: TS_OAUTH present on BOTH repos -> no asymmetry line at all — uniform is the satisfied state', async () => {
+  it('DECISIVE 2/2: TS_OAUTH present on EVERY router-carrying repo (agents + control) -> no asymmetry line at all — uniform is the satisfied state', async () => {
     installGhRouter([{ match: (argv) => argv.includes('actions/secrets'), stdout: `${TS_OAUTH_CLIENT_ID_SECRET_NAME}\n${TS_OAUTH_SECRET_SECRET_NAME}\n` }]);
     const manifest = baseManifest();
     const observed = await githubRegistryObserver(manifest, manifestPath);
+    // Every router-carrying repo — including the control repo, which this
+    // route also covers (it matches on `actions/secrets` alone) — reads the
+    // identical present pair, so this is uniform, not a split.
+    expect(observed.routingSecretRepos?.['macf-experiment/macf-trial-control']?.status).toBe('confirmed');
     const plan = computePlan(manifest, observed);
     expect(formatPlanText(plan)).not.toContain('routing_secret:');
+  });
+
+  it('a repo whose secrets listing returns something that does NOT look like a secret-name list reads `unknown`, never a fabricated absence', async () => {
+    installGhRouter([
+      {
+        match: (argv) => argv.includes('trial-code-agent/actions/secrets'),
+        stdout: `${TS_OAUTH_CLIENT_ID_SECRET_NAME}\n${TS_OAUTH_SECRET_SECRET_NAME}\n`,
+      },
+      // A malformed/unexpected response (e.g. a stray `{}` — the shape a
+      // naive default-fallback mock, or a `gh`/jq error leaking onto
+      // stdout, might produce) must NOT be laundered into "confirmed,
+      // zero secrets" — that would report every one of the six tracked
+      // names as confidently ABSENT on a repo this run never actually
+      // read.
+      { match: (argv) => argv.includes('trial-writing-agent/actions/secrets'), stdout: '{}\n' },
+    ]);
+    const manifest = baseManifest();
+    const observed = await githubRegistryObserver(manifest, manifestPath);
+    expect(observed.routingSecretRepos?.['macf-experiment/trial-writing-agent']).toMatchObject({ status: 'unknown' });
+    // Because the affected repo is honestly unknown (not confirmed absent),
+    // it must never be named in an ABSENT list.
+    const plan = computePlan(manifest, observed);
+    const finding = plan.routingSecretAsymmetries.find((f) => f.secretName === TS_OAUTH_CLIENT_ID_SECRET_NAME);
+    expect(finding?.absentRepos ?? []).not.toContain('macf-experiment/trial-writing-agent');
   });
 
   it('a repo this run could not confirm PRESENT never gets its secret list listed — gated on the SAME macf#1026 visibility discipline the CA/routing-client reads already use', async () => {

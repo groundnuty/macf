@@ -387,7 +387,26 @@ export type RepoSecretNamesObservation =
  * `{total_count: 0, secrets: []}`, HTTP 200) that inventing a confident
  * "absent" for every tracked name from it would risk a false split/uniform
  * verdict — Amendment A's honest-unknown floor.
+ *
+ * **A line that doesn't look like a GitHub secret name degrades the WHOLE
+ * read to `'unknown'`, never a confident (and possibly-empty-looking)
+ * `'confirmed'`** (groundnuty/macf#1336 review finding). GitHub's Actions
+ * secret names are restricted to `[A-Za-z0-9_]`, never starting with a
+ * digit (GitHub's own naming-rules docs); {@link SECRET_NAME_SHAPE} encodes
+ * that grammar. Genuinely zero secrets on a repo produces EMPTY stdout
+ * (jq iterating an empty `.secrets[]` array emits nothing) — that case
+ * correctly stays `'confirmed'` with an empty set, load-bearing for the
+ * real split this module exists to detect. But ANY non-empty line that
+ * fails the grammar check (a `gh`/jq error message that leaked onto
+ * stdout instead of stderr, an unexpected response shape) is evidence
+ * something went wrong with the WHOLE call, not with one line — filtering
+ * just that line out and trusting the rest would launder an ambiguous
+ * signal into a confident presence/absence claim for every OTHER tracked
+ * name too, exactly the hazard `routing-secret-parity.ts`'s own
+ * "unreadable is never 'consistent'" contract exists to prevent.
  */
+const SECRET_NAME_SHAPE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
 export async function listRepoSecretNames(repo: string): Promise<RepoSecretNamesObservation> {
   try {
     const { stdout } = await execFileAsync('gh', ['api', '--paginate', `repos/${repo}/actions/secrets`, '--jq', '.secrets[].name'], {
@@ -397,6 +416,12 @@ export async function listRepoSecretNames(repo: string): Promise<RepoSecretNames
       .split('\n')
       .map((s) => s.trim())
       .filter((s) => s.length > 0);
+    if (names.some((n) => !SECRET_NAME_SHAPE.test(n))) {
+      return {
+        status: 'unknown',
+        reason: `gh api repos/${repo}/actions/secrets returned output that doesn't look like a secret-name list — treating as unreadable rather than guessing`,
+      };
+    }
     return { status: 'confirmed', names: new Set(names) };
   } catch (err) {
     const stderr = getStderr(err);
