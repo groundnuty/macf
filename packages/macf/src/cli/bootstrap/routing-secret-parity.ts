@@ -69,6 +69,16 @@ export interface RoutingSecretAsymmetry {
   readonly message: string;
 }
 
+// groundnuty/macf#1061 — user-facing CLI output (the `formatPlanText`-rendered
+// string {@link buildAsymmetryMessage} returns) must stand on its own for an
+// operator who was never in the room: no bare `(macf#NNNN)` citation. This
+// finding's OWN motivating issue is groundnuty/macf#1336 (the split this
+// module detects); groundnuty/macf#855 established that a GitHub Actions
+// secret's value is unreadable (this module reads presence via the
+// name-listing endpoint only, never a value); groundnuty/macf#1188 is where
+// `--ts-oauth-client-id`/`--ts-oauth-secret` were added as `apply` flags —
+// all three are explained in PLAIN LANGUAGE below, never cited by number, in
+// the returned string itself.
 function buildAsymmetryMessage(
   secretName: RoutingSecretName,
   presentRepos: readonly string[],
@@ -84,11 +94,13 @@ function buildAsymmetryMessage(
   return (
     `Secret "${secretName}" is present on ${String(presentRepos.length)} of ${String(knownTotal)} repos with ` +
     `confirmed presence — ABSENT on: ${absentRepos.join(', ')}. A repo missing it cannot route once its ` +
-    `agent-router.yml requires it (macf-actions@v3.4.2 declares every routing secret \`required: true\`).` +
+    "agent-router.yml requires it (macf-actions@v3.4.2 declares every routing secret `required: true`)." +
     unknownSuffix +
-    ' Presence-only — GitHub\'s Actions-secrets API never exposes the value (groundnuty/macf#855), and this tool ' +
-    'never auto-publishes it: TS_OAUTH is operator-supplied (--ts-oauth-client-id/--ts-oauth-secret, macf#1188); ' +
-    'the router-App and routing-client secrets are published only through `apply`\'s own unified secrets writer.'
+    " Presence-only — GitHub's Actions-secrets API never exposes the value, only its name, so this tool cannot " +
+    'and does not compare or publish values, only presence. This tool never auto-publishes a routing secret it ' +
+    'detects missing: the Tailscale OAuth pair is supplied by the operator directly (the --ts-oauth-client-id/ ' +
+    '--ts-oauth-secret flags on `macf bootstrap apply`); the router-App and routing-client secrets are published ' +
+    "only through apply's own unified secrets writer."
   );
 }
 
