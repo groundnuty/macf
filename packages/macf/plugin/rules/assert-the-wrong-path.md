@@ -18,6 +18,33 @@ Five instruments observed failing this in one session (2026-08-27/28, three agen
 | a mock on `console.error` where the code writes `process.stderr` | identical whether anything is emitted at all |
 | a substring match (`realDeleteRepo` matching `realDeleteRepoVariable`) | matches a name that was never the target |
 
+### Discharging a zero: use a sibling, not the file's size
+
+**Trigger 4 says an empty result is evidence only if the search space was non-empty. The weak way to establish that is the file's size; the strong way is a sibling that WOULD have matched.**
+
+```
+bootstrap-apply.ts  runnerDeclarationMismatches   0   ← the subject
+bootstrap-apply.ts  installScopeDrift             0   ← the sibling advisory it mirrors
+bootstrap-apply.ts  unimplementedByApply          7   ← a control: this file is not inert
+```
+
+**Size tells you the file has content. It does not tell you the symbol's *class* belongs there** — a 3899-line file can be entirely about something else, and its size is then irrelevant to your zero.
+
+> **A zero is discharged by a sibling that would have matched, not by the file's size.**
+
+**And the sibling check is better because both outcomes are informative:**
+
+```
+sibling ABSENT,  subject absent   →  the class does not live in this file — architectural,
+                                     expected, and the zero means what you hoped
+sibling PRESENT, subject absent   →  a specific gap — this file handles the class and skips
+                                     your case. That is a finding, not a clean bill.
+```
+
+**Size can only ever report *"the space was non-empty."*** The sibling distinguishes *"correctly absent"* from *"conspicuously missing"* — and the second is the one worth knowing.
+
+**Pick the sibling by class, not by name:** the nearest thing that does the same *kind* of job. For an advisory field, another advisory field. For a call site, another call to the same layer. **A control that is present (`unimplementedByApply` above) additionally proves the file is reachable by your grep at all.**
+
 ### The second question: was the pipeline lossless?
 
 **The question above catches an instrument that was never connected to the system. It does not catch a connected instrument whose reading is corrupted on the way to being cited.**
