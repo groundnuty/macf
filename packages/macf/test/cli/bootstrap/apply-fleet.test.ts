@@ -2803,21 +2803,76 @@ agents:
   // --- DR-043 Amendment D phase 2 (macf#838, macf#854's CA/routing gap) ---
 
   describe('CA ceremony + two-place publish + MACF_TRUSTED_ACTORS (macf#922 — was MACF_ROUTING_RUNS_ON)', () => {
-    it('fresh mint: publishes to the registry + BOTH agent repos, stages the key for the vault, never a raw key value on any leg outcome', async () => {
+    it('fresh mint: publishes to the registry + BOTH agent repos AND the control repo (groundnuty/macf#1345 — router-carrying, not agent-repos-only), stages the key for the vault, never a raw key value on any leg outcome', async () => {
       const manifestPath = manifestPathIn();
       const manifest = manifestWith([CODE_AGENT, SCI_AGENT]);
-      const deps = baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath);
+      const logs: string[] = [];
+      const deps: FleetApplyDeps = { ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath), log: (l) => logs.push(l) };
       const result = await applyFleet(manifest, manifestPath, null, deps);
 
       expect(result.ca.resolve.status).toBe('minted');
       expect(result.ca.resolve).not.toHaveProperty('certPem');
       expect(result.ca.resolve).not.toHaveProperty('keyPem');
       expect(result.ca.registryLeg).toEqual({ status: 'created' });
+      // groundnuty/macf#1345 — the control repo (which this fixture's
+      // default `NOOP_REPO_INIT`-driven REAL `repoInit()` writes the
+      // router workflow into, allowlisted by default — see
+      // `apply-control-repo-init.ts::controlRepoCarriesRouter`) is now
+      // IN the CA-cert target set, alongside both agent repos. Pre-fix,
+      // this leg published against `confirmedRepos` (agent repos only)
+      // and the control repo was silently never covered.
+      expect(result.ca.repoLegs).toEqual({
+        'groundnuty/demo-code': { status: 'created' },
+        'groundnuty/demo-science': { status: 'created' },
+        'groundnuty/demo-fleet-control': { status: 'created' },
+      });
+      expect(JSON.stringify(result)).not.toContain('SENTINEL-CA-KEY-PEM');
+
+      // The operator-facing denominator — same "name the population
+      // covered" discipline #1341 established for routing secrets,
+      // generalized here (groundnuty/macf#1345): 3 router-carrying repos
+      // (2 agent + 1 control), all created, zero unknown.
+      expect(logs).toContain('CA cert legs: 3 created, 0 already-present of 3 router-carrying repo(s).');
+    });
+
+    it('DECISIVE PAIR (2/2) — control-repo init did NOT succeed this run -> the control repo is EXCLUDED from the CA-cert target set, and the denominator report says so (groundnuty/macf#1345)', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT, SCI_AGENT]);
+      const logs: string[] = [];
+      // A `repoInit` that throws -> `applyControlRepoInit` returns
+      // `status: 'failed'` -> `controlRepoCarriesRouter` is false (the gate
+      // `deriveRouterCarryingRepos` already encodes) -> the control repo
+      // must NOT appear anywhere in the CA-cert population or its legs.
+      const failingRepoInit: RepoInitStepDeps = {
+        cloneRepo: async () => {},
+        commitAndPush: async () => 'pushed',
+        repoInit: async () => {
+          throw new Error('simulated control-repo-init failure (groundnuty/macf#1345 decisive pair 2/2)');
+        },
+      };
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath, failingRepoInit),
+        log: (l) => logs.push(l),
+      };
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(result.ca.resolve.status).toBe('minted');
+      // Only the two agent repos — the control repo (repo-init failed) is
+      // excluded, not merely omitted-and-unmentioned.
       expect(result.ca.repoLegs).toEqual({
         'groundnuty/demo-code': { status: 'created' },
         'groundnuty/demo-science': { status: 'created' },
       });
-      expect(JSON.stringify(result)).not.toContain('SENTINEL-CA-KEY-PEM');
+      expect(result.ca.repoLegs).not.toHaveProperty('groundnuty/demo-fleet-control');
+
+      // The denominator report reflects the SMALLER population — 2, not 3
+      // — and zero unknown (the exclusion is a deliberate gate, not an
+      // enumeration failure).
+      expect(logs).toContain('CA cert legs: 2 created, 0 already-present of 2 router-carrying repo(s).');
+      // And the control-repo-init failure itself is reported (pre-existing
+      // behavior — this pair adds the CA-leg consequence, not the failure
+      // report itself).
+      expect(logs.some((l) => l.includes('Control repo "groundnuty/demo-fleet-control" repo-init: FAILED'))).toBe(true);
     });
 
     it('reuse: fleet.lock already records ca_key AND registry reports present -> REUSES (never re-mints), backfills a repo leg the registry has but a repo is missing (#806 drift), and the vault stays skipped (no NEW agent OR CA secret this run)', async () => {

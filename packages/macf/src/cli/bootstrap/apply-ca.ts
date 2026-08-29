@@ -316,6 +316,62 @@ export function skippedCaPublish(repos: readonly string[], reason: string): CaPu
   return { registryLeg: { status: 'skipped', reason }, repoLegs: skippedOutcomesFor(repos, reason) };
 }
 
+// --- Denominator report (groundnuty/macf#1345) ---
+
+/**
+ * `created`/`already-present`/`unknown` counts for a {@link CaPublishResult.repoLegs}
+ * bag, measured against the POPULATION it was supposed to cover — never
+ * `Object.keys(repoLegs).length`, which silently under-reports if the
+ * population handed to {@link publishCaCertLegs}/{@link skippedCaPublish} and
+ * the population handed here ever diverge. That divergence is exactly the
+ * defect groundnuty/macf#1345 fixed at the call site (publishing against
+ * `confirmedRepos` while the routing-secret siblings had already moved to
+ * `apply-control-repo-init.ts::deriveRouterCarryingRepos`'s
+ * `routerCarryingRepos` — macf#1073): a caller that (re-)introduces that
+ * split would have this function under-report `total` and quietly not
+ * cover the control repo, rather than accurately widen `total`.
+ *
+ * A repo in `population` with no entry in `repoLegs` counts as `unknown`
+ * — the honest-unknown floor (Amendment A4) applied to a report's own
+ * denominator: an unresolvable repo is never silently excluded from the
+ * count. Pure.
+ */
+export interface CaLegsSummary {
+  readonly created: number;
+  readonly alreadyPresent: number;
+  readonly unknown: number;
+  readonly total: number;
+}
+
+export function summarizeCaRepoLegs(repoLegs: Readonly<Record<string, EnsureVariableOutcome>>, population: readonly string[]): CaLegsSummary {
+  let created = 0;
+  let alreadyPresent = 0;
+  let unknown = 0;
+  for (const repo of population) {
+    const leg = repoLegs[repo];
+    if (leg === undefined) unknown += 1;
+    else if (leg.status === 'created') created += 1;
+    else if (leg.status === 'already-present') alreadyPresent += 1;
+  }
+  return { created, alreadyPresent, unknown, total: population.length };
+}
+
+/**
+ * Render {@link summarizeCaRepoLegs}'s counts as the operator-facing
+ * denominator line — mirrors `apply-fleet.ts`'s existing "Routing secret
+ * ... legs: N created, M already-present of K confirmed repo(s)."
+ * shape (macf#1074's six-secret publish), so the SAME "name the population
+ * covered" discipline #1341 established for routing secrets is not special
+ * to that leg (groundnuty/macf#1345). The `unknown` clause is OMITTED
+ * entirely when zero (the steady-state case — never noise on a normal
+ * run); present only when {@link summarizeCaRepoLegs} actually found a
+ * population/leg-map mismatch.
+ */
+export function formatCaLegsSummary(summary: CaLegsSummary): string {
+  const unknownPart = summary.unknown > 0 ? `, ${String(summary.unknown)} unknown` : '';
+  return `CA cert legs: ${String(summary.created)} created, ${String(summary.alreadyPresent)} already-present${unknownPart} of ${String(summary.total)} router-carrying repo(s).`;
+}
+
 // --- Real deps ---
 
 /**

@@ -276,7 +276,7 @@ import {
   routerAppInstallRepos,
 } from './apply-router-app.js';
 import type { CaApplyDeps, CaApplyOutcome, CaPublishResult, CaResolveOutcome } from './apply-ca.js';
-import { publishCaCertLegs, redactCaResolve, resolveCaCert, skippedCaPublish } from './apply-ca.js';
+import { formatCaLegsSummary, publishCaCertLegs, redactCaResolve, resolveCaCert, skippedCaPublish, summarizeCaRepoLegs } from './apply-ca.js';
 import type { EnsureVariableOutcome } from './ensure-variable.js';
 import type { RunnerRegistrationDeps, RunnerRequirementOutcome, RunnerTokenPollOptions, TrustedActorsReconcileDeps } from './apply-routing.js';
 import {
@@ -2457,15 +2457,33 @@ export async function applyFleet(
   } else {
     caSkipReason = `CA could not be resolved this run: ${caResolve.reason}`;
   }
+  // groundnuty/macf#1345 — the population is `routerCarryingRepos` (agent
+  // repos PLUS the control repo when it carries the router,
+  // `apply-control-repo-init.ts::deriveRouterCarryingRepos`), NOT
+  // `confirmedRepos` (agent repos only). The routing-secret siblings below
+  // moved to this derivation via macf#1073; this leg had not.
   const caPublish: CaPublishResult =
     certToPublish !== undefined
-      ? await publishCaCertLegs(certToPublish, manifest.metadata.name, manifest.owner.registry, confirmedRepos, deps.trustDeps)
-      : skippedCaPublish(confirmedRepos, caSkipReason ?? 'CA cert unresolved');
+      ? await publishCaCertLegs(certToPublish, manifest.metadata.name, manifest.owner.registry, routerCarryingRepos, deps.trustDeps)
+      : skippedCaPublish(routerCarryingRepos, caSkipReason ?? 'CA cert unresolved');
   deps.log(
     `CA registry leg: ${caPublish.registryLeg.status}` +
       (caPublish.registryLeg.status === 'failed' || caPublish.registryLeg.status === 'skipped' ? ` — ${caPublish.registryLeg.reason}` : '.'),
   );
-  for (const [repo, leg] of Object.entries(caPublish.repoLegs)) {
+  // groundnuty/macf#1345 — names the population covered (same discipline
+  // #1341 established for routing secrets, generalized here), and never
+  // silently drops a router-carrying repo missing an outcome — iterate
+  // `routerCarryingRepos` itself (the population), not `Object.keys
+  // (caPublish.repoLegs)` (the leg-map), so a repo the enumeration
+  // couldn't resolve renders as `unknown` instead of vanishing from both
+  // the summary line and the per-repo detail below.
+  deps.log(formatCaLegsSummary(summarizeCaRepoLegs(caPublish.repoLegs, routerCarryingRepos)));
+  for (const repo of routerCarryingRepos) {
+    const leg = caPublish.repoLegs[repo];
+    if (leg === undefined) {
+      deps.log(`CA repo leg (${repo}): unknown — no outcome recorded for this repo this run.`);
+      continue;
+    }
     deps.log(`CA repo leg (${repo}): ${leg.status}` + (leg.status === 'failed' || leg.status === 'skipped' ? ` — ${leg.reason}` : '.'));
   }
 

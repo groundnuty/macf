@@ -15,11 +15,13 @@ import { join } from 'node:path';
 import type { RegistryConfig } from '@groundnuty/macf-core';
 import {
   caCertVariableName,
+  formatCaLegsSummary,
   publishCaCertLegs,
   realMintCa,
   redactCaResolve,
   resolveCaCert,
   skippedCaPublish,
+  summarizeCaRepoLegs,
 } from '../../../src/cli/bootstrap/apply-ca.js';
 import type { CaApplyDeps, CaMintDeps, CaResolveOutcome } from '../../../src/cli/bootstrap/apply-ca.js';
 
@@ -377,6 +379,45 @@ describe('skippedCaPublish (pure)', () => {
       'a/b': { status: 'skipped', reason: 'CA could not be resolved' },
       'c/d': { status: 'skipped', reason: 'CA could not be resolved' },
     });
+  });
+});
+
+describe('summarizeCaRepoLegs / formatCaLegsSummary — the denominator report (groundnuty/macf#1345)', () => {
+  it('counts created + already-present against the POPULATION, not Object.keys(repoLegs)', () => {
+    const repoLegs = { 'a/b': { status: 'created' as const }, 'c/d': { status: 'already-present' as const } };
+    const summary = summarizeCaRepoLegs(repoLegs, ['a/b', 'c/d']);
+    expect(summary).toEqual({ created: 1, alreadyPresent: 1, unknown: 0, total: 2 });
+  });
+
+  it('DECISIVE — a population repo missing from repoLegs is `unknown`, never silently excluded from the count', () => {
+    // Simulates the exact class of bug #1345 fixed: a caller that hands
+    // `publishCaCertLegs` one population but reports against another. The
+    // control repo (`fleet-control`) is in the POPULATION (it carries the
+    // router) but has no entry in `repoLegs` — a stand-in for whatever
+    // upstream mismatch could produce this shape.
+    const repoLegs = { 'a/agent': { status: 'created' as const } };
+    const summary = summarizeCaRepoLegs(repoLegs, ['a/agent', 'a/fleet-control']);
+    expect(summary).toEqual({ created: 1, alreadyPresent: 0, unknown: 1, total: 2 });
+  });
+
+  it('an empty population -> all zero counts, total 0 (never NaN/undefined)', () => {
+    expect(summarizeCaRepoLegs({}, [])).toEqual({ created: 0, alreadyPresent: 0, unknown: 0, total: 0 });
+  });
+
+  it('a failed/skipped leg counts toward neither created nor already-present nor unknown — only toward total', () => {
+    const repoLegs = { 'a/b': { status: 'failed' as const, reason: 'boom' } };
+    const summary = summarizeCaRepoLegs(repoLegs, ['a/b']);
+    expect(summary).toEqual({ created: 0, alreadyPresent: 0, unknown: 0, total: 1 });
+  });
+
+  it('formatCaLegsSummary renders the denominator, omitting the unknown clause when zero', () => {
+    const line = formatCaLegsSummary({ created: 2, alreadyPresent: 1, unknown: 0, total: 3 });
+    expect(line).toBe('CA cert legs: 2 created, 1 already-present of 3 router-carrying repo(s).');
+  });
+
+  it('formatCaLegsSummary includes the unknown clause when non-zero — the honest-unknown floor rendered, not just computed', () => {
+    const line = formatCaLegsSummary({ created: 1, alreadyPresent: 0, unknown: 1, total: 2 });
+    expect(line).toBe('CA cert legs: 1 created, 0 already-present, 1 unknown of 2 router-carrying repo(s).');
   });
 });
 
