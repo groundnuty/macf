@@ -38,11 +38,14 @@
  *     (`startup_failure`, the icsoc-2026 outage); dropping `checks: read`
  *     alone 403s just the CI-completion job.
  *   - the `uses:` reference to the reusable workflow itself, and a way to
- *     get it the repo secrets it needs — `secrets: inherit` OR the
- *     `MACF_ROUTING_BUNDLE` single-secret form (groundnuty/macf#1112,
- *     needed once caller and callee live in different GitHub org/
- *     enterprise scopes) — without either, the `route:` job cannot invoke
- *     the reusable workflow with the repo secrets it needs.
+ *     get it the repo secrets it needs — `secrets: inherit` (same-org/
+ *     enterprise caller only), the explicit six-name form (groundnuty/
+ *     macf#1338 — the v3+ default; `inherit` does NOT cross a GitHub org/
+ *     enterprise scope boundary, which is the case for every provisioned
+ *     fleet), or the `MACF_ROUTING_BUNDLE` single-secret form (groundnuty/
+ *     macf#1112, for a not-yet-released bundle-capable pin) — without one
+ *     of these, the `route:` job cannot invoke the reusable workflow with
+ *     the repo secrets it needs.
  *
  * Deliberately scoped to the VERSION-INDEPENDENT baseline `generateWorkflow`
  * always emits. The v3-only `with: { project, registry-api-path }` block is
@@ -52,7 +55,7 @@
  * correct v1/v2 emission that intentionally has no `with:` block.
  */
 
-import { ROUTING_BUNDLE_SECRET_NAME } from '../bootstrap/apply-routing-secrets.js';
+import { ALL_ROUTING_SECRET_NAMES, ROUTING_BUNDLE_SECRET_NAME } from '../bootstrap/apply-routing-secrets.js';
 
 export interface RouterWorkflowRequirement {
   readonly name: string;
@@ -123,20 +126,33 @@ export const ROUTER_WORKFLOW_REQUIREMENTS: readonly RouterWorkflowRequirement[] 
     fixHint: 'the `route:` job must call `uses: groundnuty/macf-actions/.github/workflows/agent-router.yml@<version>` — without it nothing routes at all.',
   },
   {
-    // A bundle-capable pin emits `secrets: { MACF_ROUTING_BUNDLE: ... }`
-    // instead of `secrets: inherit` — either is a valid "the callee gets
-    // its secrets" mechanism, so this requirement accepts BOTH forms
-    // rather than hard-coding the older literal. Same "deliberately
-    // scoped to the version-independent baseline" posture this module's
-    // doc already states for the `with:` block — checking for exactly ONE
-    // literal string here would false-positive on a correct bundle-form
-    // emission.
-    name: 'secrets propagation (secrets: inherit OR MACF_ROUTING_BUNDLE)',
-    check: (c) => c.includes('secrets: inherit') || c.includes(`${ROUTING_BUNDLE_SECRET_NAME}:`),
+    // Three valid "the callee gets its secrets" mechanisms, per
+    // `repo-init.ts::generateWorkflow`'s own version gating (groundnuty/
+    // macf#1112 / #1338):
+    //   - `secrets: inherit` — same-GitHub-org/enterprise caller only
+    //     (legacy v1.x/v2.x substrate pins; `inherit` is scoped by GitHub
+    //     to "the same organization or enterprise," verified against the
+    //     live docs, so this form is WRONG for a cross-org v3+ caller).
+    //   - the explicit six-name form (`MACF_ROUTING_APP_ID:`, etc.) — the
+    //     v3+ default below the bundle threshold; unrestricted by org
+    //     boundary, and exactly what every released v3.x tag's
+    //     `workflow_call.secrets` block declares (verified live,
+    //     v3.0.0..v3.4.2). `ALL_ROUTING_SECRET_NAMES[0]` is checked as the
+    //     representative name — `generateWorkflow` emits all six or none.
+    //   - `secrets: { MACF_ROUTING_BUNDLE: ... }` — the bundle form, for a
+    //     pin at/above the not-yet-released bundle threshold.
+    // Any ONE of the three satisfies this requirement — checking for
+    // exactly one literal would false-positive on the other two correct
+    // forms. Same "deliberately scoped to the version-independent
+    // baseline" posture this module's doc already states for the `with:`
+    // block.
+    name: 'secrets propagation (secrets: inherit OR explicit six-name OR MACF_ROUTING_BUNDLE)',
+    check: (c) => c.includes('secrets: inherit') || c.includes(`${ALL_ROUTING_SECRET_NAMES[0]}:`) || c.includes(`${ROUTING_BUNDLE_SECRET_NAME}:`),
     fixHint:
-      'add `secrets: inherit` (same-GitHub-scope caller) or the `secrets: { MACF_ROUTING_BUNDLE: ... }` bundle form ' +
-      '(safe across a GitHub org/enterprise scope boundary) to the `route:` job — without one of these the ' +
-      'reusable workflow has no repo secrets to route with.',
+      'add `secrets: inherit` (same-GitHub-scope caller only — see groundnuty/macf#1338), the explicit six-name ' +
+      '`secrets:` block (safe across a GitHub org/enterprise scope boundary), or the `secrets: { MACF_ROUTING_BUNDLE: ... }` ' +
+      'bundle form (also safe across scope boundaries, once macf-actions ships a bundle-capable release) to the ' +
+      '`route:` job — without one of these the reusable workflow has no repo secrets to route with.',
   },
 ];
 

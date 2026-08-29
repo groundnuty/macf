@@ -43,6 +43,26 @@ describe('assertRouterWorkflowWellFormed / findMissingRouterWorkflowRequirements
     expect(findMissingRouterWorkflowRequirements(v3)).toEqual([]);
   });
 
+  // groundnuty/macf#1338 — the v3+ non-bundle pin now emits the explicit
+  // six-name form instead of `secrets: inherit`; the guard must recognize
+  // it as well-formed (not flag a real, correct emission as missing).
+  it('does NOT throw on a v3+ non-bundle pin that emits the explicit six-name secrets form (macf#1338)', () => {
+    const v3 = generateWorkflow('v3.4.2', { project: 'macf', registryApiPath: '/repos/groundnuty/groundnuty' });
+    expect(v3).not.toContain('secrets: inherit');
+    expect(v3).not.toContain('MACF_ROUTING_BUNDLE');
+    expect(v3).toContain('MACF_ROUTING_APP_ID:');
+    expect(() => assertRouterWorkflowWellFormed(v3)).not.toThrow();
+    expect(findMissingRouterWorkflowRequirements(v3)).toEqual([]);
+  });
+
+  it('FIRES the secrets-propagation requirement when the explicit six-name block is stripped from a v3+ non-bundle pin', () => {
+    const v3 = generateWorkflow('v3.4.2', { project: 'macf', registryApiPath: '/repos/groundnuty/groundnuty' });
+    const bad = v3.replace(/ {4}secrets:\n(?: {6}[A-Z_]+: .*\n)+/, '');
+    expect(bad).not.toBe(v3); // sanity: the corruption actually changed something
+    const missing = findMissingRouterWorkflowRequirements(bad);
+    expect(missing.map((m) => m.name)).toEqual(['secrets propagation (secrets: inherit OR explicit six-name OR MACF_ROUTING_BUNDLE)']);
+  });
+
   it('does NOT throw on a v1 pin even though it lacks the v3-only with: block (out of scope, not a defect)', () => {
     // v1 output has no `with:` at all — proves the guard doesn't wrongly
     // require the v3-only block on a legitimately-scoped v1/v2 emission.
@@ -79,7 +99,7 @@ describe('assertRouterWorkflowWellFormed / findMissingRouterWorkflowRequirements
     { name: 'permissions.pull-requests: read', corrupt: (y) => y.replace('  pull-requests: read\n', '') },
     { name: 'permissions.checks: read', corrupt: (y) => y.replace('  checks: read\n', '') },
     { name: 'reusable workflow reference (uses:)', corrupt: (y) => y.replace(/uses: groundnuty\/macf-actions[^\n]*\n/, '\n') },
-    { name: 'secrets propagation (secrets: inherit OR MACF_ROUTING_BUNDLE)', corrupt: (y) => y.replace('    secrets: inherit\n', '') },
+    { name: 'secrets propagation (secrets: inherit OR explicit six-name OR MACF_ROUTING_BUNDLE)', corrupt: (y) => y.replace('    secrets: inherit\n', '') },
   ];
 
   it('the corruption table covers every declared requirement exactly once', () => {

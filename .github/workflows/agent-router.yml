@@ -159,4 +159,20 @@ jobs:
       # MACF registry variables live on groundnuty/groundnuty. Omit the trailing
       # /actions/variables — the reusable workflow appends it.
       registry-api-path: /repos/groundnuty/groundnuty
-    secrets: inherit
+    # groundnuty/macf#1338: `secrets: inherit` is scoped by GitHub to "the
+    # same organization or enterprise" as the reusable workflow it calls —
+    # this repo and macf-actions are both in `groundnuty`, so `inherit`
+    # has always worked HERE, but `macf repo-init` now generates the
+    # explicit six-name form unconditionally for every v3+ non-bundle pin
+    # (the form that also works for a cross-org caller, which this repo
+    # isn't). Switched here too so the generator and this committed file
+    # stay byte-identical (see repo-init.test.ts's drift-detector) — same
+    # six repo secrets, read explicitly by name instead of via the
+    # `inherit` shorthand; no behavior change for this repo.
+    secrets:
+      MACF_ROUTING_APP_ID: ${{ secrets.MACF_ROUTING_APP_ID }}
+      MACF_ROUTING_APP_KEY: ${{ secrets.MACF_ROUTING_APP_KEY }}
+      ROUTING_CLIENT_CERT: ${{ secrets.ROUTING_CLIENT_CERT }}
+      ROUTING_CLIENT_KEY: ${{ secrets.ROUTING_CLIENT_KEY }}
+      TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+      TS_OAUTH_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
