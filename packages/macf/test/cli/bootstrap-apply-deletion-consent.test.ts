@@ -210,6 +210,7 @@ function basePlan(items: readonly PlanItem[]): FleetPlan {
     registryRepoScopeNotices: [],
     installScopeDrift: [],
     scopeCredentials: [],
+    routingSecretAsymmetries: [],
   };
 }
 
