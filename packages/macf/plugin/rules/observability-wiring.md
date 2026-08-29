@@ -41,11 +41,37 @@ To apply a knob: set the env var BEFORE running `macf update`. The launcher re-r
 
 ## Verification
 
-After `macf update`, verify the launcher embeds the expected exports:
+**Two checks, and only the second one verifies telemetry.**
+
+### 1. Precondition — the launcher emits the exports
 
     grep -E '^export (CLAUDE_CODE_ENABLE_TELEMETRY|OTEL_)' claude.sh
 
 If `MACF_OTEL_DISABLED=1` was set at `macf update` time, the block is absent — no OTEL exports in the launcher.
+
+**This confirms configuration and nothing else.** It cannot detect the failure this rule exists to prevent — see below.
+
+### 2. Result-invariant — traces actually arrive
+
+**`silent-fallback-hazards.md` Instance 8's failure shape is that `claude.sh` exports cleanly and telemetry still goes nowhere:** the exporter dispatches to a dead endpoint, the connect is refused, and it silently retries-then-drops with no error at any layer. Consumer agents once ran **34 minutes** producing real coordination events while Tempo and Prometheus held zero traces (macf#282 / #283).
+
+> **The exports being present is the precondition of that failure, not evidence against it.** A check that passes in both the working and the broken case has not verified anything.
+
+So assert the result, not the config:
+
+- **Cluster-side** — `check-tempo-ingestion.sh` compares `tempo_distributor_spans_received_total` delta against a TraceQL search count over the same window, and exits non-zero on the ingestion-without-search-results signature.
+- **Agent-side** — `doctor-otel.sh` reads each running `claude` process's `OTEL_SERVICE_NAME` from `/proc/<pid>/environ` and queries Tempo for that service's recent traces, reporting processes whose exporter retry budget was exhausted during a connect-refused window (Instance 8, Tier 4 — these do not auto-recover; a graceful relaunch is the remedy).
+
+**If Tempo cannot be reached, the answer is `unknown` — not "telemetry is fine."**
+
+**TraceQL gotcha when checking by hand:** a dotted resource attribute **must be quoted**, or the query returns 0 silently rather than erroring:
+
+    # WRONG — returns 0 even when traces exist
+    curl -G "$TEMPO/api/search" --data-urlencode 'q={resource.gen_ai.agent.name=~"cv-.*"}'
+    # RIGHT
+    curl -G "$TEMPO/api/search" --data-urlencode 'q={resource."gen_ai.agent.name"=~"cv-.*"}'
+
+Cross-check a zero-trace result against `{resource.service.name=~"macf-agent.*"}` before concluding the pipeline is broken.
 
 ## Cross-references
 
