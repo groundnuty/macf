@@ -414,5 +414,5 @@ export async function issueRoutingClient(
   console.log('  2. Set the other v3 router secrets: TS_OAUTH_CLIENT_ID/SECRET + MACF_ROUTING_APP_ID/KEY (a dedicated variables:read-only App)');
   console.log('  3. Point the caller workflow at macf-actions/.github/workflows/agent-router.yml@v3 (with: { project }); pass the six');
   console.log('     secrets EXPLICITLY by name (`secrets: inherit` only works when the caller repo is in the SAME GitHub org/enterprise');
-  console.log('     as macf-actions — see groundnuty/macf#1338) — `macf repo-init` generates this correctly, prefer it over hand-authoring.');
+  console.log('     as macf-actions) — `macf repo-init` generates this correctly, prefer it over hand-authoring.');
 }

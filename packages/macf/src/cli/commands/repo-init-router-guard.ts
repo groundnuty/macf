@@ -149,10 +149,11 @@ export const ROUTER_WORKFLOW_REQUIREMENTS: readonly RouterWorkflowRequirement[] 
     name: 'secrets propagation (secrets: inherit OR explicit six-name OR MACF_ROUTING_BUNDLE)',
     check: (c) => c.includes('secrets: inherit') || c.includes(`${ALL_ROUTING_SECRET_NAMES[0]}:`) || c.includes(`${ROUTING_BUNDLE_SECRET_NAME}:`),
     fixHint:
-      'add `secrets: inherit` (same-GitHub-scope caller only — see groundnuty/macf#1338), the explicit six-name ' +
-      '`secrets:` block (safe across a GitHub org/enterprise scope boundary), or the `secrets: { MACF_ROUTING_BUNDLE: ... }` ' +
-      'bundle form (also safe across scope boundaries, once macf-actions ships a bundle-capable release) to the ' +
-      '`route:` job — without one of these the reusable workflow has no repo secrets to route with.',
+      'add `secrets: inherit` (only works when the caller repo is in the same GitHub org/enterprise as the ' +
+      'reusable workflow it calls), the explicit six-name `secrets:` block (safe across a GitHub org/enterprise ' +
+      'scope boundary), or the `secrets: { MACF_ROUTING_BUNDLE: ... }` bundle form (also safe across scope ' +
+      'boundaries, once macf-actions ships a bundle-capable release) to the `route:` job — without one of these ' +
+      'the reusable workflow has no repo secrets to route with.',
   },
 ];
 

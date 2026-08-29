@@ -548,22 +548,41 @@ describe('generateWorkflow — MACF_ROUTING_BUNDLE emission (groundnuty/macf#111
 describe('generateWorkflow — explicit six-secret emission for a v3+ non-bundle pin (groundnuty/macf#1338)', () => {
   const v3Inputs = { project: 'trial-code-agent', registryApiPath: '/repos/macf-experiment/trial-code-agent' };
 
+  // Per `assert-the-wrong-path.md` Trigger 1 (circularity): asserting
+  // against `ALL_ROUTING_SECRET_NAMES` here would prove only that
+  // `generateWorkflow` agrees with `apply-routing-secrets.ts`'s OWN
+  // constant — both sides of the assertion would move together if that
+  // constant ever drifted (a dropped/renamed/added name), and the test
+  // would keep reporting "correct". This literal is deliberately NOT
+  // imported from production code — it is the exact key set independently
+  // read off the LIVE `workflow_call.secrets` block via `gh api
+  // repos/groundnuty/macf-actions/contents/.github/workflows/agent-router.yml?ref=v3.4.2`
+  // (2026-08-29; re-confirmed against `v3.0.0` too, see the sibling test
+  // below), a second, independent source of truth this test can catch
+  // `ALL_ROUTING_SECRET_NAMES` drifting away from.
+  const V3_4_2_LIVE_REQUIRED_SECRETS = [
+    'ROUTING_CLIENT_CERT',
+    'ROUTING_CLIENT_KEY',
+    'TS_OAUTH_CLIENT_ID',
+    'TS_OAUTH_SECRET',
+    'MACF_ROUTING_APP_ID',
+    'MACF_ROUTING_APP_KEY',
+  ] as const;
+
   it('DECISIVE: a v3+ non-bundle pin passes EXACTLY the six names v3.4.2\'s own workflow_call.secrets declares — not a hand-written list', () => {
     const yaml = generateWorkflow('v3.4.2', v3Inputs);
     const parsed = parseYaml(yaml) as { jobs: { route: { secrets: unknown } } };
     const secretsBlock = parsed.jobs.route.secrets as Record<string, string>;
-    // `ALL_ROUTING_SECRET_NAMES` is the SAME canonical list `apply-routing-secrets.ts`
-    // publishes the repo secrets under — its own module doc records it was
-    // "verified by fetching that file off `main`" against the live
-    // `workflow_call.secrets` block, independently re-confirmed against
-    // v3.0.0 and v3.4.2 above. Asserting against that shared constant
-    // (rather than a fresh literal array here) is what keeps this test from
-    // drifting into its own, second, hand-written expectation.
-    expect(Object.keys(secretsBlock).sort()).toEqual([...ALL_ROUTING_SECRET_NAMES].sort());
+    expect(Object.keys(secretsBlock).sort()).toEqual([...V3_4_2_LIVE_REQUIRED_SECRETS].sort());
     expect(Object.keys(secretsBlock)).toHaveLength(6);
-    for (const name of ALL_ROUTING_SECRET_NAMES) {
+    for (const name of V3_4_2_LIVE_REQUIRED_SECRETS) {
       expect(secretsBlock[name]).toBe(`\${{ secrets.${name} }}`);
     }
+    // Sanity: the independently-sourced literal above and the production
+    // constant the generator actually reads from DO currently agree — if
+    // they ever diverge, this line (not the DECISIVE assertions above) is
+    // the one that should fail, naming which side moved.
+    expect([...ALL_ROUTING_SECRET_NAMES].sort()).toEqual([...V3_4_2_LIVE_REQUIRED_SECRETS].sort());
   });
 
   it('never emits secrets: inherit or the bundle secret for a v3+ non-bundle pin', () => {
