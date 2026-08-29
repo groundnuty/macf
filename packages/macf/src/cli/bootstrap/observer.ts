@@ -45,6 +45,17 @@ import {
   vaultTsOauthSecret,
 } from './vault-read.js';
 import { RUNNER_PLATFORM_ENDPOINT_ENV_VAR, resolveRunnerPlatformEndpointWithProvenance } from './runner-platform.js';
+// groundnuty/macf#1335 — the ONE cross-module reuse in this file's per-agent
+// router-caller read: `extractCallerWithKeys` is a PURE regex extraction
+// (no I/O, no gh-auth-posture concern the rest of this file's "independent
+// copy" convention exists to avoid — see `ACTIONS_USES_RE`'s own doc above
+// for why THAT copy stays independent). Reusing it here — instead of a
+// second, independently-drifting with:-key parser in this file — is what
+// lets `githubRegistryObserver`'s per-agent loop populate BOTH `actionsPin`
+// and the new `routerWithKeys` observation from the SAME single `gh api`
+// read, never a second network read of the identical file (this issue's own
+// "a parallel read is a hazard" requirement).
+import { extractCallerWithKeys } from './runner-declaration-reach.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -1200,13 +1211,31 @@ export function extractActionsPin(content: string): string | undefined {
  * throws.
  */
 export async function readCallerActionsPin(repo: string): Promise<string | undefined> {
+  const content = await readInstalledRouterWorkflow(repo);
+  return content === undefined ? undefined : extractActionsPin(content);
+}
+
+/**
+ * The raw-content read {@link readCallerActionsPin} above delegates to —
+ * split out (groundnuty/macf#1335) so the per-agent loop in
+ * {@link githubRegistryObserver} can extract BOTH the pin (via
+ * {@link extractActionsPin}, unchanged) AND the `with:` key set (via
+ * `runner-declaration-reach.ts::extractCallerWithKeys`) from ONE `gh api`
+ * read, rather than reading the identical file twice. `readCallerActionsPin`
+ * itself is UNCHANGED in observable behaviour — same `gh api` call, same
+ * regex, same result — this is a pure refactor exposing the intermediate
+ * content. `undefined` on ANY failure (file absent, auth / network / `gh`
+ * absent) — never throws, same posture as every other best-effort read in
+ * this module.
+ */
+async function readInstalledRouterWorkflow(repo: string): Promise<string | undefined> {
   try {
     const { stdout } = await execFileAsync(
       'gh',
       ['api', `repos/${repo}/contents/.github/workflows/agent-router.yml`, '--jq', '.content'],
       { encoding: 'utf-8' },
     );
-    return extractActionsPin(decodeGhContent(stdout));
+    return decodeGhContent(stdout);
   } catch {
     return undefined;
   }
@@ -1335,7 +1364,19 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
     // run has independently proven the caller can see the repo itself — see
     // that function's doc.
     const repoState = await resolveAgentRepoState(agent.repo, caVarName, 'ROUTING_CLIENT_CERT');
-    const actionsPin = await readCallerActionsPin(agent.repo);
+    // groundnuty/macf#1335 — ONE read of the installed router caller (same
+    // `gh api` call `readCallerActionsPin` used to make on its own) powers
+    // BOTH `actionsPin` (via `extractActionsPin`, this file's own regex,
+    // UNCHANGED) and the new `routerWithKeys` observation (via
+    // `runner-declaration-reach.ts::extractCallerWithKeys` on the SAME
+    // in-memory string) — never a second `gh api` read of the identical
+    // file. `routerContent === undefined` collapses to `undefined` for
+    // BOTH derived fields, the same "file unreadable, or no macf-actions
+    // uses: line" single signal `readCallerActionsPin`'s own doc already
+    // establishes for `actionsPin` alone.
+    const routerContent = await readInstalledRouterWorkflow(agent.repo);
+    const actionsPin = routerContent === undefined ? undefined : extractActionsPin(routerContent);
+    const routerWithKeys = routerContent === undefined ? undefined : extractCallerWithKeys(routerContent)?.withKeys;
     // DR-043 Amendment G correction (groundnuty/macf#1034) — a STANDALONE
     // `{archived}` read, deliberately NOT threaded through
     // `resolveAgentRepoState` (macf#1026-gated, serves the unrelated
@@ -1353,6 +1394,7 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
       fingerprints: lockEntry?.fingerprints ?? {},
       deployedVersion: lockEntry?.deployed_version,
       actionsPin,
+      routerWithKeys,
       archived: repoArchivedMeta.archived,
       installRepositorySelection: findInstallRepositorySelection(orgInstallScopes, deriveAppHandle(manifest.metadata.name, agent.role)),
     };

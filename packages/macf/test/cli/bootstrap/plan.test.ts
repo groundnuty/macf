@@ -2697,6 +2697,109 @@ describe('computePlan installScopeDrift — already-provisioned-fleet repository
   });
 });
 
+// --- groundnuty/macf#1335 — plan surfaces a runner-declaration mismatch
+// WITHOUT being asked. `ObservedAgentState.actionsPin`/`.routerWithKeys` are
+// hand-built here (offline, no `gh` — same convention every other
+// `computePlan` test in this file uses); the LIVE observer wiring that
+// actually populates `routerWithKeys` from a single `gh api` read is
+// exercised separately in `observer-runner-declaration.test.ts`.
+describe('computePlan runnerDeclarationMismatches — self-hosted declared but the installed router cannot convey it (groundnuty/macf#1335)', () => {
+  const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
+
+  // --- Decisive pair (assert-the-wrong-path.md — (1) alone is satisfied by
+  // always emitting a row regardless of the declaration) ---
+
+  it('1. DECISIVE: self-hosted declared + installed router with: keys cannot convey it -> a plan row names the repo and the reason, WITHOUT any --runs-on-shaped input', () => {
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      agents: {
+        'science-agent': { app: 'present', install: 'present', repo: 'present', fingerprints: {}, actionsPin: 'v3.4.2', routerWithKeys: ['project', 'registry-api-path'] },
+        'code-agent': { app: 'present', install: 'present', repo: 'present', fingerprints: {}, actionsPin: 'v3.4.2', routerWithKeys: ['project', 'registry-api-path'] },
+      },
+    };
+    const plan = computePlan(manifest, observed);
+    expect(plan.runnerDeclarationMismatches).toHaveLength(2);
+    const finding = plan.runnerDeclarationMismatches.find((f) => f.repo === 'groundnuty/icsoc-2026-science-agent');
+    expect(finding?.verdict).toBe('not-honoured');
+    expect(finding?.message).toContain('groundnuty/icsoc-2026-science-agent');
+    expect(finding?.message).toContain('MACF_TRUSTED_ACTORS');
+
+    // The RENDERED plan text — not just the array — carries the mismatch.
+    const text = formatPlanText(plan);
+    expect(text).toContain('runner_declaration: NOT HONOURED');
+    expect(text).toContain('groundnuty/icsoc-2026-science-agent');
+    expect(text).toContain('groundnuty/icsoc-2026-experiment');
+  });
+
+  it('2. DECISIVE: hosted declared -> NO row, no noise, even with observed with: keys present', () => {
+    const hostedManifest = baseManifest({ routing: { runner: { runs_on: 'ubuntu-latest', warm: 1 } } });
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      agents: {
+        'science-agent': { app: 'present', install: 'present', repo: 'present', fingerprints: {}, actionsPin: 'v3.4.2', routerWithKeys: ['project'] },
+        'code-agent': { app: 'present', install: 'present', repo: 'present', fingerprints: {}, actionsPin: 'v3.4.2', routerWithKeys: ['project'] },
+      },
+    };
+    const plan = computePlan(hostedManifest, observed);
+    expect(plan.runnerDeclarationMismatches).toEqual([]);
+    expect(formatPlanText(plan)).not.toContain('runner_declaration');
+  });
+
+  it('routing.runner not declared at all -> no row, no noise (same as hosted)', () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
+    expect(plan.runnerDeclarationMismatches).toEqual([]);
+  });
+
+  it('workflow unreadable (routerWithKeys undefined) -> an UNKNOWN row, never silence and never "consistent"', () => {
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      agents: {
+        'science-agent': { app: 'present', install: 'present', repo: 'present', fingerprints: {} },
+        'code-agent': { app: 'present', install: 'present', repo: 'present', fingerprints: {} },
+      },
+    };
+    const plan = computePlan(manifest, observed);
+    expect(plan.runnerDeclarationMismatches).toHaveLength(2);
+    expect(plan.runnerDeclarationMismatches.every((f) => f.verdict === 'unknown')).toBe(true);
+    const text = formatPlanText(plan);
+    expect(text).toContain('runner_declaration: UNKNOWN');
+  });
+
+  it('a fleet whose runner is ALREADY live and registered is STILL reported here — a live observation does not suppress this manifest-level fact, and this fact never fails the run', () => {
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      agents: {
+        'science-agent': { app: 'present', install: 'present', repo: 'present', fingerprints: {}, routerWithKeys: ['project'] },
+        'code-agent': { app: 'present', install: 'present', repo: 'present', fingerprints: {}, routerWithKeys: ['project'] },
+      },
+      routingRunnerRegistered: 'present',
+    };
+    const plan = computePlan(manifest, observed);
+    expect(plan.runnerDeclarationMismatches).toHaveLength(2);
+    // The registration-live fact and the router-mismatch fact coexist —
+    // neither item construction throws, and nothing about `computePlan`'s
+    // return value signals failure (no exception, no error field).
+    expect(() => formatPlanText(plan)).not.toThrow();
+  });
+
+  it('fleetPlanToJson OMITS runner_declaration_mismatches entirely when empty — byte-identical to pre-#1335 output', () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
+    const json = fleetPlanToJson(plan) as Record<string, unknown>;
+    expect('runner_declaration_mismatches' in json).toBe(false);
+  });
+
+  it('fleetPlanToJson carries the runner_declaration_mismatches key when non-empty', () => {
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      agents: { 'science-agent': { app: 'present', install: 'present', repo: 'present', fingerprints: {}, actionsPin: 'v3.4.2', routerWithKeys: [] } },
+    };
+    const plan = computePlan({ ...manifest, agents: [manifest.agents[0]!] }, observed);
+    const json = fleetPlanToJson(plan) as Record<string, unknown>;
+    expect('runner_declaration_mismatches' in json).toBe(true);
+    expect((json.runner_declaration_mismatches as unknown[]).length).toBe(1);
+  });
+});
+
 // --- groundnuty/macf#1220 / #1129 / #1229 / DR-043 Amendment P2 — row 3 of
 // the reconciler verb matrix: `update` computed for a REUSED fleet-level App
 // whose `selected` install set no longer covers the manifest's declared

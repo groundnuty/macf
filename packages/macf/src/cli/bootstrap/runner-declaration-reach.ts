@@ -196,13 +196,7 @@ export function evaluateRunnerDeclarationReach(
   declaredRunsOn: string | undefined,
   installedContent: string | undefined,
 ): RunnerDeclarationFinding {
-  if (declaredRunsOn !== 'self-hosted') {
-    return {
-      repo,
-      verdict: 'not-applicable',
-      message: `${repo}: routing.runner.runs_on is not "self-hosted" — hosted runners are an accepted choice here; no enforcement check applies.`,
-    };
-  }
+  if (declaredRunsOn !== 'self-hosted') return notApplicableFinding(repo);
 
   if (installedContent === undefined) {
     return {
@@ -225,14 +219,38 @@ export function evaluateRunnerDeclarationReach(
     };
   }
 
-  if (conveysRunnerIntent(parsed.withKeys)) {
+  return decideFromWithKeys(repo, parsed.pin, parsed.withKeys);
+}
+
+/** Shared "declared runner isn't self-hosted" finding — identical text regardless of which entry point (content-based or already-observed) short-circuits on it. */
+function notApplicableFinding(repo: string): RunnerDeclarationFinding {
+  return {
+    repo,
+    verdict: 'not-applicable',
+    message: `${repo}: routing.runner.runs_on is not "self-hosted" — hosted runners are an accepted choice here; no enforcement check applies.`,
+  };
+}
+
+/**
+ * Module-private: the "with: keys are already known" 3-outcome tail shared
+ * by {@link evaluateRunnerDeclarationReach} (content-based — parses
+ * `withKeys` itself from raw text) and
+ * {@link evaluateRunnerDeclarationReachFromObservation} (groundnuty/macf#1335
+ * — consumes ALREADY-parsed `withKeys`, no content of its own to parse) —
+ * the ONE place "honoured"/"not-honoured" message wording lives, so the two
+ * entry points can never render different words for the identical verdict.
+ * `pin` is a display value only (`'(unknown pin)'` when the caller has none
+ * to offer) — it never participates in the decision, only the message text.
+ */
+function decideFromWithKeys(repo: string, pin: string, withKeys: readonly string[]): RunnerDeclarationFinding {
+  if (conveysRunnerIntent(withKeys)) {
     return {
       repo,
       verdict: 'honoured',
       message:
-        `${repo}: installed agent-router.yml@${parsed.pin} passes a "with:" input beyond ` +
-        `{${KNOWN_NON_RUNNER_INTENT_WITH_KEYS.join(', ')}} (with: keys: ${parsed.withKeys.join(', ')}) — this fleet's self-hosted ` +
-        `declaration MAY be reaching the router. Verify by hand against the current macf-actions@${parsed.pin} workflow_call schema; ` +
+        `${repo}: installed agent-router.yml@${pin} passes a "with:" input beyond ` +
+        `{${KNOWN_NON_RUNNER_INTENT_WITH_KEYS.join(', ')}} (with: keys: ${withKeys.join(', ')}) — this fleet's self-hosted ` +
+        `declaration MAY be reaching the router. Verify by hand against the current macf-actions@${pin} workflow_call schema; ` +
         'this check cannot yet name what a new key does.',
     };
   }
@@ -241,12 +259,12 @@ export function evaluateRunnerDeclarationReach(
   // no internal issue numbers. This module's own doc comment above (a
   // maintainer-facing surface, exempt from the guard) carries the actual
   // groundnuty/macf-actions#81 / groundnuty/macf#1194 references.
-  const withDescription = parsed.withKeys.length > 0 ? parsed.withKeys.join(', ') : '(no with: block at all)';
+  const withDescription = withKeys.length > 0 ? withKeys.join(', ') : '(no with: block at all)';
   return {
     repo,
     verdict: 'not-honoured',
     message:
-      `${repo}: fleet.yaml declares routing.runner.runs_on: self-hosted, but the installed agent-router.yml@${parsed.pin} passes ` +
+      `${repo}: fleet.yaml declares routing.runner.runs_on: self-hosted, but the installed agent-router.yml@${pin} passes ` +
       `only {${withDescription}} to macf-actions' reusable workflow. No released macf-actions router accepts an input that conveys ` +
       "a runner declaration (verified against the reusable workflow's own live workflow_call.inputs schema) — " +
       "pick-runner's hosted/self-hosted choice depends SOLELY on the MACF_TRUSTED_ACTORS variable, independent of this manifest. " +
@@ -254,6 +272,53 @@ export function evaluateRunnerDeclarationReach(
       'The reusable workflow does not yet accept an input that would let this declaration reach it; this repo cannot honour ' +
       "the declaration until both that plumbing exists and this repo's installed workflow is regenerated to use it.",
   };
+}
+
+/**
+ * The `macf bootstrap plan` entry point (groundnuty/macf#1335 — the half of
+ * #1194 #1334 deliberately left unwired: a standalone CLI an operator must
+ * remember to run is not a guarantee). Consumes fields `observer.ts`'s
+ * `githubRegistryObserver` ALREADY populated from its own single per-agent
+ * read of the installed `.github/workflows/agent-router.yml`
+ * (`ObservedAgentState.actionsPin` / `.routerWithKeys`) — this function does
+ * NO I/O of its own and reads NOTHING a second time. That is the load-bearing
+ * difference from {@link evaluateRunnerDeclarationReach}: that function (and
+ * its live-read wrapper {@link checkRunnerDeclarationReach}) exist for the
+ * STANDALONE `macf routing runner-declaration-check` CLI, where a fresh,
+ * deliberate live read is exactly what an operator invoking that command
+ * wants; wiring `plan` to also call that live-read path would perform a
+ * SECOND `gh api` read of the identical file `observer.ts` already read
+ * once this run — the parallel-read hazard this issue's own thread warns
+ * against.
+ *
+ * `withKeys === undefined` collapses the SAME two causes
+ * `evaluateRunnerDeclarationReach` collapses into one `'unknown'` signal
+ * (file unreadable, or no macf-actions `uses:` line found) — `observer.ts`'s
+ * single read already folds both into one absent-vs-present observation, so
+ * there is no second distinction left to preserve here. `pin` is cosmetic
+ * (falls back to a placeholder for the message text) — it is NEVER what
+ * decides `'unknown'` vs. a real verdict; `withKeys` alone decides that,
+ * mirroring `ObservedAgentState.routerWithKeys`'s own doc.
+ */
+export function evaluateRunnerDeclarationReachFromObservation(
+  repo: string,
+  declaredRunsOn: string | undefined,
+  pin: string | undefined,
+  withKeys: readonly string[] | undefined,
+): RunnerDeclarationFinding {
+  if (declaredRunsOn !== 'self-hosted') return notApplicableFinding(repo);
+
+  if (withKeys === undefined) {
+    return {
+      repo,
+      verdict: 'unknown',
+      message:
+        `${repo}: this run could not confirm the installed .github/workflows/agent-router.yml's macf-actions router caller — ` +
+        'cannot confirm whether this fleet\'s "self-hosted" declaration is honoured by the router. Treat as UNKNOWN, never "consistent".',
+    };
+  }
+
+  return decideFromWithKeys(repo, pin ?? '(unknown pin)', withKeys);
 }
 
 // --- Live read wrapper ---
