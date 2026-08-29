@@ -160,4 +160,28 @@ describe('findRoutingSecretAsymmetries — the decisive pair (groundnuty/macf#13
       expect(blob).not.toMatch(/ghs_|ghp_|gho_|ghu_|-----BEGIN/);
     }
   });
+
+  it('the message names the repo-scoped-only / org-scope limitation — never overclaims "cannot route" from a repo-level-only read', () => {
+    const observed: Record<string, RepoSecretNamesObservation> = {
+      [WARM]: confirmed(ROUTING_CLIENT_CERT_SECRET_NAME),
+      [COLD]: confirmed(),
+    };
+    const findings = findRoutingSecretAsymmetries([WARM, COLD], observed);
+    const finding = findings.find((f) => f.secretName === ROUTING_CLIENT_CERT_SECRET_NAME);
+    expect(finding?.message).toMatch(/organi[sz]ation/i);
+    expect(finding?.message).not.toMatch(/cannot route/i);
+  });
+
+  it('the TAILNET_NEEDED carve-out caveat appears ONLY on the two TS_OAUTH findings, never on the other four', () => {
+    const observed: Record<string, RepoSecretNamesObservation> = {
+      [WARM]: confirmed(...ALL_SIX),
+      [COLD]: confirmed(),
+    };
+    const findings = findRoutingSecretAsymmetries([WARM, COLD], observed);
+    for (const f of findings) {
+      const carveOutMentioned = /carve-out/i.test(f.message);
+      const isTsOauth = f.secretName === TS_OAUTH_CLIENT_ID_SECRET_NAME || f.secretName === TS_OAUTH_SECRET_SECRET_NAME;
+      expect(carveOutMentioned).toBe(isTsOauth);
+    }
+  });
 });

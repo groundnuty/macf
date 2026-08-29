@@ -31,10 +31,43 @@
  * operator-supplied TS_OAUTH pair stays operator-supplied
  * (`--ts-oauth-client-id`/`--ts-oauth-secret`, macf#1188); a detected split
  * here is REPORTED, never remediated, by this tool.
+ *
+ * **Two bounded, honestly-stated limitations — deliberately NOT closed by
+ * this module, both named in {@link buildAsymmetryMessage}'s rendered
+ * text, not just here:**
+ * - **Repo-scoped reads only.** `observer.ts::listRepoSecretNames` reads
+ *   `GET /repos/<repo>/actions/secrets` — it never reads the ORGANISATION-
+ *   scoped sibling endpoint `fleet-verdict.ts::realListOrgSecretsVisibleToRepo`
+ *   already uses for `apply`'s own post-run verdict widening (macf#1241). A
+ *   fleet whose routing secret lives at organisation scope (`visibility:
+ *   all` or `selected` naming the repo) would show a FALSE split here even
+ *   though `agent-router.yml`'s `${{ secrets.NAME }}` resolves it fine at
+ *   run time — this module does not (yet) perform that extra live read to
+ *   rule the false case out.
+ * - **The TAILNET_NEEDED carve-out is not modeled as a suppression.**
+ *   `fleet-verdict.ts::tailnetRequirement` can determine TS_OAUTH_* is
+ *   genuinely NOT required for a self-hosted fleet on a new-enough router
+ *   pin — this module always evaluates all six names uniformly and instead
+ *   appends a caveat sentence to the two Tailscale names' findings, rather
+ *   than suppressing them the way the fleet-verdict module can (that
+ *   module has access to the fleet's resolved pin; this one, at plan time,
+ *   does not thread it through).
  */
 import type { Presence } from './plan.js';
 import type { RepoSecretNamesObservation } from './observer.js';
-import { ALL_ROUTING_SECRET_NAMES, type RoutingSecretName } from './apply-routing-secrets.js';
+import { ALL_ROUTING_SECRET_NAMES, TS_OAUTH_CLIENT_ID_SECRET_NAME, TS_OAUTH_SECRET_SECRET_NAME, type RoutingSecretName } from './apply-routing-secrets.js';
+
+/**
+ * The two names whose "missing at repo scope" reading is NOT unconditional
+ * (`fleet-verdict.ts::tailnetRequirement`'s `TAILNET_NEEDED` carve-out — a
+ * self-hosted fleet on a router pin new enough to carry it does not require
+ * this pair at all; every OTHER routing secret stays required on every
+ * pin). {@link buildAsymmetryMessage} appends an extra caveat sentence only
+ * for these two names, never for the other four — over-qualifying every
+ * finding with a caveat that applies to two-sixths of them would bury the
+ * ones it doesn't apply to.
+ */
+const TAILNET_CARVEOUT_NAMES: ReadonlySet<RoutingSecretName> = new Set([TS_OAUTH_CLIENT_ID_SECRET_NAME, TS_OAUTH_SECRET_SECRET_NAME]);
 
 /**
  * One secret name's presence on one repo, derived from that repo's observed
@@ -91,16 +124,32 @@ function buildAsymmetryMessage(
       ? ` Presence on ${String(unknownRepos.length)} more repo(s) could not be confirmed this run — neither present ` +
         `nor absent, excluded from the ratio above: ${unknownRepos.join(', ')}.`
       : '';
+  // The org-scope + carve-out caveats below are why this reads "no
+  // repo-scoped copy" rather than "the router cannot resolve this secret" —
+  // this module reads REPO-scoped Actions secrets only (`GET .../actions/secrets`),
+  // never organisation-scoped ones. A value shared at organisation scope and
+  // visible to a listed repo can still let that repo's router resolve it at
+  // run time, so a repo named below is not necessarily broken — it is
+  // missing a REPO-level copy, which is worth knowing regardless, but is not
+  // by itself proof the router will fail.
+  const tailnetCaveat = TAILNET_CARVEOUT_NAMES.has(secretName)
+    ? ' On a self-hosted-runner fleet whose pinned router version carries the newer Tailscale carve-out, this ' +
+      'specific pair can be genuinely not required at all — check the fleet\'s runner declaration and pinned ' +
+      'router version before treating this one as a hard gap.'
+    : '';
   return (
-    `Secret "${secretName}" is present on ${String(presentRepos.length)} of ${String(knownTotal)} repos with ` +
-    `confirmed presence — ABSENT on: ${absentRepos.join(', ')}. A repo missing it cannot route once its ` +
-    "agent-router.yml requires it (macf-actions@v3.4.2 declares every routing secret `required: true`)." +
+    `Secret "${secretName}" is present (repo-scoped) on ${String(presentRepos.length)} of ${String(knownTotal)} ` +
+    `repos with confirmed presence — ABSENT on: ${absentRepos.join(', ')}.` +
     unknownSuffix +
-    " Presence-only — GitHub's Actions-secrets API never exposes the value, only its name, so this tool cannot " +
-    'and does not compare or publish values, only presence. This tool never auto-publishes a routing secret it ' +
-    'detects missing: the Tailscale OAuth pair is supplied by the operator directly (the --ts-oauth-client-id/ ' +
-    '--ts-oauth-secret flags on `macf bootstrap apply`); the router-App and routing-client secrets are published ' +
-    "only through apply's own unified secrets writer."
+    ' This reads REPO-scoped Actions secrets only — a value shared at ORGANISATION scope and visible to those ' +
+    "repos could still let their router resolve it there, so a repo named above is not necessarily broken; it's " +
+    'missing a repo-level copy, worth knowing regardless of whether an org-level one covers it.' +
+    tailnetCaveat +
+    " Presence-only — GitHub's Actions-secrets API never exposes a value, only a name, so this can compare and " +
+    'report presence but never a value. This tool never auto-publishes a routing secret it detects missing: the ' +
+    'Tailscale OAuth pair is supplied by the operator directly (the --ts-oauth-client-id/--ts-oauth-secret flags ' +
+    "on `macf bootstrap apply`); the router-App and routing-client secrets are published only through apply's own " +
+    'unified secrets writer.'
   );
 }
 
@@ -110,9 +159,12 @@ function buildAsymmetryMessage(
  * `MACF_ROUTING_APP_ID`/`MACF_ROUTING_APP_KEY` pair, the routing-client
  * `ROUTING_CLIENT_CERT`/`ROUTING_CLIENT_KEY` pair, and the operator-supplied
  * `TS_OAUTH_CLIENT_ID`/`TS_OAUTH_SECRET` pair), compares presence across
- * every repo the FLEET declares. `repos` is always `manifest.agents.map(a
- * => a.repo)` at the real call site (`plan.ts::computePlan`) — never a live
- * enumeration of the owner's other repos, so a repo the fleet does not own
+ * every router-carrying repo the FLEET declares. `repos` is always
+ * `fleet-manifest.ts::routerCarryingRepos(manifest)` at the real call site
+ * (`plan.ts::computePlan`) — every declared agent repo PLUS the control
+ * repo (router-carrying since macf#1070, the SAME publish target
+ * `apply-fleet.ts`'s own routing-secrets writer uses) — never a live
+ * enumeration of the owner's OTHER repos, so a repo the fleet does not own
  * is structurally never consulted: it simply never appears in `repos`, and
  * {@link secretPresenceFor} never looks one up that wasn't asked for.
  *

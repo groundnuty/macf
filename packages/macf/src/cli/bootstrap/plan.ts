@@ -2817,14 +2817,14 @@ export function computePlan(
 
   // groundnuty/macf#1336 — the per-repo routing-secret asymmetry sweep:
   // pure, over ALREADY-OBSERVED `observed.routingSecretRepos` data (no I/O
-  // here, matching this function's own invariant). `repos` is the fleet's
-  // OWN declared agent repos, never a live enumeration of the owner's other
-  // repos — see `findRoutingSecretAsymmetries`'s doc for why that alone
-  // guarantees a repo the fleet does not own is never consulted.
-  const routingSecretAsymmetries = findRoutingSecretAsymmetries(
-    manifest.agents.map((a) => a.repo),
-    observed.routingSecretRepos ?? {},
-  );
+  // here, matching this function's own invariant). `repos` is
+  // `routerCarryingRepos(manifest)` — every declared agent repo PLUS the
+  // control repo (`fleet-manifest.ts` doc: router-carrying since #1070, the
+  // SAME set `actionsVersionItem`'s own control-repo row above already
+  // reconciles against) — never a live enumeration of the owner's other
+  // repos, so a repo the fleet does not own is still never consulted; see
+  // `findRoutingSecretAsymmetries`'s own doc.
+  const routingSecretAsymmetries = findRoutingSecretAsymmetries(routerCarryingRepos(manifest), observed.routingSecretRepos ?? {});
 
   return {
     fleet: fleetName,

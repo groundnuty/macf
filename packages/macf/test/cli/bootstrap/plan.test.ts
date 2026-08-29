@@ -3147,6 +3147,22 @@ describe('computePlan routingSecretAsymmetries — per-repo routing-secret split
       ]),
     ).toEqual(['routing_secret: WARNING — the split text']);
   });
+
+  it('the CONTROL repo (router-carrying since #1070, not a declared agent) is consulted too — a split there is not invisible to the sweep', () => {
+    const CONTROL_REPO = 'groundnuty/icsoc-2026-control';
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      routingSecretRepos: {
+        [SCIENCE_REPO]: confirmed(TS_OAUTH_CLIENT_ID_SECRET_NAME, TS_OAUTH_SECRET_SECRET_NAME),
+        [CODE_REPO]: confirmed(TS_OAUTH_CLIENT_ID_SECRET_NAME, TS_OAUTH_SECRET_SECRET_NAME),
+        [CONTROL_REPO]: confirmed(), // the control repo lacks the pair — both agent repos have it
+      },
+    };
+    const plan = computePlan(baseManifest(), observed);
+    const finding = plan.routingSecretAsymmetries.find((f) => f.secretName === TS_OAUTH_CLIENT_ID_SECRET_NAME);
+    expect(finding?.absentRepos).toEqual([CONTROL_REPO]);
+    expect(formatPlanText(plan)).toContain(CONTROL_REPO);
+  });
 });
 
 // --- Operator interaction budget (groundnuty/macf#880, DR-044 Decision 6) ---

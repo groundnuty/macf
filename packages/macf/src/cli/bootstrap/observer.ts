@@ -1635,6 +1635,20 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
   // ({@link readCallerActionsPin}), targeted at the SAME derived full name
   // `controlRepoMeta` above already computed.
   const controlRepoActionsPin = await readCallerActionsPin(controlRepoFullNameHere);
+  // groundnuty/macf#1336 — the control repo is a router-carrying repo too
+  // (same #1072 fact `controlRepoActionsPin` immediately above already acts
+  // on: `apply-fleet.ts`'s `publishRoutingSecrets` call targets
+  // `fleet-manifest.ts::routerCarryingRepos(manifest)`, which APPENDS the
+  // control repo after every agent repo — never agent repos alone). Without
+  // this read, a routing secret missing ONLY on the control repo would be
+  // invisible to `routing-secret-parity.ts::findRoutingSecretAsymmetries`
+  // even though `apply` published (or failed to publish) it there exactly
+  // like any agent repo. Same macf#1026 gated-visibility discipline as the
+  // per-agent loop above.
+  routingSecretRepos[controlRepoFullNameHere] =
+    controlRepoMeta.presence === 'present'
+      ? await listRepoSecretNames(controlRepoFullNameHere)
+      : { status: 'unknown', reason: `control repo "${controlRepoFullNameHere}" presence unconfirmed this run` };
 
   return {
     lock,
