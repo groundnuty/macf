@@ -20,6 +20,7 @@ import {
   extractCallerWithKeys,
   conveysRunnerIntent,
   evaluateRunnerDeclarationReach,
+  evaluateRunnerDeclarationReachFromObservation,
   checkRunnerDeclarationReach,
   KNOWN_NON_RUNNER_INTENT_WITH_KEYS,
 } from '../../../src/cli/bootstrap/runner-declaration-reach.js';
@@ -174,6 +175,51 @@ describe('evaluateRunnerDeclarationReach — not-applicable + honest-unknown flo
     const finding = evaluateRunnerDeclarationReach('groundnuty/x', 'self-hosted', UNRELATED_WORKFLOW_YAML);
     expect(finding.verdict).toBe('unknown');
     expect(finding.message).toMatch(/UNKNOWN/);
+  });
+});
+
+describe('evaluateRunnerDeclarationReachFromObservation — already-observed entry point (groundnuty/macf#1335)', () => {
+  it('1. self-hosted declared + observed with: keys cannot honour it -> not-honoured, SAME message shape as the content-based function', () => {
+    const contentBased = evaluateRunnerDeclarationReach('groundnuty/x', 'self-hosted', TODAYS_CALLER_YAML);
+    const observationBased = evaluateRunnerDeclarationReachFromObservation('groundnuty/x', 'self-hosted', 'v3.4.2', ['project', 'registry-api-path']);
+    expect(observationBased.verdict).toBe('not-honoured');
+    expect(observationBased.message).toBe(contentBased.message);
+  });
+
+  it('2. self-hosted declared + observed with: keys DO carry a runner-intent key -> honoured, SAME message shape as the content-based function', () => {
+    const contentBased = evaluateRunnerDeclarationReach('groundnuty/x', 'self-hosted', FUTURE_CALLER_YAML);
+    const observationBased = evaluateRunnerDeclarationReachFromObservation('groundnuty/x', 'self-hosted', 'v3.6.0', [
+      'project',
+      'registry-api-path',
+      'runner-intent',
+    ]);
+    expect(observationBased.verdict).toBe('honoured');
+    expect(observationBased.message).toBe(contentBased.message);
+  });
+
+  it('hosted declared -> not-applicable, regardless of what was observed', () => {
+    expect(evaluateRunnerDeclarationReachFromObservation('groundnuty/x', 'hosted', 'v3.4.2', ['project']).verdict).toBe('not-applicable');
+    expect(evaluateRunnerDeclarationReachFromObservation('groundnuty/x', undefined, undefined, undefined).verdict).toBe('not-applicable');
+  });
+
+  it('DECISIVE: withKeys undefined (the SAME single signal collapsing "unreadable" and "no uses: line") -> unknown, never honoured/not-honoured/"consistent"', () => {
+    const finding = evaluateRunnerDeclarationReachFromObservation('groundnuty/x', 'self-hosted', undefined, undefined);
+    expect(finding.verdict).toBe('unknown');
+    expect(finding.verdict).not.toBe('honoured');
+    expect(finding.verdict).not.toBe('not-honoured');
+    expect(finding.message).toMatch(/UNKNOWN/);
+  });
+
+  it('an empty with: block (a real, meaningful observation — a legacy caller with no with: at all) is ALSO not-honoured, described as such', () => {
+    const finding = evaluateRunnerDeclarationReachFromObservation('groundnuty/x', 'self-hosted', 'v1.3.3', []);
+    expect(finding.verdict).toBe('not-honoured');
+    expect(finding.message).toContain('no with: block at all');
+  });
+
+  it('pin undefined falls back to a placeholder rather than throwing or losing the verdict', () => {
+    const finding = evaluateRunnerDeclarationReachFromObservation('groundnuty/x', 'self-hosted', undefined, ['project', 'registry-api-path']);
+    expect(finding.verdict).toBe('not-honoured');
+    expect(finding.message).toContain('(unknown pin)');
   });
 });
 
