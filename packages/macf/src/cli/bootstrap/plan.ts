@@ -87,7 +87,7 @@
  */
 import { toVariableSegment } from '@groundnuty/macf-core';
 import type { FleetAgent, FleetLock, FleetManifest } from './fleet-manifest.js';
-import { buildTrustedActorsValue, deriveAppHandle, routerCarryingRepos } from './fleet-manifest.js';
+import { buildTrustedActorsValue, deriveAppHandle, deriveControlRepoName, routerCarryingRepos } from './fleet-manifest.js';
 import { formatTable } from '../commands/ps.js';
 import type { VaultAgentObservation, VaultCaObservation, VaultRecipientsObservation, VaultRouterAppObservation, VaultTsOauthObservation } from './vault-read.js';
 import { countVaultAgentPresence, countVaultCaPresence } from './vault-read.js';
@@ -710,6 +710,44 @@ export interface FleetPlan {
    * same convention every sibling notice array above follows.
    */
   readonly routingSecretAsymmetries: readonly RoutingSecretAsymmetry[];
+  /**
+   * groundnuty/macf#1348 — the DISCLOSURE (not computation) that the control
+   * repo is a possible write target for two legs `caRepoItem`/
+   * `routingClientItem` never enumerate it for: those two loops iterate
+   * `manifest.agents` only, while `apply-fleet.ts` publishes both the CA
+   * cert (macf#1347) and the routing-client secret (macf#1073) to
+   * `fleet-manifest.ts::routerCarryingRepos`, which appends the control
+   * repo. Whether the control repo is ACTUALLY one of `apply`'s targets a
+   * given run is `apply-control-repo-init.ts::controlRepoCarriesRouter` —
+   * did THIS run's control-repo workflow write succeed and get allowlisted
+   * for commit — a live apply-run outcome `plan` has no way to observe or
+   * predict (read-only, no repoInit call of its own). That is a genuine,
+   * permanent limit, not a gap to close: "we cannot determine this" is a
+   * different output from emitting nothing, so this field names the
+   * uncertainty instead of staying silent about it.
+   *
+   * Always exactly one entry for a schema-valid manifest (a control repo
+   * name is unconditionally derivable from `metadata.name` — there is no
+   * manifest shape that omits one); the empty-array arm exists for the
+   * builder's own defensive contract (see
+   * {@link controlRepoRouterCoverageNotices}), not because some fleet
+   * lacks a control repo. Same "standing notice, surfaced on every run"
+   * posture {@link scopeCredentials} already establishes for its own
+   * always-true-for-now case. ALWAYS present on the TYPE (empty array
+   * convention, same as every sibling notice array above); `--json` omits
+   * the key entirely when empty, same convention every sibling above
+   * follows.
+   */
+  readonly controlRepoRouterCoverage: readonly ControlRepoRouterCoverage[];
+}
+
+/**
+ * One {@link FleetPlan.controlRepoRouterCoverage} entry — see that field's
+ * doc for what it discloses and why `plan` cannot resolve it further.
+ */
+export interface ControlRepoRouterCoverage {
+  readonly repo: string;
+  readonly message: string;
 }
 
 /**
@@ -1405,6 +1443,48 @@ export function scopeCredentialNotice(role: string, originFleet: string | undefi
       `${origin}, pending a future shared-credential store. No action needed; this notice stays visible every run ` +
       'until that store exists.',
   };
+}
+
+/**
+ * groundnuty/macf#1348 — build {@link FleetPlan.controlRepoRouterCoverage}
+ * from an ALREADY-DERIVED control-repo full name, never deriving one
+ * internally. Two reasons this takes the name as a parameter instead of a
+ * `FleetManifest`:
+ *
+ * - Same "one wording, reused" discipline every other notice-builder in
+ *   this file follows ({@link scopeCredentialNotice}, `caRepoItem`) — the
+ *   call site already needs the name for other purposes, so this stays a
+ *   pure string-in/notice-out function.
+ * - **Decisive-pair testability** (`assert-the-wrong-path.md`): a
+ *   hardcoded `return [notice]` implementation is indistinguishable from
+ *   this one on every real manifest, because a control-repo name is
+ *   unconditionally derivable — there is no manifest shape that omits it
+ *   (see {@link FleetPlan.controlRepoRouterCoverage}'s doc). Taking the
+ *   name as an explicit, possibly-`undefined` parameter is what makes the
+ *   "wrong path" (a constant, argument-ignoring implementation) callable
+ *   and failable in isolation, without needing a manifest shape that
+ *   cannot exist. The `undefined` arm is that defensive contract, not a
+ *   claim that some real fleet lacks a control repo.
+ *
+ * `computePlan`'s call site passes the SAME derivation
+ * `fleet-manifest.ts::routerCarryingRepos` uses internally
+ * (`${manifest.owner.account}/${deriveControlRepoName(manifest.metadata.name)}`),
+ * imported directly rather than via `control-repo.ts::controlRepoFullName`
+ * — that module imports `Presence` FROM `plan.ts`, so importing back from
+ * it here would be circular.
+ */
+export function controlRepoRouterCoverageNotices(controlRepoFullName: string | undefined): readonly ControlRepoRouterCoverage[] {
+  if (controlRepoFullName === undefined) return [];
+  return [
+    {
+      repo: controlRepoFullName,
+      message:
+        `"${controlRepoFullName}" may receive the CA cert variable and the routing-client secret when \`apply\` runs: ` +
+        'both legs publish to every router-carrying repo, and whether the control repo counts as one is decided by ' +
+        "this run's own control-repo router-workflow write succeeding and being committed — an apply-run outcome " +
+        '`plan` has no way to observe or predict at plan time, so it is not listed as a plan item above.',
+    },
+  ];
 }
 
 /**
@@ -2826,6 +2906,14 @@ export function computePlan(
   // `findRoutingSecretAsymmetries`'s own doc.
   const routingSecretAsymmetries = findRoutingSecretAsymmetries(routerCarryingRepos(manifest), observed.routingSecretRepos ?? {});
 
+  // groundnuty/macf#1348 — same derivation `routerCarryingRepos` itself
+  // appends (`fleet-manifest.ts::deriveControlRepoName`), computed directly
+  // here rather than read back off that array's last element, so this
+  // notice's presence is not an accident of that function's internal
+  // ordering. See {@link controlRepoRouterCoverageNotices}'s doc for why
+  // the name is passed in rather than derived inside the builder.
+  const controlRepoRouterCoverage = controlRepoRouterCoverageNotices(`${manifest.owner.account}/${deriveControlRepoName(manifest.metadata.name)}`);
+
   return {
     fleet: fleetName,
     items,
@@ -2837,6 +2925,7 @@ export function computePlan(
     scopeCredentials,
     runnerDeclarationMismatches,
     routingSecretAsymmetries,
+    controlRepoRouterCoverage,
   };
 }
 
@@ -3061,6 +3150,16 @@ function runnerDeclarationTag(verdict: RunnerDeclarationFinding['verdict']): str
  */
 export function formatRoutingSecretAsymmetryLines(asymmetries: readonly RoutingSecretAsymmetry[]): readonly string[] {
   return asymmetries.map((a) => `routing_secret: WARNING — ${a.message}`);
+}
+
+/**
+ * groundnuty/macf#1348 — one line per {@link ControlRepoRouterCoverage}.
+ * `NOTICE` (not `WARNING`) — same reasoning {@link formatScopeCredentialLines}
+ * already states: this is a manifest-derived heads-up about a possible
+ * future write, never a live observed fact about an existing problem.
+ */
+export function formatControlRepoRouterCoverageLines(notices: readonly ControlRepoRouterCoverage[]): readonly string[] {
+  return notices.map((n) => `control_repo_coverage: NOTICE — ${n.message}`);
 }
 
 // --- Operator interaction budget (groundnuty/macf#880, DR-044 Decision 6) ---
@@ -3330,6 +3429,10 @@ export function formatPlanText(plan: FleetPlan): string {
   if (routingSecretAsymmetryLines.length > 0) {
     parts.push('', ...routingSecretAsymmetryLines);
   }
+  const controlRepoRouterCoverageLines = formatControlRepoRouterCoverageLines(plan.controlRepoRouterCoverage);
+  if (controlRepoRouterCoverageLines.length > 0) {
+    parts.push('', ...controlRepoRouterCoverageLines);
+  }
   return parts.join('\n');
 }
 
@@ -3383,6 +3486,13 @@ export function fleetPlanToJson(plan: FleetPlan): unknown {
     // routing secret this run.
     ...(plan.routingSecretAsymmetries.length > 0
       ? { routing_secret_asymmetries: plan.routingSecretAsymmetries.map((i) => ({ ...i })) }
+      : {}),
+    // groundnuty/macf#1348 — SAME omitted-when-empty convention, same
+    // reason: byte-identical `--json` output for the (defensive-only,
+    // never realistically reached) case where no control-repo name could
+    // be derived. Present for every schema-valid manifest in practice.
+    ...(plan.controlRepoRouterCoverage.length > 0
+      ? { control_repo_router_coverage: plan.controlRepoRouterCoverage.map((i) => ({ ...i })) }
       : {}),
   };
 }
