@@ -9,7 +9,7 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { operatorInputProvenance, resolveDeps, runBootstrapPlan, type BootstrapPlanDeps } from '../../src/cli/commands/bootstrap.js';
-import type { ObservedState } from '../../src/cli/bootstrap/plan.js';
+import { SKIPPED_SECTION_REASONS, type ObservedState } from '../../src/cli/bootstrap/plan.js';
 import { parseFleetManifest } from '../../src/cli/bootstrap/fleet-manifest.js';
 import { resolveRunnerPlatformEndpointWithProvenance } from '../../src/cli/bootstrap/runner-platform.js';
 
@@ -172,8 +172,13 @@ describe('runBootstrapPlan', () => {
     expect(json.plan.length).toBeGreaterThan(0);
     expect(json.summary.creates).toBeGreaterThan(0);
     // collaborators is declared + non-empty in the fixture → must be SKIPPED, not silently dropped.
+    // `defaults.app_manifest` / `agents[].profile` are STANDING entries
+    // (groundnuty/macf#1355 — both are REQUIRED fields, so every
+    // schema-valid manifest, including this fixture, declares them).
     expect(json.skipped_sections).toEqual([
       { section: 'collaborators', reason: 'reconcile not implemented in v1' },
+      { section: 'defaults.app_manifest', reason: SKIPPED_SECTION_REASONS['defaults.app_manifest'] },
+      { section: 'agents[].profile', reason: SKIPPED_SECTION_REASONS['agents[].profile'] },
     ]);
     // macf#838 Amendment D phase 2: CA is fully implemented now — a fresh
     // fleet with no `routing:` declared has NOTHING unimplemented.
@@ -230,7 +235,7 @@ describe('runBootstrapPlan', () => {
     expect(out).toContain('routing:icsoc-2026:runner');
   });
 
-  it('plain-text mode omits the skipped-section block entirely when nothing was skipped', async () => {
+  it('plain-text mode omits the collaborators/shared lines when neither is declared, but still renders the standing defaults.app_manifest / agents[].profile lines (groundnuty/macf#1355)', async () => {
     const { dir, file } = writeManifest(
       VALID_FLEET_YAML.replace(/collaborators:\n(.|\n)*$/, ''),
     );
@@ -240,7 +245,14 @@ describe('runBootstrapPlan', () => {
     const code = await runBootstrapPlan({ file }, deps);
     expect(code).toBe(0);
     const out = logSpy.mock.calls.flat().join('\n');
-    expect(out).not.toContain('SKIPPED');
+    // Neither optional section was declared → presence-gated silence holds.
+    expect(out).not.toContain('collaborators:');
+    expect(out).not.toContain('shared:');
+    // `defaults.app_manifest` / `agents[].profile` are REQUIRED fields —
+    // every schema-valid manifest declares them — so their SKIPPED lines
+    // are STANDING, present even here where nothing OPTIONAL was skipped.
+    expect(out).toContain('defaults.app_manifest: SKIPPED');
+    expect(out).toContain('agents[].profile: SKIPPED');
   });
 
   it('a fully-clean plan (nothing to do) still exits 0 — a plan full of creates is a SUCCESSFUL run', async () => {

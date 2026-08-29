@@ -27,6 +27,7 @@ import {
   orphanResourceUrl,
   planItemApplyCoverage,
   scopeCredentialNotice,
+  SKIPPED_SECTION_REASONS,
   summarizePlan,
   UNKNOWN_REASONS,
   type ControlRepoRouterCoverage,
@@ -1297,13 +1298,25 @@ describe('computePlan — deterministic ordering', () => {
   });
 });
 
-describe('computePlan — skippedSections (declared-but-deferred sections, no silent caps)', () => {
-  it('is empty when collaborators is not declared', () => {
+describe('computePlan — skippedSections (declared-but-deferred / INERT sections, no silent caps)', () => {
+  // groundnuty/macf#1355 — `defaults.app_manifest` + `agents[].profile` are
+  // REQUIRED schema fields (no `.optional()` anywhere on either path), so
+  // every schema-valid manifest declares them unconditionally. Their
+  // skippedSections entries are therefore STANDING — present regardless of
+  // what else the manifest declares. `baseManifest()` never varies these
+  // two fields, so this exact pair is the expected floor for every plan in
+  // this describe block.
+  const STANDING_SECTIONS = [
+    { section: 'defaults.app_manifest', reason: SKIPPED_SECTION_REASONS['defaults.app_manifest'] },
+    { section: 'agents[].profile', reason: SKIPPED_SECTION_REASONS['agents[].profile'] },
+  ];
+
+  it('carries only the standing entries when collaborators/shared are not declared', () => {
     const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
-    expect(plan.skippedSections).toEqual([]);
+    expect(plan.skippedSections).toEqual(STANDING_SECTIONS);
   });
 
-  it('surfaces collaborators as SKIPPED when declared + non-empty', () => {
+  it('surfaces collaborators as SKIPPED when declared + non-empty (regression: reason text unchanged)', () => {
     const manifest = baseManifest({
       collaborators: [
         { project: 'ppam-2026', registry: { type: 'profile', user: 'groundnuty' }, ca_bundle: 'bundles/ppam.pem' },
@@ -1312,13 +1325,14 @@ describe('computePlan — skippedSections (declared-but-deferred sections, no si
     const plan = computePlan(manifest, EMPTY_OBSERVED);
     expect(plan.skippedSections).toEqual([
       { section: 'collaborators', reason: 'reconcile not implemented in v1' },
+      ...STANDING_SECTIONS,
     ]);
   });
 
   it('stays SILENT for an explicitly-empty collaborators array (nothing declared to skip)', () => {
     const manifest = baseManifest({ collaborators: [] });
     const plan = computePlan(manifest, EMPTY_OBSERVED);
-    expect(plan.skippedSections).toEqual([]);
+    expect(plan.skippedSections).toEqual(STANDING_SECTIONS);
   });
 
   // `versions` is DELIBERATELY ABSENT from this describe block as of DR-043
@@ -1326,17 +1340,17 @@ describe('computePlan — skippedSections (declared-but-deferred sections, no si
   // skippedSections entry (it produces real `version` / `actions_pin` plan
   // items instead; see version-steering.test.ts). This is the direct,
   // load-bearing regression-guard for that transition: a `versions:`-bearing
-  // manifest staying OUT of `skippedSections` is exactly what "D6 is wired,
-  // not deferred" means.
+  // manifest carrying only the standing entries is exactly what "D6 is
+  // wired, not deferred" means.
   it('does NOT surface versions as SKIPPED anymore — it produces real plan items instead', () => {
     const manifest = baseManifest({ versions: { macf: '0.2.44', actions: 'v3.4.1' } });
     const plan = computePlan(manifest, EMPTY_OBSERVED);
-    expect(plan.skippedSections).toEqual([]);
+    expect(plan.skippedSections).toEqual(STANDING_SECTIONS);
     expect(plan.items.some((i) => i.kind === 'version')).toBe(true);
     expect(plan.items.some((i) => i.kind === 'actions_pin')).toBe(true);
   });
 
-  it('formatSkippedLines renders the exact loud-line shape (collaborators only)', () => {
+  it('formatSkippedLines renders the exact loud-line shape (collaborators + the two standing entries)', () => {
     const manifest = baseManifest({
       versions: { macf: '0.2.44', actions: 'v3.4.1' },
       collaborators: [
@@ -1345,7 +1359,62 @@ describe('computePlan — skippedSections (declared-but-deferred sections, no si
     });
     const plan = computePlan(manifest, EMPTY_OBSERVED);
     const lines = formatSkippedLines(plan.skippedSections);
-    expect(lines).toEqual(['collaborators: SKIPPED (reconcile not implemented in v1)']);
+    expect(lines).toEqual([
+      'collaborators: SKIPPED (reconcile not implemented in v1)',
+      `defaults.app_manifest: SKIPPED (${SKIPPED_SECTION_REASONS['defaults.app_manifest']})`,
+      `agents[].profile: SKIPPED (${SKIPPED_SECTION_REASONS['agents[].profile']})`,
+    ]);
+  });
+
+  // groundnuty/macf#1355 — `shared:` is the second PRESENCE-GATED section
+  // (same optional-section shape `collaborators` already established). This
+  // is the issue's decisive test pair: a manifest DECLARING
+  // `shared.ts_oauth` names it, verbatim, in the RENDERED plan text; a
+  // manifest OMITTING `shared` entirely produces no line, no noise for that
+  // section — byte-identical to a manifest that never mentions it.
+  describe('shared (groundnuty/macf#1355)', () => {
+    it('names shared.routing_app / shared.ts_oauth in the rendered plan text when the section is declared', () => {
+      const manifest = baseManifest({ shared: { routing_app: 'acme-routing', ts_oauth: 'acme-ts-oauth' } });
+      const plan = computePlan(manifest, EMPTY_OBSERVED);
+      expect(plan.skippedSections).toEqual([{ section: 'shared', reason: SKIPPED_SECTION_REASONS.shared }, ...STANDING_SECTIONS]);
+
+      const rendered = formatPlanText(plan);
+      expect(rendered).toContain('shared: SKIPPED');
+      expect(rendered).toContain('shared.routing_app');
+      expect(rendered).toContain('shared.ts_oauth');
+      expect(rendered).toContain('#1161');
+    });
+
+    it('produces no line, no noise in the rendered plan when shared is omitted entirely', () => {
+      const withShared = computePlan(baseManifest({ shared: { routing_app: 'x', ts_oauth: 'y' } }), EMPTY_OBSERVED);
+      const withoutShared = computePlan(baseManifest(), EMPTY_OBSERVED);
+
+      expect(formatPlanText(withShared)).toContain('shared: SKIPPED');
+      expect(formatPlanText(withoutShared)).not.toContain('shared:');
+      expect(withoutShared.skippedSections.some((s) => s.section === 'shared')).toBe(false);
+    });
+  });
+
+  // groundnuty/macf#1355 — `defaults.app_manifest` / `agents[].profile` are
+  // REQUIRED fields, so their entries are unconditional (STANDING_SECTIONS
+  // above already pins this for the plain base manifest). These assert
+  // against the RENDERED text/`--json` output specifically — the
+  // mutation-catching form: suppressing either push in
+  // `computeSkippedSections` fails a test reading rendered output, not a
+  // helper's return value.
+  describe('defaults.app_manifest + agents[].profile (groundnuty/macf#1355, standing entries)', () => {
+    it('names both fields in the rendered plan text, unconditionally, on the minimal base manifest', () => {
+      const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
+      const rendered = formatPlanText(plan);
+      expect(rendered).toContain('defaults.app_manifest: SKIPPED');
+      expect(rendered).toContain('agents[].profile: SKIPPED');
+    });
+
+    it('--json carries both under the existing skipped_sections key, no new shape', () => {
+      const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
+      const json = fleetPlanToJson(plan) as { skipped_sections: readonly { section: string; reason: string }[] };
+      expect(json.skipped_sections).toEqual(STANDING_SECTIONS);
+    });
   });
 });
 

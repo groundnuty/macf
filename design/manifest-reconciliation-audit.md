@@ -92,6 +92,25 @@ where that is the reason for `not reported`, the row says so.
 | 30 | `trust.ca` | **INERT** | not reported | `manifest.trust` has zero reads; `FleetTrust` has zero references outside the schema and tests. |
 | 31 | `trust.federated_cas` | **INERT** | not reported | Same. `teardown.ts:163` builds a `federatedCasVariableName(fleetName)` target derived from the **fleet name**, never from this list. |
 
+> **Post-audit update (2026-08).** Rows 30-31 (`trust.ca` / `trust.federated_cas`)
+> describe the schema AT `1b52117`, this audit's evidence baseline — they are
+> pinned history, not live status. **groundnuty/macf#1205 (merged after this
+> audit, before either row was acted on) removed `trust:` from
+> `FleetManifestSchema` entirely** and made declaring it a loud parse-time
+> refusal (`fleet-manifest.ts::rejectDeclaredTrust`) rather than a silent
+> accept — a stronger disclosure than the `skippedSections` mechanism §2's
+> own recommendation (below) proposes for the other seven rows. A
+> `FleetManifest` value can no longer carry a `trust` key at all. The
+> remaining seven INERT rows (15, 17, 24-29) were addressed by
+> groundnuty/macf#1355, which extended `plan.ts`'s `skippedSections`
+> mechanism — already covering `collaborators[]` (row 24) — to `shared`
+> (rows 28-29, same presence-gated shape) and to `defaults.app_manifest` /
+> `agents[].profile` (rows 15/17, unconditional STANDING entries, since
+> both are REQUIRED fields with no "undeclared" state to gate on). Rows
+> 25-27 (`collaborators[].project` / `.registry` / `.ca_bundle`) stay
+> genuinely INERT — `#1355` disclosed the ARRAY's presence, not each
+> element field — same posture row 24 already had before this update.
+
 ---
 
 ## 2. INERT fields — read this section first

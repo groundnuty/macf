@@ -56,6 +56,28 @@
  * declared-but-deferred section explicitly via `FleetPlan.skippedSections`
  * — never silent.
  *
+ * **groundnuty/macf#1355 extended the SAME mechanism to every other field
+ * the #1200 audit (`design/manifest-reconciliation-audit.md`) found
+ * INERT** (parsed, zero readers) — not just `collaborators`. `shared:`
+ * follows `collaborators`'s own presence-gated shape (an optional section;
+ * silent when omitted, one line when declared). `defaults.app_manifest`
+ * and `agents[].profile` are DIFFERENT: both are REQUIRED schema fields
+ * (`FleetDefaultsSchema` / `FleetAgentSchema` are `.strict()` with no
+ * `.optional()` on either), so every schema-valid manifest declares them
+ * unconditionally — there is no "omitted" state to gate on, so these two
+ * are STANDING entries, present on every run, same "always one entry for a
+ * schema-valid manifest" posture {@link FleetPlan.controlRepoRouterCoverage}
+ * already establishes for its own always-true-today case. **`trust.ca` /
+ * `trust.federated_cas` — the #1200 audit's other two INERT fields — are
+ * deliberately ABSENT from this list**: groundnuty/macf#1205 (merged
+ * 2026-08-26, before #1355 was filed) removed `trust:` from
+ * {@link FleetManifestSchema} entirely and made declaring it a loud
+ * parse-time refusal (`fleet-manifest.ts::rejectDeclaredTrust`) — a
+ * `FleetManifest` value can no longer carry a `trust` key at all, so there
+ * is nothing here to disclose; the refusal already IS the strongest form
+ * of disclosure. See `SKIPPED_SECTION_REASONS`'s own doc for the per-field
+ * reasons.
+ *
  * `versions:` (§D6 GitOps steering) is WIRED: once declared, `computePlan`
  * emits a `version` item per agent (deployed macf CLI version) and an
  * `actions_pin` item per ROUTER-CARRYING repo — every agent's repo AND the
@@ -779,25 +801,72 @@ export interface InstallScopeDrift {
 }
 
 /**
- * The reason text for each declared-but-deferred section (Slice 1a; see
- * module doc). `versions` is GONE from this map (DR-043 §D6 is wired as of
- * this change, not deferred) — `collaborators` is the sole remaining member.
+ * The reason text for each declared-but-deferred / INERT section (Slice 1a
+ * + groundnuty/macf#1355; see module doc). `versions` is GONE from this map
+ * (DR-043 §D6 is wired as of that change, not deferred).
+ *
+ * Four members today, two shapes (see `computeSkippedSections`'s doc for
+ * which fields use which):
+ *
+ * - `collaborators` / `shared` — OPTIONAL sections; the reason fires only
+ *   when the operator actually declared the section.
+ * - `'defaults.app_manifest'` / `'agents[].profile'` — REQUIRED fields; the
+ *   reason is a standing fact true of every schema-valid manifest, because
+ *   there is no "undeclared" state for a mandatory field to be silent
+ *   about.
+ *
+ * `trust.ca` / `trust.federated_cas` (the #1200 audit's other two INERT
+ * fields) are NOT here — groundnuty/macf#1205 removed `trust:` from the
+ * schema and made declaring it a parse-time refusal, so it never reaches
+ * `computeSkippedSections` at all. See the module doc's #1355 paragraph.
  */
 export const SKIPPED_SECTION_REASONS = {
   collaborators: 'reconcile not implemented in v1',
+  // groundnuty/macf#1161 is the still-open design for the account-level
+  // shared-router-App model this field anticipated (`fleet-manifest.ts`'s
+  // `FleetSharedSchema` doc) — named here so an operator who declares
+  // `shared:` today is pointed at where the eventual consumer will land,
+  // not just told "nothing reads this."
+  shared: "shared.routing_app / shared.ts_oauth are parsed but consumed nowhere in this codebase — the account-level shared-router-App model this field anticipated is #1161's still-open design",
+  // No tracking issue exists for either of these two — the #1200 audit
+  // found zero design discussion anticipating a consumer (unlike `shared`/
+  // `trust`, which each cite an open design issue in their own schema
+  // doc), so none is fabricated here. `formatSkippedLines`' rendering is
+  // still fully specific about WHICH field and WHY.
+  'defaults.app_manifest': 'defaults.app_manifest is parsed but has zero readers in this codebase — no code path builds an App manifest from it',
+  'agents[].profile': 'agents[].profile is parsed but has zero readers in this codebase — no code path branches on it',
 } as const;
 
 /**
- * Surface every declared-but-deferred manifest section, loudly. Only fires
- * when the section is actually DECLARED (present) AND, for array sections,
- * non-empty. An absent or empty section stays silent (nothing was promised,
- * so nothing to warn about not having reconciled).
+ * Surface every declared-but-deferred / INERT manifest section, loudly.
+ * Two disclosure shapes (see `SKIPPED_SECTION_REASONS`'s doc):
+ *
+ * - **Presence-gated** (`collaborators`, `shared`) — both are OPTIONAL
+ *   schema fields (`.optional()` on `FleetManifestSchema`). Only fires when
+ *   the section is actually DECLARED (present) AND, for the array section,
+ *   non-empty. An absent or empty section stays silent (nothing was
+ *   promised, so nothing to warn about not having reconciled) — this is
+ *   the disclosure-about-THEIR-declaration contract groundnuty/macf#1355
+ *   requires, not a catalogue of unimplemented features.
+ * - **Standing** (`defaults.app_manifest`, `agents[].profile`) — both are
+ *   REQUIRED schema fields; every schema-valid `FleetManifest` carries a
+ *   non-empty value for each (`z.string().min(1)`, no `.optional()`
+ *   anywhere on the path). There is no "operator omitted it" state to gate
+ *   on, so unconditionally pushing these two IS the correct application of
+ *   the same "only fires when declared" rule — a mandatory field is always
+ *   declared. Same "always one entry for a schema-valid manifest" posture
+ *   {@link FleetPlan.controlRepoRouterCoverage} already establishes.
  */
 function computeSkippedSections(manifest: FleetManifest): readonly SkippedSection[] {
   const out: SkippedSection[] = [];
   if (manifest.collaborators !== undefined && manifest.collaborators.length > 0) {
     out.push({ section: 'collaborators', reason: SKIPPED_SECTION_REASONS.collaborators });
   }
+  if (manifest.shared !== undefined) {
+    out.push({ section: 'shared', reason: SKIPPED_SECTION_REASONS.shared });
+  }
+  out.push({ section: 'defaults.app_manifest', reason: SKIPPED_SECTION_REASONS['defaults.app_manifest'] });
+  out.push({ section: 'agents[].profile', reason: SKIPPED_SECTION_REASONS['agents[].profile'] });
   return out;
 }
 
