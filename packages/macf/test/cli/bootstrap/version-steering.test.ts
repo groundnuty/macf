@@ -20,7 +20,6 @@ import {
   computeUnimplementedByApply,
   formatUnimplementedLines,
   planItemApplyCoverage,
-  SKIPPED_SECTION_REASONS,
   UNKNOWN_REASONS,
   type ObservedAgentState,
   type ObservedState,
@@ -303,15 +302,8 @@ describe('DR-043 §D6 — versions: section gating (no silent auto-inclusion)', 
     expect(plan.items.some((i) => i.kind === 'actions_pin')).toBe(false);
     // And — the pre-existing contract this change must not regress —
     // `versions:` no longer appears in skippedSections when it IS declared
-    // elsewhere; when it's ABSENT there is nothing to skip for `versions`
-    // either way. `defaults.app_manifest` / `agents[].profile` DO still
-    // appear — groundnuty/macf#1355 made those two STANDING entries (see
-    // `plan.test.ts`'s dedicated describe block) — so this asserts the
-    // STANDING floor, not an empty array.
-    expect(plan.skippedSections).toEqual([
-      { section: 'defaults.app_manifest', reason: SKIPPED_SECTION_REASONS['defaults.app_manifest'] },
-      { section: 'agents[].profile', reason: SKIPPED_SECTION_REASONS['agents[].profile'] },
-    ]);
+    // elsewhere; when it's ABSENT there is nothing to skip either way.
+    expect(plan.skippedSections).toEqual([]);
   });
 
   it('declaring versions: emits exactly 2 items per agent (one version, one actions_pin) PLUS one actions_pin item for the control repo, in manifest agent order with the control repo LAST', () => {

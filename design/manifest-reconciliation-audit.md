@@ -100,16 +100,27 @@ where that is the reason for `not reported`, the row says so.
 > refusal (`fleet-manifest.ts::rejectDeclaredTrust`) rather than a silent
 > accept — a stronger disclosure than the `skippedSections` mechanism §2's
 > own recommendation (below) proposes for the other seven rows. A
-> `FleetManifest` value can no longer carry a `trust` key at all. The
-> remaining seven INERT rows (15, 17, 24-29) were addressed by
-> groundnuty/macf#1355, which extended `plan.ts`'s `skippedSections`
-> mechanism — already covering `collaborators[]` (row 24) — to `shared`
-> (rows 28-29, same presence-gated shape) and to `defaults.app_manifest` /
-> `agents[].profile` (rows 15/17, unconditional STANDING entries, since
-> both are REQUIRED fields with no "undeclared" state to gate on). Rows
-> 25-27 (`collaborators[].project` / `.registry` / `.ca_bundle`) stay
-> genuinely INERT — `#1355` disclosed the ARRAY's presence, not each
-> element field — same posture row 24 already had before this update.
+> `FleetManifest` value can no longer carry a `trust` key at all.
+>
+> **groundnuty/macf#1355 extended `plan.ts`'s `skippedSections` mechanism —
+> already covering `collaborators[]` (row 24) — to `shared` (rows 28-29,
+> same presence-gated shape: silent unless declared).** Rows 15/17
+> (`defaults.app_manifest` / `agents[].profile`) and 25-27
+> (`collaborators[].project` / `.registry` / `.ca_bundle`) remain OPEN —
+> `#1355` deliberately did NOT push an entry for rows 15/17, because both
+> are REQUIRED schema fields (no `.optional()` on either path): every
+> schema-valid manifest declares them unconditionally, so a presence-gated
+> entry can never be silent about "undeclared" and an unconditional one
+> would violate the SAME "declaring none is byte-identical to today"
+> contract `shared`'s presence-gating exists to honor — it would read as a
+> permanent catalogue entry, not a disclosure about a particular manifest.
+> Closing rows 15/17 honestly needs a schema change FIRST — make each
+> `.optional()` (one notch weaker than #1205's outright removal of
+> `trust:`), THEN presence-gate exactly like `shared` — or removal,
+> mirroring #1205's precedent for a field with the same zero-consumer
+> shape. Rows 25-27 stay genuinely INERT for the same reason they always
+> were: `#1355`, like the original `collaborators[]` mechanism, discloses
+> the ARRAY's presence, not each element field.
 
 ---
 

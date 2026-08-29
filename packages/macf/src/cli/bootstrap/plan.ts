@@ -56,27 +56,36 @@
  * declared-but-deferred section explicitly via `FleetPlan.skippedSections`
  * — never silent.
  *
- * **groundnuty/macf#1355 extended the SAME mechanism to every other field
- * the #1200 audit (`design/manifest-reconciliation-audit.md`) found
- * INERT** (parsed, zero readers) — not just `collaborators`. `shared:`
- * follows `collaborators`'s own presence-gated shape (an optional section;
- * silent when omitted, one line when declared). `defaults.app_manifest`
- * and `agents[].profile` are DIFFERENT: both are REQUIRED schema fields
- * (`FleetDefaultsSchema` / `FleetAgentSchema` are `.strict()` with no
- * `.optional()` on either), so every schema-valid manifest declares them
- * unconditionally — there is no "omitted" state to gate on, so these two
- * are STANDING entries, present on every run, same "always one entry for a
- * schema-valid manifest" posture {@link FleetPlan.controlRepoRouterCoverage}
- * already establishes for its own always-true-today case. **`trust.ca` /
- * `trust.federated_cas` — the #1200 audit's other two INERT fields — are
- * deliberately ABSENT from this list**: groundnuty/macf#1205 (merged
- * 2026-08-26, before #1355 was filed) removed `trust:` from
- * {@link FleetManifestSchema} entirely and made declaring it a loud
- * parse-time refusal (`fleet-manifest.ts::rejectDeclaredTrust`) — a
- * `FleetManifest` value can no longer carry a `trust` key at all, so there
- * is nothing here to disclose; the refusal already IS the strongest form
- * of disclosure. See `SKIPPED_SECTION_REASONS`'s own doc for the per-field
- * reasons.
+ * **groundnuty/macf#1355 extended the SAME mechanism to `shared:`** — the
+ * #1200 audit (`design/manifest-reconciliation-audit.md`) found it INERT
+ * (parsed, zero readers) same as `collaborators`. `shared:` follows
+ * `collaborators`'s own presence-gated shape exactly: an OPTIONAL section,
+ * silent when omitted, one line when declared — the issue's own closing
+ * criterion ("a manifest declaring none of the [inert fields] is
+ * byte-identical to today") is what makes presence-gating non-negotiable
+ * here, not a style choice.
+ *
+ * The #1200 audit named SIX inert-and-undisclosed fields; only THREE are
+ * addressed by this mechanism (`collaborators` already, `shared` as of
+ * #1355). The other three split into two different, NON-mechanism fixes:
+ *
+ * - **`trust.ca` / `trust.federated_cas`** — groundnuty/macf#1205 (merged
+ *   2026-08-26, before #1355 was filed) removed `trust:` from
+ *   {@link FleetManifestSchema} entirely and made declaring it a loud
+ *   parse-time refusal (`fleet-manifest.ts::rejectDeclaredTrust`) — a
+ *   `FleetManifest` value can no longer carry a `trust` key at all, so
+ *   there is nothing left here to disclose; the refusal already IS the
+ *   strongest form of disclosure, and is why this file never mentions
+ *   `trust` again.
+ * - **`defaults.app_manifest` / `agents[].profile`** — REQUIRED schema
+ *   fields (no `.optional()` anywhere on either path), so every
+ *   schema-valid manifest declares them unconditionally: there is no
+ *   "omitted" state for a presence-gated entry to be silent about, and an
+ *   unconditional entry would violate the SAME "byte-identical when
+ *   declaring none" criterion `shared`'s presence-gating exists to honor.
+ *   **Deliberately left OUT of `skippedSections` on this issue** — see
+ *   `SKIPPED_SECTION_REASONS`'s doc for why, and for the schema-change
+ *   this pair actually needs before a disclosure entry would be honest.
  *
  * `versions:` (§D6 GitOps steering) is WIRED: once declared, `computePlan`
  * emits a `version` item per agent (deployed macf CLI version) and an
@@ -801,24 +810,36 @@ export interface InstallScopeDrift {
 }
 
 /**
- * The reason text for each declared-but-deferred / INERT section (Slice 1a
- * + groundnuty/macf#1355; see module doc). `versions` is GONE from this map
+ * The reason text for each declared-but-deferred section (Slice 1a +
+ * groundnuty/macf#1355; see module doc). `versions` is GONE from this map
  * (DR-043 §D6 is wired as of that change, not deferred).
  *
- * Four members today, two shapes (see `computeSkippedSections`'s doc for
- * which fields use which):
+ * Both members here are OPTIONAL schema fields — the reason fires only
+ * when the operator actually declared the section (§#1355's own contract:
+ * *"a disclosure about their declaration, not a catalogue of unimplemented
+ * features"* — the issue's closing criterion pins this exactly: *"a
+ * manifest declaring none of them is byte-identical to today."*).
  *
- * - `collaborators` / `shared` — OPTIONAL sections; the reason fires only
- *   when the operator actually declared the section.
- * - `'defaults.app_manifest'` / `'agents[].profile'` — REQUIRED fields; the
- *   reason is a standing fact true of every schema-valid manifest, because
- *   there is no "undeclared" state for a mandatory field to be silent
- *   about.
+ * **`defaults.app_manifest` / `agents[].profile` — the #1200 audit's other
+ * two INERT-and-undisclosed fields — are DELIBERATELY NOT here.** Both are
+ * REQUIRED schema fields (no `.optional()` anywhere on either path), so
+ * every schema-valid manifest declares them unconditionally — there is no
+ * "operator omitted it" state for a presence-gated entry to be silent
+ * about. Pushing an unconditional entry for either would satisfy "fires
+ * only when declared" in the narrowest syntactic sense (a mandatory field
+ * IS always declared) while violating it in substance: it would appear on
+ * EVERY plan of EVERY fleet forever, removable by no operator action,
+ * carrying no information about THIS manifest — exactly the "catalogue of
+ * unimplemented features" the issue's own requirement rules out, and it
+ * would make the closing criterion's "declaring none is byte-identical"
+ * false for the ordinary case (every real fleet.yaml declares both). See
+ * `computeSkippedSections`'s doc for the fix this actually needs.
  *
- * `trust.ca` / `trust.federated_cas` (the #1200 audit's other two INERT
- * fields) are NOT here — groundnuty/macf#1205 removed `trust:` from the
- * schema and made declaring it a parse-time refusal, so it never reaches
- * `computeSkippedSections` at all. See the module doc's #1355 paragraph.
+ * `trust.ca` / `trust.federated_cas` (the audit's remaining two INERT
+ * fields) are ALSO not here — groundnuty/macf#1205 removed `trust:` from
+ * the schema and made declaring it a parse-time refusal, so it never
+ * reaches `computeSkippedSections` at all. See the module doc's #1355
+ * paragraph.
  */
 export const SKIPPED_SECTION_REASONS = {
   collaborators: 'reconcile not implemented in v1',
@@ -828,34 +849,26 @@ export const SKIPPED_SECTION_REASONS = {
   // `shared:` today is pointed at where the eventual consumer will land,
   // not just told "nothing reads this."
   shared: "shared.routing_app / shared.ts_oauth are parsed but consumed nowhere in this codebase — the account-level shared-router-App model this field anticipated is #1161's still-open design",
-  // No tracking issue exists for either of these two — the #1200 audit
-  // found zero design discussion anticipating a consumer (unlike `shared`/
-  // `trust`, which each cite an open design issue in their own schema
-  // doc), so none is fabricated here. `formatSkippedLines`' rendering is
-  // still fully specific about WHICH field and WHY.
-  'defaults.app_manifest': 'defaults.app_manifest is parsed but has zero readers in this codebase — no code path builds an App manifest from it',
-  'agents[].profile': 'agents[].profile is parsed but has zero readers in this codebase — no code path branches on it',
 } as const;
 
 /**
- * Surface every declared-but-deferred / INERT manifest section, loudly.
- * Two disclosure shapes (see `SKIPPED_SECTION_REASONS`'s doc):
+ * Surface every declared-but-deferred manifest section, loudly. Both
+ * `collaborators` and `shared` are OPTIONAL schema fields — only fires when
+ * the section is actually DECLARED (present) AND, for the array section,
+ * non-empty. An absent or empty section stays silent (nothing was
+ * promised, so nothing to warn about not having reconciled) — the
+ * disclosure-about-THEIR-declaration contract groundnuty/macf#1355
+ * requires, not a catalogue of unimplemented features.
  *
- * - **Presence-gated** (`collaborators`, `shared`) — both are OPTIONAL
- *   schema fields (`.optional()` on `FleetManifestSchema`). Only fires when
- *   the section is actually DECLARED (present) AND, for the array section,
- *   non-empty. An absent or empty section stays silent (nothing was
- *   promised, so nothing to warn about not having reconciled) — this is
- *   the disclosure-about-THEIR-declaration contract groundnuty/macf#1355
- *   requires, not a catalogue of unimplemented features.
- * - **Standing** (`defaults.app_manifest`, `agents[].profile`) — both are
- *   REQUIRED schema fields; every schema-valid `FleetManifest` carries a
- *   non-empty value for each (`z.string().min(1)`, no `.optional()`
- *   anywhere on the path). There is no "operator omitted it" state to gate
- *   on, so unconditionally pushing these two IS the correct application of
- *   the same "only fires when declared" rule — a mandatory field is always
- *   declared. Same "always one entry for a schema-valid manifest" posture
- *   {@link FleetPlan.controlRepoRouterCoverage} already establishes.
+ * **`defaults.app_manifest` / `agents[].profile` are intentionally NOT
+ * surfaced here** — see `SKIPPED_SECTION_REASONS`'s doc for why an
+ * unconditional entry for either would violate this same contract rather
+ * than serve it. Fixing their INERT status honestly needs a schema change
+ * FIRST (make each `.optional()`, mirroring the one notch weaker than
+ * groundnuty/macf#1205's outright removal of `trust:`, then presence-gate
+ * exactly like `shared` above) — filed as a follow-up rather than forced
+ * through this mechanism on this issue, which is disclosure-only and does
+ * not implement or restructure any field.
  */
 function computeSkippedSections(manifest: FleetManifest): readonly SkippedSection[] {
   const out: SkippedSection[] = [];
@@ -865,8 +878,6 @@ function computeSkippedSections(manifest: FleetManifest): readonly SkippedSectio
   if (manifest.shared !== undefined) {
     out.push({ section: 'shared', reason: SKIPPED_SECTION_REASONS.shared });
   }
-  out.push({ section: 'defaults.app_manifest', reason: SKIPPED_SECTION_REASONS['defaults.app_manifest'] });
-  out.push({ section: 'agents[].profile', reason: SKIPPED_SECTION_REASONS['agents[].profile'] });
   return out;
 }
 
