@@ -423,6 +423,99 @@ describe('composeFleetLock — age_recipients_removed_by_override (groundnuty/ma
   });
 });
 
+describe('composeFleetLock — collaborators (groundnuty/macf#1330 — federated peer recipient sets)', () => {
+  it('is undefined when neither previous nor fresh has ever recorded a federated collaborator', () => {
+    const { lock } = composeFleetLock({ fleet: 'demo-fleet', previous: null, agentUpdates: {} });
+    expect(lock.collaborators).toBeUndefined();
+  });
+
+  it('a first-recorded collaborator is written verbatim', () => {
+    const { lock } = composeFleetLock({
+      fleet: 'demo-fleet',
+      previous: null,
+      agentUpdates: {},
+      collaboratorRecipients: [{ project: 'ppam-2026', ageRecipients: ['age1a', 'age1b'] }],
+    });
+    expect(lock.collaborators).toEqual([{ project: 'ppam-2026', age_recipients: ['age1a', 'age1b'] }]);
+  });
+
+  it('an UNTOUCHED collaborator (this run updates a DIFFERENT project) carries forward verbatim — never pruned', () => {
+    const previous: FleetLock = {
+      schema_version: 1,
+      fleet: 'demo-fleet',
+      agents: [],
+      collaborators: [{ project: 'ppam-2026', age_recipients: ['age1a'] }],
+    };
+    const { lock } = composeFleetLock({
+      fleet: 'demo-fleet',
+      previous,
+      agentUpdates: {},
+      collaboratorRecipients: [{ project: 'other-fleet', ageRecipients: ['age1z'] }],
+    });
+    expect(lock.collaborators).toEqual([
+      { project: 'other-fleet', age_recipients: ['age1z'] },
+      { project: 'ppam-2026', age_recipients: ['age1a'] },
+    ]);
+  });
+
+  it('DECISIVE: a project present in `fresh` REPLACES its prior entry WHOLESALE, never unions — a shrink must actually shrink on disk, not silently keep the old members alongside the new', () => {
+    const previous: FleetLock = {
+      schema_version: 1,
+      fleet: 'demo-fleet',
+      agents: [],
+      collaborators: [{ project: 'ppam-2026', age_recipients: ['age1a', 'age1gone'] }],
+    };
+    const { lock } = composeFleetLock({
+      fleet: 'demo-fleet',
+      previous,
+      agentUpdates: {},
+      collaboratorRecipients: [{ project: 'ppam-2026', ageRecipients: ['age1a'] }],
+    });
+    expect(lock.collaborators).toEqual([{ project: 'ppam-2026', age_recipients: ['age1a'] }]);
+  });
+
+  it('carries every collaborator forward UNCHANGED when a write touches nothing collaborator-related (collaboratorRecipients omitted entirely)', () => {
+    const previous: FleetLock = {
+      schema_version: 1,
+      fleet: 'demo-fleet',
+      agents: [],
+      collaborators: [{ project: 'ppam-2026', age_recipients: ['age1a'] }],
+    };
+    const { lock } = composeFleetLock({
+      fleet: 'demo-fleet',
+      previous,
+      agentUpdates: { 'code-agent': { appId: '1', installId: '2' } },
+    });
+    expect(lock.collaborators).toEqual([{ project: 'ppam-2026', age_recipients: ['age1a'] }]);
+  });
+
+  it('sorts by project for deterministic output regardless of input/previous order', () => {
+    const previous: FleetLock = {
+      schema_version: 1,
+      fleet: 'demo-fleet',
+      agents: [],
+      collaborators: [{ project: 'zzz-fleet', age_recipients: ['age1z'] }],
+    };
+    const { lock } = composeFleetLock({
+      fleet: 'demo-fleet',
+      previous,
+      agentUpdates: {},
+      collaboratorRecipients: [{ project: 'aaa-fleet', ageRecipients: ['age1a'] }],
+    });
+    expect(lock.collaborators?.map((c) => c.project)).toEqual(['aaa-fleet', 'zzz-fleet']);
+  });
+
+  it('a collaborator with an explicit empty age_recipients (a real, recorded "zero recipients" fact) is preserved, never dropped as if it were undefined', () => {
+    const { lock } = composeFleetLock({
+      fleet: 'demo-fleet',
+      previous: null,
+      agentUpdates: {},
+      collaboratorRecipients: [{ project: 'ppam-2026', ageRecipients: [] }],
+    });
+    expect(lock.collaborators).toEqual([{ project: 'ppam-2026', age_recipients: [] }]);
+  });
+});
+
 describe('serializeFleetLock', () => {
   // groundnuty/macf#1310 — this fixture DELIBERATELY declares its
   // fleet-level fingerprints under the DEPRECATED bare `fingerprints` key
@@ -535,6 +628,40 @@ describe('serializeFleetLock', () => {
     const roundTripped = parseFleetLock(serializeFleetLock(withRepo));
     expect(roundTripped.agents[0]?.repo).toBe('groundnuty/demo-code-agent');
   });
+
+  // groundnuty/macf#1330 — same allowlist-drop shape as the two regression
+  // pins immediately above (#1230's ledger, #1296's repo), applied to the
+  // new federated `collaborators` field: `ordered`'s object literal must
+  // explicitly copy it through, or a schema-valid field silently never
+  // reaches disk.
+  it('collaborators round-trip through parseFleetLock unchanged, SORTED by project (allowlist-drop regression pin)', () => {
+    const withCollaborators: FleetLock = {
+      ...lock,
+      collaborators: [
+        { project: 'zzz-fleet', age_recipients: ['age1z'] },
+        { project: 'ppam-2026', age_recipients: ['age1a', 'age1b'] },
+      ],
+    };
+    const roundTripped = parseFleetLock(serializeFleetLock(withCollaborators));
+    expect(roundTripped.collaborators).toEqual([
+      { project: 'ppam-2026', age_recipients: ['age1a', 'age1b'] },
+      { project: 'zzz-fleet', age_recipients: ['age1z'] },
+    ]);
+  });
+
+  it('a collaborator\'s own age_recipients order is preserved VERBATIM (position is real information within one peer\'s set)', () => {
+    const withCollaborators: FleetLock = {
+      ...lock,
+      collaborators: [{ project: 'ppam-2026', age_recipients: ['age1second', 'age1first'] }],
+    };
+    const roundTripped = parseFleetLock(serializeFleetLock(withCollaborators));
+    expect(roundTripped.collaborators?.[0]?.age_recipients).toEqual(['age1second', 'age1first']);
+  });
+
+  it('omits the "collaborators" key entirely when absent (never a fabricated empty array)', () => {
+    const parsed = JSON.parse(serializeFleetLock(lock)) as Record<string, unknown>;
+    expect('collaborators' in parsed).toBe(false);
+  });
 });
 
 describe('writeFleetLock (thin I/O leaf)', () => {
@@ -596,6 +723,54 @@ describe('writeFleetLock (thin I/O leaf)', () => {
       writeFleetLock(path, lock);
       const raw = JSON.parse(readFileSync(path, 'utf-8')) as { agents: Record<string, unknown>[] };
       expect('repo' in (raw.agents[0] ?? {})).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // groundnuty/macf#1330 DECISIVE — same "assert the WRITTEN FILE, not the
+  // composer's return value" discipline the two tests immediately above
+  // (and #1296's/#1310's own decisive tests) establish, applied to the new
+  // federated `collaborators` field. Reads the RAW JSON bytes off disk
+  // directly (not through `parseFleetLock`'s schema-tolerant re-validation)
+  // — the strongest possible pin against `serializeFleetLock`'s hand-built
+  // `ordered` allowlist silently dropping `collaborators` before the write,
+  // the exact #1260/#1328 defect shape `#1330`'s own AC names. Mutation
+  // check performed manually: commenting out the
+  // `if (validated.collaborators !== undefined) { ordered.collaborators = ... }`
+  // block in `serializeFleetLock` (fleet-lock.ts) makes this test fail (raw
+  // parsed JSON has no "collaborators" key) — confirmed the same way as the
+  // #1310 precedent immediately below.
+  it('DECISIVE: a federated collaborator reaches the WRITTEN FILE on disk under "collaborators", readable as a raw key', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'macf-fleet-lock-test-'));
+    try {
+      const path = join(dir, 'fleet.lock');
+      const { lock } = composeFleetLock({
+        fleet: 'demo-fleet',
+        previous: null,
+        agentUpdates: {},
+        collaboratorRecipients: [{ project: 'ppam-2026', ageRecipients: ['age1a', 'age1b'] }],
+      });
+      writeFleetLock(path, lock);
+      const raw = JSON.parse(readFileSync(path, 'utf-8')) as { collaborators?: { project: string; age_recipients: string[] }[] };
+      expect(raw.collaborators).toEqual([{ project: 'ppam-2026', age_recipients: ['age1a', 'age1b'] }]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a lock recording no federated collaborators writes NO "collaborators" key at all', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'macf-fleet-lock-test-'));
+    try {
+      const path = join(dir, 'fleet.lock');
+      const { lock } = composeFleetLock({
+        fleet: 'demo-fleet',
+        previous: null,
+        agentUpdates: { 'code-agent': { appId: '1', installId: '2' } },
+      });
+      writeFleetLock(path, lock);
+      const raw = JSON.parse(readFileSync(path, 'utf-8')) as Record<string, unknown>;
+      expect('collaborators' in raw).toBe(false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

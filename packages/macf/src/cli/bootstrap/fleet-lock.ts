@@ -35,7 +35,7 @@
  */
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-import type { FleetLock, FleetLockAgent, FleetVersions, ScopeCredentialMarker } from './fleet-manifest.js';
+import type { FleetLock, FleetLockAgent, FleetLockCollaborator, FleetVersions, ScopeCredentialMarker } from './fleet-manifest.js';
 import { FLEET_LOCK_SCHEMA_VERSION, FleetLockSchema, effectiveFleetFingerprints, parseFleetLock } from './fleet-manifest.js';
 
 /**
@@ -169,6 +169,39 @@ export interface ComposeFleetLockInput {
    * replaced, never pruned) — see {@link mergeAgeRecipientsRemovedByOverride}.
    */
   readonly ageRecipientsRemovedByOverride?: readonly string[];
+  /**
+   * groundnuty/macf#1330 — the last-approved age recipient set THIS run is
+   * recording per federated peer (`project` → `FleetLockCollaboratorSchema`).
+   * `undefined` when this run touched no federated-collaborator recipient
+   * state at all — the same untouched-carries-forward convention
+   * {@link ageRecipients} above follows, applied one level down (by
+   * `project`, via {@link mergeFederatedCollaborators} — never replace the
+   * whole array wholesale the way {@link ageRecipients} replaces THIS
+   * fleet's own set, since an update to peer A must never drop peer B's
+   * already-recorded entry). There is no live caller of this field yet
+   * (`#789`'s fetch — the thing that would tell `apply` a peer's CURRENT
+   * set — is not built; `collaborators:` reconciliation is day-2,
+   * `plan.ts`'s `skipped_sections`); it exists so a hand-set or
+   * future-fetch-set lock entry survives a re-apply instead of being
+   * silently dropped the next time this function rebuilds the lock from
+   * scratch (the exact #1260/#1328 allowlist-drop shape, one layer up from
+   * {@link serializeFleetLock}'s own).
+   */
+  readonly collaboratorRecipients?: readonly FederatedCollaboratorRecipientsUpdate[];
+}
+
+/**
+ * One federated collaborator's recipient-set update (groundnuty/macf#1330)
+ * — the camelCase "what apply resolved/approved this run" shape
+ * {@link composeFleetLock} turns into a full {@link FleetLockCollaborator}.
+ * `ageRecipients` here is the value to RECORD (already approved via
+ * `federated-age-recipients.ts`'s guard, if a grant/first-federation
+ * required consent) — this type carries no consent state of its own; a
+ * caller decides whether to include an entry at all.
+ */
+export interface FederatedCollaboratorRecipientsUpdate {
+  readonly project: string;
+  readonly ageRecipients: readonly string[];
 }
 
 /**
@@ -269,6 +302,34 @@ function mergeScopeCredentials(
     });
   }
   const merged = [...byRole.values()].sort((a, b) => a.role.localeCompare(b.role));
+  return merged.length > 0 ? merged : undefined;
+}
+
+/**
+ * Merge fresh {@link FederatedCollaboratorRecipientsUpdate}s into
+ * previously-recorded {@link FleetLockCollaborator}s, BY PROJECT (never
+ * pruned — same "untouched carries forward" contract {@link mergeScopeCredentials}
+ * establishes, applied to `project` instead of `role`). A project present in
+ * `fresh` ALWAYS wins WHOLESALE for that one entry (mirrors
+ * {@link mergeAgeRecipients}'s own "fresh replaces, never unions" rule —
+ * `age_recipients` records the last-approved FACT, not an accumulating
+ * history); a project only in `previous` (this run touched a DIFFERENT peer,
+ * or none) is carried forward untouched. Sorted by project for
+ * {@link serializeFleetLock}'s determinism contract — same reasoning
+ * {@link mergeScopeCredentials} sorting by role already applies at this
+ * array's sibling level. Returns `undefined` (never `[]`) when the merged
+ * result is empty, same "omit rather than write a vacuous array" convention
+ * {@link mergeFingerprints} already establishes.
+ */
+function mergeFederatedCollaborators(
+  previous: readonly FleetLockCollaborator[] | undefined,
+  fresh: readonly FederatedCollaboratorRecipientsUpdate[] | undefined,
+): FleetLockCollaborator[] | undefined {
+  const byProject = new Map<string, FleetLockCollaborator>((previous ?? []).map((c) => [c.project, c]));
+  for (const update of fresh ?? []) {
+    byProject.set(update.project, { project: update.project, age_recipients: [...update.ageRecipients] });
+  }
+  const merged = [...byProject.values()].sort((a, b) => a.project.localeCompare(b.project));
   return merged.length > 0 ? merged : undefined;
 }
 
@@ -403,6 +464,7 @@ export function composeFleetLock(input: ComposeFleetLockInput): ComposeFleetLock
     input.previous?.age_recipients_removed_by_override,
     input.ageRecipientsRemovedByOverride,
   );
+  const collaborators = mergeFederatedCollaborators(input.previous?.collaborators, input.collaboratorRecipients);
 
   const composed: FleetLock = {
     schema_version: FLEET_LOCK_SCHEMA_VERSION,
@@ -413,6 +475,7 @@ export function composeFleetLock(input: ComposeFleetLockInput): ComposeFleetLock
     ...(scopeCredentials !== undefined ? { scope_credentials: scopeCredentials } : {}),
     ...(ageRecipients !== undefined ? { age_recipients: ageRecipients } : {}),
     ...(ageRecipientsRemovedByOverride !== undefined ? { age_recipients_removed_by_override: ageRecipientsRemovedByOverride } : {}),
+    ...(collaborators !== undefined ? { collaborators } : {}),
   };
 
   return { lock: FleetLockSchema.parse(composed), identityChanges };
@@ -467,6 +530,19 @@ function orderedScopeCredential(marker: ScopeCredentialMarker): ScopeCredentialM
 }
 
 /**
+ * `FleetLockCollaborator` with its fields in `FleetLockCollaboratorSchema`'s
+ * declared order (groundnuty/macf#1330) — same defensive re-ordering
+ * `orderedAgent`/`orderedScopeCredential` apply. `age_recipients` is copied
+ * VERBATIM, order preserved (unlike the collaborators ARRAY itself, which
+ * `serializeFleetLock` sorts by `project`) — same "position is real
+ * information within one recipient set, but not across peers" split the
+ * top-level `age_recipients` field's own doc already draws.
+ */
+function orderedCollaborator(collaborator: FleetLockCollaborator): FleetLockCollaborator {
+  return { project: collaborator.project, age_recipients: [...collaborator.age_recipients] };
+}
+
+/**
  * Serialize a `FleetLock` deterministically — stable key order (matching
  * `FleetLockSchema`'s declared field order top-to-bottom, `agents[]` sorted
  * by `role`, every fingerprint map sorted by secret name) + a trailing
@@ -494,6 +570,7 @@ export function serializeFleetLock(lock: FleetLock): string {
     scope_credentials?: ScopeCredentialMarker[];
     age_recipients?: string[];
     age_recipients_removed_by_override?: string[];
+    collaborators?: FleetLockCollaborator[];
   } = {
     schema_version: validated.schema_version,
     fleet: validated.fleet,
@@ -523,6 +600,12 @@ export function serializeFleetLock(lock: FleetLock): string {
   // so this copy needs no further ordering — same "verbatim copy" shape.
   if (validated.age_recipients_removed_by_override !== undefined) {
     ordered.age_recipients_removed_by_override = [...validated.age_recipients_removed_by_override];
+  }
+  // groundnuty/macf#1330 — sorted by project (like `scope_credentials` by
+  // role above); each entry's OWN `age_recipients` stays verbatim-ordered
+  // (`orderedCollaborator`'s own doc).
+  if (validated.collaborators !== undefined) {
+    ordered.collaborators = [...validated.collaborators].sort((a, b) => a.project.localeCompare(b.project)).map(orderedCollaborator);
   }
   return `${JSON.stringify(ordered, null, 2)}\n`;
 }
