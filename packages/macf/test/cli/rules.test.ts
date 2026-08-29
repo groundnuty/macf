@@ -386,6 +386,16 @@ describe('copyCanonicalScripts', () => {
         expect(existsSync(join(workspace, '.claude', 'scripts', name)), `expected ${name} on disk`).toBe(true);
       }
     });
+
+    it('distributes the #664 resumed-session identity hook (emit-agent-identity.sh)', () => {
+      const workspace = join(tmpRoot, 'workspace');
+      mkdirSync(workspace);
+
+      const copied = copyCanonicalScripts(workspace);
+
+      expect(copied).toContain('emit-agent-identity.sh');
+      expect(existsSync(join(workspace, '.claude', 'scripts', 'emit-agent-identity.sh'))).toBe(true);
+    });
   });
 });
 

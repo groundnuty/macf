@@ -251,11 +251,15 @@ The goal is correctness through dialogue, not compliance.
 
    The helper uses `--token-only`, `set -euo pipefail`, validates the `ghs_` prefix, and emits actionable diagnostics (clock drift, missing key, bad PEM, wrong App/installation ID) on failure.
 
-2. **Sanity-check your identity** at session start or when something feels off:
+2. **Two different checks — don't conflate them.** (Corrected groundnuty/macf#664 — the prior version of this rule pointed a heading that said *identity* at a script that only reports a **token class**. An agent that ran it, saw `bot installation token`, and concluded its identity check had passed was actively misled: the output never names an agent, only whether `GH_TOKEN` is a bot token or a user token. That's false confidence, worse than no check at all.)
+
+   **Token attribution** — *"is `GH_TOKEN` a bot token, and not a user token?"* — `macf-whoami.sh`'s actual job, unchanged by this correction. Run at session start or when something feels off:
 
         GH_TOKEN=$GH_TOKEN ./.claude/scripts/macf-whoami.sh
 
-   Bot tokens (`ghs_*`) print `bot installation token`. A user token (`ghp_*`, `gho_*`, `ghu_*`) prints the user login and exits non-zero with a warning — that's the attribution trap firing.
+   Bot tokens (`ghs_*`) print `bot installation token`. A user token (`ghp_*`, `gho_*`, `ghu_*`) prints the user login and exits non-zero with a warning — that's the attribution trap firing (see `gh-token-attribution-traps.md`). This confirms the **token's** class. It does **not** tell you which agent you are — don't read a clean run as an identity check.
+
+   **Agent identity** — *"which MACF agent am I — project / agent_name / agent_role / routing_label?"* — the authoritative sources are `.macf/macf-agent.json` (`project` / `agent_name` / `agent_role` / `routing_label` / `github_app.bot_login`) and the `MACF_PROJECT` / `MACF_AGENT_NAME` / `MACF_AGENT_ROLE` / `MACF_ROUTING_LABEL` environment `claude.sh` sources from `env.identity` before it execs `claude` — **never `macf-whoami.sh`, and never a guess from the workspace directory name, the tmux session name, or a token.** As of groundnuty/macf#664, the plugin's `emit-agent-identity.sh` `SessionStart` hook surfaces this into context automatically on **every** session start, including a `claude -c` **resume** — previously an agent only picked up its identity on a genuinely fresh start (nothing else to do at turn 1 prompted the old `macf-whoami.sh` nudge above); a resumed session, already mid-conversation, never had a trigger to run that lookup at all, so it stayed identity-less indefinitely. If you ever need to check by hand: `cat .macf/macf-agent.json`, or `echo "$MACF_AGENT_NAME ($MACF_AGENT_ROLE) in $MACF_PROJECT"`. If **neither** source resolves, the workspace genuinely does not know its identity — say so; don't guess one.
 
 3. **When token generation fails, diagnose — don't work around it.** Common causes observed in practice:
 
