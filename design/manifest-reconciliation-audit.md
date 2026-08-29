@@ -27,6 +27,35 @@ Paths are relative to `packages/macf/src/` unless stated otherwise.
 | **DECLARATIVE-ONLY** | read into a decision inside the tool, never applied to live state and never compared to it |
 | **INERT** | parsed and consumed nowhere |
 
+### INERT is not one state — it has four exits
+
+**"Full fleet-manifest functionality = the inert list reaching zero" is only measurable if every inert field exits the same way. They do not.**
+
+```
+REJECTED AT PARSE     trust.ca / trust.federated_cas    already closed. Declaring one is a
+                                                        loud refusal (#1205) — a STRONGER
+                                                        disclosure than any notice. Nothing
+                                                        left to do; do not re-add the field
+                                                        ahead of its enforcement.
+
+INERT + DISCLOSED     collaborators[], shared.*          the plan says the field does nothing
+                                                        when declared (#1356). Exit =
+                                                        implement it; the notice then goes.
+
+MANDATORY + INERT     defaults.app_manifest,             CANNOT be disclosed. Exit = make the
+                      agents[].profile                   field optional, or remove it (#1357).
+
+INERT + SILENT        (none, as of 2026-08-29)           Exit = disclose first, then implement.
+```
+
+**Why the mandatory pair cannot be disclosed — this is the load-bearing distinction:**
+
+> **A *"you declared X and it does nothing"* notice is only meaningful if declaring X was a CHOICE.** For a `z.string().min(1)` field that every valid manifest must carry, the notice degenerates into a permanent line about the tool's own backlog — a catalogue, not a disclosure, and removable by no operator action.
+
+> **You cannot disclose a choice that does not exist. You have to make it one first.**
+
+**Two of the four exits are therefore NOT "implement the field."** Counting inert fields as one queue with one exit overstates the remaining work and hides the two that need a schema decision before any code.
+
 Two conventions, stated up front so the rows are consistent:
 
 - **One verdict per field, taken from the `apply` path.** Where `plan`
