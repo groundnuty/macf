@@ -44,6 +44,27 @@ the other six             4                             0
 
 > **A sibling control assumes the sibling is analogous. A self-control cannot fail to be analogous to itself.**
 
+### Enumerating what exists answers two questions, not one
+
+**The enumeration above guards against building what already ships. It has a second use, and the second one bites harder** — because its wrong answer looks like good engineering.
+
+```
+is it already built?              →  if yes, don't build it
+is the obvious host suitable?     →  if no, don't reuse it — even though DRY says you should
+```
+
+**Worked pair, same session, same enumeration step, opposite conclusions (2026-08-29):**
+
+**Direction 1** — a manifest-scoped fleet status was reported missing, filed, and implemented with 26 tests. **The capability had shipped weeks earlier under a sibling subcommand.** One `--help` on the parent command would have caught it.
+
+**Direction 2** — agent identity was missing on resumed sessions. The obvious host was an existing SessionStart hook: **no new mechanism, no new file, DRY.** Opening it showed it is **gated to `source == "startup"`** — so folding identity in **would have reintroduced the exact resume-gap being fixed**, while passing every test.
+
+> **The obvious host is the DRY answer, the no-new-file answer, and sometimes the wrong one — for a reason invisible without opening its gate.**
+
+**Direction 2 is the more dangerous of the two.** Direction 1 wastes work and is caught the moment someone runs the existing command. **Direction 2 produces a fix that ships, passes, and does nothing** — the reached-versus-written class, arrived at through a decision that felt like discipline.
+
+**So when the enumeration returns a plausible host: open it and read its gate before reusing it.** The question is not *"does something like this already exist?"* but *"does the thing that exists fire in the case I need?"*
+
 ### A ruling on an absence is a zero too
 
 **The forms above apply to a `grep -c`. They apply identically to a decision** — because *"X does not exist"* is a zero, and a zero needs its search space established no matter who states it.
