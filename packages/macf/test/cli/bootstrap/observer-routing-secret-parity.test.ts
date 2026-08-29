@@ -118,7 +118,20 @@ describe('githubRegistryObserver — routing-secret NAME-list wiring (groundnuty
     expect(text).toContain('routing_secret: WARNING');
     expect(text).toContain(TS_OAUTH_CLIENT_ID_SECRET_NAME);
     expect(text).toContain('macf-experiment/trial-writing-agent'); // the ABSENT repo is named
-    expect(text).not.toContain('macf-experiment/macf-trial-control'); // the control repo HAS it here — must not be misnamed as absent
+    // The control repo HAS the secret here — must not be misnamed as absent
+    // in the routing_secret WARNING specifically (checked on the structured
+    // finding AND the WARNING lines alone, not the whole render — since
+    // groundnuty/macf#1348's separate control_repo_coverage NOTICE
+    // legitimately names the control repo too, for an unrelated CA/
+    // routing-client-write disclosure that has nothing to do with this
+    // TS_OAUTH split).
+    const asymmetry = plan.routingSecretAsymmetries.find((a) => a.secretName === TS_OAUTH_CLIENT_ID_SECRET_NAME);
+    expect(asymmetry?.absentRepos).not.toContain('macf-experiment/macf-trial-control');
+    const routingSecretLines = text
+      .split('\n')
+      .filter((line) => line.startsWith('routing_secret:'))
+      .join('\n');
+    expect(routingSecretLines).not.toContain('macf-experiment/macf-trial-control');
   });
 
   it('DECISIVE 2/2: TS_OAUTH present on EVERY router-carrying repo (agents + control) -> no asymmetry line at all — uniform is the satisfied state', async () => {
