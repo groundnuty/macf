@@ -11,6 +11,7 @@ import {
   findCliPackageRoot,
   computeCanonicalRuleFile,
   computeCanonicalScriptFile,
+  listDistributedScriptNames,
 } from '../../src/cli/rules.js';
 
 describe('findCliPackageRoot', () => {
@@ -522,5 +523,84 @@ describe('computeCanonicalScriptFile', () => {
     copyCanonicalScripts(workspace, { canonicalDir: fakeCanonical, pluginScriptsDir: fakePluginScripts });
     const written = readFileSync(join(workspace, '.claude', 'scripts', 'macf-gh-token.sh'));
     expect(computed!.equals(written)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// listDistributedScriptNames (groundnuty/macf#1362) — the enumeration
+// primitive the distributed-script-currency check needs to know what
+// "current" means BEFORE comparing any on-disk workspace file against it.
+// Must mirror copyCanonicalScripts's own filter exactly (same source dirs,
+// same exclusion sets) so the two can never drift apart.
+// ---------------------------------------------------------------------------
+
+describe('listDistributedScriptNames', () => {
+  let tmpRoot: string;
+  let fakeCanonical: string;
+  let fakePluginScripts: string;
+
+  beforeEach(() => {
+    tmpRoot = mkdtempSync(join(tmpdir(), 'macf-list-script-names-'));
+    fakeCanonical = join(tmpRoot, 'legacy');
+    fakePluginScripts = join(tmpRoot, 'plugin-scripts');
+    mkdirSync(fakeCanonical, { recursive: true });
+    mkdirSync(fakePluginScripts, { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  it('returns the union of .sh basenames from both source dirs, sorted, deduped', () => {
+    writeFileSync(join(fakeCanonical, 'macf-gh-token.sh'), '#!/usr/bin/env bash\n');
+    writeFileSync(join(fakeCanonical, 'README.md'), '# not a script');
+    writeFileSync(join(fakePluginScripts, 'check-gh-token.sh'), '#!/usr/bin/env bash\n');
+
+    const names = listDistributedScriptNames({ canonicalDir: fakeCanonical, pluginScriptsDir: fakePluginScripts });
+    expect(names).toEqual(['check-gh-token.sh', 'macf-gh-token.sh']);
+  });
+
+  it('excludes CANONICAL_SCRIPTS_REPO_LOCAL names from the legacy dir (e.g. release.sh)', () => {
+    writeFileSync(join(fakeCanonical, 'release.sh'), '#!/usr/bin/env bash\n');
+    writeFileSync(join(fakeCanonical, 'macf-gh-token.sh'), '#!/usr/bin/env bash\n');
+
+    const names = listDistributedScriptNames({ canonicalDir: fakeCanonical, pluginScriptsDir: fakePluginScripts });
+    expect(names).not.toContain('release.sh');
+    expect(names).toContain('macf-gh-token.sh');
+  });
+
+  it('excludes mark-turn-state.sh from the plugin scripts dir', () => {
+    writeFileSync(join(fakePluginScripts, 'mark-turn-state.sh'), '#!/usr/bin/env bash\n');
+    writeFileSync(join(fakePluginScripts, 'check-gh-token.sh'), '#!/usr/bin/env bash\n');
+
+    const names = listDistributedScriptNames({ canonicalDir: fakeCanonical, pluginScriptsDir: fakePluginScripts });
+    expect(names).not.toContain('mark-turn-state.sh');
+    expect(names).toContain('check-gh-token.sh');
+  });
+
+  it('returns an empty array when neither source dir exists (no crash)', () => {
+    const names = listDistributedScriptNames({
+      canonicalDir: join(tmpRoot, 'does-not-exist'),
+      pluginScriptsDir: join(tmpRoot, 'also-does-not-exist'),
+    });
+    expect(names).toEqual([]);
+  });
+
+  it('exactly matches what copyCanonicalScripts WOULD copy for the same sources', () => {
+    writeFileSync(join(fakeCanonical, 'macf-gh-token.sh'), '#!/usr/bin/env bash\n');
+    writeFileSync(join(fakePluginScripts, 'check-gh-token.sh'), '#!/usr/bin/env bash\n');
+
+    const names = listDistributedScriptNames({ canonicalDir: fakeCanonical, pluginScriptsDir: fakePluginScripts });
+
+    const workspace = join(tmpRoot, 'workspace');
+    mkdirSync(workspace);
+    const copied = copyCanonicalScripts(workspace, { canonicalDir: fakeCanonical, pluginScriptsDir: fakePluginScripts });
+    expect([...names].sort()).toEqual([...copied].sort());
+  });
+
+  it('resolves the REAL bundled script set via the default canonical dirs (non-empty, includes check-gh-token.sh)', () => {
+    const names = listDistributedScriptNames();
+    expect(names.length).toBeGreaterThan(0);
+    expect(names).toContain('check-gh-token.sh');
   });
 });

@@ -224,6 +224,38 @@ export function copyCanonicalScripts(workspaceDir: string, options: {
 }
 
 /**
+ * The set of script basenames `copyCanonicalScripts` WOULD write to
+ * `<workspace>/.claude/scripts/` right now, given the two canonical source
+ * dirs — enumeration only, no workspace involved. Mirrors
+ * `copyCanonicalScripts`'s own filter (`.sh` files, minus each dir's
+ * exclusion set) exactly, so the two can never drift apart.
+ *
+ * Used by `macf doctor`'s distributed-script-currency check
+ * (groundnuty/macf#1362) to know what "current" means for a workspace
+ * before comparing any on-disk file against it.
+ */
+export function listDistributedScriptNames(options: {
+  readonly canonicalDir?: string;
+  readonly pluginScriptsDir?: string;
+} = {}): readonly string[] {
+  const sourceDirs: readonly { readonly dir: string; readonly excluded: ReadonlySet<string> }[] = [
+    { dir: options.canonicalDir ?? canonicalScriptsDir(), excluded: CANONICAL_SCRIPTS_REPO_LOCAL },
+    { dir: options.pluginScriptsDir ?? canonicalPluginScriptsDir(), excluded: PLUGIN_SCRIPTS_EXCLUDED_FROM_COMPAT },
+  ];
+
+  const names = new Set<string>();
+  for (const { dir, excluded } of sourceDirs) {
+    if (!existsSync(dir)) continue;
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (!entry.isFile() || !entry.name.endsWith('.sh')) continue;
+      if (excluded.has(entry.name)) continue;
+      names.add(entry.name);
+    }
+  }
+  return [...names].sort();
+}
+
+/**
  * Compute the bytes `copyCanonicalScripts` WOULD write for a single script
  * `name` (e.g. `macf-gh-token.sh`), WITHOUT writing anything — the
  * canonical-compute tier-check's per-file-type primitive for
