@@ -15,14 +15,21 @@
  * for the attribution-trap class this prevents).
  */
 import { execFileSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { join, resolve } from 'node:path';
 import { fromVariableSegment, proxyAwareFetch } from '@groundnuty/macf-core';
 import { readAgentConfig, resolveCanonicalBranch, tokenSourceFromConfig, writeAgentConfig } from '../config.js';
 import type { MacfAgentConfig } from '../config.js';
-import { defaultProcReader, scanMacfProcesses } from '../proc-scan.js';
+import { defaultProcReader, readPkgVersionFs, scanMacfProcesses } from '../proc-scan.js';
 import type { ProcReader } from '../proc-scan.js';
+import {
+  canonicalPluginScriptsDir,
+  canonicalScriptsDir,
+  computeCanonicalScriptFile,
+  findCliPackageRoot,
+  listDistributedScriptNames,
+} from '../rules.js';
 import {
   getHookCommands,
   getPermissionsAllow,
@@ -1387,6 +1394,167 @@ export function checkLoadBearingHooks(workspaceDir: string): LoadBearingHooksChe
   };
 }
 
+/**
+ * One distributed script (`.claude/scripts/<name>`) found not to match what
+ * the running CLI would write there right now.
+ */
+export interface ScriptCurrencyFinding {
+  readonly name: string;
+  /** `stale` — on disk, but bytes differ from canonical. `missing` — canonical
+   *  distributes this name and the workspace has no copy at all. */
+  readonly reason: 'stale' | 'missing';
+}
+
+/**
+ * Result of the distributed-script-currency assertion (groundnuty/macf#1362
+ * — the auditor lost two sessions to a `check-gh-token.sh` copy that fell
+ * nineteen days behind canonical with nothing able to say so).
+ *
+ * `status`:
+ *   - `PASS`    — every canonical-distributed script's on-disk bytes match
+ *                 what `macf update` (run with the CURRENTLY INSTALLED CLI)
+ *                 would write right now. "Canonical" is scoped to THIS CLI's
+ *                 own bundled copy, not the groundnuty/macf source repo's
+ *                 HEAD — a workspace can PASS while running behind a pinned-
+ *                 old CLI install; `detail` stamps the CLI version so that
+ *                 provenance is visible rather than implied-current.
+ *   - `WARN`    — at least one is stale or missing; `findings` names them.
+ *   - `INFO`    — no `.macf/` — not a macf-managed workspace. Nothing ever
+ *                 refreshes `.claude/scripts/` here (root cause 2 in #1362:
+ *                 a hand-placed copy has no distribution relationship to
+ *                 canonical at all). Reported distinctly from WARN/stale —
+ *                 this is not itself a defect to fix by re-running anything.
+ *   - `UNKNOWN` — the running CLI's own canonical script source directories
+ *                 could not be located (neither the legacy nor the plugin
+ *                 scripts dir exists — a broken/stripped install), so
+ *                 canonical content is indeterminate. NEVER PASS in this
+ *                 branch — an undeterminable canonical must never be
+ *                 reported as "current".
+ */
+export interface ScriptCurrencyCheckResult {
+  readonly status: 'PASS' | 'WARN' | 'INFO' | 'UNKNOWN';
+  readonly checkedCount: number;
+  readonly totalCount: number;
+  readonly findings: readonly ScriptCurrencyFinding[];
+  readonly detail: string;
+}
+
+/**
+ * DR-039-sibling for `.claude/scripts/*` content (the load-bearing-hooks
+ * check above asserts a hook is REGISTERED; this asserts the SCRIPT BEHIND
+ * a registered hook — or any other canonically-distributed script — is
+ * actually current). Mirrors `build-info.ts::detectStaleDist`'s shape
+ * (compare on-disk bytes against a freshly-computed canonical, fail-soft to
+ * an explicit not-determinable state) applied to the files the CLI
+ * distributes into a workspace, rather than to the CLI's own `dist/`.
+ *
+ * Gated on `.macf/` presence exactly like `checkLoadBearingHooks` — a
+ * workspace `macf update` has never touched has no distribution
+ * relationship to canonical, so "stale" would be the wrong word for it.
+ */
+export function checkDistributedScriptCurrency(
+  workspaceDir: string,
+  options: {
+    readonly canonicalDir?: string;
+    readonly pluginScriptsDir?: string;
+  } = {},
+): ScriptCurrencyCheckResult {
+  const absDir = resolve(workspaceDir);
+  if (!existsSync(join(absDir, '.macf'))) {
+    return {
+      status: 'INFO',
+      checkedCount: 0,
+      totalCount: 0,
+      findings: [],
+      detail:
+        'no .macf/ directory — not a macf-managed workspace; any .claude/scripts/ here have no ' +
+        'distribution relationship to canonical and are never refreshed by `macf update`',
+    };
+  }
+
+  const legacyDir = options.canonicalDir ?? canonicalScriptsDir();
+  const pluginDir = options.pluginScriptsDir ?? canonicalPluginScriptsDir();
+  if (!existsSync(legacyDir) && !existsSync(pluginDir)) {
+    return {
+      status: 'UNKNOWN',
+      checkedCount: 0,
+      totalCount: 0,
+      findings: [],
+      detail:
+        "this CLI install's canonical script source directories could not be located — " +
+        "can't determine whether distributed scripts are current",
+    };
+  }
+
+  const names = listDistributedScriptNames({ canonicalDir: legacyDir, pluginScriptsDir: pluginDir });
+  const scriptsDir = join(absDir, '.claude', 'scripts');
+  const findings: ScriptCurrencyFinding[] = [];
+  let checkedCount = 0;
+
+  for (const name of names) {
+    const canonical = computeCanonicalScriptFile(name, { canonicalDir: legacyDir, pluginScriptsDir: pluginDir });
+    if (canonical === null) continue; // name came from these same dirs — defensive only
+    const onDiskPath = join(scriptsDir, name);
+    if (!existsSync(onDiskPath)) {
+      findings.push({ name, reason: 'missing' });
+      continue;
+    }
+    checkedCount++;
+    if (!readFileSync(onDiskPath).equals(canonical)) {
+      findings.push({ name, reason: 'stale' });
+    }
+  }
+
+  // "Canonical" here means "what THIS RUNNING macf CLI's bundled scripts say
+  // right now" — the same comparison `macf update` would make, not a fetch
+  // against the groundnuty/macf source repo. If the installed CLI is ITSELF
+  // behind (e.g. a pinned older npm install — the case detectStaleDist exists
+  // for), this check agrees with a stale copy and reports PASS. Naming the
+  // CLI version in the detail line makes that provenance visible instead of
+  // letting "match canonical" imply more certainty than the comparison
+  // actually established — an operator can then judge whether v${version} is
+  // itself current. See groundnuty/macf#1362 AC "honest-unknown."
+  const provenance = `as shipped by this CLI (${cliVersionLabel()})`;
+
+  if (findings.length === 0) {
+    return {
+      status: 'PASS',
+      checkedCount,
+      totalCount: names.length,
+      findings: [],
+      detail: `${checkedCount}/${names.length} distributed script(s) match canonical ${provenance}`,
+    };
+  }
+
+  const staleCount = findings.filter((f) => f.reason === 'stale').length;
+  const missingCount = findings.length - staleCount;
+  return {
+    status: 'WARN',
+    checkedCount,
+    totalCount: names.length,
+    findings,
+    detail:
+      `${staleCount} stale, ${missingCount} missing of ${names.length} canonical distributed script(s) ` +
+      `(canonical ${provenance})`,
+  };
+}
+
+/**
+ * `v<version>` of the running CLI, or `version unknown` if it can't be
+ * resolved (fail-soft — never throws, never blocks the currency check).
+ * Backs the provenance stamp in `checkDistributedScriptCurrency`'s detail
+ * lines: "canonical" in this check means THIS CLI's bundled copy, and that
+ * claim is only as strong as knowing which CLI version bundled it.
+ */
+function cliVersionLabel(): string {
+  try {
+    const version = readPkgVersionFs(findCliPackageRoot());
+    return version ? `v${version}` : 'version unknown';
+  } catch {
+    return 'version unknown';
+  }
+}
+
 /** Prompt the operator for a y/N confirmation on stdin. Default = No. */
 function promptYesNo(question: string): Promise<boolean> {
   return new Promise((resolveAnswer) => {
@@ -1469,6 +1637,17 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
   const config = readAgentConfig(projectDir);
   if (!config) {
     console.error('No macf-agent.json found. Run `macf init` first.');
+    // groundnuty/macf#1362 root cause 2: a workspace with NO macf-agent.json
+    // (unmanaged — e.g. macf-fleet-build) is exactly the case whose distributed
+    // scripts need an honest "unmanaged" line, not silence. Running this section
+    // before the early return is the only way it's ever reachable through
+    // `macf doctor` for that workspace shape — `checkDistributedScriptCurrency`
+    // itself gates on `.macf/` presence and never touches canonical dirs (or
+    // throws) in this branch, so it's safe to run without a parsed config.
+    console.log('');
+    console.log('Distributed script currency');
+    console.log('──────────────────────────────────────────────────────────────');
+    printScriptCurrencySection(checkDistributedScriptCurrency(projectDir));
     return 1;
   }
 
@@ -1577,6 +1756,11 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
   console.log('Load-bearing hooks');
   console.log('──────────────────────────────────────────────────────────────');
   printLoadBearingHooksSection(checkLoadBearingHooks(projectDir));
+
+  console.log('');
+  console.log('Distributed script currency');
+  console.log('──────────────────────────────────────────────────────────────');
+  printScriptCurrencySection(checkDistributedScriptCurrency(projectDir));
 
   // --fix: the existing install emitters ARE the fix (DR-028) — they write the
   // floor merge-preservingly. Detect drift read-only above, then (on consent)
@@ -1712,6 +1896,28 @@ function printLoadBearingHooksSection(check: LoadBearingHooksCheckResult): void 
     'floor. A stripped --plugin-dir (a hooks-less plugin variant), a bad stash, or a hand-edit can ' +
     'drop these silently.',
   );
+}
+
+/** Print the groundnuty/macf#1362 distributed-script-currency report section for `check`. */
+function printScriptCurrencySection(check: ScriptCurrencyCheckResult): void {
+  if (check.status === 'INFO') {
+    console.log(`  ℹ ${check.detail}  [INFO]`);
+    return;
+  }
+  if (check.status === 'UNKNOWN') {
+    console.log(`  ? ${check.detail}  [UNKNOWN]`);
+    return;
+  }
+  if (check.status === 'PASS') {
+    console.log(`  ✓ ${check.detail}  [PASS]`);
+    return;
+  }
+  console.log(`  ⚠ ${check.detail}  [WARN]`);
+  for (const f of check.findings) {
+    const reasonText = f.reason === 'stale' ? 'stale — differs from canonical' : 'missing — never distributed';
+    console.log(`    ✗ ${f.name} — ${reasonText}`);
+  }
+  console.log('    Fix: run `macf update` (or `macf rules refresh --dir .`) to bring .claude/scripts/ current.');
 }
 
 /** Print the macf#200 sandbox-fd report line(s) for `check`. */
