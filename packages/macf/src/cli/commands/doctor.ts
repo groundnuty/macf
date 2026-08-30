@@ -15,7 +15,8 @@
  * for the attribution-trap class this prevents).
  */
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, statfsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { createInterface } from 'node:readline';
 import { join, resolve } from 'node:path';
 import { fromVariableSegment, proxyAwareFetch } from '@groundnuty/macf-core';
@@ -1540,6 +1541,200 @@ export function checkDistributedScriptCurrency(
 }
 
 /**
+ * Below this, a build or test run WILL fail with ENOSPC — `npm install`,
+ * `devbox run -- npm run build`, and vitest's per-worker `mkdtemp` calls
+ * each write from tens to hundreds of MB, and the moment one of those
+ * writes lands on a filesystem this tight it aborts mid-operation. 1 GiB
+ * isn't "risky headroom" — it's "too little for one ordinary write to
+ * land," which is why this is FAIL, not WARN.
+ */
+export const DISK_SPACE_FAIL_BYTES = 1 * 1024 * 1024 * 1024; // 1 GiB
+
+/**
+ * Below this (but at/above the FAIL floor), headroom is thin enough to
+ * flag before it becomes a FAIL. A `devbox` nix-profile install, a full
+ * `make -f dev.mk check` run, or a `git worktree add` for a parallel agent
+ * can each consume several hundred MB in one pass; on a shared VM several
+ * agents doing this concurrently compounds fast. 5 GiB gives room for one
+ * heavy operation without crossing into FAIL mid-run.
+ */
+export const DISK_SPACE_WARN_BYTES = 5 * 1024 * 1024 * 1024; // 5 GiB
+
+/**
+ * The groundnuty/macf#1361 lesson applied here: name what the reader will
+ * otherwise misdiagnose, not just the number. A full disk doesn't say "disk
+ * full" anywhere — it shows up as whichever tool needed a temp file or a
+ * write first (a 227-file vitest failure, a devbox `nix profile` install
+ * error), and a reader who greps for `Tests` reads a regression that never
+ * happened.
+ *
+ * FAIL and WARN get DIFFERENT modality, deliberately — #1361 was exactly a
+ * message that claimed more certainty than its own evidence supported. A
+ * target with 2 GiB free has NOT yet failed anything; asserting "will fail"
+ * there would be the same shape of overclaim #1361 fixed elsewhere in this
+ * file. FAIL is already below the floor a single ordinary write needs, so
+ * "will fail" is accurate there; WARN is a margin call, not a certainty.
+ */
+const DISK_SPACE_FAIL_CONSEQUENCE =
+  'builds and test runs will fail with ENOSPC, which surfaces as unrelated failures — e.g. a full ' +
+  'vitest suite reporting hundreds of failed test files, or a devbox `nix profile` install error — ' +
+  'with nothing naming the disk as the cause.';
+
+const DISK_SPACE_WARN_CONSEQUENCE =
+  'a heavy operation (a devbox nix-profile install, a full `make -f dev.mk check` run, several ' +
+  'parallel agent worktrees) can exhaust this mid-run and fail with ENOSPC, which surfaces as ' +
+  'unrelated failures — e.g. a full vitest suite reporting hundreds of failed test files — with ' +
+  'nothing naming the disk as the cause.';
+
+/** One filesystem target `checkDiskSpace` measured free space on. */
+export interface DiskSpaceTargetFinding {
+  readonly label: 'workspace' | 'tmp';
+  readonly path: string;
+  readonly status: 'PASS' | 'WARN' | 'FAIL' | 'UNKNOWN';
+  /** `null` exactly when `status === 'UNKNOWN'` — never a guessed number. */
+  readonly availableBytes: number | null;
+  readonly detail: string;
+}
+
+/**
+ * Result of `checkDiskSpace` (groundnuty/macf#1365). Aggregates the worse
+ * of the two targets — `workspace` and `tmp`, which are frequently the same
+ * volume but not always, and both matter: a build writes into the
+ * workspace (`node_modules`, `dist`), while `npm`/vitest/devbox scratch
+ * writes (`mkdtemp`, package extraction) land in `tmp`.
+ *
+ * `status`:
+ *   - `PASS`    — both targets are at/above the WARN floor.
+ *   - `WARN`    — at least one target is below the WARN floor (but at/above
+ *                 the FAIL floor), and none is below the FAIL floor.
+ *   - `FAIL`    — at least one target is below the FAIL floor.
+ *   - `UNKNOWN` — free space could not be determined for at least one
+ *                 target (and no target is WARN/FAIL) — e.g. `statfs`
+ *                 unsupported or the path unreadable. NEVER reported as
+ *                 `PASS` — an undeterminable value must never read as "ok".
+ */
+export interface DiskSpaceCheckResult {
+  readonly status: 'PASS' | 'WARN' | 'FAIL' | 'UNKNOWN';
+  readonly targets: readonly DiskSpaceTargetFinding[];
+  readonly detail: string;
+}
+
+/** `bavail * bsize` in human-readable GiB/MiB, matching `df -h`'s rounding intent. */
+function formatBytes(bytes: number): string {
+  const gib = bytes / (1024 * 1024 * 1024);
+  if (gib >= 1) return `${gib.toFixed(1)} GiB`;
+  const mib = bytes / (1024 * 1024);
+  return `${mib.toFixed(0)} MiB`;
+}
+
+function classifyAvailableBytes(availableBytes: number): 'PASS' | 'WARN' | 'FAIL' {
+  if (availableBytes < DISK_SPACE_FAIL_BYTES) return 'FAIL';
+  if (availableBytes < DISK_SPACE_WARN_BYTES) return 'WARN';
+  return 'PASS';
+}
+
+/**
+ * Free space available to an unprivileged process on the filesystem
+ * holding `path` (`bavail`, not `bfree` — `bfree` includes space reserved
+ * for root, which this process can't actually write into).
+ */
+function readAvailableBytes(path: string): number {
+  const stat = statfsSync(path);
+  return stat.bavail * stat.bsize;
+}
+
+/**
+ * Measure one target. `readStats` is injectable (default `readAvailableBytes`)
+ * so tests can simulate a tight or undeterminable filesystem without
+ * actually filling — or breaking — a real one. Deliberately does no
+ * cleanup or mutation of any kind: this function only ever reads
+ * (`statfsSync`) — see the "DELETE NOTHING" requirement on groundnuty/macf#1365.
+ */
+function checkOneDiskTarget(
+  label: DiskSpaceTargetFinding['label'],
+  path: string,
+  readStats: (path: string) => number,
+): DiskSpaceTargetFinding {
+  let availableBytes: number;
+  try {
+    availableBytes = readStats(path);
+  } catch (err) {
+    return {
+      label,
+      path,
+      status: 'UNKNOWN',
+      availableBytes: null,
+      detail: `free space on ${path} could not be determined (${err instanceof Error ? err.message : String(err)})`,
+    };
+  }
+  const status = classifyAvailableBytes(availableBytes);
+  if (status === 'PASS') {
+    return { label, path, status, availableBytes, detail: `${formatBytes(availableBytes)} free on ${path}` };
+  }
+  // Both branches report "below" — a WARN target IS already under the WARN
+  // floor (that's what triggered WARN), never merely "approaching" it from
+  // above. Only the floor named and the consequence's modality differ.
+  const floor = status === 'FAIL' ? DISK_SPACE_FAIL_BYTES : DISK_SPACE_WARN_BYTES;
+  const floorLabel = status === 'FAIL' ? 'threshold' : 'comfortable-margin threshold';
+  const consequence = status === 'FAIL' ? DISK_SPACE_FAIL_CONSEQUENCE : DISK_SPACE_WARN_CONSEQUENCE;
+  return {
+    label,
+    path,
+    status,
+    availableBytes,
+    detail:
+      `${formatBytes(availableBytes)} free on ${path} — below the ${formatBytes(floor)} ${floorLabel}. ` +
+      consequence,
+  };
+}
+
+const DISK_STATUS_RANK: Record<DiskSpaceTargetFinding['status'], number> = {
+  FAIL: 3,
+  WARN: 2,
+  UNKNOWN: 1,
+  PASS: 0,
+};
+
+/**
+ * Free-space report for `workspaceDir` and the system temp directory
+ * (groundnuty/macf#1365 — the incident that motivated this: a full disk
+ * read as `227 failed` test files and a broken devbox `nix profile`
+ * install, with nothing anywhere saying the disk was the cause). Reporting
+ * only — never deletes, never touches either filesystem beyond the
+ * read-only `statfs` call.
+ *
+ * `tmpDir` defaults to `os.tmpdir()` (honors `$TMPDIR`, matching the
+ * sandbox's own temp-file convention) rather than a hardcoded `/tmp` — on
+ * this VM they resolve to the same volume, but that's not guaranteed
+ * everywhere `macf doctor` runs.
+ */
+export function checkDiskSpace(
+  workspaceDir: string,
+  options: {
+    readonly tmpDir?: string;
+    readonly readStats?: (path: string) => number;
+  } = {},
+): DiskSpaceCheckResult {
+  const readStats = options.readStats ?? readAvailableBytes;
+  const workspacePath = resolve(workspaceDir);
+  const tmpPath = options.tmpDir ?? tmpdir();
+
+  const targets: readonly DiskSpaceTargetFinding[] = [
+    checkOneDiskTarget('workspace', workspacePath, readStats),
+    checkOneDiskTarget('tmp', tmpPath, readStats),
+  ];
+
+  const worst = targets.reduce((acc, t) => (DISK_STATUS_RANK[t.status] > DISK_STATUS_RANK[acc.status] ? t : acc));
+  const status = worst.status;
+  const detail =
+    status === 'PASS'
+      ? targets.map((t) => t.detail).join('; ')
+      : `${targets.filter((t) => t.status !== 'PASS').length} of ${targets.length} filesystem target(s) need attention`;
+
+  return { status, targets, detail };
+}
+
+/**
  * `v<version>` of the running CLI, or `version unknown` if it can't be
  * resolved (fail-soft — never throws, never blocks the currency check).
  * Backs the provenance stamp in `checkDistributedScriptCurrency`'s detail
@@ -1632,6 +1827,13 @@ export interface RunDoctorOptions {
  *   - A failed/unreachable DR-019 token check is non-fatal to the rest of the
  *     report (so `--fix` of the local settings floor still runs offline) but
  *     still contributes 1 to the exit code.
+ *   - Disk-space FAIL (groundnuty/macf#1365 — either the workspace or `tmp`
+ *     filesystem below the FAIL floor) → 1. WARN and UNKNOWN do NOT affect
+ *     the exit code — same warn-only posture as the other WARN-tier checks
+ *     in this report; a status literally named FAIL does, for consistency
+ *     with every other FAIL in this function.
+ *   - The early-return path (no macf-agent.json) always returns 1 regardless
+ *     of disk-space status — unrelated to whether the disk itself is full.
  */
 export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Promise<number> {
   const config = readAgentConfig(projectDir);
@@ -1648,6 +1850,15 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
     console.log('Distributed script currency');
     console.log('──────────────────────────────────────────────────────────────');
     printScriptCurrencySection(checkDistributedScriptCurrency(projectDir));
+    // groundnuty/macf#1365: disk space is not gated on .macf/ at all — a
+    // full disk breaks a workspace's builds/tests whether or not `macf
+    // init` ever touched it, so this reachable-without-config workspace
+    // shape (the #1362/#1364 early-return trap) is exactly the case this
+    // section needs to survive, same reasoning as the currency check above.
+    console.log('');
+    console.log('Disk space');
+    console.log('──────────────────────────────────────────────────────────────');
+    printDiskSpaceSection(checkDiskSpace(projectDir));
     return 1;
   }
 
@@ -1762,6 +1973,12 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
   console.log('──────────────────────────────────────────────────────────────');
   printScriptCurrencySection(checkDistributedScriptCurrency(projectDir));
 
+  console.log('');
+  console.log('Disk space');
+  console.log('──────────────────────────────────────────────────────────────');
+  const diskSpaceCheck = checkDiskSpace(projectDir);
+  printDiskSpaceSection(diskSpaceCheck);
+
   // --fix: the existing install emitters ARE the fix (DR-028) — they write the
   // floor merge-preservingly. Detect drift read-only above, then (on consent)
   // call them + re-run the checks. NEVER write without consent.
@@ -1820,7 +2037,12 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
 
   const sandboxFailed = sandboxCheck.status === 'FAIL';
   const roleErrored = roleCheck?.status === 'ERROR';
-  return permissionsFailed || sandboxFailed || roleErrored ? 1 : 0;
+  // groundnuty/macf#1365: a status literally named FAIL feeds the exit code
+  // everywhere else in this file (sandboxFailed above) — a disk-space FAIL
+  // that stayed cosmetic would be the silent-fallback shape this repo's own
+  // rules catalog: a name that implies consequence with none attached.
+  const diskSpaceFailed = diskSpaceCheck.status === 'FAIL';
+  return permissionsFailed || sandboxFailed || roleErrored || diskSpaceFailed ? 1 : 0;
 }
 
 /** Print the macf#554/#556 OTEL launch-boundary report line for `check`. */
@@ -1918,6 +2140,23 @@ function printScriptCurrencySection(check: ScriptCurrencyCheckResult): void {
     console.log(`    ✗ ${f.name} — ${reasonText}`);
   }
   console.log('    Fix: run `macf update` (or `macf rules refresh --dir .`) to bring .claude/scripts/ current.');
+}
+
+/** Print the groundnuty/macf#1365 disk-space report section for `check`. */
+function printDiskSpaceSection(check: DiskSpaceCheckResult): void {
+  if (check.status === 'UNKNOWN') {
+    console.log(`  ? ${check.detail}  [UNKNOWN]`);
+  } else if (check.status === 'PASS') {
+    console.log(`  ✓ ${check.detail}  [PASS]`);
+  } else {
+    const symbol = check.status === 'FAIL' ? '✗' : '⚠';
+    console.log(`  ${symbol} ${check.detail}  [${check.status}]`);
+  }
+  for (const t of check.targets) {
+    if (t.status === 'PASS') continue;
+    const symbol = t.status === 'FAIL' ? '✗' : t.status === 'WARN' ? '⚠' : '?';
+    console.log(`    ${symbol} ${t.label} (${t.path}): ${t.detail}`);
+  }
 }
 
 /** Print the macf#200 sandbox-fd report line(s) for `check`. */
