@@ -1567,11 +1567,24 @@ export const DISK_SPACE_WARN_BYTES = 5 * 1024 * 1024 * 1024; // 5 GiB
  * write first (a 227-file vitest failure, a devbox `nix profile` install
  * error), and a reader who greps for `Tests` reads a regression that never
  * happened.
+ *
+ * FAIL and WARN get DIFFERENT modality, deliberately — #1361 was exactly a
+ * message that claimed more certainty than its own evidence supported. A
+ * target with 2 GiB free has NOT yet failed anything; asserting "will fail"
+ * there would be the same shape of overclaim #1361 fixed elsewhere in this
+ * file. FAIL is already below the floor a single ordinary write needs, so
+ * "will fail" is accurate there; WARN is a margin call, not a certainty.
  */
-const DISK_SPACE_CONSEQUENCE =
+const DISK_SPACE_FAIL_CONSEQUENCE =
   'builds and test runs will fail with ENOSPC, which surfaces as unrelated failures — e.g. a full ' +
   'vitest suite reporting hundreds of failed test files, or a devbox `nix profile` install error — ' +
   'with nothing naming the disk as the cause.';
+
+const DISK_SPACE_WARN_CONSEQUENCE =
+  'a heavy operation (a devbox nix-profile install, a full `make -f dev.mk check` run, several ' +
+  'parallel agent worktrees) can exhaust this mid-run and fail with ENOSPC, which surfaces as ' +
+  'unrelated failures — e.g. a full vitest suite reporting hundreds of failed test files — with ' +
+  'nothing naming the disk as the cause.';
 
 /** One filesystem target `checkDiskSpace` measured free space on. */
 export interface DiskSpaceTargetFinding {
@@ -1658,16 +1671,20 @@ function checkOneDiskTarget(
   if (status === 'PASS') {
     return { label, path, status, availableBytes, detail: `${formatBytes(availableBytes)} free on ${path}` };
   }
+  // Both branches report "below" — a WARN target IS already under the WARN
+  // floor (that's what triggered WARN), never merely "approaching" it from
+  // above. Only the floor named and the consequence's modality differ.
   const floor = status === 'FAIL' ? DISK_SPACE_FAIL_BYTES : DISK_SPACE_WARN_BYTES;
-  const relation = status === 'FAIL' ? 'below' : 'approaching';
+  const floorLabel = status === 'FAIL' ? 'threshold' : 'comfortable-margin threshold';
+  const consequence = status === 'FAIL' ? DISK_SPACE_FAIL_CONSEQUENCE : DISK_SPACE_WARN_CONSEQUENCE;
   return {
     label,
     path,
     status,
     availableBytes,
     detail:
-      `${formatBytes(availableBytes)} free on ${path} — ${relation} the ${formatBytes(floor)} threshold. ` +
-      DISK_SPACE_CONSEQUENCE,
+      `${formatBytes(availableBytes)} free on ${path} — below the ${formatBytes(floor)} ${floorLabel}. ` +
+      consequence,
   };
 }
 
@@ -1810,6 +1827,13 @@ export interface RunDoctorOptions {
  *   - A failed/unreachable DR-019 token check is non-fatal to the rest of the
  *     report (so `--fix` of the local settings floor still runs offline) but
  *     still contributes 1 to the exit code.
+ *   - Disk-space FAIL (groundnuty/macf#1365 — either the workspace or `tmp`
+ *     filesystem below the FAIL floor) → 1. WARN and UNKNOWN do NOT affect
+ *     the exit code — same warn-only posture as the other WARN-tier checks
+ *     in this report; a status literally named FAIL does, for consistency
+ *     with every other FAIL in this function.
+ *   - The early-return path (no macf-agent.json) always returns 1 regardless
+ *     of disk-space status — unrelated to whether the disk itself is full.
  */
 export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Promise<number> {
   const config = readAgentConfig(projectDir);
@@ -1952,7 +1976,8 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
   console.log('');
   console.log('Disk space');
   console.log('──────────────────────────────────────────────────────────────');
-  printDiskSpaceSection(checkDiskSpace(projectDir));
+  const diskSpaceCheck = checkDiskSpace(projectDir);
+  printDiskSpaceSection(diskSpaceCheck);
 
   // --fix: the existing install emitters ARE the fix (DR-028) — they write the
   // floor merge-preservingly. Detect drift read-only above, then (on consent)
@@ -2012,7 +2037,12 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
 
   const sandboxFailed = sandboxCheck.status === 'FAIL';
   const roleErrored = roleCheck?.status === 'ERROR';
-  return permissionsFailed || sandboxFailed || roleErrored ? 1 : 0;
+  // groundnuty/macf#1365: a status literally named FAIL feeds the exit code
+  // everywhere else in this file (sandboxFailed above) — a disk-space FAIL
+  // that stayed cosmetic would be the silent-fallback shape this repo's own
+  // rules catalog: a name that implies consequence with none attached.
+  const diskSpaceFailed = diskSpaceCheck.status === 'FAIL';
+  return permissionsFailed || sandboxFailed || roleErrored || diskSpaceFailed ? 1 : 0;
 }
 
 /** Print the macf#554/#556 OTEL launch-boundary report line for `check`. */

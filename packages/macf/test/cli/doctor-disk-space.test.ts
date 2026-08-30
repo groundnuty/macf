@@ -188,7 +188,13 @@ describe('checkDiskSpace (groundnuty/macf#1365)', () => {
       // Real invocation — no readStats override, exercises the actual
       // statfsSync path against a real directory.
       const result = checkDiskSpace(realTmpRoot);
-      expect(result.status).not.toBe(undefined); // sanity: the call completed
+      // Self-control (assert-the-wrong-path.md): prove the instrument was
+      // actually live, not that the call merely returned. A no-op stub or a
+      // silently-thrown-and-caught statfs would still satisfy "no deletes"
+      // vacuously — these two lines are what makes the negative mean
+      // something.
+      expect(vi.mocked(fs.statfsSync)).toHaveBeenCalled();
+      expect(result.status).not.toBe('UNKNOWN');
 
       expect(rmSpy).not.toHaveBeenCalled();
       expect(unlinkSpy).not.toHaveBeenCalled();
@@ -233,13 +239,23 @@ describe('runDoctor — Disk space section (rendered output, groundnuty/macf#136
     installSandboxFdAllowRead(tmpRoot);
     vi.mocked(fs.statfsSync).mockReturnValue(statfsResult(BELOW_FAIL) as ReturnType<typeof fs.statfsSync>);
 
-    await runDoctor(tmpRoot);
+    const code = await runDoctor(tmpRoot);
+    // Disk-space FAIL now feeds the exit code, same as every other FAIL in
+    // this report (sandbox-fd, role-settings ERROR) — a full disk is not a
+    // cosmetic-only finding.
+    expect(code).toBe(1);
 
     const out = logSpy.mock.calls.flat().join('\n');
     expect(out).toContain('Disk space');
-    expect(out).toMatch(/\[FAIL\]/);
-    expect(out).toMatch(/ENOSPC/);
-    expect(out).toMatch(/unrelated failures/);
+    // Scoped to the Disk space section — printSandboxSection ALSO emits
+    // "[FAIL — ...]" elsewhere in the same report, so an unscoped /\[FAIL\]/
+    // can't tell "disk space said FAIL" from "some other section did."
+    const diskSection = out.slice(out.indexOf('Disk space'));
+    expect(diskSection).toMatch(/\[FAIL\]/);
+    expect(diskSection).toMatch(/ENOSPC/);
+    expect(diskSection).toMatch(/unrelated failures/);
+    // FAIL is a certainty claim ("will fail"), never the WARN-tier hedge.
+    expect(diskSection).toMatch(/will fail with ENOSPC/);
   });
 
   it('reports ample space with NO WARN/FAIL/ENOSPC noise (decisive pair #2)', async () => {
@@ -247,16 +263,22 @@ describe('runDoctor — Disk space section (rendered output, groundnuty/macf#136
     installSandboxFdAllowRead(tmpRoot);
     vi.mocked(fs.statfsSync).mockReturnValue(statfsResult(AMPLE) as ReturnType<typeof fs.statfsSync>);
 
-    await runDoctor(tmpRoot);
+    const code = await runDoctor(tmpRoot);
+    expect(code).toBe(0);
 
     const out = logSpy.mock.calls.flat().join('\n');
     expect(out).toContain('Disk space');
-    expect(out).toMatch(/\[PASS\]/);
-    // The decisive negative assertion — an implementation that always warns
-    // would fail exactly this line.
+    // The Disk space section is the LAST thing printed in the main flow
+    // (nothing else follows it unless --fix is passed, which it isn't here)
+    // — scoping to "everything from the header onward" captures exactly
+    // this section's content, no line-count guess involved.
     const diskSection = out.slice(out.indexOf('Disk space'));
+    expect(diskSection).toMatch(/\[PASS\]/);
+    // The decisive negative assertion — an implementation that always warns
+    // (or always fails) would fail these lines.
     expect(diskSection).not.toMatch(/\[WARN\]/);
-    expect(diskSection.split('\n').slice(0, 6).join('\n')).not.toMatch(/ENOSPC/);
+    expect(diskSection).not.toMatch(/\[FAIL\]/);
+    expect(diskSection).not.toMatch(/ENOSPC/);
   });
 
   it('honest-unknown: statfs failure renders [UNKNOWN], never [PASS]/"ok"', async () => {
@@ -266,10 +288,13 @@ describe('runDoctor — Disk space section (rendered output, groundnuty/macf#136
       throw new Error('EPERM: statfs not permitted');
     });
 
-    await runDoctor(tmpRoot);
+    const code = await runDoctor(tmpRoot);
+    // UNKNOWN does not feed the exit code (only FAIL does) — an
+    // undeterminable read is not itself evidence the disk is full.
+    expect(code).toBe(0);
 
     const out = logSpy.mock.calls.flat().join('\n');
-    const diskSection = out.slice(out.indexOf('Disk space'), out.indexOf('Disk space') + 400);
+    const diskSection = out.slice(out.indexOf('Disk space'));
     expect(diskSection).toMatch(/\[UNKNOWN\]/);
     expect(diskSection).not.toMatch(/\[PASS\]/);
   });
