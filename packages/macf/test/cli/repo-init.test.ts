@@ -223,10 +223,13 @@ describe('macf#980 — pull_request synchronize/ready_for_review recovery routin
       expect(gateScript()).toContain('if [ "$ACTION" != "synchronize" ]; then');
     });
 
-    it('suppresses Dependabot-authored events, scoped to non-opened actions only (macf#872)', () => {
+    it('suppresses Dependabot-authored pull_request events uniformly, regardless of ACTION (groundnuty/macf#1363)', () => {
       const script = gateScript();
-      expect(script).toContain('if [ "$ACTION" != "opened" ] && [ "$ACTOR" = "dependabot[bot]" ]; then');
+      expect(script).toContain('if [ "$ACTOR" = "dependabot[bot]" ]; then');
       expect(script).toContain('echo "should-route=false" >> "$GITHUB_OUTPUT"');
+      // Regression guard: the pre-#1363 scoped form must be gone, not just
+      // superseded textually elsewhere in the script.
+      expect(script).not.toContain('$ACTION" != "opened" ] && [ "$ACTOR"');
     });
 
     it('excludes the CURRENT run from the prior-run count (self-exclusion by RUN_ID)', () => {
@@ -377,7 +380,7 @@ describe('macf#980 — pull_request synchronize/ready_for_review recovery routin
       expect(shouldRoute).toBe('true');
     });
 
-    it('macf#872: a Dependabot-authored synchronize is suppressed regardless of prior-run state', () => {
+    it('macf#1363: a Dependabot-authored synchronize is suppressed regardless of prior-run state', () => {
       const shouldRoute = runGate(
         { ...baseEnv, ACTION: 'synchronize', ACTOR: 'dependabot[bot]' },
         '[]',
@@ -385,9 +388,54 @@ describe('macf#980 — pull_request synchronize/ready_for_review recovery routin
       expect(shouldRoute).toBe('false');
     });
 
-    it('macf#872: a Dependabot-authored opened is NOT suppressed (existing behaviour preserved byte-for-byte)', () => {
+    // DECISIVE (1/2): the measured defect. Every dependabot PR on
+    // groundnuty/macf was born red because `opened` — the ONLY action a
+    // fresh Dependabot PR ever fires — was excluded from the pre-#1363
+    // ACTOR check (macf#980 scoped it to non-opened actions only). Six
+    // real PRs (#174/#484/#486/#487/#485/#819) sat unreviewed behind this
+    // false-red for as long as four months. `#872: a Dependabot-authored
+    // opened is NOT suppressed` was the OLD, buggy expectation this test
+    // replaces.
+    it('macf#1363 DECISIVE 1/2: a Dependabot-authored opened is now suppressed (the measured defect)', () => {
       const shouldRoute = runGate(
         { ...baseEnv, ACTION: 'opened', ACTOR: 'dependabot[bot]' },
+        '[]',
+      );
+      expect(shouldRoute).toBe('false');
+    });
+
+    // DECISIVE (2/2): the regression that matters. An agent-authored
+    // (non-Dependabot) opened PR must keep routing exactly as before —
+    // this is what distinguishes "actually gates on the actor" from "skips
+    // unconditionally" (assert-the-wrong-path.md: (1) alone is satisfied
+    // by always skipping). Duplicates the "AC: existing opened behaviour
+    // is unchanged" case above with prior-run state varied, so it survives
+    // independently of that test's own future edits.
+    it('macf#1363 DECISIVE 2/2: an agent-authored opened still routes unconditionally (the regression that matters)', () => {
+      const shouldRoute = runGate(
+        { ...baseEnv, ACTION: 'opened', ACTOR: 'macf-science-agent[bot]' },
+        JSON.stringify([{ databaseId: 111 }]),
+      );
+      expect(shouldRoute).toBe('true');
+    });
+
+    it('macf#1363: a Dependabot-authored ready_for_review is also suppressed (uniform across every pull_request action)', () => {
+      const shouldRoute = runGate(
+        { ...baseEnv, ACTION: 'ready_for_review', ACTOR: 'dependabot[bot]' },
+        '[]',
+      );
+      expect(shouldRoute).toBe('false');
+    });
+
+    // honest-unknown: an actor that cannot be determined (empty string —
+    // the shape ${{ github.actor }} would take if GitHub ever failed to
+    // populate it) must NOT be treated as dependabot[bot]. Failing open on
+    // ROUTING is safe; failing open on SECRETS is not — so the undetermined
+    // case falls through to the routable branches, same as any other
+    // non-dependabot actor.
+    it('macf#1363: an undeterminable actor (empty string) is treated as routable, not skipped', () => {
+      const shouldRoute = runGate(
+        { ...baseEnv, ACTION: 'opened', ACTOR: '' },
         '[]',
       );
       expect(shouldRoute).toBe('true');
