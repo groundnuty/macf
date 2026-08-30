@@ -303,23 +303,29 @@ export function generateWorkflow(
     // to reach a valid merge ref) is then the natural, self-healing
     // recovery.
     //
-    // opened and ready_for_review are NOT gated — they always route,
-    // unconditionally, same as opened did before this change. Gating
-    // ready_for_review on "no prior run" would wrongly suppress it whenever
-    // opened already fired for that PR — which it does today even for
-    // draft PRs (route-by-mention doesn't discriminate on draft state), so
-    // a question-carrying draft (per #942) would still be silenced at the
-    // exact moment (ready_for_review) this fix exists to unblock.
+    // opened and ready_for_review are NOT gated on prior-run recovery
+    // semantics — they always route unconditionally (same as opened did
+    // before macf#980), UNLESS the actor is dependabot[bot] (see the ACTOR
+    // check below, which applies uniformly across every pull_request
+    // action). Gating ready_for_review on "no prior run" would wrongly
+    // suppress it whenever opened already fired for that PR — which it
+    // does today even for draft PRs (route-by-mention doesn't discriminate
+    // on draft state), so a question-carrying draft (per #942) would still
+    // be silenced at the exact moment (ready_for_review) this fix exists
+    // to unblock.
     //
-    // Also closes a synchronize/ready_for_review exposure macf#872 found in
-    // opened: the caller's secrets: inherit fails the reusable-workflow
-    // CALL OUTRIGHT for Dependabot-authored pull_request events (Dependabot
-    // PRs get no repository-secrets access — a GitHub security control, not
-    // a misconfiguration), so route: would fail at composition before any
-    // step runs. Scoped to non-opened actions only, so opened's existing
-    // behaviour — including its own pre-existing #872 exposure — stays
-    // byte-identical; extending the guard to opened is a smaller, separate
-    // follow-up (#872 tracks the general case).
+    // Also closes a Dependabot-authored pull_request exposure
+    // (groundnuty/macf#1363): the caller's secrets: block fails the
+    // reusable-workflow CALL OUTRIGHT for Dependabot-authored pull_request
+    // events (Dependabot PRs get an EMPTY secrets context by GitHub
+    // design — a security control, not a misconfiguration), so route:
+    // fails at composition ("Secret X is required, but not provided")
+    // before any job body runs — a red X on a PR whose actual check may be
+    // perfectly green. An earlier pass at this (macf#980) scoped the ACTOR
+    // check to non-opened actions only and left opened exposed; macf#1363
+    // closed that gap after six Dependabot PRs sat unreviewed for months
+    // behind the false-red signal, with exactly one of the six failing on
+    // its own merits (#174, a genuine TypeScript 6.0 incompatibility).
     '  gate:',
     '    runs-on: ubuntu-latest',
     '    permissions:',
@@ -348,12 +354,17 @@ export function generateWorkflow(
     '            exit 0',
     '          fi',
     '',
-    '          # #872: skip Dependabot-authored events on the actions THIS fix',
-    "          # adds. `opened`'s existing (pre-#980) Dependabot exposure is left",
-    '          # unchanged — see the job-level comment above.',
-    '          if [ "$ACTION" != "opened" ] && [ "$ACTOR" = "dependabot[bot]" ]; then',
+    '          # groundnuty/macf#1363: Dependabot-triggered pull_request runs',
+    '          # get an EMPTY secrets context by GitHub design, so the route',
+    '          # job secrets: block fails to compose regardless of ACTION —',
+    '          # skip routing for every dependabot[bot]-actor pull_request',
+    '          # event (opened, ready_for_review, synchronize alike) rather',
+    '          # than let composition fail. An undetermined actor falls',
+    '          # through to the routable branches below: failing open on',
+    '          # ROUTING is safe, failing open on SECRETS is not.',
+    '          if [ "$ACTOR" = "dependabot[bot]" ]; then',
     '            echo "should-route=false" >> "$GITHUB_OUTPUT"',
-    '            echo "skip: dependabot[bot] actor on a non-opened pull_request action (#872)"',
+    '            echo "skip: dependabot[bot] actor on a pull_request event — no repository-secrets access (#1363)"',
     '            exit 0',
     '          fi',
     '',
