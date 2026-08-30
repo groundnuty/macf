@@ -377,6 +377,17 @@ export async function applyRepoInitForAgent(
 
     await deps.cloneRepo(cloneUrl(agent.repo), dir);
 
+    // groundnuty/macf#1368 — the manifest's declared runner intent,
+    // threaded verbatim into `repoInit()` so a v3+-pinned, runner-runs-on-
+    // capable caller actually EMITS it (see `repo-init.ts`'s own gating —
+    // this call site does no capability check of its own, same "one
+    // decision point" posture the pre-existing self-hosted-capability
+    // refusal above already established for the OTHER runner check).
+    // `undefined` when the fleet declares no `routing.runner` at all —
+    // the common case, and the one that must leave `runRepoInit`'s call
+    // byte-identical to before this field existed.
+    const runnerRunsOn = manifest.routing?.runner.runs_on;
+
     const result = await runRepoInit(dir, {
       repo: agent.repo,
       actionsVersion,
@@ -387,6 +398,7 @@ export async function applyRepoInitForAgent(
       force: opts?.force ?? false,
       project: manifest.metadata.name,
       ...(opts?.tokenSource !== undefined ? { tokenSource: opts.tokenSource } : {}),
+      ...(runnerRunsOn !== undefined ? { routingRunnerRunsOn: runnerRunsOn } : {}),
       ...registryOpts,
     });
 
