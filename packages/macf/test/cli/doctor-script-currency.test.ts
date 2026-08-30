@@ -193,6 +193,11 @@ describe('runDoctor — Distributed script currency section (rendered output, gr
     expect(out).toContain('check-gh-token.sh');
     expect(out).toMatch(/stale/i);
     expect(out).toMatch(/\[WARN\]/);
+    // The WARN line must not claim unqualified "current" — it names WHICH
+    // CLI's canonical it compared against (the honesty fix for the PASS/WARN
+    // provenance gap: "canonical" here means this running CLI's bundled
+    // copy, not the groundnuty/macf source repo's HEAD).
+    expect(out).toMatch(/as shipped by this CLI \(v[\d.]+|version unknown\)/);
   });
 
   it('reports current with no findings after a real macf-update-equivalent refresh', async () => {
@@ -209,5 +214,40 @@ describe('runDoctor — Distributed script currency section (rendered output, gr
     expect(out).toMatch(/match canonical.*\[PASS\]|\[PASS\]/i);
     // No stale finding should be listed for a fresh copy.
     expect(out).not.toMatch(/✗ .*— stale/);
+    // PASS must stamp CLI-version provenance too — "match canonical" alone
+    // over-claims when "canonical" is scoped to this CLI's own bundled copy
+    // (a pinned-old npm install would PASS against its own stale bundle).
+    expect(out).toMatch(/as shipped by this CLI \(v[\d.]+|version unknown\)/);
+  });
+
+  /**
+   * groundnuty/macf#1362 root cause 2's shape (macf-fleet-build), reached
+   * through the ACTUAL `macf doctor` entrypoint rather than the helper
+   * function directly. `runDoctor` returns 1 immediately when no
+   * macf-agent.json is found — before this fix that early return skipped
+   * every section, so the honest "unmanaged" line the AC asks for was never
+   * shown for the exact workspace shape it names. This is the altitude the
+   * issue means by "`macf doctor` reports it": the printed report, not just
+   * a helper's return value.
+   */
+  it('renders the unmanaged line even when macf-agent.json is entirely absent (no early-return skip)', async () => {
+    // Deliberately NO writeAgentConfig call — `.macf/macf-agent.json` never
+    // existed. Hook scripts present anyway (the hand-placed-copy shape).
+    mkdirSync(join(tmpRoot, '.claude', 'scripts'), { recursive: true });
+    writeFileSync(
+      join(tmpRoot, '.claude', 'scripts', 'check-gh-token.sh'),
+      '#!/usr/bin/env bash\n# ancient hand-placed copy, no .macf/ at all\n',
+    );
+
+    const code = await runDoctor(tmpRoot);
+    expect(code).toBe(1); // pre-existing "run `macf init` first" exit — unrelated to staleness
+
+    const out = logSpy.mock.calls.flat().join('\n');
+    expect(out).toContain('Distributed script currency');
+    expect(out).toMatch(/no .macf\/ directory/i);
+    expect(out).toMatch(/\[INFO\]/);
+    // Must NOT read as stale/current — the unmanaged wording is distinct.
+    expect(out).not.toMatch(/stale/i);
+    expect(out).not.toMatch(/match canonical/i);
   });
 });
