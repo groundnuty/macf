@@ -307,6 +307,65 @@ describe('applyRepoInitForAgent', () => {
     });
   });
 
+  // --- groundnuty/macf#1368 — routing.runner.runs_on threading ---
+
+  it('DECISIVE 1: manifest declares routing.runner.runs_on -> threaded verbatim into repoInit\'s routingRunnerRunsOn option', async () => {
+    let seenOpts: unknown;
+    const fakeRepoInit = vi.fn(async (_dir: string, opts: unknown) => {
+      seenOpts = opts;
+      return { workflow: 'created' as const, config: 'updated' as const, labels: { status: 'ok' as const, created: [], existed: [] } };
+    });
+    const deps: RepoInitStepDeps = { cloneRepo: fakeCloneRepo(), commitAndPush: async () => 'nothing-to-commit', repoInit: fakeRepoInit as never };
+    const selfHostedManifest: FleetManifest = { ...MANIFEST, routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
+    await applyRepoInitForAgent(AGENT, selfHostedManifest, deps, { actionsVersion: 'v3.4.1' });
+    expect(seenOpts).toMatchObject({ routingRunnerRunsOn: 'self-hosted' });
+  });
+
+  it('DECISIVE 2: manifest declares no routing at all -> repoInit is called WITHOUT a routingRunnerRunsOn key', async () => {
+    let seenOpts: unknown;
+    const fakeRepoInit = vi.fn(async (_dir: string, opts: unknown) => {
+      seenOpts = opts;
+      return { workflow: 'created' as const, config: 'updated' as const, labels: { status: 'ok' as const, created: [], existed: [] } };
+    });
+    const deps: RepoInitStepDeps = { cloneRepo: fakeCloneRepo(), commitAndPush: async () => 'nothing-to-commit', repoInit: fakeRepoInit as never };
+    // MANIFEST (module-level fixture) has no `routing` section at all.
+    await applyRepoInitForAgent(AGENT, MANIFEST, deps);
+    expect(seenOpts).not.toHaveProperty('routingRunnerRunsOn');
+  });
+
+  it('end to end through the REAL repoInit: an accepting pin + self-hosted declared lands runner-runs-on in the written workflow', async () => {
+    let written = '';
+    const deps: RepoInitStepDeps = {
+      cloneRepo: fakeCloneRepo(),
+      commitAndPush: async (dir) => {
+        written = readFileSync(join(dir, '.github', 'workflows', 'agent-router.yml'), 'utf-8');
+        return 'pushed';
+      },
+    };
+    const selfHostedManifest: FleetManifest = { ...MANIFEST, routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
+    // 'main' is the only version verified live to accept runner-runs-on
+    // today (groundnuty/macf-actions#83 has not shipped in a released tag
+    // — see repo-init.ts's own MIN_RUNNER_RUNS_ON_CAPABLE_ACTIONS_VERSION doc).
+    const outcome = await applyRepoInitForAgent(AGENT, selfHostedManifest, deps, { actionsVersion: 'main' });
+    expect(outcome.status).not.toBe('failed');
+    expect(written).toContain('runner-runs-on: self-hosted');
+  });
+
+  it('end to end through the REAL repoInit: routing.runner.runs_on: hosted also reaches the generated caller verbatim', async () => {
+    let written = '';
+    const deps: RepoInitStepDeps = {
+      cloneRepo: fakeCloneRepo(),
+      commitAndPush: async (dir) => {
+        written = readFileSync(join(dir, '.github', 'workflows', 'agent-router.yml'), 'utf-8');
+        return 'pushed';
+      },
+    };
+    const hostedManifest: FleetManifest = { ...MANIFEST, routing: { runner: { runs_on: 'hosted', warm: 1 } } };
+    const outcome = await applyRepoInitForAgent(AGENT, hostedManifest, deps, { actionsVersion: 'main' });
+    expect(outcome.status).not.toBe('failed');
+    expect(written).toContain('runner-runs-on: hosted');
+  });
+
   it('tokenSource given + labels partial-failure -> status FAILED (a fleet missing labels cannot route), workflow/config STILL pushed', async () => {
     const commits: { dir: string }[] = [];
     const fakeRepoInit = vi.fn(

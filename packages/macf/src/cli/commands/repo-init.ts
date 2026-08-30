@@ -965,12 +965,14 @@ export async function repoInit(
       if (isRunnerRunsOnCapableActionsVersion(pinnedVersion)) {
         v3Inputs = { ...v3Inputs, runnerRunsOn: opts.routingRunnerRunsOn };
       } else {
+        // Citation guard (macf#1061): this string must stand on its own —
+        // no internal issue numbers (see this module's own doc comment
+        // above, a maintainer-facing surface, for the actual references).
         process.stderr.write(
           `Warning: routing.runner.runs_on is declared ("${opts.routingRunnerRunsOn}") but the pinned macf-actions ` +
-            `router "${pinnedVersion}" does not accept the runner-runs-on input (groundnuty/macf-actions#83 has not ` +
-            'shipped in a released tag yet — only "main" carries it as of this CLI version). The generated ' +
-            'agent-router.yml will NOT declare this runner intent to the router; re-run repo-init once macf-actions ' +
-            'releases a capable tag.\n',
+            `router "${pinnedVersion}" does not accept the runner-runs-on input — no released macf-actions tag does ` +
+            'yet; only the unreleased "main" carries it. The generated agent-router.yml will NOT declare this ' +
+            'runner intent to the router; re-run repo-init once macf-actions releases a capable tag.\n',
         );
       }
     }
