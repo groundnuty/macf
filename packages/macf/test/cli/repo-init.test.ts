@@ -1902,6 +1902,41 @@ describe('repoInit integration', () => {
     expect(orgWf).not.toBe(userWf);
   });
 
+  // groundnuty/macf#1374 — an explicit registryOwner/registryRepo override
+  // (as `apply-repo-init.ts::repoInitRegistryOptions` now supplies from a
+  // fleet.yaml's declared owner.registry) must name THAT target verbatim,
+  // never the repo this call is initializing.
+  it('v3 pin + explicit registryOwner/registryRepo emits the DECLARED target, not the self-point default (macf#1374)', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201 }) as typeof fetch;
+
+    await repoInit(dir, {
+      repo: 'owner/test-repo',
+      actionsVersion: 'v3.3.0',
+      // groundnuty/macf#1373 made an UNSET registryType derive from the owner's
+      // live account type, so this must be explicit to reach the `repo` branch.
+      registryType: 'repo',
+      registryOwner: 'shared-org',
+      registryRepo: 'shared-control',
+      force: false,
+    });
+
+    const wf = readFileSync(join(dir, '.github', 'workflows', 'agent-router.yml'), 'utf-8');
+    expect(wf).toContain('      registry-api-path: /repos/shared-org/shared-control');
+    expect(wf).not.toContain('      registry-api-path: /repos/owner/test-repo');
+  });
+
+  it('v3 pin + registryOwner WITHOUT registryRepo throws — together-or-neither, never a partial override (macf#1374)', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201 }) as typeof fetch;
+
+    await expect(repoInit(dir, {
+      repo: 'owner/test-repo',
+      actionsVersion: 'v3.3.0',
+      registryType: 'repo',
+      registryOwner: 'shared-org',
+      force: false,
+    })).rejects.toThrow('registryOwner and registryRepo must be supplied together');
+  });
+
   // macf#797 — a floating v3+ pin is resolved to an immutable full tag at
   // generation time, so the born router never silently receives a behavioral
   // change within the major.
