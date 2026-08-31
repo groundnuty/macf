@@ -254,7 +254,18 @@ export const AGE_RECIPIENTS_NARROWING_OVERRIDE_TEXT =
 export const FleetDefaultsSchema = z
   .object({
     role_template: z.string().min(1),
-    app_manifest: z.string().min(1),
+    /**
+     * groundnuty/macf#1357 — made `.optional()` (was mandatory since v0,
+     * unconditionally declared by every schema-valid manifest until now).
+     * STILL unconsumed anywhere in this codebase
+     * (`design/manifest-reconciliation-audit.md` row 15 — no design or
+     * issue defines what it should drive); optionality does not change
+     * that, it only makes the gap disclosable. Declaring it now surfaces a
+     * presence-gated `skippedSections` entry (`plan.ts`'s
+     * `SKIPPED_SECTION_REASONS.app_manifest`, the same mechanism #1356 gave
+     * `shared`); omitting it — the new ordinary case — stays silent.
+     */
+    app_manifest: z.string().min(1).optional(),
   })
   .strict();
 
@@ -272,7 +283,18 @@ export const FleetDefaultsSchema = z
 export const FleetAgentSchema = z
   .object({
     role: z.string().min(1),
-    profile: z.string().min(1),
+    /**
+     * groundnuty/macf#1357 — made `.optional()` (was mandatory since v0).
+     * STILL unconsumed anywhere in this codebase
+     * (`design/manifest-reconciliation-audit.md` row 17) — provably NOT a
+     * function of `role` (real fixtures: `science-agent` -> `research`,
+     * `runner-ops` -> `code`, so no derivation rule exists either).
+     * Declaring it now surfaces a presence-gated `skippedSections` entry
+     * (`plan.ts`'s `SKIPPED_SECTION_REASONS.profile`, same mechanism
+     * `defaults.app_manifest` gets above and #1356 gave `shared`); omitting
+     * it — the new ordinary case — stays silent.
+     */
+    profile: z.string().min(1).optional(),
     repo: z.string().min(1),
     deploy_path: z.string().min(1),
     provenance: z.enum(['template', 'mirror']).optional(),

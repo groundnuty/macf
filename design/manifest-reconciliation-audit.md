@@ -38,12 +38,16 @@ REJECTED AT PARSE     trust.ca / trust.federated_cas    already closed. Declarin
                                                         left to do; do not re-add the field
                                                         ahead of its enforcement.
 
-INERT + DISCLOSED     collaborators[], shared.*          the plan says the field does nothing
-                                                        when declared (#1356). Exit =
+INERT + DISCLOSED     collaborators[], shared.*,         the plan says the field does nothing
+                      defaults.app_manifest,             when declared (#1356; extended to
+                      agents[].profile                   the mandatory pair by #1357, which
+                                                        made both optional FIRST). Exit =
                                                         implement it; the notice then goes.
 
-MANDATORY + INERT     defaults.app_manifest,             CANNOT be disclosed. Exit = make the
-                      agents[].profile                   field optional, or remove it (#1357).
+MANDATORY + INERT     (none, as of 2026-08-31)           Exit was: make the field optional,
+                                                        or remove it. #1357 chose optional
+                                                        for both remaining members (see the
+                                                        post-audit update below).
 
 INERT + SILENT        (none, as of 2026-08-29)           Exit = disclose first, then implement.
 ```
@@ -150,6 +154,37 @@ where that is the reason for `not reported`, the row says so.
 > shape. Rows 25-27 stay genuinely INERT for the same reason they always
 > were: `#1355`, like the original `collaborators[]` mechanism, discloses
 > the ARRAY's presence, not each element field.
+>
+> **groundnuty/macf#1357 closed rows 15/17, choosing OPTIONAL over
+> removal.** The science-agent ruling on that issue is explicit about why
+> `#1205`'s removal precedent does not transfer even though the conditions
+> (inert, undesigned, unenforced) match: `trust.*` was OPTIONAL, so removing
+> it broke only manifests that DECLARED it; `defaults.app_manifest` /
+> `agents[].profile` were MANDATORY, so removing them would have been a
+> breaking change to every manifest in existence, for zero functional
+> gain — a different defect (should never have been REQUIRED) needing a
+> different fix than `trust.*`'s (should never have been DECLARABLE).
+> `fleet-manifest.ts` made both `.optional()`; `plan.ts`'s
+> `computeSkippedSections` now presence-gates them exactly like `shared` —
+> same silent-unless-declared shape, same `skippedSections` mechanism. Rows
+> 15/17's **verdict** in the table above is UNCHANGED at **INERT** — neither
+> field is consumed anywhere any more than before; only its
+> disclosure/schema status moved, from MANDATORY+INERT (undisclosable) to
+> the same INERT+DISCLOSED bucket rows 24/28/29 already occupy. That
+> distinction — verdict vs. disclosure — is the same one row 24
+> (`collaborators[]`, DECLARATIVE-ONLY because its presence drives a
+> `skipped_sections` line) already draws against rows 25-27 (still INERT,
+> because the fields INSIDE the array are read by nothing): a presence
+> check reaching `skippedSections` is not the same fact as the field's
+> VALUE being consumed. Rows 15/17 sit on the row-24 side of that line, not
+> the 25-27 side — each is a single scalar field, not a container whose
+> members could diverge from its own presence-check, so "declared" and
+> "disclosed" coincide exactly for both. **With rows 15/17 closed, the
+> `MANDATORY + INERT` exit-bucket in §"INERT is not one state" above is
+> empty** — every remaining INERT row (25-27, still undisclosed at the
+> field level; 28-29, disclosed at the section level since #1356) now has a
+> KNOWN exit (implement, or stay disclosed pending implementation); none is
+> blocked on a schema decision the way 15/17 were.
 
 ---
 

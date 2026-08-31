@@ -13,6 +13,12 @@ import type { ObservedState } from '../../src/cli/bootstrap/plan.js';
 import { parseFleetManifest } from '../../src/cli/bootstrap/fleet-manifest.js';
 import { resolveRunnerPlatformEndpointWithProvenance } from '../../src/cli/bootstrap/runner-platform.js';
 
+// groundnuty/macf#1357 made `defaults.app_manifest` / `agents[].profile`
+// `.optional()`; omitted here (the new ordinary case) so this fixture's own
+// "the skipped-section block" tests below — which assert EXACT
+// `skipped_sections` content keyed on `collaborators` alone — stay accurate.
+// See `bootstrap/plan.test.ts`'s dedicated decisive-pair tests for the
+// declared-case coverage of these two fields.
 const VALID_FLEET_YAML = `
 apiVersion: macf/v0
 kind: Fleet
@@ -28,10 +34,8 @@ transport:
   age_recipients: []
 defaults:
   role_template: groundnuty/agentic-repo-template
-  app_manifest: dr-019
 agents:
   - role: code-agent
-    profile: code
     repo: groundnuty/icsoc-2026-experiment
     deploy_path: /home/ubuntu/repos/agh/icsoc-2026-experiment
 collaborators:

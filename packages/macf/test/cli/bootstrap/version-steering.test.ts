@@ -26,7 +26,13 @@ import {
   type PlanItem,
 } from '../../../src/cli/bootstrap/plan.js';
 
-/** Same 2-agent shape as `plan.test.ts`'s `baseManifest` — no `versions:` by default. */
+/**
+ * Same 2-agent shape as `plan.test.ts`'s `baseManifest` — no `versions:` by
+ * default. groundnuty/macf#1357 made `defaults.app_manifest` /
+ * `agents[].profile` `.optional()`; omitted here for the same reason
+ * `plan.test.ts`'s copy omits them — this fixture feeds the "is empty when
+ * nothing was skipped" assertion below, so declaring either would break it.
+ */
 function baseManifest(overrides: Partial<FleetManifest> = {}): FleetManifest {
   return {
     apiVersion: 'macf/v0',
@@ -35,17 +41,15 @@ function baseManifest(overrides: Partial<FleetManifest> = {}): FleetManifest {
     owner: { account: 'groundnuty', type: 'user', registry: { type: 'profile', user: 'groundnuty' } },
     network: { advertise_host: 'example.ts.net' },
     transport: { age_recipients: [] },
-    defaults: { role_template: 'groundnuty/agentic-repo-template', app_manifest: 'dr-019' },
+    defaults: { role_template: 'groundnuty/agentic-repo-template' },
     agents: [
       {
         role: 'science-agent',
-        profile: 'research',
         repo: 'groundnuty/icsoc-2026-science-agent',
         deploy_path: '/home/ubuntu/repos/agh/icsoc-2026-science-agent',
       },
       {
         role: 'code-agent',
-        profile: 'code',
         repo: 'groundnuty/icsoc-2026-experiment',
         deploy_path: '/home/ubuntu/repos/agh/icsoc-2026-experiment',
       },

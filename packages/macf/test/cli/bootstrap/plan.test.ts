@@ -55,7 +55,14 @@ import { ROUTER_APP_ROLE } from '../../../src/cli/bootstrap/apply-router-app.js'
 import { ROUTING_CLIENT_CERT_SECRET_NAME } from '../../../src/cli/bootstrap/apply-routing-client.js';
 import type { RepoSecretNamesObservation } from '../../../src/cli/bootstrap/observer.js';
 
-/** A minimal, valid, 2-agent manifest — no optional sections. */
+/**
+ * A minimal, valid, 2-agent manifest — no optional sections. groundnuty/macf#1357
+ * made `defaults.app_manifest` / `agents[].profile` `.optional()`; this
+ * fixture omits both (the new ordinary case) to actually be minimal — a
+ * fixture named "no optional sections" that still declared two optional
+ * fields would be self-contradictory. Tests exercising the "declared"
+ * half of the decisive pair pass them via `overrides`.
+ */
 function baseManifest(overrides: Partial<FleetManifest> = {}): FleetManifest {
   return {
     apiVersion: 'macf/v0',
@@ -64,17 +71,15 @@ function baseManifest(overrides: Partial<FleetManifest> = {}): FleetManifest {
     owner: { account: 'groundnuty', type: 'user', registry: { type: 'profile', user: 'groundnuty' } },
     network: { advertise_host: 'example.ts.net' },
     transport: { age_recipients: [] },
-    defaults: { role_template: 'groundnuty/agentic-repo-template', app_manifest: 'dr-019' },
+    defaults: { role_template: 'groundnuty/agentic-repo-template' },
     agents: [
       {
         role: 'science-agent',
-        profile: 'research',
         repo: 'groundnuty/icsoc-2026-science-agent',
         deploy_path: '/home/ubuntu/repos/agh/icsoc-2026-science-agent',
       },
       {
         role: 'code-agent',
-        profile: 'code',
         repo: 'groundnuty/icsoc-2026-experiment',
         deploy_path: '/home/ubuntu/repos/agh/icsoc-2026-experiment',
       },
@@ -1380,20 +1385,61 @@ describe('computePlan — skippedSections (declared-but-deferred sections, no si
     });
   });
 
-  // groundnuty/macf#1355 — `defaults.app_manifest` / `agents[].profile` are
-  // DELIBERATELY NOT disclosed via this mechanism (see `plan.ts`'s
-  // `SKIPPED_SECTION_REASONS` doc for why: both are REQUIRED fields, so an
-  // unconditional entry would violate the SAME "byte-identical when
-  // declaring none" contract the `shared` tests above pin). This is a
-  // regression guard against silently re-adding them the way an earlier
-  // draft of this change did.
-  it('does NOT surface defaults.app_manifest / agents[].profile — both are mandatory-and-inert, a schema-level gap, not a per-run disclosure', () => {
-    const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
-    const rendered = formatPlanText(plan);
-    expect(rendered).not.toContain('defaults.app_manifest');
-    expect(rendered).not.toContain('agents[].profile');
-    expect(plan.skippedSections.some((s) => s.section === 'defaults.app_manifest')).toBe(false);
-    expect(plan.skippedSections.some((s) => s.section === 'agents[].profile')).toBe(false);
+  // groundnuty/macf#1357 — `defaults.app_manifest` / `agents[].profile` were
+  // REQUIRED (no `.optional()`) when #1355 shipped `shared`'s presence-gate,
+  // which is exactly why they were EXCLUDED from that mechanism then — an
+  // unconditional entry for a mandatory field is a permanent catalogue line,
+  // not a disclosure. #1357 made both `.optional()` FIRST, which is what
+  // makes presence-gating honest here: "declared" is now a real choice an
+  // operator can make (or not), the same precondition `shared` already had.
+  // Same decisive-pair shape as the `shared` describe block above.
+  describe('defaults.app_manifest / agents[].profile (groundnuty/macf#1357)', () => {
+    it('names defaults.app_manifest in the rendered plan text when it is declared', () => {
+      const manifest = baseManifest({ defaults: { role_template: 'groundnuty/agentic-repo-template', app_manifest: 'dr-019' } });
+      const plan = computePlan(manifest, EMPTY_OBSERVED);
+      expect(plan.skippedSections).toContainEqual({ section: 'defaults.app_manifest', reason: SKIPPED_SECTION_REASONS.app_manifest });
+
+      const rendered = formatPlanText(plan);
+      expect(rendered).toContain('defaults.app_manifest: SKIPPED');
+    });
+
+    it('names agents[].profile in the rendered plan text when ANY agent declares it', () => {
+      const manifest = baseManifest({
+        agents: [
+          { role: 'science-agent', profile: 'research', repo: 'groundnuty/icsoc-2026-science-agent', deploy_path: '/home/ubuntu/repos/agh/icsoc-2026-science-agent' },
+          { role: 'code-agent', repo: 'groundnuty/icsoc-2026-experiment', deploy_path: '/home/ubuntu/repos/agh/icsoc-2026-experiment' },
+        ],
+      });
+      const plan = computePlan(manifest, EMPTY_OBSERVED);
+      expect(plan.skippedSections).toContainEqual({ section: 'agents[].profile', reason: SKIPPED_SECTION_REASONS.profile });
+
+      const rendered = formatPlanText(plan);
+      expect(rendered).toContain('agents[].profile: SKIPPED');
+    });
+
+    // The decisive pair, mirroring the `shared` block above verbatim: a
+    // manifest DECLARING both fields names them; a manifest OMITTING both
+    // (baseManifest(), unmodified — see its own doc comment) produces no
+    // line, no noise — byte-identical to today for the ordinary case.
+    it('produces no line, no noise in the rendered plan when both are omitted — byte-identical to today', () => {
+      const declaring = computePlan(
+        baseManifest({
+          defaults: { role_template: 'groundnuty/agentic-repo-template', app_manifest: 'dr-019' },
+          agents: [
+            { role: 'science-agent', profile: 'research', repo: 'groundnuty/icsoc-2026-science-agent', deploy_path: '/home/ubuntu/repos/agh/icsoc-2026-science-agent' },
+            { role: 'code-agent', profile: 'code', repo: 'groundnuty/icsoc-2026-experiment', deploy_path: '/home/ubuntu/repos/agh/icsoc-2026-experiment' },
+          ],
+        }),
+        EMPTY_OBSERVED,
+      );
+      const omitting = computePlan(baseManifest(), EMPTY_OBSERVED);
+
+      expect(formatPlanText(declaring)).toContain('defaults.app_manifest: SKIPPED');
+      expect(formatPlanText(declaring)).toContain('agents[].profile: SKIPPED');
+      expect(formatPlanText(omitting)).not.toContain('defaults.app_manifest');
+      expect(formatPlanText(omitting)).not.toContain('agents[].profile');
+      expect(omitting.skippedSections).toEqual([]);
+    });
   });
 });
 
