@@ -264,11 +264,20 @@ describe('runDoctor — Framework checkout currency section (rendered output, gr
 
     const out = logSpy.mock.calls.flat().join('\n');
     expect(out).toContain('Framework checkout currency');
-    // Scope to THIS section's own line — other sections can legitimately
-    // emit [WARN] for unrelated reasons on a minimal fixture workspace, so
-    // a whole-output [WARN] match would pass even if THIS check's own line
-    // was mistagged.
-    const sectionLine = out.split('\n').find((line) => line.includes('commit(s) behind'));
+    // Scope to THIS section's own line, restricting the search to AFTER the
+    // section header. groundnuty/macf#1383 made this necessary: the
+    // Distributed script/rule-currency sections above now compose this same
+    // checkout-currency detail into their own WARN fix line when THIS
+    // checkout is behind, so an unscoped `commit(s) behind` search would
+    // find one of those earlier, unrelated-to-THIS-test lines first — a
+    // whole-output search stopped being informative the moment composition
+    // was introduced, same principle as the pre-existing "Disk space can
+    // also emit [WARN]" scoping this test already guarded against.
+    const sectionStart = out.indexOf('Framework checkout currency');
+    const sectionLine = out
+      .slice(sectionStart)
+      .split('\n')
+      .find((line) => line.includes('commit(s) behind'));
     expect(sectionLine).toBeDefined();
     expect(sectionLine).toMatch(/1 commit\(s\) behind/);
     expect(sectionLine).toMatch(/\[WARN\]/);
