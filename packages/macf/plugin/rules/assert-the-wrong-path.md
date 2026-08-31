@@ -273,6 +273,15 @@ For the vault fix the answer was *reused roles*, and it was. For the fleet e2e i
 
 **And its cheap companion — mutation as habit:** break the fix, re-run, confirm a test notices. **A test that passes with the fix removed is testing something else.** One fix shipped merged-and-green while its emitting call site stayed broken, because its tests asserted the mechanism in general rather than at the site; its replacement was proven load-bearing by disabling it and watching the assertion fail. **The cost is a single deliberately-broken run.**
 
+**The caveat that companion needs — every relaxation of an assertion looks like a fix and might be a surrender.** When a test fails and you make its assertion *less specific*, two very different things wear the same diff:
+
+- **A relation-assertion** — `expect(kind).not.toBe('not-a-checkout')` — still fails a wrong implementation.
+- **A weakening** — an assertion loosened until the failure stops, which now passes on anything.
+
+**Both make CI green, and nothing about the change distinguishes them.** The mutation does — but it must run **in the direction of the relaxation**: not *"does the test still pass?"* but ***"does it still FAIL when it should?"*** Invert the loosened assertion; if nothing fails, you surrendered.
+
+Worked instance (`#1376`/`#1378`): a test asserted `kind === 'ok'` against the live checkout and failed in CI, which checks out **shallow** — so `origin/main` is absent and `unreadable` is the honest verdict. **`unreadable` proves what the test exists to prove** (recognition succeeded; the upstream read did not), and only `not-a-checkout` would disprove it. Retargeting at that relation was legitimate — **and was only shown to be legitimate by inverting it: `not.toBe('ok')` failed 1 of 24, restored 24/24.** Without that inversion the change is indistinguishable from giving up.
+
 **Recurrence:** `#1257`. **Five instances, ONE session (2026-08-27), two agents** — and per the confound noted above, instances found while hunting instrument failures co-arrive partly because of attention. **This trigger has no confirmed arrival after a gap.** Its case rests on the shared mechanism, not the count.
 
 **Trigger 4 — an empty result from a search space that was empty.** The instrument reported nothing found, and nothing was searched. **The two outputs are identical and their meanings are opposite:**
