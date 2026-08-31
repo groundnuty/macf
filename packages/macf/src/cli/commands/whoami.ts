@@ -540,7 +540,7 @@ function fmt(f: WhoamiField): string {
 }
 
 function formatPeersSection(peers: PeersResult): string[] {
-  const lines: string[] = ['Peers (read from the registry, macf#672):'];
+  const lines: string[] = ['Peers (read from the registry, #672):'];
   switch (peers.kind) {
     case 'found':
       for (const p of peers.peers) {
