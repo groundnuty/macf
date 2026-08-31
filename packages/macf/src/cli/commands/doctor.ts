@@ -2076,10 +2076,16 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
     // `macf doctor` for that workspace shape — `checkDistributedScriptCurrency`
     // itself gates on `.macf/` presence and never touches canonical dirs (or
     // throws) in this branch, so it's safe to run without a parsed config.
+    // groundnuty/macf#1383: computed once, ahead of the two distribution-
+    // currency sections below, so their WARN fix line can be composed with
+    // it (never plain `macf update` when the CLI is itself the stale
+    // party) — same result then reused for this section's own print call
+    // below rather than re-running the (read-only, local) git calls twice.
+    const checkoutCurrency = checkCheckoutCurrency(projectDir, null);
     console.log('');
     console.log('Distributed script currency');
     console.log('──────────────────────────────────────────────────────────────');
-    printScriptCurrencySection(checkDistributedScriptCurrency(projectDir));
+    printScriptCurrencySection(checkDistributedScriptCurrency(projectDir), checkoutCurrency);
     // groundnuty/macf#1360: same reachable-without-config reasoning as the
     // script-currency section above, applied to .claude/rules/ —
     // `checkDistributedRuleCurrency` gates on `.macf/` presence exactly like
@@ -2087,7 +2093,7 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
     console.log('');
     console.log('Distributed rule currency');
     console.log('──────────────────────────────────────────────────────────────');
-    printRuleCurrencySection(checkDistributedRuleCurrency(projectDir));
+    printRuleCurrencySection(checkDistributedRuleCurrency(projectDir), checkoutCurrency);
     // groundnuty/macf#1376: unlike the two currency checks above, this one
     // never gates on `.macf/` presence — `resolveCanonicalBranch(null)` is a
     // pure function of env + a null config (defaults to 'main'), so it's
@@ -2096,7 +2102,7 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
     console.log('');
     console.log('Framework checkout currency');
     console.log('──────────────────────────────────────────────────────────────');
-    printCheckoutCurrencySection(checkCheckoutCurrency(projectDir, null));
+    printCheckoutCurrencySection(checkoutCurrency);
     // groundnuty/macf#1365: disk space is not gated on .macf/ at all — a
     // full disk breaks a workspace's builds/tests whether or not `macf
     // init` ever touched it, so this reachable-without-config workspace
@@ -2215,20 +2221,27 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
   console.log('──────────────────────────────────────────────────────────────');
   printLoadBearingHooksSection(checkLoadBearingHooks(projectDir));
 
+  // groundnuty/macf#1383: computed once, ahead of the two distribution-
+  // currency sections below, so their WARN fix line can be composed with it
+  // (never plain `macf update` when the CLI is itself the stale party) —
+  // same result then reused for this section's own print call below rather
+  // than re-running the (read-only, local) git calls twice.
+  const checkoutCurrency = checkCheckoutCurrency(projectDir, config);
+
   console.log('');
   console.log('Distributed script currency');
   console.log('──────────────────────────────────────────────────────────────');
-  printScriptCurrencySection(checkDistributedScriptCurrency(projectDir));
+  printScriptCurrencySection(checkDistributedScriptCurrency(projectDir), checkoutCurrency);
 
   console.log('');
   console.log('Distributed rule currency');
   console.log('──────────────────────────────────────────────────────────────');
-  printRuleCurrencySection(checkDistributedRuleCurrency(projectDir));
+  printRuleCurrencySection(checkDistributedRuleCurrency(projectDir), checkoutCurrency);
 
   console.log('');
   console.log('Framework checkout currency');
   console.log('──────────────────────────────────────────────────────────────');
-  printCheckoutCurrencySection(checkCheckoutCurrency(projectDir, config));
+  printCheckoutCurrencySection(checkoutCurrency);
 
   console.log('');
   console.log('Disk space');
@@ -2377,8 +2390,77 @@ function printLoadBearingHooksSection(check: LoadBearingHooksCheckResult): void 
   );
 }
 
+/**
+ * groundnuty/macf#1383 — the distributed-script/rule-currency WARN's remedy
+ * ("run `macf update`") is actively harmful when the CLI supplying
+ * "canonical" is itself the stale party: `macf update` would pull that same
+ * stale bundle and REVERT a workspace that has otherwise converged on the
+ * true source (measured live — refreshing all 16 rules from `origin/main`
+ * took a workspace from "8 stale" to "16 stale", because the installed CLI
+ * was 102 commits behind). `#1372` is correct that matching the installed
+ * CLI is the right target for a consumer; the bug is that the verdict never
+ * says whether that reference point is itself current, and its remedy is
+ * unconditional.
+ *
+ * This composes `checkCheckoutCurrency` (`#1376`, shipped in `#1378`) — the
+ * ONLY signal in this report that can date "the installed CLI's canonical"
+ * — with the script/rule WARN's fix line. Mirrors `#1361`'s idiom: name the
+ * finding BEFORE the instruction (a `ghs_`-shaped token that fails a stale
+ * pattern is "probably FINE" while "THIS SCRIPT is probably STALE" —
+ * applied here as "these files are probably FINE; THE CLI is probably
+ * STALE").
+ *
+ * Four branches, matching `CheckoutCurrencyCheckResult['status']`:
+ *   - `WARN`    — this checkout is itself N commits behind canonical. The
+ *                 dangerous case: state the lag, then correct the remedy to
+ *                 "update the CLI first, then refresh" — never plain
+ *                 `macf update` while the CLI is the stale party.
+ *   - `UNKNOWN` — a real framework checkout, but its own currency can't be
+ *                 read (no origin remote / unresolved ref). Honest-unknown:
+ *                 say the reference point can't be dated — never imply it's
+ *                 fresh just because staleness couldn't be proven.
+ *   - `PASS`    — the checkout is confirmed current (0 behind). The healthy
+ *                 case: unchanged wording, no added caveat.
+ *   - `INFO`    — not a checkout of the framework's own source at all (the
+ *                 ordinary npm-installed-consumer shape `#1372` already
+ *                 gets right). Unchanged wording — there's no upstream
+ *                 concept to date here, and none is needed.
+ */
+function printDistributionFixLine(target: '.claude/scripts/' | '.claude/rules/', checkoutCurrency: CheckoutCurrencyCheckResult): void {
+  const refreshCmd = `\`macf update\` (or \`macf rules refresh --dir .\`)`;
+  const plainFix = `Fix: run ${refreshCmd} to bring ${target} current.`;
+
+  if (checkoutCurrency.status === 'WARN') {
+    console.log(`    ⚠ ${checkoutCurrency.detail}`);
+    console.log(
+      '    These files are probably FINE — THE INSTALLED CLI is probably STALE: its bundled ' +
+      'canonical was built from a tree that is itself behind, so running the fix below as-is ' +
+      'would REVERT these files to that same stale canonical instead of fixing them.',
+    );
+    console.log('    Fix: update the CLI FIRST (pull + rebuild this checkout, or install a current');
+    console.log(`    CLI release), THEN run ${refreshCmd}. Do not run it alone while the CLI is`);
+    console.log('    the stale party — see groundnuty/macf#1383.');
+    return;
+  }
+
+  if (checkoutCurrency.status === 'UNKNOWN') {
+    console.log(`    ? ${checkoutCurrency.detail}`);
+    console.log(
+      "    Whether the installed CLI's canonical above is itself current can't be dated from " +
+      "here — don't assume it's fresh just because staleness couldn't be proven.",
+    );
+    console.log(`    ${plainFix}`);
+    return;
+  }
+
+  // PASS (checkout confirmed current) or INFO (not a framework checkout at
+  // all — the ordinary consumer shape `#1372` already gets right) — leave
+  // the existing wording untouched; no caveat to add.
+  console.log(`    ${plainFix}`);
+}
+
 /** Print the groundnuty/macf#1362 distributed-script-currency report section for `check`. */
-function printScriptCurrencySection(check: ScriptCurrencyCheckResult): void {
+function printScriptCurrencySection(check: ScriptCurrencyCheckResult, checkoutCurrency: CheckoutCurrencyCheckResult): void {
   if (check.status === 'INFO') {
     console.log(`  ℹ ${check.detail}  [INFO]`);
     return;
@@ -2396,11 +2478,11 @@ function printScriptCurrencySection(check: ScriptCurrencyCheckResult): void {
     const reasonText = f.reason === 'stale' ? 'stale — differs from canonical' : 'missing — never distributed';
     console.log(`    ✗ ${f.name} — ${reasonText}`);
   }
-  console.log('    Fix: run `macf update` (or `macf rules refresh --dir .`) to bring .claude/scripts/ current.');
+  printDistributionFixLine('.claude/scripts/', checkoutCurrency);
 }
 
 /** Print the groundnuty/macf#1360 distributed-rule-currency report section for `check`. */
-function printRuleCurrencySection(check: RuleCurrencyCheckResult): void {
+function printRuleCurrencySection(check: RuleCurrencyCheckResult, checkoutCurrency: CheckoutCurrencyCheckResult): void {
   if (check.status === 'INFO') {
     console.log(`  ℹ ${check.detail}  [INFO]`);
     return;
@@ -2418,7 +2500,7 @@ function printRuleCurrencySection(check: RuleCurrencyCheckResult): void {
     const reasonText = f.reason === 'stale' ? 'stale — differs from canonical' : 'missing — never distributed';
     console.log(`    ✗ ${f.name} — ${reasonText}`);
   }
-  console.log('    Fix: run `macf update` (or `macf rules refresh --dir .`) to bring .claude/rules/ current.');
+  printDistributionFixLine('.claude/rules/', checkoutCurrency);
 }
 
 /** Print the groundnuty/macf#1376 Framework-checkout-currency report section for `check`. */
