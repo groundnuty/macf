@@ -2,9 +2,9 @@
  * Tests for the `fleet.yaml` / `fleet.lock` schema (DR-043 §D1, Slice 1a,
  * groundnuty/macf#838). The valid fixture mirrors the DR's own `icsoc-2026`
  * worked example, less the fields the schema has since dropped (already true
- * for `transport.vault_repo`, Amendment F; as of groundnuty/macf#1201, also
- * true for `trust:` — see the dedicated describe block below for that
- * removal's own coverage).
+ * for `transport.vault_repo`, Amendment F; `trust.ca` stays dropped per
+ * groundnuty/macf#1201 — see the dedicated describe blocks below for that
+ * sub-field's removal AND `trust.federated_cas`'s #810 reintroduction).
  */
 import { describe, it, expect } from 'vitest';
 import { readFileSync, readdirSync } from 'node:fs';
@@ -629,47 +629,79 @@ describe('parseFleetManifest — role/repo/name hygiene (macf#839 review [BLOCKI
   });
 });
 
-describe('parseFleetManifest — trust: is removed (groundnuty/macf#1201)', () => {
+describe('parseFleetManifest — trust.federated_cas (groundnuty/macf#810, superseding #1201/#1205)', () => {
   // The decisive pair (assert-the-wrong-path.md): asserting ONLY that a
   // manifest WITHOUT `trust:` still parses (below) would also pass if this
-  // PR had deleted far more than intended — e.g. the whole CA-plan-item
-  // guarantee, or `FleetManifestSchema` itself. Only the "WITH trust: gets a
-  // specific, non-generic refusal" half proves the trust-specific removal
-  // behaves as decided, not merely that unrelated behaviour survived.
+  // PR had deleted the whole feature. Only the "a WELL-FORMED trust.federated_cas
+  // parses + a malformed one is rejected" half proves the field actually
+  // exists with the shape the ruling specified, not merely that unrelated
+  // behaviour survived.
 
-  it('refuses a manifest that still declares a trust: section, with a targeted explanation — not a bare .strict() unrecognized-key error', () => {
-    // Uses the OLD valid shape (`ca: per-project`, `federated_cas: []`) —
-    // proves the refusal fires on the KEY's mere presence, independent of
-    // whether its (former) contents would themselves have validated.
-    const stillDeclaresTrust = `${VALID_FLEET_YAML}\ntrust:\n  ca: per-project\n  federated_cas: []\n`;
-    expect(() => parseFleetManifest(stillDeclaresTrust)).toThrow(/trust/i);
+  it('a manifest without a trust: section parses exactly as before — trust is optional, absence changes nothing', () => {
+    expect(() => parseFleetManifest(VALID_FLEET_YAML)).not.toThrow();
+    const manifest = parseFleetManifest(VALID_FLEET_YAML);
+    expect(manifest.trust).toBeUndefined();
+  });
+
+  it('parses a well-formed trust.federated_cas entry', () => {
+    const withTrust = `${VALID_FLEET_YAML}\ntrust:\n  federated_cas:\n    - project: ppam-2026\n      ca_bundle: |\n        -----BEGIN CERTIFICATE-----\n        abc\n        -----END CERTIFICATE-----\n`;
+    const manifest = parseFleetManifest(withTrust);
+    expect(manifest.trust?.federated_cas).toEqual([
+      { project: 'ppam-2026', ca_bundle: '-----BEGIN CERTIFICATE-----\nabc\n-----END CERTIFICATE-----\n' },
+    ]);
+  });
+
+  it('parses an empty trust.federated_cas list (declared, but nothing federated)', () => {
+    const withEmptyTrust = `${VALID_FLEET_YAML}\ntrust:\n  federated_cas: []\n`;
+    const manifest = parseFleetManifest(withEmptyTrust);
+    expect(manifest.trust?.federated_cas).toEqual([]);
+  });
+
+  it('rejects a trust.federated_cas entry missing project', () => {
+    const bad = `${VALID_FLEET_YAML}\ntrust:\n  federated_cas:\n    - ca_bundle: cert-pem\n`;
+    expect(() => parseFleetManifest(bad)).toThrow(/project/);
+  });
+
+  it('rejects a trust.federated_cas entry missing ca_bundle', () => {
+    const bad = `${VALID_FLEET_YAML}\ntrust:\n  federated_cas:\n    - project: ppam-2026\n`;
+    expect(() => parseFleetManifest(bad)).toThrow(/ca_bundle/);
+  });
+
+  it('rejects a trust.federated_cas entry with an empty project string', () => {
+    const bad = `${VALID_FLEET_YAML}\ntrust:\n  federated_cas:\n    - project: ""\n      ca_bundle: cert-pem\n`;
+    expect(() => parseFleetManifest(bad)).toThrow();
+  });
+
+  it('rejects trust declared without federated_cas at all', () => {
+    const bad = `${VALID_FLEET_YAML}\ntrust: {}\n`;
+    expect(() => parseFleetManifest(bad)).toThrow(/federated_cas/);
+  });
+
+  it('rejects an unrecognized key under trust: (no type/scope/per-agent field — #810 ruling)', () => {
+    const bad = `${VALID_FLEET_YAML}\ntrust:\n  federated_cas: []\n  scope: everything\n`;
+    expect(() => parseFleetManifest(bad)).toThrow();
+  });
+
+  it('rejects an unrecognized key on one federated_cas entry (e.g. a per-agent field)', () => {
+    const bad = `${VALID_FLEET_YAML}\ntrust:\n  federated_cas:\n    - project: ppam-2026\n      ca_bundle: cert-pem\n      agent: code-agent\n`;
+    expect(() => parseFleetManifest(bad)).toThrow();
+  });
+
+  it('still refuses the removed trust.ca sub-field, with a targeted explanation naming the replacement — not a bare .strict() unrecognized-key error', () => {
+    const stillDeclaresTrustCa = `${VALID_FLEET_YAML}\ntrust:\n  ca: per-project\n  federated_cas: []\n`;
+    expect(() => parseFleetManifest(stillDeclaresTrustCa)).toThrow(/trust\.ca/i);
     try {
-      parseFleetManifest(stillDeclaresTrust);
+      parseFleetManifest(stillDeclaresTrustCa);
       expect.unreachable('parseFleetManifest should have thrown');
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       // NOT the generic zod `.strict()` message — a targeted explanation.
       expect(message).not.toMatch(/unrecognized key/i);
-      // Says it was never enforced (not merely "unsupported" or "unknown").
-      expect(message).toMatch(/never (read|enforced)|no code path/i);
-      // States the safe action.
-      expect(message).toMatch(/remove/i);
-    }
-  });
-
-  it('a manifest without a trust: section parses exactly as before — unaffected by the removal', () => {
-    expect(() => parseFleetManifest(VALID_FLEET_YAML)).not.toThrow();
-    const manifest = parseFleetManifest(VALID_FLEET_YAML);
-    expect(manifest).not.toHaveProperty('trust');
-  });
-
-  it('the refusal message names the field but carries no internal issue/DR citation (user-facing text, macf#1061)', () => {
-    const stillDeclaresTrust = `${VALID_FLEET_YAML}\ntrust:\n  ca: per-project\n  federated_cas: []\n`;
-    try {
-      parseFleetManifest(stillDeclaresTrust);
-      expect.unreachable('parseFleetManifest should have thrown');
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      // Names the replacement field.
+      expect(message).toMatch(/federated_cas/);
+      // States the removal (not merely "unsupported" or "unknown").
+      expect(message).toMatch(/removed/i);
+      // No internal issue/DR citation in user-facing text (macf#1061).
       expect(message).not.toMatch(/\bmacf#\d+\b|\bgroundnuty\/macf#\d+\b|\bDR-0\d{2}\b|#\d+/);
     }
   });
@@ -956,24 +988,28 @@ fingerprints:
 /**
  * Regression guard, in the shape groundnuty/macf#1192's read-only WHY-guard
  * used: a source scan over production code, so a future contributor cannot
- * quietly re-add a `trust`-field consumer without this test noticing — the
- * exact "declared but inert" trap groundnuty/macf#1201 removed `trust.ca` /
- * `trust.federated_cas` to close. Deliberately narrower than "the word
- * trust" (which appears constantly for MACF_TRUSTED_ACTORS / trust bundles /
- * DR-041 federation — an unrelated, actively-consumed concept, see
- * `trust-bundle.ts`): this pattern targets only the REMOVED schema's own
- * identifiers and property-access shape.
+ * quietly re-add a `trust.ca` consumer without this test noticing. Narrowed
+ * from its pre-`#810` form (which banned ANY `manifest.trust` /
+ * `FleetTrustSchema` / `.trust.federated_cas` reference) — `#810` legitimately
+ * reintroduced `trust.federated_cas` WITH a real consumer
+ * (`apply-federated-trust.ts`), so banning bare `manifest.trust` access or
+ * `FleetTrustSchema` would now fire on the feature this test suite exists to
+ * cover. Only `trust.ca` stays banned: `#1201` removed it, `#810`'s ruling
+ * never reintroduced it (`FleetTrustSchema` has no `ca` field — see
+ * `fleet-manifest.ts`), and a bypass of the type system (e.g. `(manifest.trust
+ * as any).ca`) is exactly the "declared but inert" shape this guard exists to
+ * catch, now scoped to the one sub-field that is actually still gone.
  */
-describe('trust: leaves no code-path consumer behind (groundnuty/macf#1201 source-scan regression)', () => {
-  const BANNED_TRUST_CONSUMER_PATTERN = /\bFleetTrustSchema\b|\bFleetTrust\b|\bmanifest\.trust\b|\.trust\.(ca|federated_cas)\b/;
+describe('trust.ca leaves no code-path consumer behind (groundnuty/macf#1201 source-scan regression, narrowed for #810)', () => {
+  const BANNED_TRUST_CA_CONSUMER_PATTERN = /\.trust\.ca\b/;
 
   function isCommentLine(trimmed: string): boolean {
     return trimmed.startsWith('//') || trimmed.startsWith('/*') || trimmed.startsWith('*');
   }
 
   /** Lines matching the banned pattern, outside comments — a "hit" means a live code path, not prose explaining the removal. */
-  function scanForTrustConsumer(source: string): readonly string[] {
-    return source.split('\n').filter((line) => BANNED_TRUST_CONSUMER_PATTERN.test(line) && !isCommentLine(line.trim()));
+  function scanForTrustCaConsumer(source: string): readonly string[] {
+    return source.split('\n').filter((line) => BANNED_TRUST_CA_CONSUMER_PATTERN.test(line) && !isCommentLine(line.trim()));
   }
 
   function listTsFilesRecursive(dir: string): string[] {
@@ -990,25 +1026,30 @@ describe('trust: leaves no code-path consumer behind (groundnuty/macf#1201 sourc
   }
 
   // --- Decisive: prove the scanner actually fires (assert-the-wrong-path.md) ---
-  it('FIRES on a deliberately-reintroduced trust-field consumer', () => {
-    const bad = 'if (manifest.trust !== undefined) { doSomething(manifest.trust.federated_cas); }';
-    expect(scanForTrustConsumer(bad).length).toBeGreaterThan(0);
+  it('FIRES on a deliberately-reintroduced trust.ca consumer', () => {
+    const bad = 'if (manifest.trust.ca !== undefined) { doSomething(manifest.trust.ca); }';
+    expect(scanForTrustCaConsumer(bad).length).toBeGreaterThan(0);
   });
 
   it('does NOT fire on a comment mentioning the removed field for historical context', () => {
-    const ok = '// trust.ca / trust.federated_cas were removed, groundnuty/macf#1201 — see FleetTrust in git history.';
-    expect(scanForTrustConsumer(ok)).toEqual([]);
+    const ok = '// trust.ca was removed, groundnuty/macf#1201 — never reintroduced by #810.';
+    expect(scanForTrustCaConsumer(ok)).toEqual([]);
+  });
+
+  it('does NOT fire on the legitimate trust.federated_cas consumer this issue (#810) adds', () => {
+    const ok = 'for (const entry of manifest.trust?.federated_cas ?? []) { publish(entry); }';
+    expect(scanForTrustCaConsumer(ok)).toEqual([]);
   });
 
   it('does NOT fire on the presence-only refusal check — it tests for the KEY, never reads a value', () => {
-    // The literal shape `rejectDeclaredTrust` uses: no `.trust` property
-    // access anywhere, so this must NOT be flagged as a "consumer".
-    const ok = "if (typeof raw !== 'object' || raw === null || !('trust' in raw)) return;";
-    expect(scanForTrustConsumer(ok)).toEqual([]);
+    // The literal shape `rejectDeclaredTrustCa` uses: no `.trust.ca` property
+    // access anywhere (only an `in` check), so this must NOT be flagged.
+    const ok = "if (typeof trust !== 'object' || trust === null || !('ca' in trust)) return;";
+    expect(scanForTrustCaConsumer(ok)).toEqual([]);
   });
 
   // --- The real guard: the actual source tree carries no consumer --------
-  it('the real packages/macf/src tree carries no trust-field consumer outside comments', () => {
+  it('the real packages/macf/src tree carries no trust.ca consumer outside comments', () => {
     const srcDir = fileURLToPath(new URL('../../../src', import.meta.url));
     const files = listTsFilesRecursive(srcDir);
     expect(files.length).toBeGreaterThan(50); // sanity: the walker found the tree, not an empty dir
@@ -1016,7 +1057,7 @@ describe('trust: leaves no code-path consumer behind (groundnuty/macf#1201 sourc
     const violations: string[] = [];
     for (const file of files) {
       const source = readFileSync(file, 'utf-8');
-      const hits = scanForTrustConsumer(source);
+      const hits = scanForTrustCaConsumer(source);
       if (hits.length > 0) violations.push(`${file}:\n  ${hits.join('\n  ')}`);
     }
     expect(violations).toEqual([]);

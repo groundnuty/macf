@@ -2175,6 +2175,20 @@ function caSummaryLines(result: FleetApplyResult): string[] {
   return lines;
 }
 
+/**
+ * `trust.federated_cas` registry-publish render (groundnuty/macf#810).
+ * Empty when `trust` is undeclared or `federated_cas` is `[]` — same
+ * silent-when-nothing-declared shape `routingSummaryLines` below uses for
+ * `routing.runner`.
+ */
+function federatedTrustSummaryLines(result: FleetApplyResult): string[] {
+  const entries = Object.entries(result.federatedTrust);
+  if (entries.length === 0) return [];
+  const lines = ['Federated trust (trust.federated_cas):'];
+  for (const [project, leg] of entries) lines.push(formatVariableLegLine(`registry leg (${project})`, leg));
+  return lines;
+}
+
 /** `MACF_TRUSTED_ACTORS` per-repo render (macf#838 Amendment D phase 2; corrected target macf#922). Empty when `routing.runner` wasn't declared, or its `runs_on` isn't `"self-hosted"`. A `'failed'` leg (rendered via `formatVariableLegLine`'s reason suffix — groundnuty/macf#993 corrected this from `'skipped'`: a declared runner is REQUIRED, so the register-before-route gate blocking the write now fails the run, not just the leg) is visible here even under `--yes`, which skips the pre-approval plan render entirely. */
 function routingSummaryLines(result: FleetApplyResult): string[] {
   const entries = Object.entries(result.routing);
@@ -2386,6 +2400,8 @@ export function formatApplyResult(
   parts.push(`fleet.lock: ${result.lockPath}`);
   parts.push(`Control repo sync: ${formatControlRepoSyncLine(result.controlRepoSync)}`);
   parts.push('', ...caSummaryLines(result));
+  const federatedTrustLines = federatedTrustSummaryLines(result);
+  if (federatedTrustLines.length > 0) parts.push('', ...federatedTrustLines);
   const routingLines = routingSummaryLines(result);
   if (routingLines.length > 0) parts.push('', ...routingLines);
   const runnerRequirementLines = runnerRequirementSummaryLines(result);
@@ -2631,6 +2647,12 @@ export function fleetApplyResultToJson(
     // credential field at all. Safe to spread verbatim (macf#838 Amendment D
     // phase 2).
     ca: { resolve: { ...result.ca.resolve }, registry_leg: { ...result.ca.registryLeg }, repo_legs: { ...result.ca.repoLegs } },
+    // groundnuty/macf#810 — `EnsureVariableOutcome`s only, same
+    // no-credential-field safety as `ca.registry_leg` above (`ca_bundle` is
+    // public CA-certificate material, never present on this shape either
+    // way). ALWAYS present (never omitted on an empty `{}`), same
+    // stable-key convention `runner_requirement` documents below.
+    federated_trust: { ...result.federatedTrust },
     routing: { ...result.routing },
     // groundnuty/macf#1323 — ALWAYS present (never omitted, unlike
     // `remaining_deploy`'s omit-when-empty convention): a script consuming
@@ -2889,6 +2911,14 @@ export function applyExitCode(
     result.ca.resolve.status === 'failed' ||
     result.ca.registryLeg.status === 'failed' ||
     Object.values(result.ca.repoLegs).some((leg) => leg.status === 'failed');
+  // groundnuty/macf#810 — same bar as `caBad` immediately above: a failed
+  // federated-CA registry leg needs operator attention (an agent whose
+  // `.github/macf-fleet.json` names this project will fail to start until
+  // it's fixed). 'skipped' does NOT independently fail the run — this leg
+  // has no upstream resolve/vault precondition to be a symptom of (see
+  // `apply-federated-trust.ts`'s doc), so a 'skipped' entry here would only
+  // ever occur via a future caller that hasn't shipped yet.
+  const federatedTrustBad = Object.values(result.federatedTrust).some((leg) => leg.status === 'failed');
   // groundnuty/macf#993 — the operator's ruling: "the failure of our runner
   // should be loud, and the lack of it being provisioned at this stage
   // should block everything else." No code change was needed HERE: a
@@ -2972,6 +3002,7 @@ export function applyExitCode(
     routerAppBad ||
     result.vault.status === 'failed' ||
     caBad ||
+    federatedTrustBad ||
     routingBad ||
     runnerRequirementBad ||
     routingClientBad ||

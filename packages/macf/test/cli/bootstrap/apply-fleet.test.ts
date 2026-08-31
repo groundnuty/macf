@@ -4356,6 +4356,76 @@ agents:
     });
   });
 
+  // --- groundnuty/macf#810 — declared trust.federated_cas reaches the real
+  // registry write, through the REAL applyFleet orchestration (not a direct
+  // unit call to publishFederatedTrustLegs — apply-federated-trust.test.ts
+  // already covers that in isolation; THIS suite proves the wiring point:
+  // apply-fleet.ts actually calls it, with the manifest's real registry). ---
+  describe('trust.federated_cas registry publish (groundnuty/macf#810)', () => {
+    it('DECLARED: a fleet declaring trust.federated_cas writes the guest CA under its own <SEG>_CA_CERT, in the fleet\'s registry scope', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest: FleetManifest = {
+        ...manifestWith([CODE_AGENT]),
+        trust: { federated_cas: [{ project: 'ppam-2026', ca_bundle: 'GUEST-CERT-PEM' }] },
+      };
+      const registryWrites: { name: string; value: string }[] = [];
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        trustDeps: trustDepsFor({
+          createRegistryVariable: async (_registry, name, value) => {
+            registryWrites.push({ name, value });
+            return 'created';
+          },
+        }),
+      };
+
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(registryWrites).toContainEqual({ name: 'PPAM_2026_CA_CERT', value: 'GUEST-CERT-PEM' });
+      expect(result.federatedTrust['ppam-2026']).toEqual({ status: 'created' });
+    });
+
+    it('UNDECLARED: a fleet with no trust: section publishes nothing — result.federatedTrust is {}, byte-identical to pre-#810 behavior', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]);
+      const deps = baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath);
+
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(result.federatedTrust).toEqual({});
+    });
+
+    it('a failed federated-CA registry write fails the whole apply run (applyExitCode), same bar as a failed own-CA leg', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest: FleetManifest = {
+        ...manifestWith([CODE_AGENT]),
+        trust: { federated_cas: [{ project: 'ppam-2026', ca_bundle: 'GUEST-CERT-PEM' }] },
+      };
+      // Force ONLY the federated-CA leg to 'failed', leaving the fleet's OWN
+      // CA ceremony on its normal default (absent → mint → create succeeds)
+      // — isolates the assertion to the federated leg specifically, rather
+      // than accidentally passing because the own-CA leg ALSO failed.
+      // `checkRegistryPresence` stays at `trustDepsFor`'s default ('absent'
+      // for every name); only `createRegistryVariable`'s response for the
+      // federated var name is overridden to report a duplicate
+      // (`ensure-variable.ts`'s "confirmed absent, create says exists"
+      // race/stale-read refusal).
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        trustDeps: trustDepsFor({
+          createRegistryVariable: async (_registry, name) => (name === 'PPAM_2026_CA_CERT' ? 'exists' : 'created'),
+        }),
+      };
+
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+      // Isolation check: the fleet's OWN CA leg succeeded — only the
+      // federated leg is the reason this run fails.
+      expect(result.ca.registryLeg.status).toBe('created');
+      expect(result.federatedTrust['ppam-2026']?.status).toBe('failed');
+      expect(applyExitCode(result, [], undefined)).toBe(1);
+    });
+  });
+
   // --- groundnuty/macf#920 — THE DECISIVE TEST: is the resulting fleet ROUTABLE? ---
   //
   // Per-primitive tests (repo-init's `tokenSource` threading, the

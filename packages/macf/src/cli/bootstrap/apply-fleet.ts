@@ -277,6 +277,10 @@ import {
 } from './apply-router-app.js';
 import type { CaApplyDeps, CaApplyOutcome, CaPublishResult, CaResolveOutcome } from './apply-ca.js';
 import { formatCaLegsSummary, publishCaCertLegs, redactCaResolve, resolveCaCert, skippedCaPublish, summarizeCaRepoLegs } from './apply-ca.js';
+// groundnuty/macf#810 — the fleet-level trust-material publish, same
+// registry scope + create-only shape as the CA cert legs immediately above.
+import type { FederatedTrustPublishResult } from './apply-federated-trust.js';
+import { publishFederatedTrustLegs } from './apply-federated-trust.js';
 import type { EnsureVariableOutcome } from './ensure-variable.js';
 import type { RunnerRegistrationDeps, RunnerRequirementOutcome, RunnerTokenPollOptions, TrustedActorsReconcileDeps } from './apply-routing.js';
 import {
@@ -795,6 +799,16 @@ export interface FleetApplyResult {
   /** DR-043 Amendment D phase 2 (macf#838) — the per-project CA ceremony + two-place publish (macf#806). See {@link CaApplyResult}'s doc. */
   readonly ca: CaApplyResult;
   /**
+   * groundnuty/macf#810 — declared `trust.federated_cas` registry-scope
+   * publish, keyed by guest `project`. Empty `{}` when `trust` is
+   * undeclared or `federated_cas` is `[]` — same "silent when nothing
+   * applies" convention as `ca.repoLegs` on a fleet with zero agents (never
+   * an omitted field). See `apply-federated-trust.ts`'s module doc for the
+   * scope this does NOT cover (no repo legs, no per-agent
+   * `.github/macf-fleet.json` change, no `#1330` consent gate).
+   */
+  readonly federatedTrust: FederatedTrustPublishResult;
+  /**
    * `MACF_TRUSTED_ACTORS` create-only writes, keyed by repo — empty `{}`
    * when `routing.runner` is not declared OR its `runs_on` isn't
    * `"self-hosted"` (macf#922; was `MACF_ROUTING_RUNS_ON`, see
@@ -1206,6 +1220,13 @@ function abortedFleetApplyResult(manifestPath: string, priorLock: FleetLock | nu
       registryLeg: { status: 'skipped', reason: `${reason} — see controlRepo above.` },
       repoLegs: {},
     },
+    // groundnuty/macf#810 — empty, same reasoning as `ca.repoLegs: {}`
+    // immediately above: this helper never received `manifest.trust`, so
+    // there is no declared-project list to populate skip entries for
+    // (`skippedFederatedTrustPublish` needs that list; it isn't available
+    // here). An early abort already forces `applyExitCode`'s `hardFailure`
+    // via `runnerOps.status === 'failed'` above regardless.
+    federatedTrust: {},
     routing: {},
     // groundnuty/macf#1323 — a genuinely `'failed'` requirement is NOT
     // recomputed here (this helper never received `manifest.routing`/
@@ -2487,6 +2508,33 @@ export async function applyFleet(
     deps.log(`CA repo leg (${repo}): ${leg.status}` + (leg.status === 'failed' || leg.status === 'skipped' ? ` — ${leg.reason}` : '.'));
   }
 
+  // groundnuty/macf#810 — declared trust.federated_cas publish. Independent
+  // of the own-CA ceremony above (no mint/vault/durability ordering — a
+  // guest's public CA bundle is transcribed, not minted, so there is no key
+  // that needs a durable home before its public value is published), so
+  // this runs unconditionally against `manifest.trust?.federated_cas` at the
+  // SAME point in this function `caPublish` above already runs — this
+  // function is unreachable on a `controlRepo` foreign/failed abort for the
+  // identical reason `caPublish` is (an earlier return in this same
+  // function on that abort — see `controlRepo`'s own doc on
+  // `FleetApplyResult`). `skippedFederatedTrustPublish` exists for a FUTURE
+  // caller that needs the "never attempted" shape (mirrors
+  // `apply-ca.ts::skippedCaPublish`); this call site currently has no
+  // precondition that would need it.
+  const federatedCas = manifest.trust?.federated_cas ?? [];
+  const federatedTrustPublish: FederatedTrustPublishResult = await publishFederatedTrustLegs(federatedCas, manifest.owner.registry, deps.trustDeps);
+  for (const entry of federatedCas) {
+    const leg = federatedTrustPublish[entry.project];
+    if (leg === undefined) {
+      deps.log(`Federated-CA registry leg (${entry.project}): unknown — no outcome recorded this run.`);
+      continue;
+    }
+    deps.log(
+      `Federated-CA registry leg (${entry.project}): ${leg.status}` +
+        (leg.status === 'failed' || leg.status === 'skipped' ? ` — ${leg.reason}` : '.'),
+    );
+  }
+
   // --- groundnuty/macf#1074: the unified six-secret routing publish ---
   //
   // Resolve all six `RoutingSecretResolution`s, THEN call
@@ -2943,6 +2991,7 @@ export async function applyFleet(
     vault,
     identityChanges,
     ca,
+    federatedTrust: federatedTrustPublish,
     routing: routingFinal,
     runnerRequirement,
     runnerProvision: runnerProvisionResults,

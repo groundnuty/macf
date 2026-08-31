@@ -45,6 +45,10 @@ import {
   vaultTsOauthSecret,
 } from './vault-read.js';
 import { RUNNER_PLATFORM_ENDPOINT_ENV_VAR, resolveRunnerPlatformEndpointWithProvenance } from './runner-platform.js';
+// groundnuty/macf#810 — the SAME `<SEG>_CA_CERT` formula `apply-ca.ts`'s own
+// publish uses, imported (not re-derived) so plan/observe/apply can never
+// disagree on the variable name for a guest project's federated CA.
+import { caCertVariableName } from './apply-ca.js';
 // groundnuty/macf#1335 — the ONE cross-module reuse in this file's per-agent
 // router-caller read: `extractCallerWithKeys` is a PURE regex extraction
 // (no I/O, no gh-auth-posture concern the rest of this file's "independent
@@ -1591,6 +1595,19 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
 
   const caRegistry = await checkRegistryVariablePresence(manifest.owner.registry, caVarName);
 
+  // groundnuty/macf#810 — one registry-presence read per declared
+  // trust.federated_cas[] entry, keyed by the GUEST project (never this
+  // fleet's own segment `caVarName` above uses). Empty object (not
+  // `undefined`) when `trust` is undeclared — `ObservedState.federatedCaRegistry`
+  // is optional for pre-#810 test-fixture compatibility, but a REAL observer
+  // run always returns a defined (possibly empty) map, same "the live path
+  // never emits the placeholder-only shape" discipline `routingClientRepos`
+  // establishes for its own optional field.
+  const federatedCaRegistry: Record<string, Presence> = {};
+  for (const entry of manifest.trust?.federated_cas ?? []) {
+    federatedCaRegistry[entry.project] = await checkRegistryVariablePresence(manifest.owner.registry, caCertVariableName(entry.project));
+  }
+
   // macf#857 — representative caller repo; see this function's doc for why
   // it's `agents[0].repo`, not `transport.vault_repo` (removed) or the
   // control repo (never a routing caller).
@@ -1681,6 +1698,7 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
     agents,
     caRegistry,
     caRepos,
+    federatedCaRegistry,
     routingClientRepos,
     routingSecretRepos,
     routingTrustedActors,
