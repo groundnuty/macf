@@ -385,6 +385,16 @@ export interface PeerSummary {
 export interface PeersResult {
   readonly kind: PeersKind;
   readonly peers: ReadonlyArray<PeerSummary>;
+  /**
+   * Provenance of the REGISTRY SCOPE this result was read against — same
+   * `FieldSource` idiom `identity.registryScope.source` already uses, not
+   * a second one. `'unknown'` when the scope itself never resolved (the
+   * widest 'unreadable' case). Lets a `--json` consumer (or a human
+   * reading "none registered") tell "config-sourced, genuinely empty"
+   * apart from "we never even knew which registry to ask" — the same
+   * distinction every OTHER field in this report already carries.
+   */
+  readonly source: FieldSource;
   readonly detail: string;
 }
 
@@ -465,19 +475,24 @@ function resolvePeersTokenSource(
  * trichotomy — the decisive behavior under test — is directly unit-testable
  * with a fake `{ list }`, without any network mocking (mirrors this file's
  * existing convention of not re-testing `fetchAppSlug`'s network path here).
+ *
+ * `source` is a PARAMETER, not derived here — the caller already knows
+ * (via `identity.registryScope.source`) which scope produced the registry
+ * it built; this function only reports what the READ did with it.
  */
 export async function readPeersFromRegistry(
   registry: Pick<Registry, 'list'>,
+  source: FieldSource,
 ): Promise<PeersResult> {
   let peers: ReadonlyArray<{ readonly name: string; readonly info: AgentInfo }>;
   try {
     peers = await registry.list('');
   } catch (err) {
-    return { kind: 'unreadable', peers: [], detail: err instanceof Error ? err.message : String(err) };
+    return { kind: 'unreadable', peers: [], source, detail: err instanceof Error ? err.message : String(err) };
   }
 
   if (peers.length === 0) {
-    return { kind: 'empty', peers: [], detail: 'none registered' };
+    return { kind: 'empty', peers: [], source, detail: 'none registered' };
   }
 
   return {
@@ -489,6 +504,7 @@ export async function readPeersFromRegistry(
       type: p.info.type,
       started: p.info.started,
     })),
+    source,
     detail: `${peers.length} peer(s) registered`,
   };
 }
@@ -505,13 +521,24 @@ export async function resolvePeersReport(
   identity: IdentityReport,
   opts: { readonly resolvePeers?: boolean } = {},
 ): Promise<PeersResult> {
+  // The scope's OWN provenance (config/env/unknown) — already computed by
+  // buildIdentityReport, reused here rather than re-derived. Carried on
+  // every branch below, including 'skipped', so a --json consumer always
+  // knows which scope a result (or non-attempt) pertains to.
+  const scopeSource = identity.registryScope.source;
+
   if (opts.resolvePeers === false) {
-    return { kind: 'skipped', peers: [], detail: 'skipped (--no-resolve-peers)' };
+    return { kind: 'skipped', peers: [], source: scopeSource, detail: 'skipped (--no-resolve-peers)' };
   }
 
   const registryConfig = resolveRegistryConfigForPeers(identity, config, process.env);
   if (!registryConfig) {
-    return { kind: 'unreadable', peers: [], detail: 'registry scope is unknown — cannot resolve peers' };
+    // Deliberately 'unknown', not `scopeSource` — if a structured
+    // RegistryConfig could not be built at all (scope never resolved, OR
+    // an env-sourced scope was malformed), we don't actually know enough
+    // about it to trust whatever label `identity.registryScope.source`
+    // carried.
+    return { kind: 'unreadable', peers: [], source: 'unknown', detail: 'registry scope is unknown — cannot resolve peers' };
   }
 
   let token = '';
@@ -522,13 +549,14 @@ export async function resolvePeersReport(
       return {
         kind: 'unreadable',
         peers: [],
+        source: scopeSource,
         detail: `could not obtain a registry token: ${err instanceof Error ? err.message : String(err)}`,
       };
     }
   }
 
   const registry = createRegistryFromConfig(registryConfig, identity.project.value, token);
-  return readPeersFromRegistry(registry);
+  return readPeersFromRegistry(registry, scopeSource);
 }
 
 // ---------------------------------------------------------------------------
@@ -543,18 +571,23 @@ function formatPeersSection(peers: PeersResult): string[] {
   const lines: string[] = ['Peers (read from the registry, #672):'];
   switch (peers.kind) {
     case 'found':
+      lines.push(`  source: ${peers.source}`);
       for (const p of peers.peers) {
         lines.push(`  ${p.name.padEnd(24)} ${p.host}:${p.port}  (${p.type})`);
       }
       break;
     case 'empty':
-      lines.push('  none registered');
+      // Same idiom fmt() uses for a scalar field: value + provenance. An
+      // empty-but-readable registry is a RESULT ("none registered, per
+      // the config-sourced scope"), not the absence a bare "unknown"
+      // would imply.
+      lines.push(`  none registered  (source: ${peers.source})`);
       break;
     case 'skipped':
-      lines.push(`  ${peers.detail}`);
+      lines.push(`  ${peers.detail}  (source: ${peers.source})`);
       break;
     case 'unreadable':
-      lines.push(`  unknown  (${peers.detail})`);
+      lines.push(`  unknown  (source: ${peers.source}; ${peers.detail})`);
       break;
   }
   return lines;

@@ -313,9 +313,10 @@ describe('readPeersFromRegistry — decisive pair (macf#672)', () => {
       ],
     };
 
-    const result = await readPeersFromRegistry(fakeRegistry);
+    const result = await readPeersFromRegistry(fakeRegistry, 'config');
 
     expect(result.kind).toBe('found');
+    expect(result.source).toBe('config');
     expect(result.peers).toEqual([
       { name: 'science-agent', host: '10.0.0.5', port: 8443, type: 'permanent', started: '2026-08-31T00:00:00.000Z' },
       { name: 'writing-agent', host: '10.0.0.6', port: 8444, type: 'worker', started: '2026-08-31T01:00:00.000Z' },
@@ -325,11 +326,16 @@ describe('readPeersFromRegistry — decisive pair (macf#672)', () => {
   it('(2) a registry readable but EMPTY reports "none registered" — a RESULT, not an error, and not unknown', async () => {
     const fakeRegistry: Pick<Registry, 'list'> = { list: async () => [] };
 
-    const result = await readPeersFromRegistry(fakeRegistry);
+    const result = await readPeersFromRegistry(fakeRegistry, 'config');
 
     expect(result.kind).toBe('empty');
     expect(result.peers).toEqual([]);
     expect(result.detail).toBe('none registered');
+    // "none registered" carries the SAME source provenance every other
+    // identity field does — this is the "exactly like an unknown identity
+    // field" parallel #672's comment thread asked for, applied to a
+    // KNOWN-empty result rather than an unknown one.
+    expect(result.source).toBe('config');
     // The specific defect this must not have: an empty-but-readable
     // registry masquerading as "I could not look" (kind 'unreadable').
     expect(result.kind).not.toBe('unreadable');
@@ -344,7 +350,7 @@ describe('readPeersFromRegistry — the third state (unreadable), distinct from 
       },
     };
 
-    const result = await readPeersFromRegistry(fakeRegistry);
+    const result = await readPeersFromRegistry(fakeRegistry, 'config');
 
     expect(result.kind).toBe('unreadable');
     expect(result.peers).toEqual([]);
@@ -362,8 +368,8 @@ describe('readPeersFromRegistry — mutation guard: empty and unreadable must ne
       },
     };
 
-    const emptyResult = await readPeersFromRegistry(emptyRegistry);
-    const unreadableResult = await readPeersFromRegistry(brokenRegistry);
+    const emptyResult = await readPeersFromRegistry(emptyRegistry, 'config');
+    const unreadableResult = await readPeersFromRegistry(brokenRegistry, 'config');
 
     // A mutation that makes the empty branch return 'unreadable' (or the
     // unreadable branch return 'empty') fails THIS assertion — see
@@ -431,6 +437,10 @@ describe('resolvePeersReport — side-effect-free early-return branches (macf#67
     expect(result.kind).toBe('skipped');
     expect(result.peers).toEqual([]);
     expect(result.detail).toContain('--no-resolve-peers');
+    // The skip carries the resolved scope's provenance even though the
+    // read itself was never attempted — a config-backed workspace still
+    // reports WHICH scope it declined to read.
+    expect(result.source).toBe('config');
   });
 
   it('registry scope unknown (neither config nor env resolved it): kind "unreadable", distinct from "skipped" and "empty"', async () => {
@@ -440,6 +450,7 @@ describe('resolvePeersReport — side-effect-free early-return branches (macf#67
 
     expect(result.kind).toBe('unreadable');
     expect(result.detail).toContain('registry scope is unknown');
+    expect(result.source).toBe('unknown');
   });
 });
 
