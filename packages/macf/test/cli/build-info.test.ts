@@ -405,15 +405,24 @@ describe('detectCheckoutCurrency (groundnuty/macf#1376)', () => {
     expect(existsSync(join(realProjectDir, '.git'))).toBe(true); // .git lives here instead
 
     const result = detectCheckoutCurrency(realProjectDir, realPackageRoot, 'main');
-    // This is live, real state (this very checkout, right now) — not
-    // asserting a fixed count, but `kind` MUST be 'ok': proof the identity
-    // match + ancestor-aware git plumbing recognized the real monorepo
-    // layout as a checkout of its own framework, which a synthetic fixture
-    // could never demonstrate on its own.
-    expect(result.kind).toBe('ok');
+    // This is live, real state (this very checkout, right now). What this
+    // test proves is RECOGNITION: the identity match + ancestor-aware git
+    // plumbing saw the real monorepo layout as a checkout of its own
+    // framework — something a synthetic fixture cannot demonstrate.
+    //
+    // Assert the RELATION, not the instance. Recognition is proved by any
+    // verdict that got PAST identity matching; it is disproved only by
+    // 'not-a-checkout'. `kind` is deliberately NOT pinned to 'ok' because
+    // that pins an environment, not a behaviour: CI checks out shallow, so
+    // `origin/main` may not exist as a ref and the honest verdict there is
+    // 'unreadable' — recognition succeeded, the upstream read did not.
+    expect(result.kind).not.toBe('not-a-checkout');
     if (result.kind === 'ok') {
       expect(result.commitCount).toBeGreaterThanOrEqual(0);
       expect(result.upstream).toBe('origin/main');
+    } else {
+      // The only other states a real checkout can honestly reach.
+      expect(['unreadable', 'no-upstream']).toContain(result.kind);
     }
   });
 });
