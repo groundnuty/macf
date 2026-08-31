@@ -49,15 +49,14 @@ function fullyObservableDeps(): ManifestScaffoldDeps {
   };
 }
 
-const IRREDUCIBLE_SCHEMA_ISSUE_PATHS = [
-  'defaults.role_template',
-  'defaults.app_manifest',
-  'transport.age_recipients',
-  'agents.0.profile',
-  'agents.0.deploy_path',
-  'agents.1.profile',
-  'agents.1.deploy_path',
-];
+// groundnuty/macf#1357 made `defaults.app_manifest` / `agents[].profile`
+// `.optional()` (were mandatory when this list was written) — this scaffold
+// still OMITS both and still leaves a TODO comment pointing at them (see
+// `renderAgentBlock` / `scaffoldManifest`'s own `defaults:` block: the
+// operator still needs to decide these values even though the schema no
+// longer forces the question), but omitting an now-optional field no
+// longer produces a schema issue, so both are REMOVED from this whitelist.
+const IRREDUCIBLE_SCHEMA_ISSUE_PATHS = ['defaults.role_template', 'transport.age_recipients', 'agents.0.deploy_path', 'agents.1.deploy_path'];
 
 describe('scaffoldManifest — decisive pair', () => {
   it('test 1: a fully-observable fleet gets exactly the irreducible TODO/schema-issue set, nothing more', async () => {

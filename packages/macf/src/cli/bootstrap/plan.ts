@@ -65,9 +65,12 @@
  * byte-identical to today") is what makes presence-gating non-negotiable
  * here, not a style choice.
  *
- * The #1200 audit named SIX inert-and-undisclosed fields; only THREE are
+ * The #1200 audit named SIX inert-and-undisclosed fields.
+ * **groundnuty/macf#1357 extended the SAME mechanism to the last two**
+ * (`defaults.app_manifest` / `agents[].profile`) — FIVE of the six are now
  * addressed by this mechanism (`collaborators` already, `shared` as of
- * #1355). The other three split into two different, NON-mechanism fixes:
+ * #1355, `app_manifest` / `profile` as of #1357). Only the remaining pair
+ * split off into a different, NON-mechanism fix:
  *
  * - **`trust.ca` / `trust.federated_cas`** — groundnuty/macf#1205 (merged
  *   2026-08-26, before #1355 was filed) removed `trust:` from
@@ -77,15 +80,17 @@
  *   there is nothing left here to disclose; the refusal already IS the
  *   strongest form of disclosure, and is why this file never mentions
  *   `trust` again.
- * - **`defaults.app_manifest` / `agents[].profile`** — REQUIRED schema
- *   fields (no `.optional()` anywhere on either path), so every
- *   schema-valid manifest declares them unconditionally: there is no
- *   "omitted" state for a presence-gated entry to be silent about, and an
- *   unconditional entry would violate the SAME "byte-identical when
- *   declaring none" criterion `shared`'s presence-gating exists to honor.
- *   **Deliberately left OUT of `skippedSections` on this issue** — see
- *   `SKIPPED_SECTION_REASONS`'s doc for why, and for the schema-change
- *   this pair actually needs before a disclosure entry would be honest.
+ * - **`defaults.app_manifest` / `agents[].profile`** — were REQUIRED schema
+ *   fields (no `.optional()` on either path) until #1357. The science-agent
+ *   ruling on #1357 is explicit about why removal (`trust`'s fix) does NOT
+ *   apply here: `trust.*` was OPTIONAL, so removing it broke only manifests
+ *   that DECLARED it; these two were MANDATORY, so removing them would have
+ *   broken every manifest in existence for zero functional gain — a
+ *   different defect (should never have been REQUIRED, not should never
+ *   have been DECLARABLE) needing a different fix. `fleet-manifest.ts` made
+ *   both `.optional()`; `computeSkippedSections` below now presence-gates
+ *   them the SAME way as `shared` — see `SKIPPED_SECTION_REASONS`'s doc for
+ *   the two entries this added.
  *
  * `versions:` (§D6 GitOps steering) is WIRED: once declared, `computePlan`
  * emits a `version` item per agent (deployed macf CLI version) and an
@@ -811,35 +816,23 @@ export interface InstallScopeDrift {
 
 /**
  * The reason text for each declared-but-deferred section (Slice 1a +
- * groundnuty/macf#1355; see module doc). `versions` is GONE from this map
- * (DR-043 §D6 is wired as of that change, not deferred).
+ * groundnuty/macf#1355 + groundnuty/macf#1357; see module doc). `versions`
+ * is GONE from this map (DR-043 §D6 is wired as of that change, not
+ * deferred).
  *
- * Both members here are OPTIONAL schema fields — the reason fires only
- * when the operator actually declared the section (§#1355's own contract:
- * *"a disclosure about their declaration, not a catalogue of unimplemented
- * features"* — the issue's closing criterion pins this exactly: *"a
- * manifest declaring none of them is byte-identical to today."*).
+ * All four members here are OPTIONAL schema fields — the reason fires only
+ * when the operator actually declared the section (§#1355's own contract,
+ * extended to `app_manifest`/`profile` by #1357: *"a disclosure about their
+ * declaration, not a catalogue of unimplemented features"* — the issue's
+ * closing criterion pins this exactly: *"a manifest declaring none of them
+ * is byte-identical to today."* — which is exactly why `app_manifest` /
+ * `profile` could not join this map until they were made `.optional()`:
+ * you cannot disclose a choice that does not exist).
  *
- * **`defaults.app_manifest` / `agents[].profile` — the #1200 audit's other
- * two INERT-and-undisclosed fields — are DELIBERATELY NOT here.** Both are
- * REQUIRED schema fields (no `.optional()` anywhere on either path), so
- * every schema-valid manifest declares them unconditionally — there is no
- * "operator omitted it" state for a presence-gated entry to be silent
- * about. Pushing an unconditional entry for either would satisfy "fires
- * only when declared" in the narrowest syntactic sense (a mandatory field
- * IS always declared) while violating it in substance: it would appear on
- * EVERY plan of EVERY fleet forever, removable by no operator action,
- * carrying no information about THIS manifest — exactly the "catalogue of
- * unimplemented features" the issue's own requirement rules out, and it
- * would make the closing criterion's "declaring none is byte-identical"
- * false for the ordinary case (every real fleet.yaml declares both). See
- * `computeSkippedSections`'s doc for the fix this actually needs.
- *
- * `trust.ca` / `trust.federated_cas` (the audit's remaining two INERT
- * fields) are ALSO not here — groundnuty/macf#1205 removed `trust:` from
- * the schema and made declaring it a parse-time refusal, so it never
- * reaches `computeSkippedSections` at all. See the module doc's #1355
- * paragraph.
+ * `trust.ca` / `trust.federated_cas` (the #1200 audit's remaining two INERT
+ * fields) are NOT here — groundnuty/macf#1205 removed `trust:` from the
+ * schema and made declaring it a parse-time refusal, so it never reaches
+ * `computeSkippedSections` at all. See the module doc's #1355 paragraph.
  */
 export const SKIPPED_SECTION_REASONS = {
   collaborators: 'reconcile not implemented in v1',
@@ -849,26 +842,35 @@ export const SKIPPED_SECTION_REASONS = {
   // `shared:` today is pointed at where the eventual consumer will land,
   // not just told "nothing reads this."
   shared: "shared.routing_app / shared.ts_oauth are parsed but consumed nowhere in this codebase — the account-level shared-router-App model this field anticipated is #1161's still-open design",
+  // groundnuty/macf#1357 — `defaults.app_manifest` was REQUIRED until this
+  // issue made it `.optional()`. No design or issue defines what it should
+  // drive (`design/manifest-reconciliation-audit.md` row 15); unlike
+  // `shared`, there is no known future consumer to point at yet.
+  app_manifest: 'defaults.app_manifest is parsed but consumed nowhere in this codebase — no design or issue defines what it should drive',
+  // groundnuty/macf#1357 — `agents[].profile` was REQUIRED until this issue
+  // made it `.optional()`. Provably not a function of `role` (real
+  // fixtures: science-agent -> research, runner-ops -> code — see
+  // `design/manifest-reconciliation-audit.md` row 17), so no derivation
+  // rule could replace declaring it either.
+  profile: 'agents[].profile is parsed but consumed nowhere in this codebase — no design or issue defines what it should drive',
 } as const;
 
 /**
- * Surface every declared-but-deferred manifest section, loudly. Both
- * `collaborators` and `shared` are OPTIONAL schema fields — only fires when
- * the section is actually DECLARED (present) AND, for the array section,
- * non-empty. An absent or empty section stays silent (nothing was
- * promised, so nothing to warn about not having reconciled) — the
- * disclosure-about-THEIR-declaration contract groundnuty/macf#1355
- * requires, not a catalogue of unimplemented features.
+ * Surface every declared-but-deferred manifest section, loudly.
+ * `collaborators`, `shared`, `defaults.app_manifest`, and `agents[].profile`
+ * are all OPTIONAL schema fields (the last two only since groundnuty/macf#1357
+ * — see that issue + the module doc for why they could not join this
+ * mechanism while mandatory) — each only fires when the field is actually
+ * DECLARED (present) AND, for the array section, non-empty. An absent or
+ * empty section stays silent (nothing was promised, so nothing to warn
+ * about not having reconciled) — the disclosure-about-THEIR-declaration
+ * contract groundnuty/macf#1355 requires, not a catalogue of unimplemented
+ * features.
  *
- * **`defaults.app_manifest` / `agents[].profile` are intentionally NOT
- * surfaced here** — see `SKIPPED_SECTION_REASONS`'s doc for why an
- * unconditional entry for either would violate this same contract rather
- * than serve it. Fixing their INERT status honestly needs a schema change
- * FIRST (make each `.optional()`, mirroring the one notch weaker than
- * groundnuty/macf#1205's outright removal of `trust:`, then presence-gate
- * exactly like `shared` above) — filed as a follow-up rather than forced
- * through this mechanism on this issue, which is disclosure-only and does
- * not implement or restructure any field.
+ * `agents[].profile` presence-gates on the ARRAY (fires once if ANY agent
+ * declares `profile`), the same granularity `collaborators` uses for its
+ * own array — not once per agent — matching `SkippedSection`'s "one entry
+ * per declared-but-deferred FIELD" shape rather than a per-element list.
  */
 function computeSkippedSections(manifest: FleetManifest): readonly SkippedSection[] {
   const out: SkippedSection[] = [];
@@ -877,6 +879,12 @@ function computeSkippedSections(manifest: FleetManifest): readonly SkippedSectio
   }
   if (manifest.shared !== undefined) {
     out.push({ section: 'shared', reason: SKIPPED_SECTION_REASONS.shared });
+  }
+  if (manifest.defaults.app_manifest !== undefined) {
+    out.push({ section: 'defaults.app_manifest', reason: SKIPPED_SECTION_REASONS.app_manifest });
+  }
+  if (manifest.agents.some((agent) => agent.profile !== undefined)) {
+    out.push({ section: 'agents[].profile', reason: SKIPPED_SECTION_REASONS.profile });
   }
   return out;
 }

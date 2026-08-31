@@ -108,14 +108,17 @@
  * run when base object validation already produced issues — verified
  * empirically while writing this module (zod v4: a `.strict()` object with
  * a missing required field never reaches its own `superRefine`). Because
- * `defaults.role_template` / `defaults.app_manifest` /
- * `transport.age_recipients` / every `agents[N].profile` /
- * `agents[N].deploy_path` are ALWAYS missing in v0 (see above), `.superRefine`
- * NEVER runs on a scaffolded draft — so `schemaIssuePaths` reports "these
- * required fields are still empty," never "these two agents share a role"
- * or "this role is double-prefixed." A human reviewing the draft still has
- * to catch those by reading it, same as the round-trip's well-formedness-
- * only ceiling the module doc already states.
+ * `defaults.role_template` / `transport.age_recipients` /
+ * `agents[N].deploy_path` are ALWAYS missing in v0 (see above — all three
+ * remain REQUIRED; `defaults.app_manifest` / `agents[N].profile` do NOT
+ * belong in this list as of groundnuty/macf#1357, which made both
+ * `.optional()` — omitting an optional field never blocks `.superRefine`
+ * on its own, though the three still-required fields above already do),
+ * `.superRefine` NEVER runs on a scaffolded draft — so `schemaIssuePaths`
+ * reports "these required fields are still empty," never "these two agents
+ * share a role" or "this role is double-prefixed." A human reviewing the
+ * draft still has to catch those by reading it, same as the round-trip's
+ * well-formedness-only ceiling the module doc already states.
  */
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -591,9 +594,16 @@ function wrapComment(text: string): readonly string[] {
  * `FleetManifestSchema.safeParse()`, returning the issue paths verbatim
  * (dot-joined). Proves well-formedness only (per the module doc) — an
  * irreducible subset of these paths (`defaults.role_template`,
- * `defaults.app_manifest`, `transport.age_recipients`, and every
- * `agents[N].profile`) can NEVER be empty in v0, by design; see the module
- * doc for why that is not a defect in this function.
+ * `transport.age_recipients`, and every `agents[N].deploy_path`) can NEVER
+ * be empty in v0, by design; see the module doc for why that is not a
+ * defect in this function.
+ *
+ * **`defaults.app_manifest` / `agents[N].profile` are DELIBERATELY NOT in
+ * that irreducible set as of groundnuty/macf#1357** — both became
+ * `.optional()`, so this module's own choice to keep omitting them (and
+ * keep leaving a TODO comment) no longer produces a schema issue here. The
+ * scaffold still doesn't know what to put in either field — nothing changed
+ * about that — but the schema no longer treats the gap as a hard failure.
  */
 function computeSchemaIssuePaths(yamlText: string): readonly string[] {
   const raw: unknown = parseYamlText(yamlText);
