@@ -73,6 +73,23 @@ export interface RepoInitOptions {
   /** User login for `--registry-type profile`. */
   readonly registryUser?: string;
   /**
+   * Explicit `owner`/`repo` override for `--registry-type repo`
+   * (groundnuty/macf#1374) — the manifest-declared target `apply` threads
+   * through from `owner.registry.{owner,repo}` (`bootstrap/apply-repo-init.ts`
+   * ::repoInitRegistryOptions). No CLI flag sets these — a bare `macf
+   * repo-init --registry-type repo` invocation always omits them, and
+   * {@link buildRoutingRegistry} keeps its pre-#1374 self-point default
+   * (the repo THIS call is initializing) whenever either is absent. Must be
+   * given TOGETHER or not at all: `apply` only ever supplies both (a
+   * `RegistryConfig` with `type: 'repo'` requires both fields at the schema
+   * level — `RepoRegistryConfigSchema` — so a partial pair is a caller bug,
+   * not a real state), and `buildRoutingRegistry` throws rather than
+   * silently mixing a manifest-declared owner with a self-pointed repo.
+   */
+  readonly registryOwner?: string;
+  /** Paired with {@link registryOwner} — see its doc. */
+  readonly registryRepo?: string;
+  /**
    * Verbatim `fleet.yaml` `routing.runner.runs_on` declaration
    * (groundnuty/macf#1368) — threaded straight through to
    * `generateWorkflow`'s `with:` block via {@link V3WorkflowInputs.runnerRunsOn},
@@ -261,6 +278,18 @@ export async function fetchOwnerType(owner: string): Promise<'user' | 'org' | 'u
  * unconditionally against a User account); undeterminable → throw, naming
  * both explicit forms so the caller can choose rather than silently
  * receiving a scope that only fails later.
+ *
+ * **`case 'repo'` (groundnuty/macf#1374 fix):** `opts.registryOwner`/
+ * `opts.registryRepo`, when BOTH given, name the manifest-declared target
+ * verbatim — never the repo this call happens to be initializing. When
+ * NEITHER is given (every bare-CLI call; no Commander flag sets them), the
+ * pre-#1374 self-point default is unchanged: `owner`/`repoName` (the repo
+ * `repoInit()` derived from `opts.repo` a few lines up its own call site) —
+ * DR-006's documented first-choice default for an operator who hasn't
+ * declared an explicit scope. A caller supplying exactly ONE of the pair is
+ * a bug, not a real state (`RepoRegistryConfigSchema` requires both
+ * together at the schema `apply` reads from) — fail loud rather than
+ * silently mixing a manifest owner with a self-pointed repo or vice versa.
  */
 async function buildRoutingRegistry(
   opts: RepoInitOptions,
@@ -287,8 +316,14 @@ async function buildRoutingRegistry(
     case 'profile':
       if (!opts.registryUser) throw new Error('--registry-user required for profile registry');
       return { type: 'profile', user: opts.registryUser };
-    case 'repo':
-      return { type: 'repo', owner, repo: repoName };
+    case 'repo': {
+      const hasOwner = opts.registryOwner !== undefined;
+      const hasRepo = opts.registryRepo !== undefined;
+      if (hasOwner !== hasRepo) {
+        throw new Error('registryOwner and registryRepo must be supplied together (or neither)');
+      }
+      return { type: 'repo', owner: opts.registryOwner ?? owner, repo: opts.registryRepo ?? repoName };
+    }
     case 'local':
       throw new Error(
         'local registry has no GitHub-Actions routing path; macf-actions v3 routing ' +

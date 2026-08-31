@@ -69,17 +69,34 @@ export class RepoInitStepError extends Error {
  * reverse direction, CLI-flags → `RegistryConfig`) — `local` has no
  * GitHub-Actions routing path, same rejection `repo-init --registry-type
  * local` already gives.
+ *
+ * **`case 'repo'` (groundnuty/macf#1374 fix):** carries `registry.owner` /
+ * `registry.repo` through as `registryOwner`/`registryRepo` instead of
+ * dropping them. Before this fix the case returned bare `{ registryType:
+ * 'repo' }`, discarding the manifest's declared target entirely; `repo-
+ * init.ts`'s `buildRoutingRegistry` then fell back to its bare-CLI
+ * self-point default — the repo CURRENTLY being repo-init'd, not the
+ * manifest's declared scope — so `apply` silently wrote a self-pointing
+ * `registry-api-path` for every agent of a `type: repo`-scoped fleet
+ * (live-reproduced on `macf-trial` / `macf-fresh`, both of which declare a
+ * SHARED control-repo scope: `{ type: repo, owner: <org>, repo:
+ * <fleet>-control }`). `registry.owner`/`registry.repo` are non-optional on
+ * `RepoRegistryConfigSchema` (`@groundnuty/macf-core`) whenever `registry.type
+ * === 'repo'`, so both are always present here — no partial-pair case to
+ * guard against on this side (`buildRoutingRegistry`'s own together-or-
+ * neither check covers a directly-constructed `RepoInitOptions` from a
+ * caller that isn't this function).
  */
 export function repoInitRegistryOptions(
   registry: RegistryConfig,
-): Pick<RepoInitOptions, 'registryType' | 'registryOrg' | 'registryUser'> {
+): Pick<RepoInitOptions, 'registryType' | 'registryOrg' | 'registryUser' | 'registryOwner' | 'registryRepo'> {
   switch (registry.type) {
     case 'org':
       return { registryType: 'org', registryOrg: registry.org };
     case 'profile':
       return { registryType: 'profile', registryUser: registry.user };
     case 'repo':
-      return { registryType: 'repo' };
+      return { registryType: 'repo', registryOwner: registry.owner, registryRepo: registry.repo };
     case 'local':
       throw new RepoInitStepError(
         'repo_init_local_registry',
