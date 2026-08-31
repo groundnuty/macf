@@ -114,16 +114,25 @@ if ! token="$("${gh_args[@]}" 2>"$err_file")"; then
   exit 1
 fi
 
-# Sanity-check the result. Installation tokens start with ghs_. Anything
-# else (ghp_ user PAT, gho_ OAuth, empty string) would be a footgun.
-token_prefix="${token:0:4}"
+# Sanity-check the result against the SAME anchored full-shape predicate
+# the downstream consumers use — check-gh-token.sh's PreToolUse hook and
+# claude-sh.ts's launch-boundary check (`^ghs_[A-Za-z0-9._-]+$`). A
+# prefix-only check here (the old `${token:0:4} == ghs_` form) is a
+# coarser gate than what the hook enforces, so this producer could hand a
+# caller a token the hook then refuses — the exact "producer and consumer
+# disagree" gap named in groundnuty/macf#1360, which cost the auditor two
+# sessions of misdiagnosis. Widened per #825/#826 to accept GitHub's new
+# `ghs_<app-id>_<JWT>` token format (dots + dashes, ~380-520 chars)
+# alongside the classic opaque 40-char alnum form; the charset (not the
+# length) is the injection-safety invariant this predicate owns.
 if [ -z "$token" ]; then
   echo "Error: gh token generate succeeded but returned an empty token." >&2
   exit 1
 fi
-if [ "$token_prefix" != "ghs_" ]; then
-  echo "Error: generated token has prefix '${token_prefix}' — expected 'ghs_' (installation token)." >&2
-  echo "  Refusing to emit a non-installation token to avoid mis-attribution." >&2
+if ! [[ "$token" =~ ^ghs_[A-Za-z0-9._-]+$ ]]; then
+  echo "Error: generated token does not match the expected installation-token shape (got prefix '${token:0:4}')." >&2
+  echo "  Expected pattern: ^ghs_[A-Za-z0-9._-]+\$" >&2
+  echo "  Refusing to emit a non-installation-shaped token to avoid mis-attribution." >&2
   exit 1
 fi
 

@@ -26,9 +26,12 @@ import { defaultProcReader, readPkgVersionFs, scanMacfProcesses } from '../proc-
 import type { ProcReader } from '../proc-scan.js';
 import {
   canonicalPluginScriptsDir,
+  canonicalRulesDir,
   canonicalScriptsDir,
+  computeCanonicalRuleFile,
   computeCanonicalScriptFile,
   findCliPackageRoot,
+  listDistributedRuleNames,
   listDistributedScriptNames,
 } from '../rules.js';
 import {
@@ -1541,6 +1544,123 @@ export function checkDistributedScriptCurrency(
 }
 
 /**
+ * One distributed rule (`.claude/rules/<name>.md`) found not to match what
+ * the running CLI would write there right now. Sibling of
+ * `ScriptCurrencyFinding` for `.claude/rules/*.md` rather than
+ * `.claude/scripts/*`.
+ */
+export interface RuleCurrencyFinding {
+  readonly name: string;
+  /** `stale` — on disk, but content differs from canonical. `missing` —
+   *  canonical distributes this name and the workspace has no copy at all. */
+  readonly reason: 'stale' | 'missing';
+}
+
+/**
+ * Result of the distributed-rule-currency assertion — the `.claude/rules/`
+ * sibling of `checkDistributedScriptCurrency` (groundnuty/macf#1360
+ * "consider whether the same gap applies to rules, not just scripts"). Same
+ * four-state shape and the same honest-unknown discipline; see
+ * `ScriptCurrencyCheckResult`'s doc comment for the per-status contract this
+ * mirrors exactly, substituting "rule" for "script" throughout.
+ */
+export interface RuleCurrencyCheckResult {
+  readonly status: 'PASS' | 'WARN' | 'INFO' | 'UNKNOWN';
+  readonly checkedCount: number;
+  readonly totalCount: number;
+  readonly findings: readonly RuleCurrencyFinding[];
+  readonly detail: string;
+}
+
+/**
+ * `.claude/rules/*.md` sibling of `checkDistributedScriptCurrency` — same
+ * shape, same gating on `.macf/` presence, same content-not-presence
+ * comparison, same honest-unknown discipline. Compares against
+ * `computeCanonicalRuleFile`, NOT the raw canonical bytes: `copyCanonicalRules`
+ * prepends a managed-file header to any canonical source that doesn't
+ * already start with `<!--`, so a naive byte-for-byte compare against the
+ * canonical source file would report every distributed rule as stale.
+ */
+export function checkDistributedRuleCurrency(
+  workspaceDir: string,
+  options: {
+    readonly canonicalDir?: string;
+  } = {},
+): RuleCurrencyCheckResult {
+  const absDir = resolve(workspaceDir);
+  if (!existsSync(join(absDir, '.macf'))) {
+    return {
+      status: 'INFO',
+      checkedCount: 0,
+      totalCount: 0,
+      findings: [],
+      detail:
+        'no .macf/ directory — not a macf-managed workspace; any .claude/rules/ here have no ' +
+        'distribution relationship to canonical and are never refreshed by `macf update`',
+    };
+  }
+
+  const rulesDir = options.canonicalDir ?? canonicalRulesDir();
+  if (!existsSync(rulesDir)) {
+    return {
+      status: 'UNKNOWN',
+      checkedCount: 0,
+      totalCount: 0,
+      findings: [],
+      detail:
+        "this CLI install's canonical rules source directory could not be located — " +
+        "can't determine whether distributed rules are current",
+    };
+  }
+
+  const names = listDistributedRuleNames({ canonicalDir: rulesDir });
+  const targetDir = join(absDir, '.claude', 'rules');
+  const findings: RuleCurrencyFinding[] = [];
+  let checkedCount = 0;
+
+  for (const name of names) {
+    const canonical = computeCanonicalRuleFile(name, { canonicalDir: rulesDir });
+    if (canonical === null) continue; // name came from this same dir — defensive only
+    const onDiskPath = join(targetDir, name);
+    if (!existsSync(onDiskPath)) {
+      findings.push({ name, reason: 'missing' });
+      continue;
+    }
+    checkedCount++;
+    if (readFileSync(onDiskPath, 'utf-8') !== canonical) {
+      findings.push({ name, reason: 'stale' });
+    }
+  }
+
+  // Same provenance framing as checkDistributedScriptCurrency: "canonical"
+  // means "what THIS RUNNING macf CLI's bundled rules say right now", not a
+  // fetch against groundnuty/macf's source-repo HEAD.
+  const provenance = `as shipped by this CLI (${cliVersionLabel()})`;
+
+  if (findings.length === 0) {
+    return {
+      status: 'PASS',
+      checkedCount,
+      totalCount: names.length,
+      findings: [],
+      detail: `${checkedCount}/${names.length} distributed rule(s) match canonical ${provenance}`,
+    };
+  }
+
+  const staleCount = findings.filter((f) => f.reason === 'stale').length;
+  const missingCount = findings.length - staleCount;
+  return {
+    status: 'WARN',
+    checkedCount,
+    totalCount: names.length,
+    findings,
+    detail:
+      `${staleCount} stale, ${missingCount} missing of ${names.length} canonical distributed rule(s) ` +
+      `(canonical ${provenance})`,
+  };
+}
+
+/**
  * Below this, a build or test run WILL fail with ENOSPC — `npm install`,
  * `devbox run -- npm run build`, and vitest's per-worker `mkdtemp` calls
  * each write from tens to hundreds of MB, and the moment one of those
@@ -1850,6 +1970,14 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
     console.log('Distributed script currency');
     console.log('──────────────────────────────────────────────────────────────');
     printScriptCurrencySection(checkDistributedScriptCurrency(projectDir));
+    // groundnuty/macf#1360: same reachable-without-config reasoning as the
+    // script-currency section above, applied to .claude/rules/ —
+    // `checkDistributedRuleCurrency` gates on `.macf/` presence exactly like
+    // its script sibling, so it's safe to run without a parsed config too.
+    console.log('');
+    console.log('Distributed rule currency');
+    console.log('──────────────────────────────────────────────────────────────');
+    printRuleCurrencySection(checkDistributedRuleCurrency(projectDir));
     // groundnuty/macf#1365: disk space is not gated on .macf/ at all — a
     // full disk breaks a workspace's builds/tests whether or not `macf
     // init` ever touched it, so this reachable-without-config workspace
@@ -1972,6 +2100,11 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
   console.log('Distributed script currency');
   console.log('──────────────────────────────────────────────────────────────');
   printScriptCurrencySection(checkDistributedScriptCurrency(projectDir));
+
+  console.log('');
+  console.log('Distributed rule currency');
+  console.log('──────────────────────────────────────────────────────────────');
+  printRuleCurrencySection(checkDistributedRuleCurrency(projectDir));
 
   console.log('');
   console.log('Disk space');
@@ -2140,6 +2273,28 @@ function printScriptCurrencySection(check: ScriptCurrencyCheckResult): void {
     console.log(`    ✗ ${f.name} — ${reasonText}`);
   }
   console.log('    Fix: run `macf update` (or `macf rules refresh --dir .`) to bring .claude/scripts/ current.');
+}
+
+/** Print the groundnuty/macf#1360 distributed-rule-currency report section for `check`. */
+function printRuleCurrencySection(check: RuleCurrencyCheckResult): void {
+  if (check.status === 'INFO') {
+    console.log(`  ℹ ${check.detail}  [INFO]`);
+    return;
+  }
+  if (check.status === 'UNKNOWN') {
+    console.log(`  ? ${check.detail}  [UNKNOWN]`);
+    return;
+  }
+  if (check.status === 'PASS') {
+    console.log(`  ✓ ${check.detail}  [PASS]`);
+    return;
+  }
+  console.log(`  ⚠ ${check.detail}  [WARN]`);
+  for (const f of check.findings) {
+    const reasonText = f.reason === 'stale' ? 'stale — differs from canonical' : 'missing — never distributed';
+    console.log(`    ✗ ${f.name} — ${reasonText}`);
+  }
+  console.log('    Fix: run `macf update` (or `macf rules refresh --dir .`) to bring .claude/rules/ current.');
 }
 
 /** Print the groundnuty/macf#1365 disk-space report section for `check`. */
