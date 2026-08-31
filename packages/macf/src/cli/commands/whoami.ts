@@ -11,15 +11,28 @@
  * ppam-2026 promotion incident that motivated this.
  *
  * SCOPE (deliberately bounded — see #672 comment thread / PR body): this
- * command implements #672's "(1) Identity" field list in full. It does NOT
- * implement "(2) Capabilities + fleet context" (role's declared remit,
- * peers, which repos route here) — those fields have no structured,
+ * command implements #672's "(1) Identity" field list in full, PLUS the
+ * "peers" slice of "(2) Capabilities + fleet context" (per the
+ * science-agent's 2026-08-31 correction of the original over-broad
+ * refusal — see below). It does NOT implement the REST of "(2)" (role's
+ * declared remit, which repos route here) — those have no structured,
  * non-prose source in the codebase today (role remit lives only in prose
  * `.claude/rules/agent-identity.md`; "which repos route to me" would need
  * cross-repo enumeration this workspace has no local record of). Inventing
- * a capability model to fill that gap would just be a differently-shaped
+ * a capability model to fill THAT gap would be a differently-shaped
  * inference — the exact failure mode #672 is about. That's left for a
  * follow-up once a structured capability/remit source exists.
+ *
+ * WHY PEERS IS DIFFERENT (not the same refusal as role-remit): peers are
+ * not prose to be structured — they are `<PROJECT>_AGENT_<name>` entries
+ * already living in the registry as a lookup table, the exact same store
+ * `route-by-label` already reads. Listing them is READING an existing
+ * structured store, not INVENTING a model. And an empty result is
+ * informative on its own: `macf whoami` reporting "peers: none
+ * registered" on a fleet that should have N agents is a FINDING (a
+ * registration failure), not a gap in the command — see #672's registered
+ * comment thread for the live incident (`#800`) this would have caught
+ * immediately instead of at the end of a multi-hour trace.
  *
  * TWO AUTHORITATIVE SOURCES, in priority order (mirrors
  * `plugin/scripts/emit-agent-identity.sh` exactly — see that file's header
@@ -49,6 +62,8 @@ import { resolve } from 'node:path';
 import { agentCertPath, readAgentConfig, resolveCanonicalBranch, tokenSourceFromConfig } from '../config.js';
 import type { MacfAgentConfig } from '../config.js';
 import { fetchAppSlug, deriveBotLogin } from './doctor.js';
+import { createRegistryFromConfig, generateToken } from '@groundnuty/macf-core';
+import type { AgentInfo, Registry, RegistryConfig } from '@groundnuty/macf-core';
 
 // ---------------------------------------------------------------------------
 // Field-level result — every reported value carries its provenance so a
@@ -336,6 +351,215 @@ async function resolveBotLoginBestEffort(
 }
 
 // ---------------------------------------------------------------------------
+// Peers — read from the registry (#672 comment thread, science-agent
+// 2026-08-31). See the file-header "WHY PEERS IS DIFFERENT" note: this is
+// READING an existing `<PROJECT>_AGENT_<name>` lookup table (the same one
+// `route-by-label` and `macf peers` already read), not inventing a model.
+//
+// THREE STATES, never collapsed into each other (the specific defect this
+// must not have — see whoami.test.ts's mutation-check test):
+//   - 'found'      — the registry has one or more `<PROJECT>_AGENT_*` entries.
+//   - 'empty'      — the registry was read successfully and has NONE. This is
+//                    a RESULT (a finding, per the file header), not an error
+//                    and not 'unknown' — reported the same honest way an
+//                    empty-but-legitimate identity field would be.
+//   - 'unreadable' — the registry could not be read at all (network/
+//                    permission failure, or the scope itself is unresolved).
+//                    Reported like an unknown identity field: we genuinely
+//                    don't know, as opposed to knowing it's empty.
+// Plus 'skipped' — the read was never attempted (offline / --no-resolve-peers
+// opt-out, mirroring --no-resolve-bot-login's precedent). Distinct from
+// 'unreadable': this is an intentional non-attempt, not a failed one.
+// ---------------------------------------------------------------------------
+
+export type PeersKind = 'found' | 'empty' | 'unreadable' | 'skipped';
+
+export interface PeerSummary {
+  readonly name: string;
+  readonly host: string;
+  readonly port: number;
+  readonly type: string;
+  readonly started: string;
+}
+
+export interface PeersResult {
+  readonly kind: PeersKind;
+  readonly peers: ReadonlyArray<PeerSummary>;
+  /**
+   * Provenance of the REGISTRY SCOPE this result was read against — same
+   * `FieldSource` idiom `identity.registryScope.source` already uses, not
+   * a second one. `'unknown'` when the scope itself never resolved (the
+   * widest 'unreadable' case). Lets a `--json` consumer (or a human
+   * reading "none registered") tell "config-sourced, genuinely empty"
+   * apart from "we never even knew which registry to ask" — the same
+   * distinction every OTHER field in this report already carries.
+   */
+  readonly source: FieldSource;
+  readonly detail: string;
+}
+
+/**
+ * Reuses the scope decision `buildIdentityReport` ALREADY made
+ * (`identity.registryScope.source`) rather than re-deriving config-vs-env
+ * dispatch from scratch. When config-sourced, `config.registry` is reused
+ * directly (zero re-derivation — it's the very object `registryScope` was
+ * read from). When env-sourced, reconstructs the structured `RegistryConfig`
+ * `createRegistryFromConfig` needs from the same flat `MACF_REGISTRY_*` vars
+ * `buildIdentityReport`'s env branch reads (unavoidable: env only carries
+ * flat strings, no structured object to reuse). Returns `null` when the
+ * scope itself never resolved — the 'unreadable' case at its widest.
+ */
+export function resolveRegistryConfigForPeers(
+  identity: IdentityReport,
+  config: MacfAgentConfig | null,
+  env: NodeJS.ProcessEnv,
+): RegistryConfig | null {
+  if (identity.registryScope.source === 'config' && config) {
+    return config.registry;
+  }
+  if (identity.registryScope.source === 'env') {
+    switch (identity.registryScope.value) {
+      case 'org': {
+        const org = env['MACF_REGISTRY_ORG'];
+        return org ? { type: 'org', org } : null;
+      }
+      case 'profile': {
+        const user = env['MACF_REGISTRY_USER'];
+        return user ? { type: 'profile', user } : null;
+      }
+      case 'repo': {
+        // MACF_REGISTRY_REPO is the already-combined "owner/repo" string
+        // (env-files.ts/claude-sh.ts write it that way) — split it back
+        // apart into the two fields createRegistryFromConfig's repo arm
+        // needs.
+        const repoVar = env['MACF_REGISTRY_REPO'];
+        const slash = repoVar?.indexOf('/') ?? -1;
+        if (!repoVar || slash <= 0 || slash === repoVar.length - 1) return null;
+        return { type: 'repo', owner: repoVar.slice(0, slash), repo: repoVar.slice(slash + 1) };
+      }
+      case 'local': {
+        const path = env['MACF_REGISTRY_PATH'];
+        return path ? { type: 'local', path } : null;
+      }
+      default:
+        return null;
+    }
+  }
+  return null;
+}
+
+/**
+ * Token source for minting an installation token to read the registry.
+ * Same config-then-env precedence the bot_login resolution above uses, but
+ * requires `install_id` too — unlike the App-level `GET /app` bot_login
+ * lookup, minting an installation token needs it. Returns `undefined` when
+ * neither source has the full triple; `generateToken` itself still falls
+ * back to `GH_TOKEN` / `APP_ID` / `INSTALL_ID` / `KEY_PATH` env in that case.
+ */
+function resolvePeersTokenSource(
+  projectDir: string,
+  config: MacfAgentConfig | null,
+  identity: IdentityReport,
+): { appId: string; installId: string; keyPath: string } | undefined {
+  if (config?.github_app) return tokenSourceFromConfig(projectDir, config);
+  const rawKeyPath = process.env['KEY_PATH'];
+  if (identity.appId.value !== 'unknown' && identity.installId.value !== 'unknown' && rawKeyPath) {
+    return { appId: identity.appId.value, installId: identity.installId.value, keyPath: resolve(projectDir, rawKeyPath) };
+  }
+  return undefined;
+}
+
+/**
+ * Read peers from an already-constructed registry. Deliberately isolated
+ * from scope resolution + token minting so the found/empty/unreadable
+ * trichotomy — the decisive behavior under test — is directly unit-testable
+ * with a fake `{ list }`, without any network mocking (mirrors this file's
+ * existing convention of not re-testing `fetchAppSlug`'s network path here).
+ *
+ * `source` is a PARAMETER, not derived here — the caller already knows
+ * (via `identity.registryScope.source`) which scope produced the registry
+ * it built; this function only reports what the READ did with it.
+ */
+export async function readPeersFromRegistry(
+  registry: Pick<Registry, 'list'>,
+  source: FieldSource,
+): Promise<PeersResult> {
+  let peers: ReadonlyArray<{ readonly name: string; readonly info: AgentInfo }>;
+  try {
+    peers = await registry.list('');
+  } catch (err) {
+    return { kind: 'unreadable', peers: [], source, detail: err instanceof Error ? err.message : String(err) };
+  }
+
+  if (peers.length === 0) {
+    return { kind: 'empty', peers: [], source, detail: 'none registered' };
+  }
+
+  return {
+    kind: 'found',
+    peers: peers.map((p) => ({
+      name: p.name,
+      host: p.info.host,
+      port: p.info.port,
+      type: p.info.type,
+      started: p.info.started,
+    })),
+    source,
+    detail: `${peers.length} peer(s) registered`,
+  };
+}
+
+/**
+ * Orchestration: skip check → scope resolution → (local: no token needed;
+ * else: mint one) → read. Each early-return branch (skip / unresolved scope
+ * / token-mint failure) is side-effect-free before it returns, so the
+ * offline/opt-out behavior is directly testable without network mocking.
+ */
+export async function resolvePeersReport(
+  projectDir: string,
+  config: MacfAgentConfig | null,
+  identity: IdentityReport,
+  opts: { readonly resolvePeers?: boolean } = {},
+): Promise<PeersResult> {
+  // The scope's OWN provenance (config/env/unknown) — already computed by
+  // buildIdentityReport, reused here rather than re-derived. Carried on
+  // every branch below, including 'skipped', so a --json consumer always
+  // knows which scope a result (or non-attempt) pertains to.
+  const scopeSource = identity.registryScope.source;
+
+  if (opts.resolvePeers === false) {
+    return { kind: 'skipped', peers: [], source: scopeSource, detail: 'skipped (--no-resolve-peers)' };
+  }
+
+  const registryConfig = resolveRegistryConfigForPeers(identity, config, process.env);
+  if (!registryConfig) {
+    // Deliberately 'unknown', not `scopeSource` — if a structured
+    // RegistryConfig could not be built at all (scope never resolved, OR
+    // an env-sourced scope was malformed), we don't actually know enough
+    // about it to trust whatever label `identity.registryScope.source`
+    // carried.
+    return { kind: 'unreadable', peers: [], source: 'unknown', detail: 'registry scope is unknown — cannot resolve peers' };
+  }
+
+  let token = '';
+  if (registryConfig.type !== 'local') {
+    try {
+      token = await generateToken(resolvePeersTokenSource(projectDir, config, identity));
+    } catch (err) {
+      return {
+        kind: 'unreadable',
+        peers: [],
+        source: scopeSource,
+        detail: `could not obtain a registry token: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+  }
+
+  const registry = createRegistryFromConfig(registryConfig, identity.project.value, token);
+  return readPeersFromRegistry(registry, scopeSource);
+}
+
+// ---------------------------------------------------------------------------
 // Formatting
 // ---------------------------------------------------------------------------
 
@@ -343,11 +567,38 @@ function fmt(f: WhoamiField): string {
   return f.value === 'unknown' ? 'unknown' : `${f.value}  (source: ${f.source})`;
 }
 
+function formatPeersSection(peers: PeersResult): string[] {
+  const lines: string[] = ['Peers (read from the registry, #672):'];
+  switch (peers.kind) {
+    case 'found':
+      lines.push(`  source: ${peers.source}`);
+      for (const p of peers.peers) {
+        lines.push(`  ${p.name.padEnd(24)} ${p.host}:${p.port}  (${p.type})`);
+      }
+      break;
+    case 'empty':
+      // Same idiom fmt() uses for a scalar field: value + provenance. An
+      // empty-but-readable registry is a RESULT ("none registered, per
+      // the config-sourced scope"), not the absence a bare "unknown"
+      // would imply.
+      lines.push(`  none registered  (source: ${peers.source})`);
+      break;
+    case 'skipped':
+      lines.push(`  ${peers.detail}  (source: ${peers.source})`);
+      break;
+    case 'unreadable':
+      lines.push(`  unknown  (source: ${peers.source}; ${peers.detail})`);
+      break;
+  }
+  return lines;
+}
+
 export function formatWhoamiReport(
   identity: IdentityReport,
   cert: CertInfo,
   token: TokenTypeResult,
   botLoginResolution: BotLoginResolution | null,
+  peers: PeersResult,
 ): string {
   const lines: string[] = [];
   lines.push('macf whoami — identity (#672 deterministic self-discovery, never inferred)');
@@ -391,10 +642,12 @@ export function formatWhoamiReport(
   lines.push('Token attribution (see .claude/scripts/macf-whoami.sh for the login-resolved form):');
   lines.push(`  ${token.detail}`);
   lines.push('');
+  lines.push(...formatPeersSection(peers));
+  lines.push('');
   lines.push(
-    'NOT implemented (#672 "(2) Capabilities + fleet context"): role remit, ' +
-    'peers, and which repos route here have no structured non-prose source ' +
-    'yet — see this file\'s header comment.',
+    'NOT implemented (#672 "(2) Capabilities + fleet context"): role remit ' +
+    'and which repos route here have no structured non-prose source yet — ' +
+    'see this file\'s header comment. Peers ARE implemented (above).',
   );
   return lines.join('\n');
 }
@@ -407,6 +660,8 @@ export interface WhoamiOptions {
   readonly json?: boolean;
   /** Set false to skip the best-effort network bot_login resolution. */
   readonly resolveBotLogin?: boolean;
+  /** Set false to skip the best-effort network peer-registry read. */
+  readonly resolvePeers?: boolean;
 }
 
 /**
@@ -438,10 +693,12 @@ export async function runWhoami(projectDir: string, opts: WhoamiOptions = {}): P
     }
   }
 
+  const peers = await resolvePeersReport(projectDir, config, identity, { resolvePeers: opts.resolvePeers });
+
   if (opts.json) {
-    console.log(JSON.stringify({ identity, cert, token, botLoginResolution }, null, 2));
+    console.log(JSON.stringify({ identity, cert, token, botLoginResolution, peers }, null, 2));
   } else {
-    console.log(formatWhoamiReport(identity, cert, token, botLoginResolution));
+    console.log(formatWhoamiReport(identity, cert, token, botLoginResolution, peers));
   }
   return 0;
 }
