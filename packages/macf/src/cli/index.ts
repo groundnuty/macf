@@ -35,6 +35,7 @@ import { certsInit, certsRecover, certsRotate, issueRoutingClient } from './comm
 import { repoInit } from './commands/repo-init.js';
 import { rulesRefresh } from './commands/rules-refresh.js';
 import { runDoctor } from './commands/doctor.js';
+import { runWhoami } from './commands/whoami.js';
 import { runMonitorCommand } from './commands/monitor.js';
 import { runProposeCommand } from './commands/propose.js';
 import { selfUpdate } from './commands/self-update.js';
@@ -1169,6 +1170,24 @@ program
   .option('--yes', 'Skip the --fix confirmation prompt (non-interactive)', false)
   .action(async (opts) => {
     const code = await runDoctor(resolveProjectDir(opts.dir), { fix: opts.fix, yes: opts.yes });
+    process.exitCode = code;
+  });
+
+program
+  .command('whoami')
+  .description(
+    'Deterministic self-discovery: identity fields sourced from ' +
+    '.macf/macf-agent.json or the MACF_*/APP_ID/INSTALL_ID/KEY_PATH environment — ' +
+    'never inferred. A field neither source resolves reports "unknown", not a guess. ' +
+    'Unlike most --dir commands this does NOT require .macf/macf-agent.json to exist: ' +
+    'a linked-worktree worker (Agent(isolation:"worktree")) has only the inherited env.',
+  )
+  .option('--dir <path>', 'Directory to inspect (defaults to cwd; need not be a MACF project)')
+  .option('--json', 'Emit the structured report as JSON for automation', false)
+  .option('--no-resolve-bot-login', 'Skip the best-effort network GET /app bot_login resolution')
+  .action(async (opts) => {
+    const dir = resolve(opts.dir ?? process.cwd());
+    const code = await runWhoami(dir, { json: Boolean(opts.json), resolveBotLogin: opts.resolveBotLogin });
     process.exitCode = code;
   });
 
