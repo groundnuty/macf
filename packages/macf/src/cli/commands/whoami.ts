@@ -568,7 +568,7 @@ function fmt(f: WhoamiField): string {
 }
 
 function formatPeersSection(peers: PeersResult): string[] {
-  const lines: string[] = ['Peers (read from the registry, #672):'];
+  const lines: string[] = ['Peers (read from the registry):'];
   switch (peers.kind) {
     case 'found':
       lines.push(`  source: ${peers.source}`);
@@ -601,7 +601,7 @@ export function formatWhoamiReport(
   peers: PeersResult,
 ): string {
   const lines: string[] = [];
-  lines.push('macf whoami — identity (#672 deterministic self-discovery, never inferred)');
+  lines.push('macf whoami — identity, read from configuration rather than inferred');
   lines.push('');
   lines.push('Identity:');
   lines.push(`  project              ${fmt(identity.project)}`);
@@ -645,7 +645,7 @@ export function formatWhoamiReport(
   lines.push(...formatPeersSection(peers));
   lines.push('');
   lines.push(
-    'NOT implemented (#672 "(2) Capabilities + fleet context"): role remit ' +
+    'Not reported: a declared role remit, and which repos route here. ' +
     'and which repos route here have no structured non-prose source yet — ' +
     'see this file\'s header comment. Peers ARE implemented (above).',
   );
