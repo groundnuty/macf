@@ -50,9 +50,16 @@ describe('repoInitRegistryOptions', () => {
       registryUser: 'groundnuty',
     });
   });
-  it('maps repo (no owner/repo needed — repoInit derives it from --repo itself)', () => {
+  // groundnuty/macf#1374 — repo scope used to drop owner/repo entirely
+  // ("repoInit derives it from --repo itself"), which is exactly the bug:
+  // it made `buildRoutingRegistry` self-point to whatever repo is CURRENTLY
+  // being repo-init'd instead of the manifest's declared target. The
+  // manifest's owner/repo must survive this mapping.
+  it('maps repo — carries owner/repo through as the explicit target (macf#1374)', () => {
     expect(repoInitRegistryOptions({ type: 'repo', owner: 'x', repo: 'y' } as RegistryConfig)).toEqual({
       registryType: 'repo',
+      registryOwner: 'x',
+      registryRepo: 'y',
     });
   });
   it('rejects local — no GitHub-Actions routing path', () => {
@@ -125,6 +132,67 @@ describe('applyRepoInitForAgent', () => {
     });
     expect(commits).toHaveLength(1);
     expect(commits[0]?.message).toMatch(/repo-init/);
+  });
+
+  // groundnuty/macf#1374 — the decisive pair. (1) alone (a type:repo
+  // manifest emits ITS declared target) is satisfied even by a broken
+  // implementation that always emits the declared target regardless of
+  // what's asked for — (2) is what actually pins the fix in place: an
+  // org/profile manifest must still resolve to ITS OWN declared scope,
+  // unaffected by the repo-case change.
+  it('DECISIVE 1 (macf#1374): manifest declares a SHARED repo-scoped registry, different from the agent\'s own repo -> registry-api-path names the DECLARED target, never the agent repo', async () => {
+    const sharedRegistryManifest: FleetManifest = {
+      ...MANIFEST,
+      owner: {
+        ...MANIFEST.owner,
+        registry: { type: 'repo', owner: 'shared-org', repo: 'shared-control' } as RegistryConfig,
+      },
+    };
+    const deps: RepoInitStepDeps = {
+      cloneRepo: fakeCloneRepo(),
+      commitAndPush: async (dir) => {
+        const wf = readFileSync(join(dir, '.github', 'workflows', 'agent-router.yml'), 'utf-8');
+        // The manifest's declared shared control-repo scope reaches the
+        // generated workflow verbatim...
+        expect(wf).toContain('registry-api-path: /repos/shared-org/shared-control');
+        // ...and NEVER the agent's own repo (the pre-#1374 self-point bug).
+        expect(wf).not.toContain('registry-api-path: /repos/groundnuty/demo-code');
+        return 'pushed';
+      },
+    };
+    const outcome = await applyRepoInitForAgent(AGENT, sharedRegistryManifest, deps);
+    expect(outcome.status).toBe('applied');
+  });
+
+  it('DECISIVE 2 (macf#1374): org/profile registry scopes are UNCHANGED by the repo-case fix', async () => {
+    // MANIFEST declares owner.registry: { type: 'profile', user: 'groundnuty' }
+    // — unrelated to the repo case this fix touches. Pin the exact
+    // registry-api-path this has always produced.
+    const deps: RepoInitStepDeps = {
+      cloneRepo: fakeCloneRepo(),
+      commitAndPush: async (dir) => {
+        const wf = readFileSync(join(dir, '.github', 'workflows', 'agent-router.yml'), 'utf-8');
+        expect(wf).toContain('registry-api-path: /repos/groundnuty/groundnuty');
+        return 'pushed';
+      },
+    };
+    const outcome = await applyRepoInitForAgent(AGENT, MANIFEST, deps);
+    expect(outcome.status).toBe('applied');
+
+    const orgManifest: FleetManifest = {
+      ...MANIFEST,
+      owner: { ...MANIFEST.owner, registry: { type: 'org', org: 'acme' } as RegistryConfig },
+    };
+    const orgDeps: RepoInitStepDeps = {
+      cloneRepo: fakeCloneRepo(),
+      commitAndPush: async (dir) => {
+        const wf = readFileSync(join(dir, '.github', 'workflows', 'agent-router.yml'), 'utf-8');
+        expect(wf).toContain('registry-api-path: /orgs/acme');
+        return 'pushed';
+      },
+    };
+    const orgOutcome = await applyRepoInitForAgent(AGENT, orgManifest, orgDeps);
+    expect(orgOutcome.status).toBe('applied');
   });
 
   it('nothing-to-commit (idempotent re-run) -> pushed: false, still status applied', async () => {

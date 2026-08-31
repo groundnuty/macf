@@ -499,6 +499,46 @@ describe('parseFleetManifest — rejections', () => {
     expect(() => parseFleetManifest(bad)).toThrow();
   });
 
+  // groundnuty/macf#1374 — the schema-level half of the fix: `registry.type:
+  // 'repo'` must REQUIRE `owner` + `repo`, so a self-pointing registry is
+  // unrepresentable rather than written and corrected at runtime.
+  // `RegistryConfigSchema`'s `RepoRegistryConfigSchema` (`@groundnuty/macf-core`)
+  // already makes both fields non-optional — this pins that invariant at the
+  // fleet-manifest boundary, since `FleetOwnerSchema.registry` is that exact
+  // schema (not a locally-relaxed copy of it).
+  it('rejects registry.type: repo with NEITHER owner nor repo declared (macf#1374)', () => {
+    const bad = VALID_FLEET_YAML.replace(
+      'registry: { type: profile, user: groundnuty }\n\nnetwork:',
+      'registry: { type: repo }\n\nnetwork:',
+    );
+    expect(() => parseFleetManifest(bad)).toThrow();
+  });
+
+  it('rejects registry.type: repo with owner but NO repo (partial targeting, macf#1374)', () => {
+    const bad = VALID_FLEET_YAML.replace(
+      'registry: { type: profile, user: groundnuty }\n\nnetwork:',
+      'registry: { type: repo, owner: groundnuty }\n\nnetwork:',
+    );
+    expect(() => parseFleetManifest(bad)).toThrow();
+  });
+
+  it('rejects registry.type: repo with repo but NO owner (partial targeting, macf#1374)', () => {
+    const bad = VALID_FLEET_YAML.replace(
+      'registry: { type: profile, user: groundnuty }\n\nnetwork:',
+      'registry: { type: repo, repo: macf-control }\n\nnetwork:',
+    );
+    expect(() => parseFleetManifest(bad)).toThrow();
+  });
+
+  it('accepts registry.type: repo WITH both owner and repo declared (the shared-control-repo scope macf-trial/macf-fresh actually use, macf#1374)', () => {
+    const good = VALID_FLEET_YAML.replace(
+      'registry: { type: profile, user: groundnuty }\n\nnetwork:',
+      'registry: { type: repo, owner: macf-experiment, repo: macf-trial-control }\n\nnetwork:',
+    );
+    const manifest = parseFleetManifest(good);
+    expect(manifest.owner.registry).toEqual({ type: 'repo', owner: 'macf-experiment', repo: 'macf-trial-control' });
+  });
+
   it('rejects an unknown top-level key (typo protection — `.strict()`)', () => {
     const bad = VALID_FLEET_YAML.replace('kind: Fleet', 'kind: Fleet\nkidn: Fleet');
     expect(() => parseFleetManifest(bad)).toThrow();
