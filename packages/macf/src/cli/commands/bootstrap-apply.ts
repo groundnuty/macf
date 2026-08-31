@@ -1975,8 +1975,24 @@ function launchNextStepLines(deployPhase: DeployPhaseRenderInput): string[] {
  * per entry were already `'unknown'`-capable before this bump (an
  * in-vault credential-resolution or repo-existence gap already produced
  * it) — only the KEY'S PRESENCE on a vault-free run is new.
+ *
+ * **groundnuty/macf#800 bumps this 3 → 4.** Every precedent bump above
+ * ADDED a shape a `--json` consumer would need to account for (a new enum
+ * value, a new top-level key, a key's presence condition widening). This
+ * one REMOVES a key outright: `ca.repo_legs` is gone — `apply-ca.ts
+ * ::publishCaCertLegs` no longer writes a per-repo `<SEG>_CA_CERT` copy at
+ * all (a single registry-scope write replaces the macf#806 two-place one;
+ * see that module's doc for why). A consumer that read `ca.repo_legs` to
+ * confirm per-repo publish status would previously see `{}` (nothing to
+ * report, a legitimate empty map) and now sees `undefined` (the key does
+ * not exist) — a strictly bigger break than any presence-CONDITION change
+ * this constant has bumped for before, since there is no fallback reading
+ * of the OLD key that still makes sense post-fix. Pre-existing per-repo
+ * copies from before this change are reported by `macf bootstrap plan`'s
+ * `--json` orphan items instead (`plan.ts`'s `FLEET_PLAN_JSON_SCHEMA_VERSION`
+ * — a separate command, separate schema, unaffected by this bump).
  */
-export const FLEET_APPLY_JSON_SCHEMA_VERSION = 3;
+export const FLEET_APPLY_JSON_SCHEMA_VERSION = 4;
 
 /**
  * The control-repo status line — ALWAYS rendered first (macf#857), so a
@@ -2161,18 +2177,14 @@ function formatVariableLegLine(label: string, leg: EnsureVariableOutcome): strin
   return `  ${label}: ${leg.status.toUpperCase()}${suffix}`;
 }
 
-/** CA ceremony + two-place publish render (macf#838 Amendment D phase 2). Never a credential value — `result.ca.resolve` is the redacted `CaApplyOutcome` (fingerprint only, never cert/key PEM). */
+/** CA ceremony + single registry-scope publish render (macf#838 Amendment D phase 2; single-scope since groundnuty/macf#800). Never a credential value — `result.ca.resolve` is the redacted `CaApplyOutcome` (fingerprint only, never cert/key PEM). No per-repo leg line any more — `apply-ca.ts::publishCaCertLegs` writes the registry scope ONLY; pre-existing per-repo copies are reported by `macf bootstrap plan`'s orphan block (`plan.ts::caRepoItem`), not here. */
 function caSummaryLines(result: FleetApplyResult): string[] {
   const r = result.ca.resolve;
   const resolveLine =
     r.status === 'failed'
       ? `CA: FAILED to resolve — ${r.reason}`
       : `CA: ${r.status.toUpperCase()}${r.certFingerprint !== undefined ? ` (fingerprint ${r.certFingerprint})` : ''}`;
-  const lines = [resolveLine, formatVariableLegLine('registry leg', result.ca.registryLeg)];
-  for (const [repo, leg] of Object.entries(result.ca.repoLegs)) {
-    lines.push(formatVariableLegLine(`repo leg (${repo})`, leg));
-  }
-  return lines;
+  return [resolveLine, formatVariableLegLine('registry leg', result.ca.registryLeg)];
 }
 
 /**
@@ -2643,10 +2655,12 @@ export function fleetApplyResultToJson(
       : {}),
     // `result.ca.resolve` is ALREADY the redacted `CaApplyOutcome`
     // (fingerprint only — see `apply-ca.ts::redactCaResolve`); `registryLeg`/
-    // `repoLegs`/`routing` are `EnsureVariableOutcome`s, which carry no
-    // credential field at all. Safe to spread verbatim (macf#838 Amendment D
-    // phase 2).
-    ca: { resolve: { ...result.ca.resolve }, registry_leg: { ...result.ca.registryLeg }, repo_legs: { ...result.ca.repoLegs } },
+    // `routing` are `EnsureVariableOutcome`s, which carry no credential
+    // field at all. Safe to spread verbatim (macf#838 Amendment D phase 2).
+    // No `repo_legs` key any more (groundnuty/macf#800 — see
+    // `FLEET_APPLY_JSON_SCHEMA_VERSION`'s own comment for the bump this
+    // key REMOVAL required).
+    ca: { resolve: { ...result.ca.resolve }, registry_leg: { ...result.ca.registryLeg } },
     // groundnuty/macf#810 — `EnsureVariableOutcome`s only, same
     // no-credential-field safety as `ca.registry_leg` above (`ca_bundle` is
     // public CA-certificate material, never present on this shape either
@@ -2907,10 +2921,12 @@ export function applyExitCode(
   // failure. A 'skipped' leg does NOT independently fail the run here — it
   // is always a SYMPTOM of an already-`ca.resolve.status === 'failed'` or
   // `vault.status === 'failed'` state, both already covered below.
+  // groundnuty/macf#800 — no `repoLegs` term any more: the CA is written ONCE
+  // at the fleet registry scope, so `registryLeg` is the only publish leg that
+  // can fail. Superseded per-repo copies are ORPHANED (rendered), never
+  // written and never deleted, so they have no failure state to fold in here.
   const caBad =
-    result.ca.resolve.status === 'failed' ||
-    result.ca.registryLeg.status === 'failed' ||
-    Object.values(result.ca.repoLegs).some((leg) => leg.status === 'failed');
+    result.ca.resolve.status === 'failed' || result.ca.registryLeg.status === 'failed';
   // groundnuty/macf#810 — same bar as `caBad` immediately above: a failed
   // federated-CA registry leg needs operator attention (an agent whose
   // `.github/macf-fleet.json` names this project will fail to start until

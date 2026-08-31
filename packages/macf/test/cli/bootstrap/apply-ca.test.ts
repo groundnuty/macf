@@ -13,16 +13,7 @@ import { existsSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { RegistryConfig } from '@groundnuty/macf-core';
-import {
-  caCertVariableName,
-  formatCaLegsSummary,
-  publishCaCertLegs,
-  realMintCa,
-  redactCaResolve,
-  resolveCaCert,
-  skippedCaPublish,
-  summarizeCaRepoLegs,
-} from '../../../src/cli/bootstrap/apply-ca.js';
+import { caCertVariableName, publishCaCertLegs, realMintCa, redactCaResolve, resolveCaCert, skippedCaPublish } from '../../../src/cli/bootstrap/apply-ca.js';
 import type { CaApplyDeps, CaMintDeps, CaResolveOutcome } from '../../../src/cli/bootstrap/apply-ca.js';
 
 const REGISTRY: RegistryConfig = { type: 'profile', user: 'groundnuty' };
@@ -321,103 +312,68 @@ describe('redactCaResolve — the security-critical redaction boundary', () => {
   });
 });
 
-describe('publishCaCertLegs — the two-place publish (macf#806)', () => {
-  it('writes the registry leg + every repo leg with the SAME cert value', async () => {
+describe('publishCaCertLegs — single registry-scope publish (groundnuty/macf#800, superseding the macf#806 two-place write)', () => {
+  it('writes the registry leg with the cert value', async () => {
     const registryValues: string[] = [];
-    const repoValues: Record<string, string> = {};
     const deps = fullDepsWith({
       createRegistryVariable: async (_registry, _name, value) => {
         registryValues.push(value);
         return 'created';
       },
-      createRepoVariable: async (repo, _name, value) => {
-        repoValues[repo] = value;
-        return 'created';
-      },
     });
-    const result = await publishCaCertLegs('CERT-PEM-VALUE', 'demo-fleet', REGISTRY, ['a/b', 'c/d'], deps);
-    expect(result.registryLeg).toEqual({ status: 'created' });
-    expect(result.repoLegs).toEqual({ 'a/b': { status: 'created' }, 'c/d': { status: 'created' } });
+    const result = await publishCaCertLegs('CERT-PEM-VALUE', 'demo-fleet', REGISTRY, deps);
+    expect(result).toEqual({ registryLeg: { status: 'created' } });
     expect(registryValues).toEqual(['CERT-PEM-VALUE']);
-    expect(repoValues).toEqual({ 'a/b': 'CERT-PEM-VALUE', 'c/d': 'CERT-PEM-VALUE' });
   });
 
-  it('an already-present registry var is left untouched; a missing repo leg is still created (independent per-leg outcomes)', async () => {
-    const deps = fullDepsWith({
-      checkRegistryPresence: async () => 'present',
-      checkRepoPresence: async () => 'absent',
-    });
-    const result = await publishCaCertLegs('CERT', 'demo-fleet', REGISTRY, ['a/b'], deps);
+  it('an already-present registry var is left untouched (create-only)', async () => {
+    const deps = fullDepsWith({ checkRegistryPresence: async () => 'present' });
+    const result = await publishCaCertLegs('CERT', 'demo-fleet', REGISTRY, deps);
     expect(result.registryLeg).toEqual({ status: 'already-present' });
-    expect(result.repoLegs['a/b']).toEqual({ status: 'created' });
   });
 
-  it('a failed repo leg does not prevent the OTHER repo legs from being attempted', async () => {
+  it('a failed registry create reports failed', async () => {
+    const deps = fullDepsWith({ createRegistryVariable: async () => { throw new Error('403 forbidden'); } });
+    const result = await publishCaCertLegs('CERT', 'demo-fleet', REGISTRY, deps);
+    expect(result.registryLeg.status).toBe('failed');
+  });
+
+  // --- DECISIVE PAIR (groundnuty/macf#800) — the write path no longer
+  // touches a per-repo variable at all. Test 1 alone ("registry leg
+  // created") would pass under the OLD two-place code too; the pair's
+  // second half is what actually discriminates old from new. See
+  // `assert-the-wrong-path.md`.
+
+  it('DECISIVE 1/2 — publishes ONCE, at the registry scope', async () => {
+    const deps = fullDepsWith();
+    const result = await publishCaCertLegs('CERT', 'demo-fleet', REGISTRY, deps);
+    expect(result.registryLeg).toEqual({ status: 'created' });
+  });
+
+  it('DECISIVE 2/2 — deps.createRepoVariable (and deps.checkRepoPresence) are NEVER called; the returned result carries no repoLegs field at all', async () => {
+    let createRepoVariableCalled = false;
+    let checkRepoPresenceCalled = false;
     const deps = fullDepsWith({
-      createRepoVariable: async (repo) => {
-        if (repo === 'a/fails') throw new Error('403 forbidden');
+      createRepoVariable: async () => {
+        createRepoVariableCalled = true;
         return 'created';
       },
+      checkRepoPresence: async () => {
+        checkRepoPresenceCalled = true;
+        return 'absent';
+      },
     });
-    const result = await publishCaCertLegs('CERT', 'demo-fleet', REGISTRY, ['a/fails', 'b/ok'], deps);
-    expect(result.repoLegs['a/fails']?.status).toBe('failed');
-    expect(result.repoLegs['b/ok']).toEqual({ status: 'created' });
-  });
-
-  it('an empty repo list produces an empty repoLegs map (registry leg still runs)', async () => {
-    const result = await publishCaCertLegs('CERT', 'demo-fleet', REGISTRY, [], fullDepsWith());
-    expect(result.repoLegs).toEqual({});
-    expect(result.registryLeg).toEqual({ status: 'created' });
+    const result = await publishCaCertLegs('CERT', 'demo-fleet', REGISTRY, deps);
+    expect(createRepoVariableCalled).toBe(false);
+    expect(checkRepoPresenceCalled).toBe(false);
+    expect(result).not.toHaveProperty('repoLegs');
   });
 });
 
 describe('skippedCaPublish (pure)', () => {
-  it('produces a skipped registry leg + skipped repo legs, all sharing the reason', () => {
-    const result = skippedCaPublish(['a/b', 'c/d'], 'CA could not be resolved');
-    expect(result.registryLeg).toEqual({ status: 'skipped', reason: 'CA could not be resolved' });
-    expect(result.repoLegs).toEqual({
-      'a/b': { status: 'skipped', reason: 'CA could not be resolved' },
-      'c/d': { status: 'skipped', reason: 'CA could not be resolved' },
-    });
-  });
-});
-
-describe('summarizeCaRepoLegs / formatCaLegsSummary — the denominator report (groundnuty/macf#1345)', () => {
-  it('counts created + already-present against the POPULATION, not Object.keys(repoLegs)', () => {
-    const repoLegs = { 'a/b': { status: 'created' as const }, 'c/d': { status: 'already-present' as const } };
-    const summary = summarizeCaRepoLegs(repoLegs, ['a/b', 'c/d']);
-    expect(summary).toEqual({ created: 1, alreadyPresent: 1, unknown: 0, total: 2 });
-  });
-
-  it('DECISIVE — a population repo missing from repoLegs is `unknown`, never silently excluded from the count', () => {
-    // Simulates the exact class of bug #1345 fixed: a caller that hands
-    // `publishCaCertLegs` one population but reports against another. The
-    // control repo (`fleet-control`) is in the POPULATION (it carries the
-    // router) but has no entry in `repoLegs` — a stand-in for whatever
-    // upstream mismatch could produce this shape.
-    const repoLegs = { 'a/agent': { status: 'created' as const } };
-    const summary = summarizeCaRepoLegs(repoLegs, ['a/agent', 'a/fleet-control']);
-    expect(summary).toEqual({ created: 1, alreadyPresent: 0, unknown: 1, total: 2 });
-  });
-
-  it('an empty population -> all zero counts, total 0 (never NaN/undefined)', () => {
-    expect(summarizeCaRepoLegs({}, [])).toEqual({ created: 0, alreadyPresent: 0, unknown: 0, total: 0 });
-  });
-
-  it('a failed/skipped leg counts toward neither created nor already-present nor unknown — only toward total', () => {
-    const repoLegs = { 'a/b': { status: 'failed' as const, reason: 'boom' } };
-    const summary = summarizeCaRepoLegs(repoLegs, ['a/b']);
-    expect(summary).toEqual({ created: 0, alreadyPresent: 0, unknown: 0, total: 1 });
-  });
-
-  it('formatCaLegsSummary renders the denominator, omitting the unknown clause when zero', () => {
-    const line = formatCaLegsSummary({ created: 2, alreadyPresent: 1, unknown: 0, total: 3 });
-    expect(line).toBe('CA cert legs: 2 created, 1 already-present of 3 router-carrying repo(s).');
-  });
-
-  it('formatCaLegsSummary includes the unknown clause when non-zero — the honest-unknown floor rendered, not just computed', () => {
-    const line = formatCaLegsSummary({ created: 1, alreadyPresent: 0, unknown: 1, total: 2 });
-    expect(line).toBe('CA cert legs: 1 created, 0 already-present, 1 unknown of 2 router-carrying repo(s).');
+  it('produces a skipped registry leg carrying the reason', () => {
+    const result = skippedCaPublish('CA could not be resolved');
+    expect(result).toEqual({ registryLeg: { status: 'skipped', reason: 'CA could not be resolved' } });
   });
 });
 

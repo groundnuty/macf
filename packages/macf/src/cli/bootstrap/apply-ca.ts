@@ -15,9 +15,10 @@
  *      mirror {@link redactCaResolve} produces) or anywhere `FleetApplyResult`
  *      reaches, mirroring `commands/bootstrap-apply.ts`'s `redactIdentity`
  *      precedent for `AgentApplyOutcome.created.credentials`.
- *   2. **{@link publishCaCertLegs} — the two-place PUBLIC-cert write
- *      (macf#806).** Takes an ALREADY-RESOLVED cert PEM (never a key) and
- *      create-only-writes it to the registry + every given repo via
+ *   2. **{@link publishCaCertLegs} — the SINGLE registry-scope PUBLIC-cert
+ *      write (groundnuty/macf#800, superseding the macf#806 two-place
+ *      write).** Takes an ALREADY-RESOLVED cert PEM (never a key) and
+ *      create-only-writes it ONCE, to the fleet's registry scope, via
  *      `ensure-variable.ts::ensureVariableCreated`. Deliberately a SEPARATE
  *      function from (1) — `apply-fleet.ts` calls this ONLY after confirming
  *      the corresponding key (when freshly minted) is durable in `vault.age`
@@ -26,6 +27,23 @@
  *      module doc for the exact sequencing). Publishing a cert whose key was
  *      never durably persisted would recreate the #799 orphan-cert failure
  *      class the moment the vault write failed on a fresh mint.
+ *
+ *      **Why not two-place any more (groundnuty/macf#800).** The original
+ *      macf#806 design also `createRepoVariable`-wrote the SAME cert to
+ *      every router-carrying repo, on the theory that a per-repo reader
+ *      needed a per-repo copy. It didn't: `registry-api-path` (the reader's
+ *      OWN scope selector, `apply-routing.ts`/`fleet-manifest.ts` — macf#810)
+ *      decides where a caller reads from, and `createRepoVariable` here
+ *      decided where THIS write landed — two independent paths that macf#800's
+ *      thread found conflated more than once. Writing per-repo meant a CA
+ *      rotation had to touch N+1 places to stay consistent, and any place it
+ *      missed silently kept serving a stale cert — the exact "CA rotation
+ *      silently orphans routing" failure macf#800 reports. A single
+ *      registry-scope write removes the N+1 requirement entirely: rotate
+ *      once, every fleet-scope reader sees it. Pre-existing per-repo copies
+ *      from before this change are NOT deleted by this function (or by
+ *      anything in `apply`) — see `plan.ts::caRepoItem`'s doc for why they
+ *      are rendered as `'orphan'`, not removed.
  *
  * **Never mint twice.** {@link resolveCaCert} treats "a CA cert is already
  * present in the registry" OR "`fleet.lock` already records a `ca_key`
@@ -72,8 +90,8 @@ import { createCA, caCertFingerprint, toVariableSegment } from '@groundnuty/macf
 import type { Presence } from './plan.js';
 import type { CreateVariableResult } from './variable-write.js';
 import { realCreateVariable } from './variable-write.js';
-import type { EnsureVariableDeps, EnsureVariableOutcome } from './ensure-variable.js';
-import { ensureVariableCreated, skippedOutcomesFor } from './ensure-variable.js';
+import type { EnsureVariableOutcome } from './ensure-variable.js';
+import { ensureVariableCreated } from './ensure-variable.js';
 import { registryPathPrefix } from '../registry-helper.js';
 
 /** `<SEG>_CA_CERT` — the DR two-place-rule variable name (macf#806), same segment derivation `plan.ts::computePlan` already uses. */
@@ -265,8 +283,18 @@ export async function resolveCaCert(
   return { status: 'minted', certPem, keyPem };
 }
 
-// --- Two-place publish (public cert only — never a key) ---
+// --- Single registry-scope publish (public cert only — never a key) ---
 
+/**
+ * `checkRepoPresence`/`createRepoVariable` are NOT used by
+ * {@link publishCaCertLegs} any more (groundnuty/macf#800 — see the module
+ * doc's "Why not two-place any more"). They stay on this interface because
+ * `apply-routing.ts::RoutingApplyDeps` is `Pick<CaApplyDeps, 'checkRepoPresence'
+ * | 'createRepoVariable'>` — a completely different write (`MACF_TRUSTED_ACTORS`)
+ * that genuinely IS per-repo, sharing this bag purely for wiring convenience
+ * at `apply-fleet.ts`'s single combined `trustDeps` call site. Removing these
+ * fields would break that unrelated consumer, not just this one.
+ */
 export interface CaApplyDeps extends CaMintDeps {
   readonly createRegistryVariable: (registry: RegistryConfig, name: string, value: string) => Promise<CreateVariableResult>;
   readonly checkRepoPresence: (repo: string, name: string) => Promise<Presence>;
@@ -275,23 +303,23 @@ export interface CaApplyDeps extends CaMintDeps {
 
 export interface CaPublishResult {
   readonly registryLeg: EnsureVariableOutcome;
-  readonly repoLegs: Readonly<Record<string, EnsureVariableOutcome>>;
 }
 
 /**
- * Create-only two-place publish of an ALREADY-RESOLVED cert PEM (macf#806).
- * `certPem` is public material — safe to pass around and log its fingerprint,
- * but this function never receives (and could not leak) a private key. See
- * the module doc for the ordering constraint the CALLER (`apply-fleet.ts`)
- * is responsible for honoring before invoking this on a `'minted'` result.
+ * Create-only SINGLE-scope publish of an ALREADY-RESOLVED cert PEM
+ * (groundnuty/macf#800). `certPem` is public material — safe to pass around
+ * and log its fingerprint, but this function never receives (and could not
+ * leak) a private key. See the module doc for the ordering constraint the
+ * CALLER (`apply-fleet.ts`) is responsible for honoring before invoking this
+ * on a `'minted'` result.
+ *
+ * No `repos` parameter (groundnuty/macf#800 dropped it) — this function
+ * writes to exactly one place, `registry`, and nowhere else. Pre-existing
+ * per-repo `<SEG>_CA_CERT` copies from before this change are left
+ * completely untouched by this function (never read, never written, never
+ * deleted) — `plan.ts::caRepoItem` is what reports on them now.
  */
-export async function publishCaCertLegs(
-  certPem: string,
-  fleetName: string,
-  registry: RegistryConfig,
-  repos: readonly string[],
-  deps: CaApplyDeps,
-): Promise<CaPublishResult> {
+export async function publishCaCertLegs(certPem: string, fleetName: string, registry: RegistryConfig, deps: CaApplyDeps): Promise<CaPublishResult> {
   const varName = caCertVariableName(fleetName);
   const registryLeg = await ensureVariableCreated(
     {
@@ -300,76 +328,12 @@ export async function publishCaCertLegs(
     },
     `CA registry var "${varName}"`,
   );
-  const repoLegs: Record<string, EnsureVariableOutcome> = {};
-  for (const repo of repos) {
-    const depsForRepo: EnsureVariableDeps = {
-      checkPresence: () => deps.checkRepoPresence(repo, varName),
-      create: () => deps.createRepoVariable(repo, varName, certPem),
-    };
-    repoLegs[repo] = await ensureVariableCreated(depsForRepo, `CA repo var "${varName}" on "${repo}"`);
-  }
-  return { registryLeg, repoLegs };
+  return { registryLeg };
 }
 
 /** The `CaPublishResult` shape for "never attempted this run" (CA resolve failed, or a fresh mint's vault write did not succeed — see `apply-fleet.ts`'s ordering doc). Pure. */
-export function skippedCaPublish(repos: readonly string[], reason: string): CaPublishResult {
-  return { registryLeg: { status: 'skipped', reason }, repoLegs: skippedOutcomesFor(repos, reason) };
-}
-
-// --- Denominator report (groundnuty/macf#1345) ---
-
-/**
- * `created`/`already-present`/`unknown` counts for a {@link CaPublishResult.repoLegs}
- * bag, measured against the POPULATION it was supposed to cover — never
- * `Object.keys(repoLegs).length`, which silently under-reports if the
- * population handed to {@link publishCaCertLegs}/{@link skippedCaPublish} and
- * the population handed here ever diverge. That divergence is exactly the
- * defect groundnuty/macf#1345 fixed at the call site (publishing against
- * `confirmedRepos` while the routing-secret siblings had already moved to
- * `apply-control-repo-init.ts::deriveRouterCarryingRepos`'s
- * `routerCarryingRepos` — macf#1073): a caller that (re-)introduces that
- * split would have this function under-report `total` and quietly not
- * cover the control repo, rather than accurately widen `total`.
- *
- * A repo in `population` with no entry in `repoLegs` counts as `unknown`
- * — the honest-unknown floor (Amendment A4) applied to a report's own
- * denominator: an unresolvable repo is never silently excluded from the
- * count. Pure.
- */
-export interface CaLegsSummary {
-  readonly created: number;
-  readonly alreadyPresent: number;
-  readonly unknown: number;
-  readonly total: number;
-}
-
-export function summarizeCaRepoLegs(repoLegs: Readonly<Record<string, EnsureVariableOutcome>>, population: readonly string[]): CaLegsSummary {
-  let created = 0;
-  let alreadyPresent = 0;
-  let unknown = 0;
-  for (const repo of population) {
-    const leg = repoLegs[repo];
-    if (leg === undefined) unknown += 1;
-    else if (leg.status === 'created') created += 1;
-    else if (leg.status === 'already-present') alreadyPresent += 1;
-  }
-  return { created, alreadyPresent, unknown, total: population.length };
-}
-
-/**
- * Render {@link summarizeCaRepoLegs}'s counts as the operator-facing
- * denominator line — mirrors `apply-fleet.ts`'s existing "Routing secret
- * ... legs: N created, M already-present of K confirmed repo(s)."
- * shape (macf#1074's six-secret publish), so the SAME "name the population
- * covered" discipline #1341 established for routing secrets is not special
- * to that leg (groundnuty/macf#1345). The `unknown` clause is OMITTED
- * entirely when zero (the steady-state case — never noise on a normal
- * run); present only when {@link summarizeCaRepoLegs} actually found a
- * population/leg-map mismatch.
- */
-export function formatCaLegsSummary(summary: CaLegsSummary): string {
-  const unknownPart = summary.unknown > 0 ? `, ${String(summary.unknown)} unknown` : '';
-  return `CA cert legs: ${String(summary.created)} created, ${String(summary.alreadyPresent)} already-present${unknownPart} of ${String(summary.total)} router-carrying repo(s).`;
+export function skippedCaPublish(reason: string): CaPublishResult {
+  return { registryLeg: { status: 'skipped', reason } };
 }
 
 // --- Real deps ---
@@ -388,7 +352,7 @@ export function formatCaLegsSummary(summary: CaLegsSummary): string {
  * registry-upload path calls `GitHubVariablesClient.writeVariable`, which
  * (`@groundnuty/macf-core`'s `github-client.ts`) is PATCH-then-POST (upsert)
  * — that violates DR-043's create-only posture (never silently overwrite).
- * This module does its OWN create-only two-place publish instead
+ * This module does its OWN create-only registry-scope publish instead
  * ({@link publishCaCertLegs}) — don't "simplify" this by re-adding a client
  * here.
  */
