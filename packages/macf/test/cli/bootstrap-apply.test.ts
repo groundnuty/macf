@@ -1834,14 +1834,15 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       vi.stubEnv(RUNNER_TOKEN_ENV_VAR, '');
       const file = writeManifest(FLEET_YAML_WITH_ROUTING);
       const setSecretCalls: { repo: string; name: string; value: string }[] = [];
-      // `trustDeps.createRepoVariable` is SHARED — `apply-ca.ts`'s per-repo
-      // `DEMO_FLEET_CA_CERT` writes go through the SAME primitive as
-      // `MACF_TRUSTED_ACTORS`. A raw call-count of zero would be the WRONG
-      // assertion (CA legs are expected to write here, since CA doesn't
-      // depend on the runner token either) — capture the variable NAME per
-      // call so the negative-half assertion below can single out
-      // `MACF_TRUSTED_ACTORS` specifically.
+      // `trustDeps.createRepoVariable` is `MACF_TRUSTED_ACTORS`-ONLY now
+      // (groundnuty/macf#800 — `apply-ca.ts`'s `DEMO_FLEET_CA_CERT` write
+      // moved to `createRegistryVariable`, a SEPARATE primitive, no longer
+      // shared with routing). Capture the variable NAME per call so the
+      // negative-half assertion below can single out `MACF_TRUSTED_ACTORS`
+      // specifically; capture `createRegistryVariable` calls separately as
+      // the CA leg's OWN positive-half proof.
       const createRepoVariableCalls: { repo: string; name: string }[] = [];
+      const createRegistryVariableCalls: { name: string }[] = [];
       let checkRunnerUsableCalls = 0;
 
       const code = await runBootstrapApply(
@@ -1858,6 +1859,10 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
           trustDeps: fakeTrustDeps({
             createRepoVariable: async (repo, name) => {
               createRepoVariableCalls.push({ repo, name });
+              return 'created';
+            },
+            createRegistryVariable: async (_registry, name) => {
+              createRegistryVariableCalls.push({ name });
               return 'created';
             },
             // groundnuty/macf#1195 — genuinely absent here (not 'present'):
@@ -1899,12 +1904,15 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       // Negative half (the actual point, per assert-the-wrong-path.md) —
       // MACF_TRUSTED_ACTORS was genuinely WITHHELD, not silently written
       // anyway despite the exit code being non-zero for some OTHER reason.
-      // `createRepoVariable` DOES get called — for the CA legs, which don't
-      // depend on the runner token either and are expected to succeed (proof
-      // CA proceeded too) — so the assertion is on the VARIABLE NAME, not the
-      // raw call count: no call ever named `MACF_TRUSTED_ACTORS`.
+      // `createRepoVariable` is `MACF_TRUSTED_ACTORS`-only now (groundnuty/
+      // macf#800), so a raw call-count of zero WOULD be the right shape too
+      // — asserted on the name anyway to keep the discriminator explicit if
+      // that ever changes again.
       expect(createRepoVariableCalls.some((c) => c.name === 'MACF_TRUSTED_ACTORS')).toBe(false);
-      expect(createRepoVariableCalls.some((c) => c.name === 'DEMO_FLEET_CA_CERT')).toBe(true);
+      // Positive half for the CA leg specifically — it doesn't depend on the
+      // runner token either, and is expected to succeed via the SEPARATE
+      // `createRegistryVariable` primitive (never `createRepoVariable`).
+      expect(createRegistryVariableCalls.some((c) => c.name === 'DEMO_FLEET_CA_CERT')).toBe(true);
       // groundnuty/macf#1195 — the runner-usability check IS now consulted
       // (that is the fix); the refusal above is EVIDENCED by a live read
       // reporting 'absent', not assumed from the missing token alone. A
@@ -4526,7 +4534,7 @@ function resultWith(overrides: Partial<FleetApplyResult> = {}): FleetApplyResult
     // DR-043 Amendment D phase 2 (macf#838) defaults: a REUSED CA (no fresh
     // key this run, nothing to fail on) + no routing declared. Individual
     // tests below override to exercise failure/skip shapes.
-    ca: { resolve: { status: 'reused', certFingerprint: 'deadbeef'.repeat(8) }, registryLeg: { status: 'already-present' }, repoLegs: {} },
+    ca: { resolve: { status: 'reused', certFingerprint: 'deadbeef'.repeat(8) }, registryLeg: { status: 'already-present' } },
     // groundnuty/macf#810 default: empty (no trust.federated_cas declared) —
     // matches `routing: {}`'s own "nothing declared" default immediately
     // below. Individual tests below override to exercise the declared shape.
@@ -4714,33 +4722,27 @@ describe('formatApplyResult / fleetApplyResultToJson / applyExitCode (pure)', ()
   // --- DR-043 Amendment D phase 2 (macf#838) — CA + routing exit-code / render / JSON ---
 
   it('applyExitCode: 1 when the CA resolve failed', () => {
-    const result = resultWith({ ca: { resolve: { status: 'failed', reason: 'no recipient' }, registryLeg: { status: 'skipped', reason: 'x' }, repoLegs: {} } });
+    const result = resultWith({ ca: { resolve: { status: 'failed', reason: 'no recipient' }, registryLeg: { status: 'skipped', reason: 'x' } } });
     expect(applyExitCode(result)).toBe(1);
   });
 
+  // DECISIVE (groundnuty/macf#800) — the registry leg alone gates the exit
+  // code now; there is no per-repo disjunct left to remove accidentally.
+  // Restoring `Object.values(result.ca.repoLegs).some(...)` to `caBad`'s
+  // definition is the mutation this test exists to catch (it wouldn't even
+  // compile against the current `CaApplyResult` type, which is itself part
+  // of the guard — see `apply-fleet.ts::CaApplyResult`'s doc).
   it('applyExitCode: 1 when the CA registry leg failed', () => {
-    const result = resultWith({ ca: { resolve: { status: 'minted', certFingerprint: 'ab'.repeat(32) }, registryLeg: { status: 'failed', reason: 'race' }, repoLegs: {} } });
+    const result = resultWith({ ca: { resolve: { status: 'minted', certFingerprint: 'ab'.repeat(32) }, registryLeg: { status: 'failed', reason: 'race' } } });
     expect(applyExitCode(result)).toBe(1);
   });
 
-  it('applyExitCode: 1 when ANY CA repo leg failed', () => {
-    const result = resultWith({
-      ca: {
-        resolve: { status: 'reused', certFingerprint: 'ab'.repeat(32) },
-        registryLeg: { status: 'already-present' },
-        repoLegs: { 'x/y': { status: 'failed', reason: 'network' } },
-      },
-    });
-    expect(applyExitCode(result)).toBe(1);
-  });
-
-  it('applyExitCode: 0 when CA legs are all skipped due to an already-accounted-for vault failure (skipped is not independently bad)', () => {
+  it('applyExitCode: 0 when the CA registry leg is skipped due to an already-accounted-for vault failure (skipped is not independently bad)', () => {
     const result = resultWith({
       vault: { status: 'skipped' },
       ca: {
         resolve: { status: 'reused', certFingerprint: 'ab'.repeat(32) },
         registryLeg: { status: 'skipped', reason: 'unrelated' },
-        repoLegs: { 'x/y': { status: 'skipped', reason: 'unrelated' } },
       },
     });
     expect(applyExitCode(result)).toBe(0);
@@ -4921,18 +4923,19 @@ describe('formatApplyResult / fleetApplyResultToJson / applyExitCode (pure)', ()
       ca: {
         resolve: { status: 'minted', certFingerprint: 'ab'.repeat(32) },
         registryLeg: { status: 'created' },
-        repoLegs: { 'groundnuty/x': { status: 'created' } },
       },
     });
     const text = formatApplyResult(result);
     expect(text).toMatch(/CA: MINTED \(fingerprint (?:ab){32}\)/);
     expect(text).toMatch(/registry leg: CREATED/);
-    expect(text).toMatch(/repo leg \(groundnuty\/x\): CREATED/);
+    // groundnuty/macf#800 — no per-repo leg line any more; the registry
+    // leg IS the whole publish now.
+    expect(text).not.toMatch(/repo leg/);
     expect(text).not.toContain('-----BEGIN');
   });
 
   it('formatApplyResult renders a CA resolve failure loudly', () => {
-    const text = formatApplyResult(resultWith({ ca: { resolve: { status: 'failed', reason: 'no age recipient' }, registryLeg: { status: 'skipped', reason: 'no cert resolved' }, repoLegs: {} } }));
+    const text = formatApplyResult(resultWith({ ca: { resolve: { status: 'failed', reason: 'no age recipient' }, registryLeg: { status: 'skipped', reason: 'no cert resolved' } } }));
     expect(text).toMatch(/CA: FAILED to resolve — no age recipient/);
     expect(text).toMatch(/registry leg: SKIPPED — no cert resolved/);
   });
@@ -5060,17 +5063,18 @@ describe('formatApplyResult / fleetApplyResultToJson / applyExitCode (pure)', ()
       ca: {
         resolve: { status: 'minted', certFingerprint: 'cd'.repeat(32) },
         registryLeg: { status: 'created' },
-        repoLegs: { 'groundnuty/x': { status: 'created' } },
       },
       routing: { 'groundnuty/x': { status: 'created' } },
     });
     const json = JSON.parse(JSON.stringify(fleetApplyResultToJson(result))) as {
-      ca: { resolve: { status: string; cert_fingerprint?: string; certFingerprint?: string }; registry_leg: { status: string }; repo_legs: Record<string, { status: string }> };
+      ca: { resolve: { status: string; cert_fingerprint?: string; certFingerprint?: string }; registry_leg: { status: string } };
       routing: Record<string, { status: string }>;
     };
     expect(json.ca.resolve.status).toBe('minted');
     expect(json.ca.registry_leg.status).toBe('created');
-    expect(json.ca.repo_legs['groundnuty/x']?.status).toBe('created');
+    // groundnuty/macf#800 — `repo_legs` is GONE (FLEET_APPLY_JSON_SCHEMA_VERSION
+    // bumped 3 -> 4 for this removal; see that constant's own doc).
+    expect(json.ca).not.toHaveProperty('repo_legs');
     expect(json.routing['groundnuty/x']?.status).toBe('created');
     const raw = JSON.stringify(json);
     expect(raw).not.toContain('-----BEGIN');

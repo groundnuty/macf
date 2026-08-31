@@ -121,6 +121,13 @@ describe('computePlan — all-missing manifest (fresh fleet) → all creates', (
       // `plan-item-write-always.test.ts` for the dedicated coverage proof.
       if (item.kind === 'labels') {
         expect(item.verb).toBe('write-always');
+      } else if (item.kind === 'ca' && item.target.startsWith('ca:repo:')) {
+        // groundnuty/macf#800 — apply no longer writes a per-repo CA copy
+        // at all, so an unconfirmed-presence repo item is `'noop'`, never
+        // `'create'` (there is nothing left for apply to create there). See
+        // the dedicated "per-repo CA" describe block below for the full
+        // presence/verb table.
+        expect(item.verb).toBe('noop');
       } else {
         expect(item.verb).toBe('create');
       }
@@ -141,8 +148,17 @@ describe('computePlan — all-missing manifest (fresh fleet) → all creates', (
       'ca:repo:groundnuty/icsoc-2026-science-agent:ICSOC_2026_CA_CERT',
       'ca:repo:groundnuty/icsoc-2026-experiment:ICSOC_2026_CA_CERT',
     ]);
+    // The registry leg is still a genuine create-candidate (unconfirmed
+    // presence, low confidence) — apply DOES write there. The per-repo legs
+    // are `'noop'` now (groundnuty/macf#800 — apply has no per-repo CA write
+    // left to attempt, so an unconfirmed-presence repo item can never claim
+    // `'create'`; see the dedicated "per-repo CA" describe block below for
+    // the full presence/verb table, including the `'present'` -> `'orphan'`
+    // case this fixture's `EMPTY_OBSERVED.caRepos: {}` doesn't reach).
+    expect(caItems[0]?.verb).toBe('create');
+    expect(caItems[1]?.verb).toBe('noop');
+    expect(caItems[2]?.verb).toBe('noop');
     for (const item of caItems) {
-      expect(item.verb).toBe('create');
       // CA items are `variable` reads (a registry/repo var fetch, not the
       // identity plane) — the reason must come from UNKNOWN_REASONS.variable,
       // never UNKNOWN_REASONS.identity's JWT framing (macf#842 review: naming
@@ -174,15 +190,15 @@ describe('computePlan — all-missing manifest (fresh fleet) → all creates', (
   });
 });
 
-describe('computePlan — per-repo CA drift (macf#806 reproduction, macf#839 review [BLOCKING] 3)', () => {
-  it('registry + repo-A present, repo-B absent → noop for registry + repo-A, create for repo-B', () => {
+describe('computePlan — per-repo CA copies are superseded, not drift (groundnuty/macf#800, superseding the macf#806/#839-review-[BLOCKING]-3 per-repo-CREATE reproduction this block used to cover)', () => {
+  it('registry present, repo-A present, repo-B absent → registry noop, repo-A ORPHAN, repo-B noop (never create — apply has no per-repo CA write left to attempt)', () => {
     const manifest = baseManifest(); // agents: science-agent (repo A), code-agent (repo B)
     const observed: ObservedState = {
       ...EMPTY_OBSERVED,
       caRegistry: 'present',
       caRepos: {
-        'groundnuty/icsoc-2026-science-agent': 'present', // repo-A
-        'groundnuty/icsoc-2026-experiment': 'absent', // repo-B
+        'groundnuty/icsoc-2026-science-agent': 'present', // repo-A — a copy from before macf#800
+        'groundnuty/icsoc-2026-experiment': 'absent', // repo-B — never had one
       },
     };
 
@@ -195,16 +211,50 @@ describe('computePlan — per-repo CA drift (macf#806 reproduction, macf#839 rev
       }),
       expect.objectContaining({
         target: 'ca:repo:groundnuty/icsoc-2026-science-agent:ICSOC_2026_CA_CERT',
-        verb: 'noop',
+        verb: 'orphan',
       }),
       expect.objectContaining({
         target: 'ca:repo:groundnuty/icsoc-2026-experiment:ICSOC_2026_CA_CERT',
-        verb: 'create',
+        verb: 'noop',
       }),
     ]);
-    // A single fleet-level representative-repo read (the pre-macf#839 shape)
-    // would have collapsed this to a uniform noop/create — this per-repo
-    // split is exactly what lets the plan reproduce the #806 drift class.
+    // Pre-macf#800, this exact fixture reproduced the #806 drift class (a
+    // present/absent split across repos, each independently create-or-noop).
+    // Post-#800 there is no drift to reproduce — apply writes ONE place —
+    // but the SAME per-repo observation is what lets `plan` tell "repo-A
+    // has a stale pre-#800 copy" apart from "repo-B never had one," which a
+    // single fleet-level representative-repo read could not distinguish.
+  });
+
+  it('DECISIVE — the reason text names the fleet-scope write + the fallback var, and the orphan-render block picks it up (science\'s #1282 "an orphan is not complete until it is RENDERED" ruling)', () => {
+    const manifest = baseManifest();
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      caRegistry: 'present',
+      caRepos: { 'groundnuty/icsoc-2026-science-agent': 'present', 'groundnuty/icsoc-2026-experiment': 'absent' },
+    };
+    const plan = computePlan(manifest, observed);
+    const orphanItem = itemFor(plan.items, 'ca', 'ca:repo:groundnuty/icsoc-2026-science-agent:ICSOC_2026_CA_CERT');
+    expect(orphanItem?.verb).toBe('orphan');
+    expect(orphanItem?.reason).toMatch(/registry scope/);
+    expect(orphanItem?.reason).toMatch(/PROJECT_CA_CERT_REPO_VAR_FALLBACK/);
+    expect(orphanItem?.reason).toMatch(/NOTHING WAS DELETED/);
+    expect(orphanItem?.confirm_required).toBe(false);
+    // The generic orphan-render machinery (row-4's own surface, reused
+    // verbatim — no second orphan surface) picks this row up automatically.
+    expect(plan.items.filter((i) => i.verb === 'orphan')).toHaveLength(1);
+    const lines = formatOrphanLines(plan.items);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('ca:repo:groundnuty/icsoc-2026-science-agent:ICSOC_2026_CA_CERT');
+    const text = formatPlanText(plan);
+    expect(text).toMatch(/⚠ 1 resource\(s\) below are ORPHAN/);
+    expect(text).toMatch(/no longer declared or superseded by a newer write path/);
+  });
+
+  it('a repo with NO pre-existing copy (never present) produces ZERO orphan noise', () => {
+    const manifest = baseManifest();
+    const plan = computePlan(manifest, EMPTY_OBSERVED); // caRepos: {} — every repo unconfirmed, never 'present'
+    expect(plan.items.filter((i) => i.kind === 'ca' && i.verb === 'orphan')).toEqual([]);
   });
 });
 
@@ -257,7 +307,7 @@ describe('computePlan — trust.federated_cas registry item (groundnuty/macf#810
 });
 
 describe('computePlan — all-match observed state → all noops', () => {
-  it('every per-agent resource + CA (registry + per-repo) + routing is noop when fully observed-matching', () => {
+  it('every per-agent resource + CA registry + routing is noop when fully observed-matching (per-repo CA is ORPHAN, not noop — groundnuty/macf#800, a present per-repo copy is always superseded now)', () => {
     const manifest = baseManifest({
       routing: { runner: { runs_on: 'self-hosted', warm: 1 } },
     });
@@ -330,11 +380,20 @@ describe('computePlan — all-match observed state → all noops', () => {
         expect(item.verb).toBe('write-always');
       } else if (item.kind === 'runner_ops' || item.kind === 'router_app' || item.kind === 'ts_oauth') {
         expect(item.verb).toBe('create');
+      } else if (item.kind === 'ca' && item.target.startsWith('ca:repo:')) {
+        // groundnuty/macf#800 — a `'present'` per-repo copy is a superseded
+        // write target, ALWAYS, regardless of how much else in this fixture
+        // matches. `caRegistryItem` (the OTHER 'ca'-kind item) still reaches
+        // `noop` normally and falls into the generic branch below.
+        expect(item.verb).toBe('orphan');
       } else {
         expect(item.verb).toBe('noop');
       }
       expect(item.confirm_required).toBe(false);
     }
+    // Decisive count — 2 orphans (one per agent repo), matching
+    // `PlanSummary.orphans` (`summarizePlan`'s own dedicated coverage).
+    expect(plan.items.filter((i) => i.verb === 'orphan')).toHaveLength(2);
   });
 });
 
@@ -1497,20 +1556,29 @@ describe('summarizePlan', () => {
     const observed: ObservedState = { ...EMPTY_OBSERVED, routingTrustedActors: 'github-hosted' };
     const plan = computePlan(manifest, observed);
     const summary = summarizePlan(plan.items);
-    // 8 per-agent creates (app/repo/install/secret_fingerprint × 2) + 3 CA
-    // creates (registry + 2 agent repos) + 2 routing_client creates + 1
-    // runner_ops create (groundnuty/macf#943) + 1 router_app create
-    // (groundnuty/macf#1105, UNCONDITIONAL) + 1 ts_oauth create
-    // (groundnuty/macf#1109, UNCONDITIONAL) = 16 creates. + 1 routing
-    // update. `labels` (× 2 agents) + `runner_warm` (macf#942) + `runner_platform`
+    // 8 per-agent creates (app/repo/install/secret_fingerprint × 2) + 1 CA
+    // registry create + 2 routing_client creates + 1 runner_ops create
+    // (groundnuty/macf#943) + 1 router_app create (groundnuty/macf#1105,
+    // UNCONDITIONAL) + 1 ts_oauth create (groundnuty/macf#1109,
+    // UNCONDITIONAL) = 14 creates. + 1 routing update. The 2 per-repo CA
+    // items are `'noop'` now, NOT `'create'` (groundnuty/macf#800 — apply
+    // has no per-repo CA write left to attempt, so an unconfirmed-presence
+    // repo item can never claim `'create'`; this fixture's `caRepos: {}`
+    // never reaches the `'present'` -> `'orphan'` case either). `labels`
+    // (× 2 agents) + `runner_warm` (macf#942) + `runner_platform`
     // (groundnuty/macf#1211 — runs_on is self-hosted here) are
     // `'write-always'`, NOT `'create'` (groundnuty/macf#926 — see
     // `plan-item-write-always.test.ts`), so they count separately: 4.
-    // `deletes`/`orphans` (groundnuty/macf#1229, DR-043 Amendment P3 row 4)
-    // are 0 here — this fixture declares no `fleet.lock` at all
-    // (`EMPTY_OBSERVED.lock` is `null`), so row 4 never fires (the whole
-    // safety property: not-in-the-lock stays untouched).
-    expect(summary).toEqual({ creates: 16, updates: 1, noops: 0, extras: 0, writeAlways: 4, deletes: 0, orphans: 0 });
+    // `deletes` (groundnuty/macf#1229, DR-043 Amendment P3 row 4) is 0 here
+    // — this fixture declares no `fleet.lock` at all (`EMPTY_OBSERVED.lock`
+    // is `null`), so row 4 never fires (the whole safety property:
+    // not-in-the-lock stays untouched). `orphans` is ALSO 0, for the
+    // DIFFERENT reason `caRepoItem` (groundnuty/macf#800) applies: this
+    // fixture's `caRepos: {}` never reads `'present'` for a per-repo CA
+    // var, so the `'orphan'` branch is never reached either — 0, not for
+    // row-4's not-in-the-lock reason, but because there is nothing observed
+    // to call superseded.
+    expect(summary).toEqual({ creates: 14, updates: 1, noops: 2, extras: 0, writeAlways: 4, deletes: 0, orphans: 0 });
   });
 });
 

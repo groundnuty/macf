@@ -199,7 +199,12 @@ describe('write-always kinds NEVER reach noop, under ANY fixture (groundnuty/mac
         'code-agent': { app: 'present', install: 'present', repo: 'present', fingerprints: { app_private_key: 'sha256:x' } },
       },
       caRegistry: 'present',
-      caRepos: { [REPO]: 'present' },
+      // groundnuty/macf#800 — 'absent', not 'present': a PRESENT per-repo
+      // CA copy is now a superseded write target (`verb: 'orphan'`), never
+      // `'noop'`. This fixture's "quiet" claim needs the per-repo CA item
+      // to reach `'noop'` too, which only 'absent'/'unknown' presence does
+      // post-#800 (apply never (re-)creates a per-repo copy either way).
+      caRepos: { [REPO]: 'absent' },
       routingClientRepos: { [REPO]: 'present' },
       routingTrustedActors: `${FLEET}-code-agent[bot]`,
       routingRunnerRegistered: 'present',
@@ -232,7 +237,12 @@ describe('write-always kinds NEVER reach noop, under ANY fixture (groundnuty/mac
         'code-agent': { app: 'present', install: 'present', repo: 'present', fingerprints: { app_private_key: 'sha256:x' } },
       },
       caRegistry: 'present',
-      caRepos: { [REPO]: 'present' },
+      // groundnuty/macf#800 — 'absent', not 'present': a PRESENT per-repo
+      // CA copy is now a superseded write target (`verb: 'orphan'`), never
+      // `'noop'`. This fixture's "quiet" claim needs the per-repo CA item
+      // to reach `'noop'` too, which only 'absent'/'unknown' presence does
+      // post-#800 (apply never (re-)creates a per-repo copy either way).
+      caRepos: { [REPO]: 'absent' },
       routingClientRepos: { [REPO]: 'present' },
       routingTrustedActors: `${FLEET}-code-agent[bot]`,
       routingRunnerRegistered: 'present',
@@ -262,7 +272,12 @@ describe('write-always kinds NEVER reach noop, under ANY fixture (groundnuty/mac
         'code-agent': { app: 'present', install: 'present', repo: 'present', fingerprints: { app_private_key: 'sha256:x' } },
       },
       caRegistry: 'present',
-      caRepos: { [REPO]: 'present' },
+      // groundnuty/macf#800 — 'absent', not 'present': a PRESENT per-repo
+      // CA copy is now a superseded write target (`verb: 'orphan'`), never
+      // `'noop'`. This fixture's "quiet" claim needs the per-repo CA item
+      // to reach `'noop'` too, which only 'absent'/'unknown' presence does
+      // post-#800 (apply never (re-)creates a per-repo copy either way).
+      caRepos: { [REPO]: 'absent' },
       routingClientRepos: { [REPO]: 'present' },
       routingTrustedActors: `${FLEET}-code-agent[bot]`,
       routingRunnerRegistered: 'present',
@@ -305,7 +320,10 @@ const PRESENCE_QUIET_OBSERVED: ObservedState = {
     },
   },
   caRegistry: 'present',
-  caRepos: { [REPO]: 'present' },
+  // groundnuty/macf#800 — 'absent', not 'present': see the identical
+  // comment on the other three `PRESENCE_QUIET_OBSERVED`-shaped fixtures
+  // above for why a present per-repo copy would NOT be quiet any more.
+  caRepos: { [REPO]: 'absent' },
   routingClientRepos: { [REPO]: 'present' },
   vaultRouterApp: { status: 'confirmed', present: true },
 };

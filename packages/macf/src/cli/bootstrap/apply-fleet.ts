@@ -276,7 +276,7 @@ import {
   routerAppInstallRepos,
 } from './apply-router-app.js';
 import type { CaApplyDeps, CaApplyOutcome, CaPublishResult, CaResolveOutcome } from './apply-ca.js';
-import { formatCaLegsSummary, publishCaCertLegs, redactCaResolve, resolveCaCert, skippedCaPublish, summarizeCaRepoLegs } from './apply-ca.js';
+import { publishCaCertLegs, redactCaResolve, resolveCaCert, skippedCaPublish } from './apply-ca.js';
 // groundnuty/macf#810 — the fleet-level trust-material publish, same
 // registry scope + create-only shape as the CA cert legs immediately above.
 import type { FederatedTrustPublishResult } from './apply-federated-trust.js';
@@ -630,16 +630,21 @@ export type ControlRepoSyncOutcome =
  * DR-043 Amendment D phase 2 (macf#838) — the CA ceremony's render-safe
  * result. `resolve` is {@link CaApplyOutcome} (`apply-ca.ts::redactCaResolve`'s
  * output — NEVER a raw {@link CaResolveOutcome}, which would carry the
- * private key on a `'minted'` result). `registryLeg`/`repoLegs` are always
- * present (never `undefined`) — a `'skipped'` entry (via
+ * private key on a `'minted'` result). `registryLeg` is always present
+ * (never `undefined`) — a `'skipped'` entry (via
  * `apply-ca.ts::skippedCaPublish`) makes "never attempted this run" as
  * visible as a real failure, mirroring `plan.ts`'s `unimplementedByApply`
  * discipline of never letting a gap render as silence.
+ *
+ * No `repoLegs` (groundnuty/macf#800 dropped the per-repo write —
+ * `apply-ca.ts::publishCaCertLegs` writes the registry scope ONLY now; see
+ * that module's doc for why). Pre-existing per-repo `<SEG>_CA_CERT` copies
+ * are reported by `plan.ts::caRepoItem` as `'orphan'`, never by this
+ * result.
  */
 export interface CaApplyResult {
   readonly resolve: CaApplyOutcome;
   readonly registryLeg: EnsureVariableOutcome;
-  readonly repoLegs: Readonly<Record<string, EnsureVariableOutcome>>;
 }
 
 /**
@@ -1218,7 +1223,6 @@ function abortedFleetApplyResult(manifestPath: string, priorLock: FleetLock | nu
     ca: {
       resolve: { status: 'failed', reason: `${reason} — see controlRepo above.` },
       registryLeg: { status: 'skipped', reason: `${reason} — see controlRepo above.` },
-      repoLegs: {},
     },
     // groundnuty/macf#810 — empty, same reasoning as `ca.repoLegs: {}`
     // immediately above: this helper never received `manifest.trust`, so
@@ -2478,35 +2482,19 @@ export async function applyFleet(
   } else {
     caSkipReason = `CA could not be resolved this run: ${caResolve.reason}`;
   }
-  // groundnuty/macf#1345 — the population is `routerCarryingRepos` (agent
-  // repos PLUS the control repo when it carries the router,
-  // `apply-control-repo-init.ts::deriveRouterCarryingRepos`), NOT
-  // `confirmedRepos` (agent repos only). The routing-secret siblings below
-  // moved to this derivation via macf#1073; this leg had not.
+  // groundnuty/macf#800 — a SINGLE registry-scope write, no `repos`
+  // population any more (`routerCarryingRepos` stays in scope below for the
+  // routing-secret siblings, which genuinely are per-repo; the CA leg no
+  // longer needs it — see `apply-ca.ts`'s module doc for why the per-repo
+  // write was dropped).
   const caPublish: CaPublishResult =
     certToPublish !== undefined
-      ? await publishCaCertLegs(certToPublish, manifest.metadata.name, manifest.owner.registry, routerCarryingRepos, deps.trustDeps)
-      : skippedCaPublish(routerCarryingRepos, caSkipReason ?? 'CA cert unresolved');
+      ? await publishCaCertLegs(certToPublish, manifest.metadata.name, manifest.owner.registry, deps.trustDeps)
+      : skippedCaPublish(caSkipReason ?? 'CA cert unresolved');
   deps.log(
     `CA registry leg: ${caPublish.registryLeg.status}` +
       (caPublish.registryLeg.status === 'failed' || caPublish.registryLeg.status === 'skipped' ? ` — ${caPublish.registryLeg.reason}` : '.'),
   );
-  // groundnuty/macf#1345 — names the population covered (same discipline
-  // #1341 established for routing secrets, generalized here), and never
-  // silently drops a router-carrying repo missing an outcome — iterate
-  // `routerCarryingRepos` itself (the population), not `Object.keys
-  // (caPublish.repoLegs)` (the leg-map), so a repo the enumeration
-  // couldn't resolve renders as `unknown` instead of vanishing from both
-  // the summary line and the per-repo detail below.
-  deps.log(formatCaLegsSummary(summarizeCaRepoLegs(caPublish.repoLegs, routerCarryingRepos)));
-  for (const repo of routerCarryingRepos) {
-    const leg = caPublish.repoLegs[repo];
-    if (leg === undefined) {
-      deps.log(`CA repo leg (${repo}): unknown — no outcome recorded for this repo this run.`);
-      continue;
-    }
-    deps.log(`CA repo leg (${repo}): ${leg.status}` + (leg.status === 'failed' || leg.status === 'skipped' ? ` — ${leg.reason}` : '.'));
-  }
 
   // groundnuty/macf#810 — declared trust.federated_cas publish. Independent
   // of the own-CA ceremony above (no mint/vault/durability ordering — a
@@ -2967,7 +2955,7 @@ export async function applyFleet(
     }
   }
 
-  const ca: CaApplyResult = { resolve: redactCaResolve(caResolve), registryLeg: caPublish.registryLeg, repoLegs: caPublish.repoLegs };
+  const ca: CaApplyResult = { resolve: redactCaResolve(caResolve), registryLeg: caPublish.registryLeg };
   // groundnuty/macf#1074 — `certLegs`/`keyLegs` are now a PROJECTION of the
   // unified six-secret publish result (`routingSecretsPublish`, below),
   // never a second publish call — kept as a field for backward-compat with

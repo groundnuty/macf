@@ -41,7 +41,7 @@ function resultWith(overrides: Partial<FleetApplyResult> = {}): FleetApplyResult
     routerApp: { role: 'router', status: 'reused', appId: '902', installId: '903' },
     vault: { status: 'skipped' },
     identityChanges: [],
-    ca: { resolve: { status: 'reused', certFingerprint: 'deadbeef'.repeat(8) }, registryLeg: { status: 'already-present' }, repoLegs: {} },
+    ca: { resolve: { status: 'reused', certFingerprint: 'deadbeef'.repeat(8) }, registryLeg: { status: 'already-present' } },
     // groundnuty/macf#810 default: empty (no trust.federated_cas declared) — mirrors `bootstrap-apply.test.ts::resultWith`'s own default.
     federatedTrust: {},
     routing: {},

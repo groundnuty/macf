@@ -1662,16 +1662,17 @@ agents:
     // gate 1 + gate 2 complete) and BEFORE the final control-repo sync — the
     // ordering rule that keeps a fresh mint's PUBLIC cert from publishing
     // before its key is durable (see `apply-fleet.ts`'s doc). This manifest
-    // declares no `routing:`, so only the CA legs fire here.
+    // declares no `routing:`, so only the CA registry leg fires here.
     const gate2SciIdxForCa = calls.indexOf('gate2:science-agent');
     const caRegistryCreateIdx = calls.indexOf('ca:createRegistryVariable');
-    const caRepoCreateCodeIdx = calls.indexOf('repoVar:create:groundnuty/demo-code');
-    const caRepoCreateSciIdx = calls.indexOf('repoVar:create:groundnuty/demo-science');
     const finalCommitAndPushIdx = calls.lastIndexOf('control:commitAndPush');
     expect(caRegistryCreateIdx).toBeGreaterThan(gate2SciIdxForCa);
-    expect(caRepoCreateCodeIdx).toBeGreaterThan(gate2SciIdxForCa);
-    expect(caRepoCreateSciIdx).toBeGreaterThan(gate2SciIdxForCa);
     expect(caRegistryCreateIdx).toBeLessThan(finalCommitAndPushIdx);
+    // groundnuty/macf#800 — the CA leg is registry-scope ONLY now; no
+    // `repoVar:create:*` call should ever appear in this trace (that dep is
+    // ONLY exercised by `RoutingApplyDeps`'s MACF_TRUSTED_ACTORS write,
+    // which this manifest's no-`routing:` declaration never reaches either).
+    expect(calls.some((c) => c.startsWith('repoVar:create:'))).toBe(false);
 
     // The full sequence, quoted verbatim in this test file so it's citable
     // directly (see the report requirement to quote ordering from code):
@@ -2802,8 +2803,8 @@ agents:
 
   // --- DR-043 Amendment D phase 2 (macf#838, macf#854's CA/routing gap) ---
 
-  describe('CA ceremony + two-place publish + MACF_TRUSTED_ACTORS (macf#922 — was MACF_ROUTING_RUNS_ON)', () => {
-    it('fresh mint: publishes to the registry + BOTH agent repos AND the control repo (groundnuty/macf#1345 — router-carrying, not agent-repos-only), stages the key for the vault, never a raw key value on any leg outcome', async () => {
+  describe('CA ceremony + single registry-scope publish + MACF_TRUSTED_ACTORS (groundnuty/macf#800, superseding the macf#806/#1345 two-place-per-repo write)', () => {
+    it('fresh mint: publishes ONCE to the registry scope, stages the key for the vault, never a raw key value in the result', async () => {
       const manifestPath = manifestPathIn();
       const manifest = manifestWith([CODE_AGENT, SCI_AGENT]);
       const logs: string[] = [];
@@ -2814,68 +2815,54 @@ agents:
       expect(result.ca.resolve).not.toHaveProperty('certPem');
       expect(result.ca.resolve).not.toHaveProperty('keyPem');
       expect(result.ca.registryLeg).toEqual({ status: 'created' });
-      // groundnuty/macf#1345 — the control repo (which this fixture's
-      // default `NOOP_REPO_INIT`-driven REAL `repoInit()` writes the
-      // router workflow into, allowlisted by default — see
-      // `apply-control-repo-init.ts::controlRepoCarriesRouter`) is now
-      // IN the CA-cert target set, alongside both agent repos. Pre-fix,
-      // this leg published against `confirmedRepos` (agent repos only)
-      // and the control repo was silently never covered.
-      expect(result.ca.repoLegs).toEqual({
-        'groundnuty/demo-code': { status: 'created' },
-        'groundnuty/demo-science': { status: 'created' },
-        'groundnuty/demo-fleet-control': { status: 'created' },
-      });
+      expect(result.ca).not.toHaveProperty('repoLegs');
       expect(JSON.stringify(result)).not.toContain('SENTINEL-CA-KEY-PEM');
-
-      // The operator-facing denominator — same "name the population
-      // covered" discipline #1341 established for routing secrets,
-      // generalized here (groundnuty/macf#1345): 3 router-carrying repos
-      // (2 agent + 1 control), all created, zero unknown.
-      expect(logs).toContain('CA cert legs: 3 created, 0 already-present of 3 router-carrying repo(s).');
+      expect(logs).toContain('CA registry leg: created.');
     });
 
-    it('DECISIVE PAIR (2/2) — control-repo init did NOT succeed this run -> the control repo is EXCLUDED from the CA-cert target set, and the denominator report says so (groundnuty/macf#1345)', async () => {
+    // --- DECISIVE PAIR (groundnuty/macf#800) — reachable from the REAL
+    // apply path (`applyFleet`, `bootstrap-apply.ts`'s command entrypoint),
+    // not just the `apply-ca.ts` unit level. Test 1 alone ("registry leg
+    // created") is satisfied by the OLD two-place code too; the pair's
+    // second half is the discriminator. See `assert-the-wrong-path.md`.
+
+    it('DECISIVE 1/2 — a fresh apply, with a non-empty router-carrying-repo population, writes the CA cert to the registry scope', async () => {
+      const manifestPath = manifestPathIn();
+      // Two agent repos AND a control repo (router-carrying) all exist in
+      // this run's population — if the CA leg still looped over repos, this
+      // fixture would exercise it.
+      const manifest = manifestWith([CODE_AGENT, SCI_AGENT]);
+      const deps: FleetApplyDeps = baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath);
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+      expect(result.ca.registryLeg).toEqual({ status: 'created' });
+    });
+
+    it('DECISIVE 2/2 — the SAME run never calls createRepoVariable for the CA leg, even though 3 router-carrying repos are in scope (2 agents + the control repo)', async () => {
       const manifestPath = manifestPathIn();
       const manifest = manifestWith([CODE_AGENT, SCI_AGENT]);
-      const logs: string[] = [];
-      // A `repoInit` that throws -> `applyControlRepoInit` returns
-      // `status: 'failed'` -> `controlRepoCarriesRouter` is false (the gate
-      // `deriveRouterCarryingRepos` already encodes) -> the control repo
-      // must NOT appear anywhere in the CA-cert population or its legs.
-      const failingRepoInit: RepoInitStepDeps = {
-        cloneRepo: async () => {},
-        commitAndPush: async () => 'pushed',
-        repoInit: async () => {
-          throw new Error('simulated control-repo-init failure (groundnuty/macf#1345 decisive pair 2/2)');
-        },
-      };
+      const repoVariableWrites: [string, string][] = [];
       const deps: FleetApplyDeps = {
-        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath, failingRepoInit),
-        log: (l) => logs.push(l),
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        trustDeps: trustDepsFor({
+          createRepoVariable: async (repo, name) => {
+            repoVariableWrites.push([repo, name]);
+            return 'created';
+          },
+        }),
       };
       const result = await applyFleet(manifest, manifestPath, null, deps);
-
-      expect(result.ca.resolve.status).toBe('minted');
-      // Only the two agent repos — the control repo (repo-init failed) is
-      // excluded, not merely omitted-and-unmentioned.
-      expect(result.ca.repoLegs).toEqual({
-        'groundnuty/demo-code': { status: 'created' },
-        'groundnuty/demo-science': { status: 'created' },
-      });
-      expect(result.ca.repoLegs).not.toHaveProperty('groundnuty/demo-fleet-control');
-
-      // The denominator report reflects the SMALLER population — 2, not 3
-      // — and zero unknown (the exclusion is a deliberate gate, not an
-      // enumeration failure).
-      expect(logs).toContain('CA cert legs: 2 created, 0 already-present of 2 router-carrying repo(s).');
-      // And the control-repo-init failure itself is reported (pre-existing
-      // behavior — this pair adds the CA-leg consequence, not the failure
-      // report itself).
-      expect(logs.some((l) => l.includes('Control repo "groundnuty/demo-fleet-control" repo-init: FAILED'))).toBe(true);
+      // `routing.runner` is NOT declared on this manifest (`manifestWith`'s
+      // default), so `RoutingApplyDeps`'s OWN per-repo write (a genuinely
+      // different concern sharing this same `createRepoVariable` dep field)
+      // never fires either — this spy is unambiguously attributable to the
+      // CA leg alone. Restoring `apply-ca.ts`'s old `for (const repo of
+      // repos) { … deps.createRepoVariable(...) }` loop is exactly what
+      // would make this assertion fail.
+      expect(repoVariableWrites).toEqual([]);
+      expect(result.ca.registryLeg).toEqual({ status: 'created' });
     });
 
-    it('reuse: fleet.lock already records ca_key AND registry reports present -> REUSES (never re-mints), backfills a repo leg the registry has but a repo is missing (#806 drift), and the vault stays skipped (no NEW agent OR CA secret this run)', async () => {
+    it('reuse: fleet.lock already records ca_key AND registry reports present -> REUSES (never re-mints), and the vault stays skipped (no NEW agent OR CA secret this run)', async () => {
       const manifestPath = manifestPathIn();
       const manifest = manifestWith([CODE_AGENT, SCI_AGENT]);
       const priorLock: FleetLock = {
@@ -2910,9 +2897,6 @@ agents:
         trustDeps: trustDepsFor({
           checkRegistryPresence: async () => 'present',
           readRegistryVariable: async () => 'EXISTING-CA-CERT-PEM',
-          // One repo leg reports the #806 drift class — present on the
-          // registry, absent on THIS one repo.
-          checkRepoPresence: async (repo) => (repo === 'groundnuty/demo-code' ? 'present' : 'absent'),
           mintCa: async () => {
             mintCalled = true;
             throw new Error('must not be called — a CA already exists');
@@ -2924,8 +2908,7 @@ agents:
       expect(result.agents.map((a) => a.identity.status)).toEqual(['reused', 'reused']);
       expect(mintCalled).toBe(false);
       expect(result.ca.resolve.status).toBe('reused');
-      expect(result.ca.repoLegs['groundnuty/demo-code']).toEqual({ status: 'already-present' });
-      expect(result.ca.repoLegs['groundnuty/demo-science']).toEqual({ status: 'created' }); // backfilled
+      expect(result.ca.registryLeg).toEqual({ status: 'already-present' });
       expect(result.vault.status).toBe('skipped'); // no NEW agent OR CA secret to persist on a reuse
     });
 
@@ -3043,7 +3026,6 @@ agents:
       // were never reached.
       expect(result.ca.resolve.status).toBe('restored');
       expect(result.ca.registryLeg).toEqual({ status: 'created' });
-      expect(result.ca.repoLegs['groundnuty/demo-code']).toEqual({ status: 'created' });
       expect(registryWrites).toEqual(['VAULT-RESTORED-CA-CERT-PEM']);
       expect(result.agents[0]?.identity.status).toBe('reused');
       expect(result.runnerOps.status).toBe('reused');
@@ -3205,7 +3187,7 @@ agents:
       expect(result.ca.resolve.reason).toMatch(/age_recipients is empty/);
     });
 
-    it('a fresh mint whose vault write FAILS -> NOTHING is published — every leg reads skipped, the CA key never appears in the registry or any repo', async () => {
+    it('a fresh mint whose vault write FAILS -> NOTHING is published — the registry leg reads skipped, the CA key never appears in the registry', async () => {
       const manifestPath = manifestPathIn();
       const manifest = manifestWith([CODE_AGENT]);
       let createRegistryCalled = false;
@@ -3226,7 +3208,6 @@ agents:
       expect(createRegistryCalled).toBe(false); // publish never attempted
       expect(result.ca.registryLeg.status).toBe('skipped');
       expect(result.ca.registryLeg).toMatchObject({ reason: expect.stringContaining('vault write did not succeed') });
-      expect(result.ca.repoLegs['groundnuty/demo-code']).toEqual({ status: 'skipped', reason: expect.any(String) });
     });
 
     it('create-only: a live presence check reporting "already exists" on a create attempt (absent-then-race) is FAILED, never silently accepted', async () => {
@@ -3262,8 +3243,6 @@ agents:
         ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
         trustDeps: trustDepsFor({
           createRepoVariable: async (_repo, name) => {
-            // Only the CA leg should ever call this — routing must never
-            // fire when `routing.runner` isn't declared.
             expect(name).not.toBe('MACF_TRUSTED_ACTORS');
             createRepoVarCalled += 1;
             return 'created';
@@ -3273,7 +3252,13 @@ agents:
       const result = await applyFleet(manifest, manifestPath, null, deps);
 
       expect(result.routing).toEqual({});
-      expect(createRepoVarCalled).toBeGreaterThan(0); // the CA leg DID fire — proves the fake wasn't just unreachable
+      // groundnuty/macf#800 — the CA leg no longer calls `createRepoVariable`
+      // at all (registry-scope-only publish now), so this fake is UNREACHED
+      // here by construction, not merely by the routing gate. The sibling
+      // "already present" / "created" tests below exercise this SAME fake
+      // via a genuinely self-hosted-declared manifest, proving it isn't
+      // dead code.
+      expect(createRepoVarCalled).toBe(0);
     });
 
     // macf#922 — a declared runs_on other than "self-hosted" needs no write
@@ -3295,7 +3280,9 @@ agents:
       const result = await applyFleet(manifest, manifestPath, null, deps);
 
       expect(result.routing).toEqual({});
-      expect(createRepoVarCalled).toBeGreaterThan(0); // the CA leg DID fire
+      // groundnuty/macf#800 — same reasoning as the sibling test above: the
+      // CA leg is registry-scope-only now, so nothing reaches this fake.
+      expect(createRepoVarCalled).toBe(0);
     });
 
     it('routing: a repo where the var is ALREADY PRESENT is left untouched (create-only)', async () => {
@@ -4100,7 +4087,7 @@ agents:
       });
     });
 
-    it('CA + routing legs are skipped for an agent whose repo-ensure FAILED this run — nothing is written to a repo that does not exist', async () => {
+    it('routing legs are skipped for an agent whose repo-ensure FAILED this run — nothing is written to a repo that does not exist (CA is unaffected — groundnuty/macf#800, it no longer has a per-repo leg to skip)', async () => {
       const manifestPath = manifestPathIn();
       const manifest: FleetManifest = { ...manifestWith([CODE_AGENT, SCI_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
       const agentRepoDeps: AgentRepoDeps = {
@@ -4115,11 +4102,12 @@ agents:
       const result = await applyFleet(manifest, manifestPath, null, deps);
 
       expect(result.agents.find((a) => a.role === 'code-agent')?.identity.status).toBe('failed');
-      expect(result.ca.repoLegs['groundnuty/demo-code']).toBeUndefined();
       expect(result.routing['groundnuty/demo-code']).toBeUndefined();
-      // science-agent's repo WAS ensured — its legs still ran.
-      expect(result.ca.repoLegs['groundnuty/demo-science']).toEqual({ status: 'created' });
+      // science-agent's repo WAS ensured — its routing leg still ran.
       expect(result.routing['groundnuty/demo-science']).toEqual({ status: 'created' });
+      // The CA registry leg is a single fleet-scope write, unaffected by
+      // which agent repos did or didn't get ensured this run.
+      expect(result.ca.registryLeg).toEqual({ status: 'created' });
     });
 
     // --- macf#929 — the runner-token gate itself, wired end-to-end through applyFleet ---

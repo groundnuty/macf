@@ -230,7 +230,16 @@ describe('runBootstrapPlan — fleet.lock live-control-repo fallback (groundnuty
     expect(code).toBe(0);
 
     const json = JSON.parse(logSpy.mock.calls.flat().join('')) as PlanJson;
-    expect(json.plan.some((i) => i.target.includes('code-agent') && i.verb === 'orphan')).toBe(false);
+    // Scoped to row 4's OWN orphan producers ('app'/'repo' — a declared
+    // role dropped from the manifest but still in the lock). Deliberately
+    // NOT a blanket "no orphan item touches code-agent at all": this
+    // file's `installGhRouter` fallback answers EVERY unmatched `gh` call
+    // with a generic 200 (`installGhRouter`'s own doc), which also makes
+    // `code-agent`'s per-repo CA-var read look 'present' — a genuinely
+    // DIFFERENT, EXPECTED orphan class (groundnuty/macf#800's superseded-
+    // write-target signal, `plan.ts::caRepoItem`), unrelated to this test's
+    // row-4 claim and not a regression of it.
+    expect(json.plan.some((i) => (i.kind === 'app' || i.kind === 'repo') && i.target.includes('code-agent') && i.verb === 'orphan')).toBe(false);
     expect(json.plan.some((i) => i.kind === 'agent' && i.target === 'agent:code-agent')).toBe(false);
     expect(json.fleet_lock_source).toBe('control-repo');
 

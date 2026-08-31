@@ -2021,15 +2021,67 @@ function federatedCaItem(project: string, presence: Presence): PlanItem {
  * The per-agent-repo CA plan item — the other DR two-place-rule leg
  * (macf#806). One of these per agent repo is what lets the plan reproduce
  * the #806 drift class: registry + repo-A present, repo-B absent.
+ * The per-agent-repo CA plan item — reports on a SUPERSEDED write target,
+ * not a live one (groundnuty/macf#800, superseding the macf#806 two-place
+ * design this function originally reproduced the drift class for).
+ * `apply-ca.ts::publishCaCertLegs` writes the CA cert ONCE now, at the
+ * fleet's registry scope — it never (re-)creates a per-repo `<SEG>_CA_CERT`
+ * copy, so a `'present'` one here is never a `'create'` candidate: apply has
+ * no per-repo CA write left to attempt, and claiming "it's absent, go create
+ * it" would misstate what apply will do (the exact `unimplementedByApply`
+ * discipline this module already applies elsewhere — see
+ * `planItemApplyCoverage`'s doc).
+ *
+ * A `'present'` per-repo copy is an ORPHAN of the retired write path —
+ * reuses the SAME `verb: 'orphan'` + `formatOrphanLines`/`PlanSummary.orphans`
+ * machinery the row-4 App/repo orphans below already establish (never a
+ * second orphan-rendering surface — science's #1282 ruling: "an orphan is
+ * not complete until it is RENDERED"). Deliberately `'orphan'`, NOT
+ * `'delete'` (science's ruling on macf#800, 2026-08-31):
+ * `PROJECT_CA_CERT_REPO_VAR_FALLBACK` exists precisely so a caller still
+ * pinned to an actions-pin version that reads the per-repo copy keeps
+ * working — deleting it today would silently break routing for exactly
+ * that caller, the SAME undetected-breakage shape macf#800 itself reports.
+ * High revival cost (a caller loses its cert) puts this in Amendment P3's
+ * expensive-to-revive column despite being "just a variable" — never
+ * actioned by apply, under any flag, an instruction to the operator only.
+ *
+ * **The condition under which this becomes a safe `'delete'` instead:**
+ * every caller in the fleet is verified reading the fleet (registry) scope
+ * — i.e. no repo's installed `agent-router.yml` pin still resolves via
+ * `PROJECT_CA_CERT_REPO_VAR_FALLBACK`. That is a live, checkable fact (the
+ * pins are enumerable via `observer.ts`'s `actionsPin` read) — NOT recorded
+ * here today (this function takes no such input) — so the row stays
+ * `'orphan'` until a future increment adds that check and can safely
+ * reclassify it.
  */
 function caRepoItem(seg: string, repo: string, presence: Presence): PlanItem {
   const varName = `${seg}_CA_CERT`;
-  const { verb, reasonSuffix } = presenceVerb(presence, UNKNOWN_REASONS.variable);
+  const target = `ca:repo:${repo}:${varName}`;
+  if (presence === 'present') {
+    return {
+      kind: 'ca',
+      target,
+      verb: 'orphan',
+      reason:
+        `per-repo CA var "${varName}" on "${repo}" is present, but it is now written ONCE at the fleet's registry ` +
+        'scope — this per-repo copy is superseded and no longer read by callers on the newer actions version. ' +
+        'NOTHING WAS DELETED — apply never auto-removes it, under any flag: a caller still pinned to an ' +
+        'actions-pin version that reads `PROJECT_CA_CERT_REPO_VAR_FALLBACK` would lose its cert the moment this ' +
+        'copy goes away, so removing it is unsafe until every caller in the fleet is verified reading the fleet ' +
+        '(registry) scope — at that point this becomes a safe delete, not an orphan. Remove it by hand once you ' +
+        'have made that check.',
+      confirm_required: false,
+    };
+  }
+  const reasonSuffix = presence === 'absent' ? 'is absent' : `${UNKNOWN_REASONS.variable}`;
   return {
     kind: 'ca',
-    target: `ca:repo:${repo}:${varName}`,
-    verb,
-    reason: `per-repo CA var "${varName}" on "${repo}" ${reasonSuffix}`,
+    target,
+    verb: 'noop',
+    reason:
+      `per-repo CA var "${varName}" on "${repo}" ${reasonSuffix} — apply no longer writes a per-repo copy here ` +
+      '(registry-scope-only publish), so there is nothing to create regardless.',
     confirm_required: false,
   };
 }
@@ -3553,13 +3605,22 @@ export function formatPlanText(plan: FleetPlan): string {
   // restates it in a loud, impossible-to-miss form, the same "table row PLUS
   // a dedicated loud block" shape `unimplementedLines` immediately above
   // already establishes for its own verb.
+  //
+  // groundnuty/macf#800 widened the header wording ("no longer declared OR
+  // superseded") — the ORIGINAL producers of this verb (`app`/`repo` row 4)
+  // are all "the whole ROLE is undeclared"; `caRepoItem`'s new orphan
+  // producer is a DIFFERENT shape — the agent is still declared, only the
+  // WRITE TARGET moved (registry scope, not per-repo). The old "no longer
+  // declared" wording would be a false claim on that row; each per-item
+  // REASON already carries the precise story, this header just needs to
+  // stop overclaiming for the reader who only skims the loud line.
   const orphanLines = formatOrphanLines(plan.items);
   if (orphanLines.length > 0) {
     parts.push(
       '',
-      `⚠ ${String(orphanLines.length)} resource(s) below are ORPHAN — created by this tool, no longer declared, ` +
-        'and NEVER deleted by apply, under any flag. NOTHING IS DELETED for these; each line names how to ' +
-        'remove it yourself, by hand, if it should go away:',
+      `⚠ ${String(orphanLines.length)} resource(s) below are ORPHAN — created by this tool, no longer declared ` +
+        'or superseded by a newer write path, and NEVER deleted by apply, under any flag. NOTHING IS DELETED ' +
+        'for these; each line names how to remove it yourself, by hand, if it should go away:',
       ...orphanLines,
     );
   }
