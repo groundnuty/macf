@@ -1912,6 +1912,9 @@ describe('repoInit integration', () => {
     await repoInit(dir, {
       repo: 'owner/test-repo',
       actionsVersion: 'v3.3.0',
+      // groundnuty/macf#1373 made an UNSET registryType derive from the owner's
+      // live account type, so this must be explicit to reach the `repo` branch.
+      registryType: 'repo',
       registryOwner: 'shared-org',
       registryRepo: 'shared-control',
       force: false,
@@ -1928,6 +1931,7 @@ describe('repoInit integration', () => {
     await expect(repoInit(dir, {
       repo: 'owner/test-repo',
       actionsVersion: 'v3.3.0',
+      registryType: 'repo',
       registryOwner: 'shared-org',
       force: false,
     })).rejects.toThrow('registryOwner and registryRepo must be supplied together');
