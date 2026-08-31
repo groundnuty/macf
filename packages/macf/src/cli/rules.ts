@@ -99,6 +99,40 @@ export function copyCanonicalRules(workspaceDir: string, options: {
 }
 
 /**
+ * The set of rule basenames `copyCanonicalRules` WOULD write to
+ * `<workspace>/.claude/rules/` right now — enumeration only, no workspace
+ * involved. Mirrors `copyCanonicalRules`'s own filter (`.md` files in the
+ * canonical rules dir) exactly, so the two can never drift apart — same
+ * discipline as `listDistributedScriptNames` for `.claude/scripts/`.
+ *
+ * Used by `macf doctor`'s distributed-rule-currency check (groundnuty/macf#1360
+ * "consider whether the same gap applies to rules, not just scripts" — the
+ * auditor's own stale workspace had BOTH a nineteen-day-stale
+ * `check-gh-token.sh` AND rule files that had drifted behind canonical, and
+ * only the script half had a doctor check).
+ *
+ * Deliberately does NOT include per-agent identity files
+ * (`agent-identity.md`, `gh-token-refresh.md`, project-tier rules under
+ * `.claude/rules/project/`) — those are not part of `canonicalRulesDir()`'s
+ * flat `.md` listing, so they fall outside `copyCanonicalRules`'s own
+ * filter and outside this population too. A workspace carrying extra
+ * files beyond this list is not itself a currency defect.
+ */
+export function listDistributedRuleNames(options: {
+  readonly canonicalDir?: string;
+} = {}): readonly string[] {
+  const sourceDir = options.canonicalDir ?? canonicalRulesDir();
+  if (!existsSync(sourceDir)) return [];
+
+  const names: string[] = [];
+  for (const entry of readdirSync(sourceDir, { withFileTypes: true })) {
+    if (!entry.isFile() || !entry.name.endsWith('.md')) continue;
+    names.push(entry.name);
+  }
+  return names.sort();
+}
+
+/**
  * Apply the same header-prepend logic `copyCanonicalRules` uses (avoid
  * double-prepending on re-copy) to a canonical rule file's raw content. Pure
  * — exported (DR-040 Decision 3 / macf#698 R1) so `computeCanonicalRuleFile`
