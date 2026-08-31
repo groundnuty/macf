@@ -16,8 +16,12 @@ import {
   classifyTokenType,
   extractSubjectCNFromNodeCert,
   readAgentCertInfo,
+  readPeersFromRegistry,
+  resolveRegistryConfigForPeers,
+  resolvePeersReport,
 } from '../../src/cli/commands/whoami.js';
 import type { MacfAgentConfig } from '../../src/cli/config.js';
+import type { AgentInfo, Registry } from '@groundnuty/macf-core';
 
 function baseConfig(overrides: Partial<MacfAgentConfig> = {}): MacfAgentConfig {
   return {
@@ -272,6 +276,170 @@ describe('classifyTokenType (macf#672 — kept as a sub-section, mirrors macf-wh
   it('classifies an unrecognized prefix as unknown-prefix', () => {
     const r = classifyTokenType('xyz_whatever');
     expect(r.kind).toBe('unknown-prefix');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Peers (macf#672, science-agent's 2026-08-31 correction of the earlier
+// over-broad refusal). `readPeersFromRegistry` is deliberately isolated
+// from scope resolution + token minting so it's testable with a fake
+// `{ list }` — no network mocking, same convention as this file's existing
+// bot_login-untested-here policy (see file-top docblock).
+// ---------------------------------------------------------------------------
+
+function fakeAgentInfo(overrides: Partial<AgentInfo> = {}): AgentInfo {
+  return {
+    host: '10.0.0.5',
+    port: 8443,
+    type: 'permanent',
+    instance_id: 'inst-1',
+    started: '2026-08-31T00:00:00.000Z',
+    ...overrides,
+  };
+}
+
+describe('readPeersFromRegistry — decisive pair (macf#672)', () => {
+  it('(1) a registry with <PROJECT>_AGENT_* entries lists exactly those peers, from the registry', async () => {
+    const fakeRegistry: Pick<Registry, 'list'> = {
+      list: async () => [
+        {
+          name: 'science-agent',
+          info: fakeAgentInfo({ host: '10.0.0.5', port: 8443, type: 'permanent', started: '2026-08-31T00:00:00.000Z' }),
+        },
+        {
+          name: 'writing-agent',
+          info: fakeAgentInfo({ host: '10.0.0.6', port: 8444, type: 'worker', started: '2026-08-31T01:00:00.000Z' }),
+        },
+      ],
+    };
+
+    const result = await readPeersFromRegistry(fakeRegistry);
+
+    expect(result.kind).toBe('found');
+    expect(result.peers).toEqual([
+      { name: 'science-agent', host: '10.0.0.5', port: 8443, type: 'permanent', started: '2026-08-31T00:00:00.000Z' },
+      { name: 'writing-agent', host: '10.0.0.6', port: 8444, type: 'worker', started: '2026-08-31T01:00:00.000Z' },
+    ]);
+  });
+
+  it('(2) a registry readable but EMPTY reports "none registered" — a RESULT, not an error, and not unknown', async () => {
+    const fakeRegistry: Pick<Registry, 'list'> = { list: async () => [] };
+
+    const result = await readPeersFromRegistry(fakeRegistry);
+
+    expect(result.kind).toBe('empty');
+    expect(result.peers).toEqual([]);
+    expect(result.detail).toBe('none registered');
+    // The specific defect this must not have: an empty-but-readable
+    // registry masquerading as "I could not look" (kind 'unreadable').
+    expect(result.kind).not.toBe('unreadable');
+  });
+});
+
+describe('readPeersFromRegistry — the third state (unreadable), distinct from both found and empty (macf#672)', () => {
+  it('a registry that fails to read (network/permission error) reports kind "unreadable", never "empty"', async () => {
+    const fakeRegistry: Pick<Registry, 'list'> = {
+      list: async () => {
+        throw new Error('GitHub API 401: Bad credentials');
+      },
+    };
+
+    const result = await readPeersFromRegistry(fakeRegistry);
+
+    expect(result.kind).toBe('unreadable');
+    expect(result.peers).toEqual([]);
+    expect(result.detail).toContain('401');
+    expect(result.detail).not.toBe('none registered');
+  });
+});
+
+describe('readPeersFromRegistry — mutation guard: empty and unreadable must never collapse (macf#672)', () => {
+  it('MUTATION GUARD: "nobody registered" (empty) and "I could not look" (unreadable) are never the same kind', async () => {
+    const emptyRegistry: Pick<Registry, 'list'> = { list: async () => [] };
+    const brokenRegistry: Pick<Registry, 'list'> = {
+      list: async () => {
+        throw new Error('boom');
+      },
+    };
+
+    const emptyResult = await readPeersFromRegistry(emptyRegistry);
+    const unreadableResult = await readPeersFromRegistry(brokenRegistry);
+
+    // A mutation that makes the empty branch return 'unreadable' (or the
+    // unreadable branch return 'empty') fails THIS assertion — see
+    // whoami.ts's PeersKind doc comment for the invariant this pins.
+    expect(emptyResult.kind).not.toBe(unreadableResult.kind);
+    expect(emptyResult.kind).toBe('empty');
+    expect(unreadableResult.kind).toBe('unreadable');
+  });
+});
+
+describe('resolveRegistryConfigForPeers — reuses the scope buildIdentityReport already resolved (macf#672)', () => {
+  it('config-sourced: reuses config.registry directly — zero re-derivation (same reference)', () => {
+    const config = baseConfig();
+    const identity = buildIdentityReport(config, {});
+
+    const registryConfig = resolveRegistryConfigForPeers(identity, config, {});
+
+    expect(registryConfig).toBe(config.registry);
+  });
+
+  it('env-sourced repo type: splits the combined MACF_REGISTRY_REPO "owner/repo" back apart', () => {
+    const env = {
+      MACF_PROJECT: 'testproj',
+      MACF_AGENT_NAME: 'test-agent',
+      MACF_AGENT_ROLE: 'code-agent',
+      MACF_REGISTRY_TYPE: 'repo',
+      MACF_REGISTRY_REPO: 'acme/widgets',
+    };
+    const identity = buildIdentityReport(null, env);
+
+    expect(resolveRegistryConfigForPeers(identity, null, env)).toEqual({
+      type: 'repo',
+      owner: 'acme',
+      repo: 'widgets',
+    });
+  });
+
+  it('env-sourced org type', () => {
+    const env = {
+      MACF_PROJECT: 'testproj',
+      MACF_AGENT_NAME: 'test-agent',
+      MACF_AGENT_ROLE: 'code-agent',
+      MACF_REGISTRY_TYPE: 'org',
+      MACF_REGISTRY_ORG: 'acme-org',
+    };
+    const identity = buildIdentityReport(null, env);
+
+    expect(resolveRegistryConfigForPeers(identity, null, env)).toEqual({ type: 'org', org: 'acme-org' });
+  });
+
+  it('neither source resolved a scope: returns null (the widest "cannot resolve" case)', () => {
+    const identity = buildIdentityReport(null, {});
+
+    expect(resolveRegistryConfigForPeers(identity, null, {})).toBeNull();
+  });
+});
+
+describe('resolvePeersReport — side-effect-free early-return branches (macf#672)', () => {
+  it('offline/opt-out (--no-resolve-peers): returns kind "skipped" immediately, reporting why — does not hang, no network attempted', async () => {
+    const config = baseConfig();
+    const identity = buildIdentityReport(config, {});
+
+    const result = await resolvePeersReport('/nonexistent/dir', config, identity, { resolvePeers: false });
+
+    expect(result.kind).toBe('skipped');
+    expect(result.peers).toEqual([]);
+    expect(result.detail).toContain('--no-resolve-peers');
+  });
+
+  it('registry scope unknown (neither config nor env resolved it): kind "unreadable", distinct from "skipped" and "empty"', async () => {
+    const identity = buildIdentityReport(null, {});
+
+    const result = await resolvePeersReport('/nonexistent/dir', null, identity, {});
+
+    expect(result.kind).toBe('unreadable');
+    expect(result.detail).toContain('registry scope is unknown');
   });
 });
 

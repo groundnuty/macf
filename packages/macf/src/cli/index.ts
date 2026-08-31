@@ -1185,9 +1185,14 @@ program
   .option('--dir <path>', 'Directory to inspect (defaults to cwd; need not be a MACF project)')
   .option('--json', 'Emit the structured report as JSON for automation', false)
   .option('--no-resolve-bot-login', 'Skip the best-effort network GET /app bot_login resolution')
+  .option('--no-resolve-peers', 'Skip the best-effort network peer-registry read')
   .action(async (opts) => {
     const dir = resolve(opts.dir ?? process.cwd());
-    const code = await runWhoami(dir, { json: Boolean(opts.json), resolveBotLogin: opts.resolveBotLogin });
+    const code = await runWhoami(dir, {
+      json: Boolean(opts.json),
+      resolveBotLogin: opts.resolveBotLogin,
+      resolvePeers: opts.resolvePeers,
+    });
     process.exitCode = code;
   });
 
