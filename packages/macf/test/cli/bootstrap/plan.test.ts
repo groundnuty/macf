@@ -208,6 +208,54 @@ describe('computePlan — per-repo CA drift (macf#806 reproduction, macf#839 rev
   });
 });
 
+describe('computePlan — trust.federated_cas registry item (groundnuty/macf#810)', () => {
+  it('UNDECLARED: no trust: section → zero federated_ca items (silent, same as collaborators/shared)', () => {
+    const plan = computePlan(baseManifest(), EMPTY_OBSERVED);
+    expect(plan.items.some((i) => i.kind === 'federated_ca')).toBe(false);
+  });
+
+  it('DECLARED, unobserved: emits ONE federated_ca item per entry, keyed by the GUEST project\'s segment — never this fleet\'s own', () => {
+    const manifest = baseManifest({ trust: { federated_cas: [{ project: 'ppam-2026', ca_bundle: 'GUEST-CERT-PEM' }] } });
+    const plan = computePlan(manifest, EMPTY_OBSERVED);
+    const item = itemFor(plan.items, 'federated_ca', 'federated_ca:registry:PPAM_2026_CA_CERT');
+    expect(item).toBeDefined();
+    expect(item?.verb).toBe('create'); // EMPTY_OBSERVED has no federatedCaRegistry entry → unknown → low-confidence 'create'
+    expect(item?.confirm_required).toBe(false);
+  });
+
+  it('DECLARED, observed present → noop (plan and apply agree via the SAME caCertVariableName formula)', () => {
+    const manifest = baseManifest({ trust: { federated_cas: [{ project: 'ppam-2026', ca_bundle: 'GUEST-CERT-PEM' }] } });
+    const observed: ObservedState = { ...EMPTY_OBSERVED, federatedCaRegistry: { 'ppam-2026': 'present' } };
+    const plan = computePlan(manifest, observed);
+    const item = itemFor(plan.items, 'federated_ca', 'federated_ca:registry:PPAM_2026_CA_CERT');
+    expect(item?.verb).toBe('noop');
+  });
+
+  it('multiple declared projects each get their own item, independent presence', () => {
+    const manifest = baseManifest({
+      trust: {
+        federated_cas: [
+          { project: 'ppam-2026', ca_bundle: 'CERT-A' },
+          { project: 'icsoc-2026', ca_bundle: 'CERT-B' },
+        ],
+      },
+    });
+    const observed: ObservedState = { ...EMPTY_OBSERVED, federatedCaRegistry: { 'ppam-2026': 'present', 'icsoc-2026': 'absent' } };
+    const plan = computePlan(manifest, observed);
+    expect(itemFor(plan.items, 'federated_ca', 'federated_ca:registry:PPAM_2026_CA_CERT')?.verb).toBe('noop');
+    expect(itemFor(plan.items, 'federated_ca', 'federated_ca:registry:ICSOC_2026_CA_CERT')?.verb).toBe('create');
+  });
+
+  it('federated_ca is `implemented` in planItemApplyCoverage — never a silent "NOT IMPLEMENTED BY APPLY" gap', () => {
+    const manifest = baseManifest({ trust: { federated_cas: [{ project: 'ppam-2026', ca_bundle: 'GUEST-CERT-PEM' }] } });
+    const plan = computePlan(manifest, EMPTY_OBSERVED);
+    expect(plan.unimplementedByApply.some((i) => i.kind === 'federated_ca')).toBe(false);
+    const item = itemFor(plan.items, 'federated_ca', 'federated_ca:registry:PPAM_2026_CA_CERT');
+    expect(item).toBeDefined();
+    if (item !== undefined) expect(planItemApplyCoverage(item)).toBe('implemented');
+  });
+});
+
 describe('computePlan — all-match observed state → all noops', () => {
   it('every per-agent resource + CA (registry + per-repo) + routing is noop when fully observed-matching', () => {
     const manifest = baseManifest({

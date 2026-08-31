@@ -42,6 +42,8 @@ function resultWith(overrides: Partial<FleetApplyResult> = {}): FleetApplyResult
     vault: { status: 'skipped' },
     identityChanges: [],
     ca: { resolve: { status: 'reused', certFingerprint: 'deadbeef'.repeat(8) }, registryLeg: { status: 'already-present' }, repoLegs: {} },
+    // groundnuty/macf#810 default: empty (no trust.federated_cas declared) — mirrors `bootstrap-apply.test.ts::resultWith`'s own default.
+    federatedTrust: {},
     routing: {},
     routingClient: { mint: { status: 'skipped', reason: 'no CA minted this run' }, certLegs: {}, keyLegs: {} },
     routingSecrets: {
