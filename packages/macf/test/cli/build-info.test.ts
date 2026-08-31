@@ -156,10 +156,15 @@ describe('detectUnknownFreshness', () => {
 
 /**
  * Tests for `detectCheckoutCurrency` (groundnuty/macf#1376 — a repo checkout
- * of THIS CLI's own source has no way to learn it is behind the canonical
- * branch it tracks). Distinct axis from `detectStaleDist` above: that
- * compares the BUILT dist/ stamp against packageRoot's own HEAD; this
- * compares packageRoot's HEAD against its configured upstream.
+ * of the macf framework's own source has no way to learn it is behind the
+ * canonical branch it tracks). Distinct axis from `detectStaleDist` above:
+ * that compares the BUILT dist/ stamp against packageRoot's own HEAD; this
+ * compares `projectDir`'s HEAD against `origin/<canonicalBranch>` — but only
+ * when `projectDir` really is a checkout of the same package `packageRoot`
+ * identifies (content-based identity, not a path comparison — see the
+ * function's doc comment in build-info.ts for why a path/packageRoot-only
+ * design was tried and abandoned after live-verifying it would never fire
+ * for the actual deployed fleet).
  */
 describe('detectCheckoutCurrency (groundnuty/macf#1376)', () => {
   let tmp: string;
@@ -172,29 +177,120 @@ describe('detectCheckoutCurrency (groundnuty/macf#1376)', () => {
     rmSync(tmp, { recursive: true, force: true });
   });
 
+  const OWN_NAME = '@fake-scope/fake-cli';
+
+  /** The "running CLI's own source" identity marker — always has this name. */
+  function makePackageRoot(dir: string, name = OWN_NAME): void {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ name, version: '0.0.0' }));
+  }
+
   function initBareRemote(dir: string): void {
     mkdirSync(dir, { recursive: true });
     git(dir, 'init', '-q', '--bare', '--initial-branch=main');
   }
 
-  /** `initRepo` (defined above) + wire it to `remoteDir` as its upstream. */
-  function initRepoWithUpstream(dir: string, remoteDir: string): void {
+  /** A git checkout whose root package.json carries the given identity marker (non-monorepo layout). */
+  function initIdentityRepo(dir: string, name = OWN_NAME): void {
     mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ name, version: '0.0.0' }));
     initRepo(dir);
-    git(dir, 'remote', 'add', 'origin', remoteDir);
-    git(dir, 'push', '-q', '-u', 'origin', 'main');
+    // package.json isn't committed — detectCheckoutCurrency reads it straight
+    // off disk, not from git history, so this is deliberately untracked.
   }
 
-  it('not-a-checkout: a plain (non-git) directory does not fire — this is what keeps the check off for npm-installed consumers', () => {
-    // `tmp` is untouched by git entirely — the npm-install shape.
-    const result = detectCheckoutCurrency(tmp);
+  /** `initIdentityRepo` + wire it to `remoteDir` as `origin` (registered, not necessarily fetched). */
+  function initIdentityRepoWithOrigin(dir: string, remoteDir: string, name = OWN_NAME): void {
+    initIdentityRepo(dir, name);
+    git(dir, 'remote', 'add', 'origin', remoteDir);
+  }
+
+  it('not-a-checkout: projectDir has no package.json at all — the plain-npm-install-consumer shape', () => {
+    const packageRoot = join(tmp, 'pkgroot');
+    const projectDir = join(tmp, 'project');
+    makePackageRoot(packageRoot);
+    mkdirSync(projectDir, { recursive: true }); // no package.json, no git
+
+    const result = detectCheckoutCurrency(projectDir, packageRoot, 'main');
     expect(result.kind).toBe('not-a-checkout');
   });
 
-  it('honest-unknown: a git checkout with no configured upstream is never reported current', () => {
-    initRepo(tmp);
-    const result = detectCheckoutCurrency(tmp);
+  it('not-a-checkout: projectDir is a DIFFERENT, unrelated project — even though it IS git-tracked with its own origin (the real npm-installed-consumer shape)', () => {
+    const packageRoot = join(tmp, 'pkgroot');
+    const consumerRemote = join(tmp, 'consumer-remote.git');
+    const projectDir = join(tmp, 'consumer-project');
+    makePackageRoot(packageRoot);
+    initBareRemote(consumerRemote);
+    initIdentityRepoWithOrigin(projectDir, consumerRemote, 'some-consumer-project');
+
+    const result = detectCheckoutCurrency(projectDir, packageRoot, 'main');
+    expect(result.kind).toBe('not-a-checkout');
+  });
+
+  it('not-a-checkout: identity matches but projectDir is not a git checkout at all', () => {
+    const packageRoot = join(tmp, 'pkgroot');
+    const projectDir = join(tmp, 'project');
+    makePackageRoot(packageRoot);
+    mkdirSync(projectDir, { recursive: true });
+    writeFileSync(join(projectDir, 'package.json'), JSON.stringify({ name: OWN_NAME })); // matches, but no git init
+
+    const result = detectCheckoutCurrency(projectDir, packageRoot, 'main');
+    expect(result.kind).toBe('not-a-checkout');
+  });
+
+  it('identity match via the REAL monorepo layout: packages/macf/ carries the marker, the workspace root does not', () => {
+    // Mirrors the actual shape of THIS repo exactly: the workspace root's
+    // own package.json is the monorepo-tooling package (a DIFFERENT name),
+    // and the identity marker lives one level down at packages/macf/.
+    const packageRoot = join(tmp, 'pkgroot');
+    const projectDir = join(tmp, 'project');
+    makePackageRoot(packageRoot);
+    mkdirSync(projectDir, { recursive: true });
+    writeFileSync(join(projectDir, 'package.json'), JSON.stringify({ name: 'some-monorepo-tooling-package' }));
+    mkdirSync(join(projectDir, 'packages', 'macf'), { recursive: true });
+    writeFileSync(join(projectDir, 'packages', 'macf', 'package.json'), JSON.stringify({ name: OWN_NAME }));
+    initRepo(projectDir);
+
+    const result = detectCheckoutCurrency(projectDir, packageRoot, 'main');
+    // No origin configured yet — proves identity matched (else this would
+    // be 'not-a-checkout' too) and progressed to the next honest-unknown gate.
     expect(result.kind).toBe('no-upstream');
+  });
+
+  it('honest-unknown: an identity-matching git checkout with no origin remote is never reported current', () => {
+    const packageRoot = join(tmp, 'pkgroot');
+    const projectDir = join(tmp, 'project');
+    makePackageRoot(packageRoot);
+    initIdentityRepo(projectDir);
+
+    const result = detectCheckoutCurrency(projectDir, packageRoot, 'main');
+    expect(result.kind).toBe('no-upstream');
+  });
+
+  it('unreadable: an origin remote is configured but was never fetched, so origin/<canonicalBranch> does not resolve locally — genuinely reachable via real git, not an injected scenario', () => {
+    const packageRoot = join(tmp, 'pkgroot');
+    const remote = join(tmp, 'remote.git');
+    const projectDir = join(tmp, 'project');
+    makePackageRoot(packageRoot);
+    initBareRemote(remote); // has the 'main' branch, but never fetched into projectDir
+    initIdentityRepoWithOrigin(projectDir, remote);
+
+    const result = detectCheckoutCurrency(projectDir, packageRoot, 'main');
+    expect(result.kind).toBe('unreadable');
+  });
+
+  it('unreadable: origin exists and IS fetched, but the canonical branch name is misconfigured (points at a ref that was never fetched)', () => {
+    const packageRoot = join(tmp, 'pkgroot');
+    const remote = join(tmp, 'remote.git');
+    const projectDir = join(tmp, 'project');
+    makePackageRoot(packageRoot);
+    initBareRemote(remote);
+    initIdentityRepoWithOrigin(projectDir, remote);
+    git(projectDir, 'push', '-q', '-u', 'origin', 'main');
+
+    // Ask about a DIFFERENT canonical branch than the one that was ever pushed/fetched.
+    const result = detectCheckoutCurrency(projectDir, packageRoot, 'develop');
+    expect(result.kind).toBe('unreadable');
   });
 
   // --- Decisive pair (assert-the-wrong-path.md) ---
@@ -202,12 +298,15 @@ describe('detectCheckoutCurrency (groundnuty/macf#1376)', () => {
   // implementation that always prints SOME number. (2) is what proves the
   // count is real: a level checkout must read "current," not noise.
 
-  it('DECISIVE PAIR (1/2): a checkout BEHIND its upstream reports the exact count, not a stand-in value', () => {
+  it('DECISIVE PAIR (1/2): a checkout BEHIND its canonical branch reports the exact count, not a stand-in value', () => {
+    const packageRoot = join(tmp, 'pkgroot');
     const remote = join(tmp, 'remote.git');
     const work = join(tmp, 'work');
     const work2 = join(tmp, 'work2');
+    makePackageRoot(packageRoot);
     initBareRemote(remote);
-    initRepoWithUpstream(work, remote);
+    initIdentityRepoWithOrigin(work, remote);
+    git(work, 'push', '-q', '-u', 'origin', 'main');
 
     // A second clone pushes TWO new commits — an implementation that always
     // prints a fixed/hardcoded number would not track this.
@@ -224,7 +323,7 @@ describe('detectCheckoutCurrency (groundnuty/macf#1376)', () => {
     // this; see the mutation check below.
     git(work, 'fetch', '-q', 'origin');
 
-    const result = detectCheckoutCurrency(work);
+    const result = detectCheckoutCurrency(work, packageRoot, 'main');
     expect(result.kind).toBe('ok');
     if (result.kind === 'ok') {
       expect(result.commitCount).toBe(2);
@@ -232,13 +331,16 @@ describe('detectCheckoutCurrency (groundnuty/macf#1376)', () => {
     }
   });
 
-  it('DECISIVE PAIR (2/2): a checkout LEVEL with its upstream reports current (0), no noise', () => {
+  it('DECISIVE PAIR (2/2): a checkout LEVEL with its canonical branch reports current (0), no noise', () => {
+    const packageRoot = join(tmp, 'pkgroot');
     const remote = join(tmp, 'remote.git');
     const work = join(tmp, 'work');
+    makePackageRoot(packageRoot);
     initBareRemote(remote);
-    initRepoWithUpstream(work, remote);
+    initIdentityRepoWithOrigin(work, remote);
+    git(work, 'push', '-q', '-u', 'origin', 'main');
 
-    const result = detectCheckoutCurrency(work);
+    const result = detectCheckoutCurrency(work, packageRoot, 'main');
     expect(result.kind).toBe('ok');
     if (result.kind === 'ok') {
       expect(result.commitCount).toBe(0);
@@ -246,22 +348,31 @@ describe('detectCheckoutCurrency (groundnuty/macf#1376)', () => {
     }
   });
 
-  it('unreadable: a non-numeric rev-list result is honest-unknown, never current (injected GitRunner — verified no real git failure reaches this branch: a dangling upstream config makes @{u} itself fail with "no such branch", which is the no-upstream branch above, not this one)', () => {
+  it('unreadable (defensive): a non-numeric rev-list result is honest-unknown, never current (injected GitRunner — protects against an unexpected future git output shape; the identity check reads real files, so real package.jsons are still needed to reach the gitRunner-driven branches at all)', () => {
+    const packageRoot = join(tmp, 'pkgroot');
+    const projectDir = join(tmp, 'project');
+    makePackageRoot(packageRoot);
+    mkdirSync(projectDir, { recursive: true });
+    writeFileSync(join(projectDir, 'package.json'), JSON.stringify({ name: OWN_NAME }));
+
     const fakeRunner: GitRunner = (args) => {
       if (args[0] === 'rev-parse' && args.includes('--is-inside-work-tree')) return 'true';
-      if (args[0] === 'rev-parse' && args.includes('@{u}')) return 'origin/main';
+      if (args[0] === 'remote') return 'https://example.invalid/repo.git';
       if (args[0] === 'rev-list') return 'not-a-number';
       return null;
     };
-    const result = detectCheckoutCurrency('/irrelevant-for-this-test', fakeRunner);
+    const result = detectCheckoutCurrency(projectDir, packageRoot, 'main', fakeRunner);
     expect(result.kind).toBe('unreadable');
   });
 
   it('mutation check: never fetches — no git call this function makes includes "fetch" or "pull"', () => {
+    const packageRoot = join(tmp, 'pkgroot');
     const remote = join(tmp, 'remote.git');
     const work = join(tmp, 'work');
+    makePackageRoot(packageRoot);
     initBareRemote(remote);
-    initRepoWithUpstream(work, remote);
+    initIdentityRepoWithOrigin(work, remote);
+    git(work, 'push', '-q', '-u', 'origin', 'main');
 
     const invocations: (readonly string[])[] = [];
     const recordingRunner: GitRunner = (args, cwd) => {
@@ -269,7 +380,7 @@ describe('detectCheckoutCurrency (groundnuty/macf#1376)', () => {
       return defaultGitRunner(args, cwd);
     };
 
-    const result = detectCheckoutCurrency(work, recordingRunner);
+    const result = detectCheckoutCurrency(work, packageRoot, 'main', recordingRunner);
     expect(result.kind).toBe('ok'); // sanity: the recording wrapper didn't break anything
 
     expect(invocations.length).toBeGreaterThan(0);
@@ -279,31 +390,30 @@ describe('detectCheckoutCurrency (groundnuty/macf#1376)', () => {
     }
   });
 
-  it('fires in a REAL repo checkout — packages/macf itself, whose .git lives at the monorepo root, not inside packages/macf (the exact shape #144 never reached, and not only a fixture)', () => {
+  it('fires in a REAL repo checkout — the actual monorepo root + packages/macf, not a fixture (packages/macf has no .git of its own; .git lives at the monorepo root, one level up)', () => {
     // findCliPackageRoot() resolves to packages/macf/ for a dev/npm-link
-    // install of THIS repo. .git/ is one level up (the monorepo root), not
-    // inside packages/macf/ — a direct existsSync(join(dir, '.git'))-style
-    // gate (what detectStaleDist uses) can never see this as a checkout.
-    // This is not a fixture: it is this repo's own package root, right now.
+    // install of THIS repo — no .git/ inside it at all (the exact shape a
+    // direct existsSync(join(dir, '.git')) gate, like detectStaleDist's,
+    // can never see as a checkout). The identity-matching design in THIS
+    // function sidesteps that path question entirely: it walks up from
+    // `projectDir` via real git plumbing, so it doesn't matter that
+    // packages/macf itself is .git-less.
     const realPackageRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
+    const realProjectDir = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..', '..');
     expect(existsSync(join(realPackageRoot, 'package.json'))).toBe(true);
     expect(existsSync(join(realPackageRoot, '.git'))).toBe(false); // the exact gap this check closes
+    expect(existsSync(join(realProjectDir, '.git'))).toBe(true); // .git lives here instead
 
-    const result = detectCheckoutCurrency(realPackageRoot);
-    // `kind` must NOT be 'not-a-checkout' — that IS the ancestor-detection
-    // proof: this environment's current branch may or may not itself carry
-    // a configured upstream (a throwaway agent worktree branch commonly
-    // doesn't — verified: this very worktree's branch has none), so 'ok'
-    // vs 'no-upstream' is environment-dependent and asserting one of them
-    // specifically would be asserting this session's branch config, not the
-    // defect under test. What's NOT environment-dependent, and what a
-    // synthetic fixture could never demonstrate, is that the real
-    // packages/macf directory — .git-less itself — is recognized as living
-    // inside a git working tree at all.
-    expect(result.kind).not.toBe('not-a-checkout');
-    expect(['ok', 'no-upstream']).toContain(result.kind);
+    const result = detectCheckoutCurrency(realProjectDir, realPackageRoot, 'main');
+    // This is live, real state (this very checkout, right now) — not
+    // asserting a fixed count, but `kind` MUST be 'ok': proof the identity
+    // match + ancestor-aware git plumbing recognized the real monorepo
+    // layout as a checkout of its own framework, which a synthetic fixture
+    // could never demonstrate on its own.
+    expect(result.kind).toBe('ok');
     if (result.kind === 'ok') {
       expect(result.commitCount).toBeGreaterThanOrEqual(0);
+      expect(result.upstream).toBe('origin/main');
     }
   });
 });

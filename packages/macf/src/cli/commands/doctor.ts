@@ -1663,30 +1663,42 @@ export function checkDistributedRuleCurrency(
 
 /**
  * Result of the CLI-checkout-currency assertion (groundnuty/macf#1376 — a
- * repo checkout of this CLI's own source has no way to learn it is behind
- * canonical: `checkDistributedScriptCurrency`/`checkDistributedRuleCurrency`
- * above resolve "canonical" via `findCliPackageRoot()`, which — in a
- * repo-checkout/npm-link dev install — IS the same tree being doctored, so
- * those checks compare that tree to itself and always PASS regardless of
- * whether the tree itself is behind `origin/<branch>`; `detectStaleDist`
- * (#144) only compares the BUILT `dist/` stamp against that same tree's own
- * HEAD, never against its upstream. Neither layer answers "is this checkout
- * behind canonical."
+ * repo checkout of the macf framework's own source has no way to learn it
+ * is behind canonical: `checkDistributedScriptCurrency`/
+ * `checkDistributedRuleCurrency` above resolve "canonical" via
+ * `findCliPackageRoot()`, which — in a repo-checkout/npm-link dev install —
+ * CAN be the same tree being doctored, so those checks compare that tree to
+ * itself and always PASS regardless of whether the tree itself is behind
+ * `origin/<branch>`; `detectStaleDist` (#144) only compares the BUILT
+ * `dist/` stamp against that same tree's own HEAD, never against its
+ * upstream. Neither layer answers "is this checkout behind canonical."
+ *
+ * This targets `projectDir` (the workspace being doctored), NOT
+ * `packageRoot` — see `detectCheckoutCurrency`'s doc comment in
+ * `build-info.ts` for why a `packageRoot`-targeted design was tried first
+ * and abandoned: verified against a live substrate deployment that the
+ * installed CLI (a real `npm i -g` install) has zero directory relationship
+ * to the workspace it operates on, so a `packageRoot`-only check would
+ * never fire for the actual reported problem.
  *
  * `status`:
- *   - `PASS`    — the checkout's HEAD has 0 commits behind its configured
- *                 upstream (`detectCheckoutCurrency` kind `ok`, count 0).
+ *   - `PASS`    — `projectDir`'s HEAD has 0 commits behind
+ *                 `origin/<canonicalBranch>` (`detectCheckoutCurrency` kind
+ *                 `ok`, count 0).
  *   - `WARN`    — 1+ commits behind; `detail` names the exact count and the
- *                 upstream ref compared against. No invented "stale enough"
+ *                 ref compared against. No invented "stale enough"
  *                 threshold — any nonzero count is worth printing.
- *   - `INFO`    — `packageRoot` is not inside a git working tree at all (an
- *                 npm-installed CLI — global, local, or via `npx`). This is
- *                 the branch that keeps the check from ever firing for a
- *                 plain npm-installed consumer.
- *   - `UNKNOWN` — inside a git working tree, but no upstream is configured
- *                 (including a detached HEAD) or the count could not be
- *                 read. NEVER PASS in this branch — an undeterminable
- *                 currency must never be reported as current.
+ *   - `INFO`    — `projectDir` isn't a git checkout of the macf framework's
+ *                 own source at all — either not a git checkout, or a git
+ *                 checkout whose package identity doesn't match
+ *                 `packageRoot`'s (an unrelated consumer project). This is
+ *                 what keeps the check off for npm-installed consumers.
+ *   - `UNKNOWN` — a checkout of this framework's own source, but with no
+ *                 `origin` remote configured, or `origin/<canonicalBranch>`
+ *                 doesn't resolve locally (never fetched, or the canonical
+ *                 branch name is misconfigured). NEVER PASS in this branch
+ *                 — an undeterminable currency must never be reported as
+ *                 current.
  */
 export interface CheckoutCurrencyCheckResult {
   readonly status: 'PASS' | 'WARN' | 'INFO' | 'UNKNOWN';
@@ -1694,52 +1706,64 @@ export interface CheckoutCurrencyCheckResult {
 }
 
 /**
+ * `config` resolves the canonical branch name via `resolveCanonicalBranch`
+ * — the SAME resolution `checkCanonicalBranch` above already uses (env
+ * override → `macf-agent.json` → `'main'` default) — rather than a git
+ * `@{u}` lookup: `@{u}` names the CURRENT branch's own upstream, which is
+ * commonly unconfigured on a throwaway/feature/worktree branch (verified on
+ * this very repo), causing a false `UNKNOWN` even when the workspace
+ * genuinely is behind canonical. `config` may be `null` — `resolveCanonicalBranch`
+ * handles that (defaults to `'main'`), so this is safe to call in
+ * `runDoctor`'s no-macf-agent.json early-return branch where no config has
+ * been parsed yet, same reasoning as `checkDistributedScriptCurrency`'s doc
+ * comment above.
+ *
  * `packageRoot` defaults to `findCliPackageRoot()` — the running CLI's own
- * source root, exactly the parameter `detectStaleDist` takes. This check
- * never touches `workspaceDir`/`projectDir`: it is entirely about the
- * CLI's OWN checkout, independent of whether the workspace being doctored
- * has ever run `macf init` — safe to call even in `runDoctor`'s
- * no-macf-agent.json early-return branch, same reasoning as
- * `checkDistributedScriptCurrency`'s doc comment above.
+ * source root, used only as the identity marker `detectCheckoutCurrency`
+ * matches `projectDir` against (see that function's doc comment).
  *
  * Never fetches — every git call inside `detectCheckoutCurrency` is
- * read-only (`rev-parse`, `rev-list`). The comparison is only as fresh as
- * the last local fetch of the upstream ref; the WARN detail names that
- * explicitly rather than implying the count is a live, guaranteed floor.
+ * read-only (`rev-parse`, `remote get-url`, `rev-list`). The comparison is
+ * only as fresh as the last local fetch of the upstream ref; the WARN
+ * detail names that explicitly rather than implying the count is a live,
+ * guaranteed floor.
  */
 export function checkCheckoutCurrency(
+  projectDir: string,
+  config: MacfAgentConfig | null,
   packageRoot: string = findCliPackageRoot(),
 ): CheckoutCurrencyCheckResult {
-  const result = detectCheckoutCurrency(packageRoot);
+  const canonicalBranch = resolveCanonicalBranch(config);
+  const result = detectCheckoutCurrency(projectDir, packageRoot, canonicalBranch);
   switch (result.kind) {
     case 'not-a-checkout':
       return {
         status: 'INFO',
         detail:
-          'this CLI is not running from a git checkout (an npm install) — nothing to compare against a canonical branch',
+          "this workspace is not a checkout of the macf framework's own source (or not a git checkout at " +
+          'all) — nothing to compare against a canonical branch',
       };
     case 'no-upstream':
       return {
         status: 'UNKNOWN',
-        detail:
-          "this CLI's checkout has no configured upstream (or is on a detached HEAD) — cannot determine currency",
+        detail: 'this checkout has no `origin` remote configured — cannot determine currency',
       };
     case 'unreadable':
       return {
         status: 'UNKNOWN',
-        detail: `this CLI's checkout currency could not be read (${result.reason})`,
+        detail: `this checkout's currency could not be read (${result.reason})`,
       };
     case 'ok':
       if (result.commitCount === 0) {
         return {
           status: 'PASS',
-          detail: `this CLI's checkout is current with \`${result.upstream}\` (0 commits behind, as of the last local fetch)`,
+          detail: `this checkout is current with \`${result.upstream}\` (0 commits behind, as of the last local fetch)`,
         };
       }
       return {
         status: 'WARN',
         detail:
-          `this CLI's checkout is ${result.commitCount} commit(s) behind \`${result.upstream}\` — ` +
+          `this checkout is ${result.commitCount} commit(s) behind \`${result.upstream}\` — ` +
           `compared against the LOCALLY CACHED ${result.upstream} (this check never fetches; if that ref ` +
           `itself hasn't been fetched recently, the true gap may be larger)`,
       };
@@ -2065,14 +2089,14 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
     console.log('──────────────────────────────────────────────────────────────');
     printRuleCurrencySection(checkDistributedRuleCurrency(projectDir));
     // groundnuty/macf#1376: unlike the two currency checks above, this one
-    // never touches `.macf/` or `projectDir` at all — it's entirely about
-    // the running CLI's OWN checkout (`findCliPackageRoot()`), so it's
-    // reachable in this early-return branch for free, same reasoning as the
-    // currency checks above.
+    // never gates on `.macf/` presence — `resolveCanonicalBranch(null)` is a
+    // pure function of env + a null config (defaults to 'main'), so it's
+    // reachable in this early-return branch for free even before any config
+    // has been parsed, same reasoning as the currency checks above.
     console.log('');
     console.log('CLI checkout currency');
     console.log('──────────────────────────────────────────────────────────────');
-    printCheckoutCurrencySection(checkCheckoutCurrency());
+    printCheckoutCurrencySection(checkCheckoutCurrency(projectDir, null));
     // groundnuty/macf#1365: disk space is not gated on .macf/ at all — a
     // full disk breaks a workspace's builds/tests whether or not `macf
     // init` ever touched it, so this reachable-without-config workspace
@@ -2204,7 +2228,7 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
   console.log('');
   console.log('CLI checkout currency');
   console.log('──────────────────────────────────────────────────────────────');
-  printCheckoutCurrencySection(checkCheckoutCurrency());
+  printCheckoutCurrencySection(checkCheckoutCurrency(projectDir, config));
 
   console.log('');
   console.log('Disk space');
