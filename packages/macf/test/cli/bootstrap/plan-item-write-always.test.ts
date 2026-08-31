@@ -116,6 +116,10 @@ function classifyPlanItemKind(kind: PlanItemKind): Classification {
     case 'install':
     case 'secret_fingerprint':
     case 'ca':
+    // groundnuty/macf#810 — same shape as 'ca' immediately above:
+    // `federatedCaItem` is produced by `presenceVerb`, a live existence
+    // check, never write-always.
+    case 'federated_ca':
     case 'routing':
     case 'agent':
     case 'control_repo':
@@ -138,6 +142,7 @@ const ALL_KINDS: readonly PlanItemKind[] = [
   'install',
   'secret_fingerprint',
   'ca',
+  'federated_ca',
   'routing',
   'runner_warm',
   'runner_platform',
@@ -163,15 +168,16 @@ describe('PlanItemKind coverage — every kind is classified exactly once (groun
     for (const kind of ALL_KINDS) {
       expect(['write-always', 'checkable']).toContain(classifyPlanItemKind(kind));
     }
-    // 20 kinds as of groundnuty/macf#1220 (3 write-always + 17 checkable) —
+    // 21 kinds as of groundnuty/macf#810 (3 write-always + 18 checkable) —
     // pins the count so a kind added to ALL_KINDS-but-not-the-switch (or
     // vice versa) is caught here even though both are hand-maintained lists
     // (the switch is compile-checked against the TYPE; this asserts the
     // array is compile-checked against the SWITCH's own domain by literally
     // exercising every member). 'install_scope' joined at groundnuty/macf#1220
     // / #1129 / #1229 / DR-043 Amendment P2 (row 3 of the reconciler verb
-    // matrix); was 19 (3 + 16) before it.
-    expect(ALL_KINDS).toHaveLength(20);
+    // matrix); was 19 (3 + 16) before it. 'federated_ca' joined at
+    // groundnuty/macf#810 (was 20 (3 + 17) before it).
+    expect(ALL_KINDS).toHaveLength(21);
   });
 });
 
@@ -352,6 +358,22 @@ const COVERAGE_CASES: readonly CoverageCase[] = [
     kind: 'ca',
     quiet: () => computePlan(presenceQuietManifest(), PRESENCE_QUIET_OBSERVED),
     active: () => computePlan(PRESENCE_ACTIVE_MANIFEST, EMPTY),
+  },
+  {
+    // groundnuty/macf#810 — a dedicated manifest (not `presenceQuietManifest`)
+    // since `federated_ca` items are gated on `trust.federated_cas` being
+    // declared at all (see `computePlan`'s own presence-gated call site).
+    kind: 'federated_ca',
+    quiet: () =>
+      computePlan(manifest({ trust: { federated_cas: [{ project: 'ppam-2026', ca_bundle: 'GUEST-CERT-PEM' }] } }), {
+        ...EMPTY,
+        federatedCaRegistry: { 'ppam-2026': 'present' },
+      }),
+    active: () =>
+      computePlan(manifest({ trust: { federated_cas: [{ project: 'ppam-2026', ca_bundle: 'GUEST-CERT-PEM' }] } }), {
+        ...EMPTY,
+        federatedCaRegistry: { 'ppam-2026': 'absent' },
+      }),
   },
   {
     kind: 'routing_client',
