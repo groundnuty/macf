@@ -56,6 +56,17 @@ export interface RepoInitOptions {
   readonly registryOrg?: string;
   /** User login for `--registry-type profile`. */
   readonly registryUser?: string;
+  /**
+   * Verbatim `fleet.yaml` `routing.runner.runs_on` declaration
+   * (groundnuty/macf#1368) — threaded straight through to
+   * `generateWorkflow`'s `with:` block via {@link V3WorkflowInputs.runnerRunsOn},
+   * gated there on `isRunnerRunsOnCapableActionsVersion(actionsVersion)`.
+   * Omitted (the default — every pre-#1368 caller, and any fleet with no
+   * `routing.runner` declared at all) emits nothing new: the generated
+   * caller is byte-identical to before this option existed. Only consumed
+   * on a v3+ pin; a v1.x/v2.x caller never gets a `with:` block regardless.
+   */
+  readonly routingRunnerRunsOn?: string;
 }
 
 /**
@@ -125,6 +136,58 @@ export function isBundleCapableActionsVersion(version: string): boolean {
   const [major, minor] = tuple;
   const [minMajor, minMinor] = parseActionsVersionTuple(MIN_BUNDLE_CAPABLE_ACTIONS_VERSION)!;
   return major > minMajor || (major === minMajor && minor >= minMinor);
+}
+
+/**
+ * The full-tag threshold at which `agent-router.yml`'s reusable workflow
+ * accepts the `runner-runs-on` input (groundnuty/macf-actions#83,
+ * groundnuty/macf#1368/#1194) — the input that lets `pick-runner` FAIL a
+ * declared-self-hosted fleet's job rather than silently relocating it to a
+ * metered `ubuntu-latest` runner.
+ *
+ * Deliberately `undefined`, NOT a guessed tag. Verified live 2026-08-30
+ * (`gh api repos/groundnuty/macf-actions/tags`): the latest RELEASED full
+ * tag is `v3.4.2`, cut before #83 merged — #83 landed on macf-actions'
+ * `main` (commit `7316fec2`) and has not shipped in any tag yet. This is
+ * the exact class {@link MIN_BUNDLE_CAPABLE_ACTIONS_VERSION} warns about:
+ * that constant named `v3.5.0` while no such tag existed, so every real
+ * pin fell through its gate and the fix it guarded was unreachable for
+ * months (see the `generateWorkflow — explicit six-secret emission for a
+ * v3+ non-bundle pin` test block's own citation of that incident). This
+ * constant does not repeat the mistake — it stays `undefined` (meaning NO
+ * released tag is treated as capable) until an operator bumps it to the
+ * real tag once macf-actions actually cuts a release containing #83
+ * (`git tag --contains 7316fec2` on that repo names it).
+ * {@link isRunnerRunsOnCapableActionsVersion} treats `main` as capable
+ * regardless — the same "dev branch always current" convention
+ * {@link isV3PlusActionsVersion} and {@link isBundleCapableActionsVersion}
+ * already use.
+ */
+export const MIN_RUNNER_RUNS_ON_CAPABLE_ACTIONS_VERSION: string | undefined = undefined;
+
+/**
+ * True only for `main`, or a FULLY-PINNED tag at/above
+ * {@link MIN_RUNNER_RUNS_ON_CAPABLE_ACTIONS_VERSION} once that constant
+ * names a real released tag (it does not today — see its doc). Compares
+ * major.minor.PATCH, unlike {@link isBundleCapableActionsVersion}'s
+ * major.minor-only comparison: #83 could ship as a patch release of the
+ * existing v3.4 line just as easily as a new minor, and this function must
+ * not treat an already-released PATCH below the eventual threshold (e.g.
+ * the already-shipped `v3.4.0`/`v3.4.1`/`v3.4.2`, none of which carry
+ * `runner-runs-on`) as capable merely because it shares a major.minor with
+ * a future capable patch.
+ */
+export function isRunnerRunsOnCapableActionsVersion(version: string): boolean {
+  if (version === 'main') return true;
+  if (MIN_RUNNER_RUNS_ON_CAPABLE_ACTIONS_VERSION === undefined) return false;
+  const tuple = parseActionsVersionTuple(version);
+  const minTuple = parseActionsVersionTuple(MIN_RUNNER_RUNS_ON_CAPABLE_ACTIONS_VERSION);
+  if (!tuple || !minTuple) return false;
+  const [major, minor, patch] = tuple;
+  const [minMajor, minMinor, minPatch] = minTuple;
+  if (major !== minMajor) return major > minMajor;
+  if (minor !== minMinor) return minor > minMinor;
+  return patch >= minPatch;
 }
 
 /**
@@ -242,6 +305,18 @@ function validateVersion(version: string): void {
 export interface V3WorkflowInputs {
   readonly project: string;
   readonly registryApiPath: string;
+  /**
+   * Verbatim `routing.runner.runs_on` declaration from `fleet.yaml`
+   * (groundnuty/macf#1368) — `undefined` when the fleet declares no
+   * routing runner at all, which is the common case and must leave the
+   * generated caller byte-identical to before this field existed.
+   * `generateWorkflow` only emits it into the `with:` block when
+   * {@link isRunnerRunsOnCapableActionsVersion} confirms the pinned
+   * macf-actions router actually declares the input — an unknown `with:`
+   * key is a hard composition error (see `isV3PlusActionsVersion`'s doc),
+   * so the gate lives in `generateWorkflow` itself, not in this type.
+   */
+  readonly runnerRunsOn?: string;
 }
 
 export function generateWorkflow(
@@ -404,6 +479,16 @@ export function generateWorkflow(
     lines.push('    with:');
     lines.push(`      project: ${v3Inputs.project}`);
     lines.push(`      registry-api-path: ${v3Inputs.registryApiPath}`);
+    // groundnuty/macf#1368: only a pin whose workflow_call.inputs actually
+    // declares `runner-runs-on` may receive it — passing an input a pinned
+    // reusable workflow doesn't declare is a hard composition error (see
+    // this function's own `isV3PlusActionsVersion` gate above, same
+    // reasoning). A fleet that declares nothing
+    // (`v3Inputs.runnerRunsOn === undefined`) emits nothing here — the
+    // generated caller stays byte-identical to before this field existed.
+    if (v3Inputs.runnerRunsOn !== undefined && isRunnerRunsOnCapableActionsVersion(actionsVersion)) {
+      lines.push(`      runner-runs-on: ${v3Inputs.runnerRunsOn}`);
+    }
   }
   // groundnuty/macf#1112 / #1338: `secrets: inherit` does not cross a GitHub
   // org/enterprise scope boundary. Confirmed twice now — live on macf#1111
@@ -867,6 +952,30 @@ export async function repoInit(
     }
     const registry = buildRoutingRegistry(opts, owner!, repoName!);
     v3Inputs = { project, registryApiPath: registryPathPrefix(registry) };
+
+    // groundnuty/macf#1368 — thread the manifest's declared runner intent
+    // through, but only when the pinned macf-actions router actually
+    // accepts it (an unknown `with:` key is a hard composition error).
+    // Below-threshold pins are told LOUDLY why the declaration was
+    // dropped rather than silently omitted, per this issue's own "reason
+    // stated" requirement — `generateWorkflow` itself is a pure string
+    // generator with no I/O, so the warning lives here, at the one caller
+    // that has both the declared value and a place to print to stderr.
+    if (opts.routingRunnerRunsOn !== undefined) {
+      if (isRunnerRunsOnCapableActionsVersion(pinnedVersion)) {
+        v3Inputs = { ...v3Inputs, runnerRunsOn: opts.routingRunnerRunsOn };
+      } else {
+        // Citation guard (macf#1061): this string must stand on its own —
+        // no internal issue numbers (see this module's own doc comment
+        // above, a maintainer-facing surface, for the actual references).
+        process.stderr.write(
+          `Warning: routing.runner.runs_on is declared ("${opts.routingRunnerRunsOn}") but the pinned macf-actions ` +
+            `router "${pinnedVersion}" does not accept the runner-runs-on input — no released macf-actions tag does ` +
+            'yet; only the unreleased "main" carries it. The generated agent-router.yml will NOT declare this ' +
+            'runner intent to the router; re-run repo-init once macf-actions releases a capable tag.\n',
+        );
+      }
+    }
   }
 
   // groundnuty/macf#886 — the artifact self-check: assert the emitted

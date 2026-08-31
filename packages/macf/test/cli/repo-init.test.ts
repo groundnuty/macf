@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, rmSync, existsSync, readFileSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { parse as parseYaml } from 'yaml';
-import { generateWorkflow, generateAgentConfig, patchAgentConfig, createLabel, repoInit, isV3PlusActionsVersion, isBundleCapableActionsVersion } from '../../src/cli/commands/repo-init.js';
+import { generateWorkflow, generateAgentConfig, patchAgentConfig, createLabel, repoInit, isV3PlusActionsVersion, isBundleCapableActionsVersion, isRunnerRunsOnCapableActionsVersion } from '../../src/cli/commands/repo-init.js';
 import { ALL_ROUTING_SECRET_NAMES } from '../../src/cli/bootstrap/apply-routing-secrets.js';
 
 function tempDir(): string {
@@ -502,6 +502,99 @@ describe('isBundleCapableActionsVersion (groundnuty/macf#1112)', () => {
 
   it('returns false for non-tag refs other than main', () => {
     expect(isBundleCapableActionsVersion('some-branch')).toBe(false);
+  });
+});
+
+// groundnuty/macf#1368 — verified live 2026-08-30 (`gh api
+// repos/groundnuty/macf-actions/tags`): the latest RELEASED full tag is
+// v3.4.2, cut before macf-actions#83 merged. #83 landed only on main
+// (7316fec2). So NO released tag accepts `runner-runs-on` today — every
+// full tag, including the newest one, must read false here. This is the
+// decisive difference from `isBundleCapableActionsVersion` above: that
+// predicate's threshold names a version (`v3.5.0`) the constant COULD be
+// bumped to reflect once released; this one is pinned to `undefined`
+// (see the constant's own doc for why — repeating #1338's mistake is
+// exactly what this issue exists to avoid).
+describe('isRunnerRunsOnCapableActionsVersion (groundnuty/macf#1368)', () => {
+  it.each([
+    ['main', true],
+    ['v1', false],
+    ['v2.0.1', false],
+    ['v3', false],
+    ['v3.4.0', false],
+    ['v3.4.1', false],
+    ['v3.4.2', false],
+    ['v3.5.0', false],
+    ['v4.0.0', false],
+  ] as const)('%s -> %s', (ver, expected) => {
+    expect(isRunnerRunsOnCapableActionsVersion(ver)).toBe(expected);
+  });
+
+  it('returns false for non-tag refs other than main', () => {
+    expect(isRunnerRunsOnCapableActionsVersion('some-branch')).toBe(false);
+  });
+});
+
+describe('generateWorkflow — runner-runs-on emission (groundnuty/macf#1368)', () => {
+  const v3Inputs = { project: 'macf-experiment', registryApiPath: '/orgs/macf-experiment' };
+
+  // Decisive pair 1/2 (per assert-the-wrong-path.md — (1) alone is
+  // satisfied by a generator that always emits the key regardless of
+  // declaration; the mutation below confirms (2) actually catches that).
+  it('DECISIVE 1: declares runs_on: self-hosted + an accepting pin -> the generated caller carries runner-runs-on: self-hosted', () => {
+    const yaml = generateWorkflow('main', { ...v3Inputs, runnerRunsOn: 'self-hosted' });
+    const parsed = parseYaml(yaml) as { jobs: { route: { with: unknown } } };
+    expect(parsed.jobs.route.with).toEqual({
+      project: v3Inputs.project,
+      'registry-api-path': v3Inputs.registryApiPath,
+      'runner-runs-on': 'self-hosted',
+    });
+  });
+
+  it('DECISIVE 2: declares nothing -> generated caller byte-identical to today', () => {
+    const withoutField = generateWorkflow('main', v3Inputs);
+    const withUndefinedField = generateWorkflow('main', { ...v3Inputs, runnerRunsOn: undefined });
+    expect(withoutField).not.toContain('runner-runs-on');
+    expect(withUndefinedField).toBe(withoutField);
+  });
+
+  it('a pin below the accepting version does not emit the key even when declared', () => {
+    // v3.4.2 is the newest RELEASED tag as of this test's writing and does
+    // NOT carry runner-runs-on (verified live — see the module doc); "the
+    // reason is stated" is asserted at the repoInit() integration layer
+    // below (generateWorkflow is a pure string generator with no I/O to
+    // state a reason through).
+    const yaml = generateWorkflow('v3.4.2', { ...v3Inputs, runnerRunsOn: 'self-hosted' });
+    expect(yaml).not.toContain('runner-runs-on');
+    const parsed = parseYaml(yaml) as { jobs: { route: { with: unknown } } };
+    expect(parsed.jobs.route.with).toEqual({
+      project: v3Inputs.project,
+      'registry-api-path': v3Inputs.registryApiPath,
+    });
+  });
+
+  it('runs_on: hosted is emitted verbatim, not omitted -- the declaration is still a declaration', () => {
+    const yaml = generateWorkflow('main', { ...v3Inputs, runnerRunsOn: 'hosted' });
+    expect(yaml).toContain('runner-runs-on: hosted');
+  });
+
+  it('a v1.x pin never emits runner-runs-on even when declared (no with: block at all)', () => {
+    const yaml = generateWorkflow('v1', { ...v3Inputs, runnerRunsOn: 'self-hosted' });
+    expect(yaml).not.toContain('runner-runs-on');
+    expect(yaml).not.toContain('with:');
+  });
+
+  it('still passes the drift-detector shape check (with: carries only known keys when nothing declared)', () => {
+    // Mirrors the pre-existing "byte-identical to committed router" test
+    // above — macf's own committed router declares no routing.runner, so
+    // its generated `with:` block must still be exactly {project,
+    // registry-api-path}, unaffected by this feature's existence.
+    const yaml = generateWorkflow('v3.4.2', v3Inputs);
+    const parsed = parseYaml(yaml) as { jobs: { route: { with: unknown } } };
+    expect(parsed.jobs.route.with).toEqual({
+      project: v3Inputs.project,
+      'registry-api-path': v3Inputs.registryApiPath,
+    });
   });
 });
 
@@ -1308,6 +1401,68 @@ describe('repoInit integration', () => {
       expect(printed).toContain('AGENT_SSH_KEY');
     } finally {
       logSpy.mockRestore();
+    }
+  });
+
+  // groundnuty/macf#1368 — the RepoInitOptions.routingRunnerRunsOn ->
+  // generateWorkflow wiring, exercised at the repoInit() integration
+  // layer (real filesystem, real generated content on disk).
+  it('threads routingRunnerRunsOn through to the on-disk workflow for an accepting pin (macf#1368)', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201 }) as typeof fetch;
+
+    await repoInit(dir, {
+      repo: 'owner/test-repo',
+      actionsVersion: 'main',
+      project: 'trial',
+      registryType: 'org',
+      registryOrg: 'macf-experiment',
+      routingRunnerRunsOn: 'self-hosted',
+      force: false,
+    });
+
+    const wf = readFileSync(join(dir, '.github', 'workflows', 'agent-router.yml'), 'utf-8');
+    expect(wf).toContain('runner-runs-on: self-hosted');
+  });
+
+  it('states the reason on stderr when routingRunnerRunsOn is declared but the pin cannot accept it (macf#1368)', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201 }) as typeof fetch;
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      await repoInit(dir, {
+        repo: 'owner/test-repo',
+        actionsVersion: 'v3.4.2',
+        project: 'trial',
+        registryType: 'org',
+        registryOrg: 'macf-experiment',
+        routingRunnerRunsOn: 'self-hosted',
+        force: false,
+      });
+      const printed = errSpy.mock.calls.map((c) => String(c[0])).join('\n');
+      expect(printed).toMatch(/routing\.runner\.runs_on is declared/);
+      expect(printed).toContain('v3.4.2');
+      const wf = readFileSync(join(dir, '.github', 'workflows', 'agent-router.yml'), 'utf-8');
+      expect(wf).not.toContain('runner-runs-on');
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
+  it('does not warn when routingRunnerRunsOn is undeclared (the common case)', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201 }) as typeof fetch;
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      await repoInit(dir, {
+        repo: 'owner/test-repo',
+        actionsVersion: 'v3.4.2',
+        project: 'trial',
+        registryType: 'org',
+        registryOrg: 'macf-experiment',
+        force: false,
+      });
+      const printed = errSpy.mock.calls.map((c) => String(c[0])).join('\n');
+      expect(printed).not.toMatch(/routing\.runner\.runs_on/);
+    } finally {
+      errSpy.mockRestore();
     }
   });
 
