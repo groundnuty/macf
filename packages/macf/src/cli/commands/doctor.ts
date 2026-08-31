@@ -2410,7 +2410,18 @@ function printLoadBearingHooksSection(check: LoadBearingHooksCheckResult): void 
  * applied here as "these files are probably FINE; THE CLI is probably
  * STALE").
  *
- * Four branches, matching `CheckoutCurrencyCheckResult['status']`:
+ * The revert-risk caution below is gated on `staleCount > 0`, NOT merely on
+ * `checkoutCurrency.status`. This is a #1361-shaped self-check: a MISSING
+ * file (the #1362 root cause 2 shape — a hook that never fires at all) has
+ * nothing on disk for a stale CLI to overwrite, so `macf update` from a
+ * behind CLI still strictly helps it (a stale-but-present copy beats an
+ * absent one). Cautioning the reader off the one remedy that fixes 15
+ * missing files, on the strength of evidence about a 16th STALE one, is
+ * exactly the contradiction #1361 fixed elsewhere in this file — a message
+ * that tells the reader to withhold the remedy that would actually help.
+ *
+ * Given `staleCount > 0` (at least one finding really would be reverted),
+ * four branches, matching `CheckoutCurrencyCheckResult['status']`:
  *   - `WARN`    — this checkout is itself N commits behind canonical. The
  *                 dangerous case: state the lag, then correct the remedy to
  *                 "update the CLI first, then refresh" — never plain
@@ -2425,17 +2436,25 @@ function printLoadBearingHooksSection(check: LoadBearingHooksCheckResult): void 
  *                 ordinary npm-installed-consumer shape `#1372` already
  *                 gets right). Unchanged wording — there's no upstream
  *                 concept to date here, and none is needed.
+ * `staleCount === 0` (all findings are `missing`) always falls through to
+ * the plain remedy regardless of `checkoutCurrency.status` — there is no
+ * revert risk to caveat.
  */
-function printDistributionFixLine(target: '.claude/scripts/' | '.claude/rules/', checkoutCurrency: CheckoutCurrencyCheckResult): void {
+function printDistributionFixLine(
+  target: '.claude/scripts/' | '.claude/rules/',
+  checkoutCurrency: CheckoutCurrencyCheckResult,
+  staleCount: number,
+): void {
   const refreshCmd = `\`macf update\` (or \`macf rules refresh --dir .\`)`;
   const plainFix = `Fix: run ${refreshCmd} to bring ${target} current.`;
 
-  if (checkoutCurrency.status === 'WARN') {
+  if (staleCount > 0 && checkoutCurrency.status === 'WARN') {
     console.log(`    ⚠ ${checkoutCurrency.detail}`);
     console.log(
-      '    These files are probably FINE — THE INSTALLED CLI is probably STALE: its bundled ' +
-      'canonical was built from a tree that is itself behind, so running the fix below as-is ' +
-      'would REVERT these files to that same stale canonical instead of fixing them.',
+      '    The stale finding(s) above are probably FINE — THE INSTALLED CLI is probably STALE: ' +
+      "if the CLI you're running was built from this checkout (e.g. `npm link`), its bundled " +
+      'canonical is stale by roughly the same margin, and running the fix below as-is would ' +
+      'REVERT those files to that same stale canonical instead of fixing them.',
     );
     console.log('    Fix: update the CLI FIRST (pull + rebuild this checkout, or install a current');
     console.log(`    CLI release), THEN run ${refreshCmd}. Do not run it alone while the CLI is`);
@@ -2443,7 +2462,7 @@ function printDistributionFixLine(target: '.claude/scripts/' | '.claude/rules/',
     return;
   }
 
-  if (checkoutCurrency.status === 'UNKNOWN') {
+  if (staleCount > 0 && checkoutCurrency.status === 'UNKNOWN') {
     console.log(`    ? ${checkoutCurrency.detail}`);
     console.log(
       "    Whether the installed CLI's canonical above is itself current can't be dated from " +
@@ -2453,9 +2472,10 @@ function printDistributionFixLine(target: '.claude/scripts/' | '.claude/rules/',
     return;
   }
 
-  // PASS (checkout confirmed current) or INFO (not a framework checkout at
-  // all — the ordinary consumer shape `#1372` already gets right) — leave
-  // the existing wording untouched; no caveat to add.
+  // staleCount === 0 (missing-only — nothing on disk to revert), OR PASS
+  // (checkout confirmed current), OR INFO (not a framework checkout at all
+  // — the ordinary consumer shape `#1372` already gets right) — leave the
+  // existing wording untouched; no caveat to add.
   console.log(`    ${plainFix}`);
 }
 
@@ -2478,7 +2498,8 @@ function printScriptCurrencySection(check: ScriptCurrencyCheckResult, checkoutCu
     const reasonText = f.reason === 'stale' ? 'stale — differs from canonical' : 'missing — never distributed';
     console.log(`    ✗ ${f.name} — ${reasonText}`);
   }
-  printDistributionFixLine('.claude/scripts/', checkoutCurrency);
+  const staleCount = check.findings.filter((f) => f.reason === 'stale').length;
+  printDistributionFixLine('.claude/scripts/', checkoutCurrency, staleCount);
 }
 
 /** Print the groundnuty/macf#1360 distributed-rule-currency report section for `check`. */
@@ -2500,7 +2521,8 @@ function printRuleCurrencySection(check: RuleCurrencyCheckResult, checkoutCurren
     const reasonText = f.reason === 'stale' ? 'stale — differs from canonical' : 'missing — never distributed';
     console.log(`    ✗ ${f.name} — ${reasonText}`);
   }
-  printDistributionFixLine('.claude/rules/', checkoutCurrency);
+  const staleCount = check.findings.filter((f) => f.reason === 'stale').length;
+  printDistributionFixLine('.claude/rules/', checkoutCurrency, staleCount);
 }
 
 /** Print the groundnuty/macf#1376 Framework-checkout-currency report section for `check`. */

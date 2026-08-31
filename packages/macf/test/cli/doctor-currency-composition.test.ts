@@ -22,13 +22,19 @@
  * these fixtures use the real identity marker exactly like
  * `doctor-checkout-currency.test.ts`'s own rendered describe block).
  *
- * Decisive pair (assert-the-wrong-path.md): a checkout BEHIND canonical
- * must compose the corrected remedy; a checkout LEVEL with canonical must
- * render byte-for-byte the pre-#1383 plain remedy (no added noise). Both
- * fixtures otherwise force the SAME rule-currency WARN (a deliberately
- * stale `.claude/rules/coordination.md`), so the only variable between the
- * two tests is the checkout's own currency — proving the composition is
- * driven by that signal and nothing else.
+ * Two decisive pairs (assert-the-wrong-path.md), on two independent axes:
+ *
+ * 1. Checkout lag, findings held fixed (one stale rule): a checkout BEHIND
+ *    canonical must compose the corrected remedy; a checkout LEVEL with
+ *    canonical must render byte-for-byte the pre-#1383 plain remedy (no
+ *    added noise).
+ * 2. Finding shape, checkout lag held fixed (behind): a STALE finding must
+ *    compose the corrected remedy; an all-MISSING finding set must render
+ *    the plain remedy even though the checkout is behind — a missing file
+ *    has nothing on disk for a stale CLI to overwrite, so cautioning the
+ *    reader off `macf update` for it would repeat the exact #1361-shaped
+ *    contradiction ("this evidence says X, so don't do the one thing that
+ *    helps") this file's own fix was built to avoid.
  */
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -166,6 +172,51 @@ describe('runDoctor — rule-currency WARN composed with checkout currency (grou
     expect(section).not.toContain(
       'Fix: run `macf update` (or `macf rules refresh --dir .`) to bring .claude/rules/ current.',
     );
+  });
+
+  // --- Second decisive pair: stale vs missing at fixed checkout lag ---
+  //
+  // The pair above holds findings fixed (one stale rule) and varies checkout
+  // lag. This one holds checkout lag fixed (behind, same as pair 1/1) and
+  // varies the finding shape: stale vs all-missing. A MISSING file (#1362
+  // root cause 2 — a hook that never fires at all) has nothing on disk for
+  // a stale CLI to overwrite, so `macf update` from a behind CLI still
+  // strictly helps it. Cautioning the reader off the remedy that would fix
+  // 15 missing files, on the strength of one stale finding, is the exact
+  // #1361-shaped contradiction this test pins against.
+
+  it('all-MISSING findings render the plain remedy even though the checkout is behind — nothing on disk to revert', async () => {
+    const { remote } = initFrameworkFixture(tmpRoot);
+    git(tmpRoot, 'push', '-q', '-u', 'origin', 'main');
+
+    const work2 = join(tmpRoot, '..', 'work2-' + Math.random().toString(36).slice(2));
+    git(join(tmpRoot, '..'), 'clone', '-q', remote, work2);
+    git(work2, 'config', 'user.email', 'test@example.invalid');
+    git(work2, 'config', 'user.name', 'Test');
+    git(work2, 'config', 'commit.gpgsign', 'false');
+    git(work2, 'commit', '-q', '--allow-empty', '-m', 'ahead');
+    git(work2, 'push', '-q', 'origin', 'HEAD:main');
+    git(tmpRoot, 'fetch', '-q', 'origin');
+    rmSync(work2, { recursive: true, force: true });
+
+    // Deliberately NO writeStaleRuleFile call and no `.claude/rules/` at
+    // all — every canonical rule name reports `missing`, zero `stale`.
+    writeAgentConfig(tmpRoot, localConfig());
+    installSandboxFdAllowRead(tmpRoot);
+
+    const code = await runDoctor(tmpRoot);
+    expect(code).toBe(0);
+
+    const out = logSpy.mock.calls.flat().join('\n');
+    const section = ruleCurrencyWarnLines(out).join('\n');
+
+    expect(section).toMatch(/0 stale, \d+ missing of/);
+    // The plain remedy fires — no revert-risk caution for missing-only findings.
+    expect(section).toContain(
+      'Fix: run `macf update` (or `macf rules refresh --dir .`) to bring .claude/rules/ current.',
+    );
+    expect(section).not.toMatch(/THE INSTALLED CLI is probably STALE/);
+    expect(section).not.toMatch(/update the CLI FIRST/);
   });
 
   it('DECISIVE PAIR (2/2): a checkout LEVEL with canonical renders the unchanged plain remedy — no added noise', async () => {
