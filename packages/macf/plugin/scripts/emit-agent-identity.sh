@@ -186,6 +186,7 @@ if [ -n "$IDENTITY_SOURCE" ]; then
       printf 'GitHub bot identity: %s.\n' "$BOT_LOGIN"
     fi
     printf '(identity source: %s — not macf-whoami.sh, which only confirms token attribution, see groundnuty/macf#664)\n' "$IDENTITY_SOURCE"
+    printf 'Run `macf whoami` for the full self-discovery report (registry, cert CN+expiry, versions, token type).\n'
   } 2>/dev/null || true
 else
   cat <<'UNKNOWN'
@@ -194,8 +195,8 @@ nor the MACF_PROJECT/MACF_AGENT_NAME/MACF_AGENT_ROLE environment resolved a
 complete identity for this workspace. This workspace does NOT know which
 MACF agent it is. Do not assume an identity from the directory name, the
 tmux session name, or a GH token (macf-whoami.sh confirms token attribution
-only — it does not name an agent). If this is unexpected, run `macf doctor`
-or inspect `.macf/macf-agent.json` directly.
+only — it does not name an agent). If this is unexpected, run `macf whoami`
+or `macf doctor` or inspect `.macf/macf-agent.json` directly.
 UNKNOWN
 fi
 
