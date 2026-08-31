@@ -4527,6 +4527,10 @@ function resultWith(overrides: Partial<FleetApplyResult> = {}): FleetApplyResult
     // key this run, nothing to fail on) + no routing declared. Individual
     // tests below override to exercise failure/skip shapes.
     ca: { resolve: { status: 'reused', certFingerprint: 'deadbeef'.repeat(8) }, registryLeg: { status: 'already-present' }, repoLegs: {} },
+    // groundnuty/macf#810 default: empty (no trust.federated_cas declared) —
+    // matches `routing: {}`'s own "nothing declared" default immediately
+    // below. Individual tests below override to exercise the declared shape.
+    federatedTrust: {},
     routing: {},
     // groundnuty/macf#1323 default: NOT-REQUIRED (no self-hosted runner
     // declared) — matches `routing: {}`'s own "nothing declared" default
@@ -4877,6 +4881,16 @@ describe('formatApplyResult / fleetApplyResultToJson / applyExitCode (pure)', ()
     expect(applyExitCode(resultWith({}))).toBe(0);
   });
 
+  it('applyExitCode: 1 when a federated-CA registry leg failed (groundnuty/macf#810 — same bar as a failed own-CA leg)', () => {
+    expect(applyExitCode(resultWith({ federatedTrust: { 'ppam-2026': { status: 'failed', reason: 'network error' } } }))).toBe(1);
+  });
+
+  it('applyExitCode: 0 when every declared federated-CA leg is created/already-present', () => {
+    expect(
+      applyExitCode(resultWith({ federatedTrust: { 'ppam-2026': { status: 'created' }, 'icsoc-2026': { status: 'already-present' } } })),
+    ).toBe(0);
+  });
+
   it('--json (fleetApplyResultToJson) distinguishes all three routing-client mint statuses verbatim — minted / skipped / failed (macf#954)', () => {
     const minted = fleetApplyResultToJson(resultWith({ routingClient: { mint: { status: 'minted' }, certLegs: {}, keyLegs: {} } })) as {
       routing_client: { mint: { status: string } };
@@ -4921,6 +4935,40 @@ describe('formatApplyResult / fleetApplyResultToJson / applyExitCode (pure)', ()
     const text = formatApplyResult(resultWith({ ca: { resolve: { status: 'failed', reason: 'no age recipient' }, registryLeg: { status: 'skipped', reason: 'no cert resolved' }, repoLegs: {} } }));
     expect(text).toMatch(/CA: FAILED to resolve — no age recipient/);
     expect(text).toMatch(/registry leg: SKIPPED — no cert resolved/);
+  });
+
+  describe('federated trust render (groundnuty/macf#810)', () => {
+    it('formatApplyResult renders nothing for federated trust when none was declared — silent, same as routing', () => {
+      const text = formatApplyResult(resultWith({}));
+      expect(text).not.toMatch(/Federated trust/);
+    });
+
+    it('formatApplyResult renders one line per declared project, and NEVER a CA bundle value', () => {
+      const text = formatApplyResult(
+        resultWith({ federatedTrust: { 'ppam-2026': { status: 'created' }, 'icsoc-2026': { status: 'already-present' } } }),
+      );
+      expect(text).toMatch(/Federated trust \(trust\.federated_cas\):/);
+      expect(text).toMatch(/registry leg \(ppam-2026\): CREATED/);
+      expect(text).toMatch(/registry leg \(icsoc-2026\): ALREADY-PRESENT/);
+      expect(text).not.toContain('-----BEGIN');
+    });
+
+    it('formatApplyResult renders a federated-CA leg failure loudly', () => {
+      const text = formatApplyResult(resultWith({ federatedTrust: { 'ppam-2026': { status: 'failed', reason: 'network error' } } }));
+      expect(text).toMatch(/registry leg \(ppam-2026\): FAILED — network error/);
+    });
+
+    it('fleetApplyResultToJson always carries federated_trust, empty {} when nothing declared', () => {
+      const json = fleetApplyResultToJson(resultWith({})) as { federated_trust: Record<string, unknown> };
+      expect(json.federated_trust).toEqual({});
+    });
+
+    it('fleetApplyResultToJson carries the declared legs verbatim, keyed by project', () => {
+      const json = fleetApplyResultToJson(resultWith({ federatedTrust: { 'ppam-2026': { status: 'created' } } })) as {
+        federated_trust: Record<string, unknown>;
+      };
+      expect(json.federated_trust).toEqual({ 'ppam-2026': { status: 'created' } });
+    });
   });
 
   it('formatApplyResult renders routing lines only when routing is non-empty', () => {

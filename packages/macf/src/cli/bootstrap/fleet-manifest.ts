@@ -451,6 +451,68 @@ export const FleetCollaboratorSchema = z
   .strict();
 
 /**
+ * One fleet-level federated-trust grant (groundnuty/macf#810, DR-041
+ * Amendment B, superseding the removed `trust.*` shape per groundnuty/
+ * macf#1201/#1205 — see {@link rejectDeclaredTrustCa}'s doc for how the two
+ * rulings compose). `project` is the guest fleet's identifier (`#786`'s
+ * home-project convention, e.g. `ppam-2026`) — the SAME identifier
+ * `resolveFederatedCaBundle` (`@groundnuty/macf-core`'s `trust-bundle.ts`)
+ * already reads registry entries for via `${toVariableSegment(project)}_CA_CERT`.
+ *
+ * `ca_bundle` is the guest's CA certificate PEM, declared **inline** — not a
+ * reference, not a fetch. `#789`/`#1330` established that the channel-server
+ * serves no CA-fetch endpoint (`/health`, `/notify`, `/sign`,
+ * `/.well-known/agent-card.json`, `/a2a/v1` — none reads or serves one), so
+ * there is nothing to point at; the operator transcribes it from the guest
+ * fleet directly. **This is PUBLIC key material** (a CA certificate, not a
+ * private key) — declaring it in `fleet.yaml` (a committed file) leaks
+ * nothing, the same posture `FleetCollaboratorSchema.ca_bundle` and
+ * `fleet.lock`'s `age_recipients` already take. Do not "protect" this field
+ * into the vault or a secret store — doing so would break federation (there
+ * is nowhere else `apply` would read it from) for a value that was never
+ * secret to begin with.
+ *
+ * No `type`, no scope, no per-agent override field — every one of those is a
+ * decision this issue's ruling explicitly declined to make ahead of a real
+ * need (`#810` comment thread, 2026-08-31 ruling). In particular, this is
+ * NOT unioned with any per-agent-repo declaration — see
+ * {@link FleetTrustSchema}'s doc for the precedence rule.
+ */
+export const FleetFederatedCaSchema = z
+  .object({
+    project: z.string().min(1),
+    ca_bundle: z.string().min(1),
+  })
+  .strict();
+export type FleetFederatedCa = z.infer<typeof FleetFederatedCaSchema>;
+
+/**
+ * Fleet-level trust declaration (groundnuty/macf#810). Reintroduces the
+ * `trust:` manifest key `#1201` removed — but landing WITH its enforcement
+ * this time (`apply-federated-trust.ts`'s registry publish), per `#1205`'s
+ * condition: *"a schema field must land WITH its enforcement, not ahead of
+ * it."* `#1205` set a condition, not a prohibition — this field returning as
+ * part of the change that makes it live is exactly what it asked for.
+ *
+ * **`federated_cas` is fleet-scoped and AUTHORITATIVE — never unioned with a
+ * per-agent declaration.** An agent trusting a CA the fleet did not declare
+ * would be an ungoverned grant (the dangerous half of the widening/narrowing
+ * asymmetry the `#810` ruling names); a fleet-level grant an agent lacks is
+ * the ORIGINAL silent-asymmetry incident this issue exists to fix (one
+ * agent's `.github/macf-fleet.json` federated a guest, a sibling agent's did
+ * not, and the sibling's mTLS handshake failed as an opaque "offline" rather
+ * than a legible trust gap). Declaring the fleet-level grant once, in one
+ * place, is what makes that asymmetry unrepresentable — the field is a
+ * floor, not a suggestion.
+ */
+export const FleetTrustSchema = z
+  .object({
+    federated_cas: z.array(FleetFederatedCaSchema),
+  })
+  .strict();
+export type FleetTrust = z.infer<typeof FleetTrustSchema>;
+
+/**
  * Account-level, cross-fleet resources — detected + reused, never re-created
  * (the `macf-routing` App silent-duplicate-create hazard DR-035 documented).
  * `ts_oauth` is a REFERENCE (an out-of-band-supplied credential name), never
@@ -505,6 +567,7 @@ export const FleetManifestSchema = z
     routing: FleetRoutingSchema.optional(),
     collaborators: z.array(FleetCollaboratorSchema).optional(),
     shared: FleetSharedSchema.optional(),
+    trust: FleetTrustSchema.optional(),
   })
   .strict()
   .superRefine((manifest, ctx) => {
@@ -631,50 +694,55 @@ export type FleetShared = z.infer<typeof FleetSharedSchema>;
 export type FleetManifest = z.infer<typeof FleetManifestSchema>;
 
 /**
- * groundnuty/macf#1201 — `trust.ca` / `trust.federated_cas` were removed
- * from {@link FleetManifestSchema}: `FleetTrust` had zero consumers
- * anywhere in this codebase (the #1200 reconciliation audit,
- * `design/manifest-reconciliation-audit.md` rows 30-31) — the sharpest of
- * that audit's nine inert fields, because the doc comment that used to sit
- * on the removed `trust:` field described a CA-plan gating relationship
- * that never existed. Fleet-level CA/federation trust is `#810`'s still-
- * open design; a schema field landing ahead of that design's enforcement
- * is exactly what produced this problem, so it is not quietly re-added
- * here — read `#810` before reintroducing either sub-field.
+ * groundnuty/macf#1201 removed BOTH `trust.ca` and `trust.federated_cas`
+ * from {@link FleetManifestSchema} — `FleetTrust` had zero consumers
+ * anywhere in this codebase at the time (the #1200 reconciliation audit,
+ * `design/manifest-reconciliation-audit.md` rows 30-31), and a schema field
+ * landing ahead of its enforcement is indistinguishable from a field that
+ * regressed (`#1205`'s ruling). **`#810` (this module's {@link
+ * FleetTrustSchema}) reintroduces `trust.federated_cas` landing WITH its
+ * enforcement** (`apply-federated-trust.ts`'s registry publish) — `#1205`
+ * set a condition on re-adding a trust field, not a permanent prohibition,
+ * and the condition is satisfied here. `trust.ca` was never given a
+ * design and stays removed; this function's ONLY remaining job is
+ * catching that ONE specific stale sub-field with a targeted message,
+ * rather than the whole `trust:` key.
  *
- * This check runs BEFORE `FleetManifestSchema.parse` deliberately: a bare
- * `.strict()` "Unrecognized key: trust" is true but useless to an operator
- * holding an old `fleet.yaml`, and — verified empirically — zod's
- * `superRefine` never runs once the object-level strict check has already
- * raised an unrecognized-key issue (the same base-validation-first
- * ordering `manifest-scaffold.ts`'s module doc documents for a missing
- * required field), so a refusal added there would never even execute.
- * Intercepting the raw parsed value here, ahead of `.parse`, is what makes
- * a targeted explanation possible instead.
+ * This check runs BEFORE `FleetManifestSchema.parse` deliberately: for the
+ * `trust.ca` case specifically, a bare `.strict()` "Unrecognized key: ca"
+ * issue on the nested `FleetTrustSchema` would be technically correct but
+ * would not explain that `ca` was deliberately removed (vs. a typo) or
+ * point at the replacement field — and (per the ORIGINAL form of this
+ * check, still true here) zod's `superRefine` never runs once the
+ * object-level strict check has already raised an unrecognized-key issue,
+ * so a refusal added inside `FleetManifestSchema.superRefine` would never
+ * even execute for a malformed `trust:` shape. Intercepting the raw parsed
+ * value here, ahead of `.parse`, is what makes a targeted explanation
+ * possible.
  */
-function rejectDeclaredTrust(raw: unknown): void {
+function rejectDeclaredTrustCa(raw: unknown): void {
   if (typeof raw !== 'object' || raw === null || !('trust' in raw)) return;
+  const trust = (raw as { readonly trust?: unknown }).trust;
+  if (typeof trust !== 'object' || trust === null || !('ca' in trust)) return;
   throw new Error(
-    'fleet.yaml declares a "trust:" section (trust.ca / trust.federated_cas). Nothing in this version of ' +
-      'macf reads that section — an earlier schema parsed it, but no code path ever enforced it, so declaring ' +
-      'it changed nothing. Fleet-level CA/federation trust is an unsettled design; until it lands, remove the ' +
-      '"trust:" section from this fleet.yaml. This does not weaken anything you already have: every fleet gets ' +
-      'its own CA unconditionally, with or without a "trust:" section.',
+    'fleet.yaml declares "trust.ca" — this field does not exist and was removed; it was never implemented. ' +
+      'Fleet-level CA/federation trust is declared via "trust.federated_cas" (a list of { project, ca_bundle } ' +
+      'entries); rename or remove "trust.ca" from this fleet.yaml.',
   );
 }
 
 /**
  * Parse + validate a `fleet.yaml` document from its raw text. Throws a
  * `ZodError` (via `.parse`) on any schema violation, or a plain `Error` with
- * a dedicated explanation when the manifest declares a removed field (today:
- * a declared `trust:` section — see {@link rejectDeclaredTrust}). Callers at
- * the CLI boundary (`commands/bootstrap.ts`) catch + render EITHER kind's
- * `.message` into the `--json`-never-empty failure envelope (macf#830
- * lesson), so no caller needs to discriminate the two.
+ * a dedicated explanation when the manifest declares the removed `trust.ca`
+ * sub-field (see {@link rejectDeclaredTrustCa}). Callers at the CLI boundary
+ * (`commands/bootstrap.ts`) catch + render EITHER kind's `.message` into the
+ * `--json`-never-empty failure envelope (macf#830 lesson), so no caller
+ * needs to discriminate the two.
  */
 export function parseFleetManifest(yamlText: string): FleetManifest {
   const raw: unknown = parseYaml(yamlText);
-  rejectDeclaredTrust(raw);
+  rejectDeclaredTrustCa(raw);
   return FleetManifestSchema.parse(raw);
 }
 

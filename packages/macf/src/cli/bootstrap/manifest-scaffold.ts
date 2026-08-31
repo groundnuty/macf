@@ -89,11 +89,14 @@
  * | routing.*                           | omitted (optional)      | declarative routing-target/label/hibernation policy; no live signal drives any of the three sub-fields |
  * | collaborators                       | omitted (optional)      | cross-fleet federation membership has no live discovery path implemented (day-2 per its own schema doc) |
  * | shared                              | omitted (optional)      | unconsumed field per its own schema doc |
+ * | trust.federated_cas                 | omitted (optional)      | a guest fleet's CA bundle is operator-transcribed, never live-discoverable (`fleet-manifest.ts::FleetFederatedCaSchema`'s own doc — no fetch endpoint exists) — same "nothing to derive from" reasoning as `collaborators`/`shared` above |
  *
- * `trust.ca` / `trust.federated_cas` are gone from this table because they
- * are gone from the schema (groundnuty/macf#1201 — see `fleet-manifest.ts`'s
- * `rejectDeclaredTrust` doc for why, and `#810` for the still-open
- * fleet-federation design they anticipated).
+ * `trust.ca` is gone from this table because it is gone from the schema —
+ * removed by groundnuty/macf#1201 and never reintroduced (see
+ * `fleet-manifest.ts`'s `rejectDeclaredTrustCa` doc). `trust.federated_cas`
+ * WAS also removed by #1201 but `#810` reintroduced it, landing with its
+ * enforcement (`apply-federated-trust.ts`) — it stays in this table, above,
+ * as `omitted (optional)` like every other undiscoverable field.
  *
  * **`defaults.role_template` is flagged, never decided, per explicit
  * instruction** — this module reports it as a judgment call for whoever

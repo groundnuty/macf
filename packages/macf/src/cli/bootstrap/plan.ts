@@ -72,14 +72,22 @@
  * #1355, `app_manifest` / `profile` as of #1357). Only the remaining pair
  * split off into a different, NON-mechanism fix:
  *
- * - **`trust.ca` / `trust.federated_cas`** — groundnuty/macf#1205 (merged
- *   2026-08-26, before #1355 was filed) removed `trust:` from
- *   {@link FleetManifestSchema} entirely and made declaring it a loud
- *   parse-time refusal (`fleet-manifest.ts::rejectDeclaredTrust`) — a
- *   `FleetManifest` value can no longer carry a `trust` key at all, so
- *   there is nothing left here to disclose; the refusal already IS the
- *   strongest form of disclosure, and is why this file never mentions
- *   `trust` again.
+ * - **`trust.ca`** — groundnuty/macf#1201 removed it from
+ *   {@link FleetManifestSchema} and `#1205` held the line: `trust.ca` was
+ *   never given a design, so it stays a loud parse-time refusal
+ *   (`fleet-manifest.ts::rejectDeclaredTrustCa`) rather than a disclosed
+ *   section — there is nothing here to reconcile because the field cannot
+ *   even be declared.
+ * - **`trust.federated_cas`** — the SAME `#1201` removal applied here too,
+ *   but groundnuty/macf#810 reintroduced it landing WITH its enforcement
+ *   (satisfying `#1205`'s condition: a schema field must land with its
+ *   enforcement, never ahead of it). Unlike `collaborators`/`shared`
+ *   above, this section is NOT in `skippedSections` — `computePlan` emits a
+ *   `'federated_ca'` item per declared entry (see {@link federatedCaItem})
+ *   and `apply-federated-trust.ts` actually publishes it, mirroring the
+ *   `'ca'` kind's own registry-scope publish. See `fleet-manifest.ts`'s
+ *   `FleetTrustSchema` doc for the field shape and the union-vs-authoritative
+ *   precedence ruling.
  * - **`defaults.app_manifest` / `agents[].profile`** — were REQUIRED schema
  *   fields (no `.optional()` on either path) until #1357. The science-agent
  *   ruling on #1357 is explicit about why removal (`trust`'s fix) does NOT
@@ -134,6 +142,15 @@ import { countVaultAgentPresence, countVaultCaPresence } from './vault-read.js';
 // a one-directional runtime dependency — see `apply-routing.ts::
 // checkRunnerTokenPreflight`'s doc).
 import { RUNNER_TOKEN_ENV_VAR, RUNNER_TOKEN_FLAG } from './apply-routing.js';
+// groundnuty/macf#810 — same one-directional-runtime-dependency shape as the
+// `apply-routing.js` import immediately above: `apply-ca.ts` only ever
+// `import type`s `Presence` from THIS module, so a value import going the
+// other way here creates no runtime cycle (only a type-level one, which TS
+// resolves fine). `caCertVariableName` is the SAME `<SEG>_CA_CERT` formula
+// `federatedCaItem` below needs — keyed by the GUEST project's segment, not
+// this fleet's own, mirroring `apply-federated-trust.ts`'s publish target
+// exactly so plan and apply name the identical registry variable.
+import { caCertVariableName } from './apply-ca.js';
 // groundnuty/macf#1186 — same one-directional-runtime-dependency shape as
 // the `RUNNER_TOKEN_ENV_VAR`/`RUNNER_TOKEN_FLAG` import immediately above:
 // `apply-routing-secrets.ts` only ever `import type`s `Presence` from THIS
@@ -386,6 +403,15 @@ export interface ObservedState {
   /** Per-agent-repo `<SEG>_CA_CERT` presence, keyed by `agent.repo`. */
   readonly caRepos: Readonly<Record<string, Presence>>;
   /**
+   * groundnuty/macf#810 — registry-scope `<GUEST_SEG>_CA_CERT` presence for
+   * each declared `trust.federated_cas[]` entry, keyed by `project` (never by
+   * this fleet's own segment — see {@link federatedCaItem}'s doc). Optional,
+   * same "pre-this-feature fixture keeps compiling" reasoning
+   * `routingClientRepos` above documents — an absent map (or an absent entry
+   * within it) reads identically to `'unknown'` at `computePlan`'s call site.
+   */
+  readonly federatedCaRegistry?: Readonly<Record<string, Presence>>;
+  /**
    * Per-agent-repo `ROUTING_CLIENT_CERT` secret presence (groundnuty/macf#920
    * gap 2), keyed by `agent.repo`. A proxy for "has this repo received its
    * routing-client identity" — checks `ROUTING_CLIENT_CERT` only (not also
@@ -545,6 +571,8 @@ export type PlanItemKind =
   | 'install'
   | 'secret_fingerprint'
   | 'ca'
+  /** groundnuty/macf#810 — one per declared `trust.federated_cas[]` entry: this fleet's registry-scope copy of a GUEST project's CA cert, keyed by the guest's segment (never this fleet's own `'ca'` segment). See {@link federatedCaItem}'s doc. */
+  | 'federated_ca'
   | 'routing'
   | 'runner_warm'
   | 'agent'
@@ -1041,6 +1069,13 @@ export function planItemApplyCoverage(item: PlanItem): ApplyCoverage {
       // existence check that only ever emits 'create' or 'noop' — so this
       // arm's only live input is 'create'; 'noop' is filtered above.
       return 'implemented';
+    case 'federated_ca':
+      // groundnuty/macf#810 — apply-fleet.ts calls
+      // apply-federated-trust.ts's registry publish for every declared
+      // trust.federated_cas[] entry, same "a create verb here IS actioned"
+      // fact as 'ca' immediately above; also produced by `presenceVerb`, so
+      // 'noop' is filtered above and 'create' is the only live input here.
+      return 'implemented';
     case 'version':
       // DR-043 Amendment L (macf#1045) — `apply-version.ts` now calls the
       // `macf fleet upgrade` roll machinery (delegation, never
@@ -1214,6 +1249,7 @@ function unimplementedReasonFor(item: PlanItem): string {
     case 'agent':
     case 'repo':
     case 'ca':
+    case 'federated_ca':
     case 'control_repo':
     case 'agent_repo_archived':
     case 'labels':
@@ -1230,7 +1266,8 @@ function unimplementedReasonFor(item: PlanItem): string {
       // Unreachable: `planItemApplyCoverage` never returns 'not_implemented'
       // for these kinds (see its switch above — 'repo' joined this group in
       // macf#857 / DR-043 Amendment F, 'ca' in macf#838 Amendment D phase
-      // 2, 'control_repo' in macf#867 / DR-043 Amendment G, 'agent_repo_archived'
+      // 2, 'federated_ca' in groundnuty/macf#810 (same registry-publish
+      // shape as 'ca'), 'control_repo' in macf#867 / DR-043 Amendment G, 'agent_repo_archived'
       // in macf#1034 (DR-043 Amendment G correction), 'labels'/
       // 'routing_client' in groundnuty/macf#920, 'runner_ops' in
       // groundnuty/macf#943, 'vault_recipients' in groundnuty/macf#957,
@@ -1950,6 +1987,32 @@ function caRegistryItem(seg: string, presence: Presence, vaultCa: VaultCaObserva
     target: `ca:registry:${varName}`,
     verb,
     reason: `registry CA var "${varName}" ${reasonSuffix}${formatVaultCaSuffix(vaultCa)}`,
+    confirm_required: false,
+  };
+}
+
+/**
+ * The registry-scope federated-CA plan item (groundnuty/macf#810) — one per
+ * declared `trust.federated_cas[]` entry. Deliberately mirrors
+ * {@link caRegistryItem}'s shape (registry-scope, `presenceVerb` against a
+ * live read, `UNKNOWN_REASONS.variable` on an unconfirmable read) but keyed
+ * by the GUEST project's segment (`caCertVariableName(project)`, e.g.
+ * `PPAM_2026_CA_CERT`), never this fleet's own — this is a copy of a PEER's
+ * public CA cert living in THIS fleet's registry scope, not this fleet's own
+ * CA. No repo-leg sibling: unlike `caRepoItem`, `apply-federated-trust.ts`
+ * publishes registry-scope ONLY — the sole consumer
+ * (`@groundnuty/macf-core`'s `trust-bundle.ts::resolveFederatedCaBundle`)
+ * reads via `varsClient.readVariable`, never a repo variable, so there is no
+ * second leg to plan against.
+ */
+function federatedCaItem(project: string, presence: Presence): PlanItem {
+  const varName = caCertVariableName(project);
+  const { verb, reasonSuffix } = presenceVerb(presence, UNKNOWN_REASONS.variable);
+  return {
+    kind: 'federated_ca',
+    target: `federated_ca:registry:${varName}`,
+    verb,
+    reason: `registry federated-CA var "${varName}" (guest project "${project}") ${reasonSuffix}`,
     confirm_required: false,
   };
 }
@@ -2691,6 +2754,13 @@ export function computePlan(
   items.push(caRegistryItem(seg, observed.caRegistry, observed.vaultCa));
   for (const agent of manifest.agents) {
     items.push(caRepoItem(seg, agent.repo, observed.caRepos[agent.repo] ?? 'unknown'));
+  }
+  // groundnuty/macf#810 — one item per declared trust.federated_cas[] entry;
+  // silent (zero items) when `trust` is undeclared, same presence-gated
+  // shape `collaborators`/`shared` use elsewhere in this file, except this
+  // section IS reconciled by apply (never added to `skippedSections`).
+  for (const entry of manifest.trust?.federated_cas ?? []) {
+    items.push(federatedCaItem(entry.project, observed.federatedCaRegistry?.[entry.project] ?? 'unknown'));
   }
   for (const agent of manifest.agents) {
     items.push(routingClientItem(agent.repo, observed.routingClientRepos?.[agent.repo] ?? 'unknown'));
