@@ -171,8 +171,16 @@ export type CheckoutCurrencyResult =
   | { readonly kind: 'unreadable'; readonly reason: string }
   | { readonly kind: 'ok'; readonly upstream: string; readonly commitCount: number };
 
-/** Run a read-only git subcommand in `cwd`; null on any failure. Never mutates git state. */
-function tryGit(args: readonly string[], cwd: string): string | null {
+/**
+ * Runs a read-only git subcommand in `cwd`; returns `null` on any failure
+ * (never throws). Injectable seam — same shape as `proc-scan.ts`'s
+ * `ProcReader` — so `detectCheckoutCurrency`'s harder-to-construct-for-real
+ * branches (see `unreadable` below) are testable without needing a git
+ * failure mode that real git can actually be coaxed into producing.
+ */
+export type GitRunner = (args: readonly string[], cwd: string) => string | null;
+
+export const defaultGitRunner: GitRunner = (args, cwd) => {
   try {
     return execFileSync('git', [...args], {
       cwd,
@@ -182,7 +190,7 @@ function tryGit(args: readonly string[], cwd: string): string | null {
   } catch {
     return null;
   }
-}
+};
 
 /**
  * Determine how far `packageRoot`'s HEAD is behind its configured upstream.
@@ -195,19 +203,33 @@ function tryGit(args: readonly string[], cwd: string): string | null {
  * direct-existence gate never detects that as a checkout at all, which is
  * exactly how #144's build-freshness check "never reaches" the real
  * monorepo checkout shape (see groundnuty/macf#1376).
+ *
+ * `unreadable` is a defensive branch, not one real git can be coaxed into
+ * hitting: empirically, `@{u}` resolution is atomic — if it names an
+ * upstream at all, that upstream already resolves to a real commit, so the
+ * subsequent `rev-list --count` essentially cannot fail (verified: a
+ * dangling upstream config with the tracking ref deleted makes `@{u}` ITSELF
+ * fail with "no such branch", collapsing into `no-upstream` rather than
+ * reaching this branch). It stays as a guard against a non-numeric
+ * `rev-list` result from a future/unexpected git output shape — exercised
+ * in tests via the injected `gitRunner` seam, not a constructed real
+ * checkout, since no real one reaches it.
  */
-export function detectCheckoutCurrency(packageRoot: string): CheckoutCurrencyResult {
-  const insideWorkTree = tryGit(['rev-parse', '--is-inside-work-tree'], packageRoot);
+export function detectCheckoutCurrency(
+  packageRoot: string,
+  gitRunner: GitRunner = defaultGitRunner,
+): CheckoutCurrencyResult {
+  const insideWorkTree = gitRunner(['rev-parse', '--is-inside-work-tree'], packageRoot);
   if (insideWorkTree !== 'true') {
     return { kind: 'not-a-checkout' };
   }
 
-  const upstream = tryGit(['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'], packageRoot);
+  const upstream = gitRunner(['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'], packageRoot);
   if (upstream === null || upstream.length === 0) {
     return { kind: 'no-upstream' };
   }
 
-  const countRaw = tryGit(['rev-list', '--count', `HEAD..${upstream}`], packageRoot);
+  const countRaw = gitRunner(['rev-list', '--count', `HEAD..${upstream}`], packageRoot);
   if (countRaw === null || !/^\d+$/.test(countRaw)) {
     return {
       kind: 'unreadable',
