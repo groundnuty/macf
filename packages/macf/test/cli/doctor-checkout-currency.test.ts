@@ -1,5 +1,5 @@
 /**
- * Tests for `macf doctor`'s CLI-checkout-currency check (groundnuty/macf#1376
+ * Tests for `macf doctor`'s Framework-checkout-currency check (groundnuty/macf#1376
  * — a repo checkout of the macf framework's own source has no way to learn
  * it is behind the canonical branch it tracks; `doctor.ts` documented the
  * gap in prose comments — "nineteen days behind canonical with nothing able
@@ -178,7 +178,7 @@ describe('checkCheckoutCurrency (groundnuty/macf#1376)', () => {
   });
 });
 
-describe('runDoctor — CLI checkout currency section (rendered output, groundnuty/macf#1376)', () => {
+describe('runDoctor — Framework checkout currency section (rendered output, groundnuty/macf#1376)', () => {
   let tmpRoot: string;
   let logSpy: ReturnType<typeof vi.spyOn>;
   let errSpy: ReturnType<typeof vi.spyOn>;
@@ -231,7 +231,7 @@ describe('runDoctor — CLI checkout currency section (rendered output, groundnu
     expect(code).toBe(0);
 
     const out = logSpy.mock.calls.flat().join('\n');
-    expect(out).toContain('CLI checkout currency');
+    expect(out).toContain('Framework checkout currency');
     // Scope to THIS section's own line — the Disk space section further
     // down legitimately reports [PASS] for an unrelated reason, so a
     // whole-output [PASS] match would pass even if this check reported
@@ -263,7 +263,7 @@ describe('runDoctor — CLI checkout currency section (rendered output, groundnu
     expect(code).toBe(0); // WARN-only — never affects the exit code
 
     const out = logSpy.mock.calls.flat().join('\n');
-    expect(out).toContain('CLI checkout currency');
+    expect(out).toContain('Framework checkout currency');
     // Scope to THIS section's own line — other sections can legitimately
     // emit [WARN] for unrelated reasons on a minimal fixture workspace, so
     // a whole-output [WARN] match would pass even if THIS check's own line
@@ -289,8 +289,8 @@ describe('runDoctor — CLI checkout currency section (rendered output, groundnu
     expect(code).toBe(1); // pre-existing "run `macf init` first" exit — unrelated to this check
 
     const out = logSpy.mock.calls.flat().join('\n');
-    expect(out).toContain('CLI checkout currency');
-    // Scope the assertion to the CLI-checkout-currency section's own line —
+    expect(out).toContain('Framework checkout currency');
+    // Scope the assertion to the Framework-checkout-currency section's own line —
     // the Disk space section further down legitimately reports [PASS] for
     // an unrelated reason, so a whole-output PASS/WARN exclusion would be a
     // false failure, not a real signal about THIS check.

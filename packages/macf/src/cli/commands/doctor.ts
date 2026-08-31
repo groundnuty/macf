@@ -1662,9 +1662,9 @@ export function checkDistributedRuleCurrency(
 }
 
 /**
- * Result of the CLI-checkout-currency assertion (groundnuty/macf#1376 — a
- * repo checkout of the macf framework's own source has no way to learn it
- * is behind canonical: `checkDistributedScriptCurrency`/
+ * Result of the Framework-checkout-currency assertion (groundnuty/macf#1376
+ * — a repo checkout of the macf framework's own source has no way to learn
+ * it is behind canonical: `checkDistributedScriptCurrency`/
  * `checkDistributedRuleCurrency` above resolve "canonical" via
  * `findCliPackageRoot()`, which — in a repo-checkout/npm-link dev install —
  * CAN be the same tree being doctored, so those checks compare that tree to
@@ -2094,7 +2094,7 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
     // reachable in this early-return branch for free even before any config
     // has been parsed, same reasoning as the currency checks above.
     console.log('');
-    console.log('CLI checkout currency');
+    console.log('Framework checkout currency');
     console.log('──────────────────────────────────────────────────────────────');
     printCheckoutCurrencySection(checkCheckoutCurrency(projectDir, null));
     // groundnuty/macf#1365: disk space is not gated on .macf/ at all — a
@@ -2226,7 +2226,7 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
   printRuleCurrencySection(checkDistributedRuleCurrency(projectDir));
 
   console.log('');
-  console.log('CLI checkout currency');
+  console.log('Framework checkout currency');
   console.log('──────────────────────────────────────────────────────────────');
   printCheckoutCurrencySection(checkCheckoutCurrency(projectDir, config));
 
@@ -2421,7 +2421,7 @@ function printRuleCurrencySection(check: RuleCurrencyCheckResult): void {
   console.log('    Fix: run `macf update` (or `macf rules refresh --dir .`) to bring .claude/rules/ current.');
 }
 
-/** Print the groundnuty/macf#1376 CLI-checkout-currency report section for `check`. */
+/** Print the groundnuty/macf#1376 Framework-checkout-currency report section for `check`. */
 function printCheckoutCurrencySection(check: CheckoutCurrencyCheckResult): void {
   if (check.status === 'INFO') {
     console.log(`  ℹ ${check.detail}  [INFO]`);
