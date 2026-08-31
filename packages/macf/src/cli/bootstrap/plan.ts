@@ -2065,12 +2065,12 @@ function caRepoItem(seg: string, repo: string, presence: Presence): PlanItem {
       verb: 'orphan',
       reason:
         `per-repo CA var "${varName}" on "${repo}" is present, but it is now written ONCE at the fleet's registry ` +
-        'scope (groundnuty/macf#800) — this per-repo copy is superseded and no longer read by callers on the ' +
-        'newer actions version. NOTHING WAS DELETED — apply never auto-removes it, under any flag: a caller ' +
-        'still pinned to an actions-pin version that reads `PROJECT_CA_CERT_REPO_VAR_FALLBACK` would lose its ' +
-        'cert the moment this copy goes away, so removing it is unsafe until every caller in the fleet is ' +
-        'verified reading the fleet (registry) scope — at that point this becomes a safe delete, not an orphan. ' +
-        'Remove it by hand once you have made that check.',
+        'scope — this per-repo copy is superseded and no longer read by callers on the newer actions version. ' +
+        'NOTHING WAS DELETED — apply never auto-removes it, under any flag: a caller still pinned to an ' +
+        'actions-pin version that reads `PROJECT_CA_CERT_REPO_VAR_FALLBACK` would lose its cert the moment this ' +
+        'copy goes away, so removing it is unsafe until every caller in the fleet is verified reading the fleet ' +
+        '(registry) scope — at that point this becomes a safe delete, not an orphan. Remove it by hand once you ' +
+        'have made that check.',
       confirm_required: false,
     };
   }
@@ -2081,7 +2081,7 @@ function caRepoItem(seg: string, repo: string, presence: Presence): PlanItem {
     verb: 'noop',
     reason:
       `per-repo CA var "${varName}" on "${repo}" ${reasonSuffix} — apply no longer writes a per-repo copy here ` +
-      '(registry-scope-only publish, groundnuty/macf#800), so there is nothing to create regardless.',
+      '(registry-scope-only publish), so there is nothing to create regardless.',
     confirm_required: false,
   };
 }

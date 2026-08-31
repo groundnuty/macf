@@ -265,15 +265,24 @@ describe('runBootstrapPlan', () => {
           },
         },
         caRegistry: 'present',
-        caRepos: { 'groundnuty/icsoc-2026-experiment': 'present' },
+        // groundnuty/macf#800 — 'absent', not 'present': apply no longer
+        // writes a per-repo CA copy at all, so the genuinely-clean steady
+        // state for this var is "was never written here," not "written and
+        // matching." A 'present' per-repo copy is now an ORPHAN (superseded
+        // write target) — the opposite of "nothing to do" this test's title
+        // claims. See `plan.test.ts`'s dedicated "per-repo CA" describe
+        // block for the full presence/verb table.
+        caRepos: { 'groundnuty/icsoc-2026-experiment': 'absent' },
         routingClientRepos: { 'groundnuty/icsoc-2026-experiment': 'present' },
       }),
     };
     const code = await runBootstrapPlan({ file, json: true }, deps);
     expect(code).toBe(0);
     const json = JSON.parse(logSpy.mock.calls.flat().join('')) as { summary: { noops: number; creates: number; writeAlways: number } };
-    // 4 per-agent (app, repo, install, secret_fingerprint) + 2 CA (registry +
-    // the one agent repo) + 1 routing_client (observed-present) — all noop.
+    // 4 per-agent (app, repo, install, secret_fingerprint) + 2 CA (registry
+    // present + the one agent repo confirmed absent — both noop, since
+    // apply has no per-repo CA write to attempt regardless) + 1
+    // routing_client (observed-present) — all noop.
     // `labels` is a write-always structural exception (groundnuty/macf#920,
     // verb per groundnuty/macf#926): it has no plan-time observed read at
     // all, so it ALWAYS emits `write-always` — this is not "unclean," it's
