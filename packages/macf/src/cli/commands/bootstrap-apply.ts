@@ -1099,9 +1099,13 @@ export function formatApprovalBanner(plan: FleetPlan, creations: readonly Planne
   const orphanLines = formatOrphanLines(plan.items);
   if (orphanLines.length > 0) {
     lines.push(
-      `⚠ ${String(orphanLines.length)} resource(s) are ORPHAN — created by this tool, no longer declared, and ` +
-        'NEVER deleted by apply, under any flag. NOTHING IS DELETED for these; each line names how to remove ' +
-        'it yourself, by hand, if it should go away:',
+      // groundnuty/macf#800 — same header widening as `plan.ts::formatPlanText`'s
+      // own copy ("no longer declared OR superseded") — see that call site's
+      // comment for why the original "no longer declared" wording would be a
+      // false claim on a `caRepoItem`-produced orphan row.
+      `⚠ ${String(orphanLines.length)} resource(s) are ORPHAN — created by this tool, no longer declared or ` +
+        'superseded by a newer write path, and NEVER deleted by apply, under any flag. NOTHING IS DELETED for ' +
+        'these; each line names how to remove it yourself, by hand, if it should go away:',
       ...orphanLines,
     );
   }
