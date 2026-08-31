@@ -24,6 +24,7 @@ import { readAgentConfig, resolveCanonicalBranch, tokenSourceFromConfig, writeAg
 import type { MacfAgentConfig } from '../config.js';
 import { defaultProcReader, readPkgVersionFs, scanMacfProcesses } from '../proc-scan.js';
 import type { ProcReader } from '../proc-scan.js';
+import { detectCheckoutCurrency } from '../build-info.js';
 import {
   canonicalPluginScriptsDir,
   canonicalRulesDir,
@@ -1661,6 +1662,91 @@ export function checkDistributedRuleCurrency(
 }
 
 /**
+ * Result of the CLI-checkout-currency assertion (groundnuty/macf#1376 — a
+ * repo checkout of this CLI's own source has no way to learn it is behind
+ * canonical: `checkDistributedScriptCurrency`/`checkDistributedRuleCurrency`
+ * above resolve "canonical" via `findCliPackageRoot()`, which — in a
+ * repo-checkout/npm-link dev install — IS the same tree being doctored, so
+ * those checks compare that tree to itself and always PASS regardless of
+ * whether the tree itself is behind `origin/<branch>`; `detectStaleDist`
+ * (#144) only compares the BUILT `dist/` stamp against that same tree's own
+ * HEAD, never against its upstream. Neither layer answers "is this checkout
+ * behind canonical."
+ *
+ * `status`:
+ *   - `PASS`    — the checkout's HEAD has 0 commits behind its configured
+ *                 upstream (`detectCheckoutCurrency` kind `ok`, count 0).
+ *   - `WARN`    — 1+ commits behind; `detail` names the exact count and the
+ *                 upstream ref compared against. No invented "stale enough"
+ *                 threshold — any nonzero count is worth printing.
+ *   - `INFO`    — `packageRoot` is not inside a git working tree at all (an
+ *                 npm-installed CLI — global, local, or via `npx`). This is
+ *                 the branch that keeps the check from ever firing for a
+ *                 plain npm-installed consumer.
+ *   - `UNKNOWN` — inside a git working tree, but no upstream is configured
+ *                 (including a detached HEAD) or the count could not be
+ *                 read. NEVER PASS in this branch — an undeterminable
+ *                 currency must never be reported as current.
+ */
+export interface CheckoutCurrencyCheckResult {
+  readonly status: 'PASS' | 'WARN' | 'INFO' | 'UNKNOWN';
+  readonly detail: string;
+}
+
+/**
+ * `packageRoot` defaults to `findCliPackageRoot()` — the running CLI's own
+ * source root, exactly the parameter `detectStaleDist` takes. This check
+ * never touches `workspaceDir`/`projectDir`: it is entirely about the
+ * CLI's OWN checkout, independent of whether the workspace being doctored
+ * has ever run `macf init` — safe to call even in `runDoctor`'s
+ * no-macf-agent.json early-return branch, same reasoning as
+ * `checkDistributedScriptCurrency`'s doc comment above.
+ *
+ * Never fetches — every git call inside `detectCheckoutCurrency` is
+ * read-only (`rev-parse`, `rev-list`). The comparison is only as fresh as
+ * the last local fetch of the upstream ref; the WARN detail names that
+ * explicitly rather than implying the count is a live, guaranteed floor.
+ */
+export function checkCheckoutCurrency(
+  packageRoot: string = findCliPackageRoot(),
+): CheckoutCurrencyCheckResult {
+  const result = detectCheckoutCurrency(packageRoot);
+  switch (result.kind) {
+    case 'not-a-checkout':
+      return {
+        status: 'INFO',
+        detail:
+          'this CLI is not running from a git checkout (an npm install) — nothing to compare against a canonical branch',
+      };
+    case 'no-upstream':
+      return {
+        status: 'UNKNOWN',
+        detail:
+          "this CLI's checkout has no configured upstream (or is on a detached HEAD) — cannot determine currency",
+      };
+    case 'unreadable':
+      return {
+        status: 'UNKNOWN',
+        detail: `this CLI's checkout currency could not be read (${result.reason})`,
+      };
+    case 'ok':
+      if (result.commitCount === 0) {
+        return {
+          status: 'PASS',
+          detail: `this CLI's checkout is current with \`${result.upstream}\` (0 commits behind, as of the last local fetch)`,
+        };
+      }
+      return {
+        status: 'WARN',
+        detail:
+          `this CLI's checkout is ${result.commitCount} commit(s) behind \`${result.upstream}\` — ` +
+          `compared against the LOCALLY CACHED ${result.upstream} (this check never fetches; if that ref ` +
+          `itself hasn't been fetched recently, the true gap may be larger)`,
+      };
+  }
+}
+
+/**
  * Below this, a build or test run WILL fail with ENOSPC — `npm install`,
  * `devbox run -- npm run build`, and vitest's per-worker `mkdtemp` calls
  * each write from tens to hundreds of MB, and the moment one of those
@@ -1978,6 +2064,15 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
     console.log('Distributed rule currency');
     console.log('──────────────────────────────────────────────────────────────');
     printRuleCurrencySection(checkDistributedRuleCurrency(projectDir));
+    // groundnuty/macf#1376: unlike the two currency checks above, this one
+    // never touches `.macf/` or `projectDir` at all — it's entirely about
+    // the running CLI's OWN checkout (`findCliPackageRoot()`), so it's
+    // reachable in this early-return branch for free, same reasoning as the
+    // currency checks above.
+    console.log('');
+    console.log('CLI checkout currency');
+    console.log('──────────────────────────────────────────────────────────────');
+    printCheckoutCurrencySection(checkCheckoutCurrency());
     // groundnuty/macf#1365: disk space is not gated on .macf/ at all — a
     // full disk breaks a workspace's builds/tests whether or not `macf
     // init` ever touched it, so this reachable-without-config workspace
@@ -2105,6 +2200,11 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
   console.log('Distributed rule currency');
   console.log('──────────────────────────────────────────────────────────────');
   printRuleCurrencySection(checkDistributedRuleCurrency(projectDir));
+
+  console.log('');
+  console.log('CLI checkout currency');
+  console.log('──────────────────────────────────────────────────────────────');
+  printCheckoutCurrencySection(checkCheckoutCurrency());
 
   console.log('');
   console.log('Disk space');
@@ -2295,6 +2395,24 @@ function printRuleCurrencySection(check: RuleCurrencyCheckResult): void {
     console.log(`    ✗ ${f.name} — ${reasonText}`);
   }
   console.log('    Fix: run `macf update` (or `macf rules refresh --dir .`) to bring .claude/rules/ current.');
+}
+
+/** Print the groundnuty/macf#1376 CLI-checkout-currency report section for `check`. */
+function printCheckoutCurrencySection(check: CheckoutCurrencyCheckResult): void {
+  if (check.status === 'INFO') {
+    console.log(`  ℹ ${check.detail}  [INFO]`);
+    return;
+  }
+  if (check.status === 'UNKNOWN') {
+    console.log(`  ? ${check.detail}  [UNKNOWN]`);
+    return;
+  }
+  if (check.status === 'PASS') {
+    console.log(`  ✓ ${check.detail}  [PASS]`);
+    return;
+  }
+  console.log(`  ⚠ ${check.detail}  [WARN]`);
+  console.log('    Fix: `git pull` (or `git fetch` first if the cached upstream ref might itself be stale).');
 }
 
 /** Print the groundnuty/macf#1365 disk-space report section for `check`. */

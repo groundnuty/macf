@@ -132,3 +132,88 @@ export function detectUnknownFreshness(
   // drift, not this function.
   return null;
 }
+
+/**
+ * Result of `detectCheckoutCurrency` (groundnuty/macf#1376) — the layer
+ * neither `detectStaleDist` nor `checkDistributedScriptCurrency`/
+ * `checkDistributedRuleCurrency` (doctor.ts) cover: is `packageRoot`'s OWN
+ * git checkout behind the canonical branch it tracks. `detectStaleDist`
+ * compares the BUILT `dist/` stamp against `packageRoot`'s own HEAD (a
+ * rebuild-freshness question); this compares `packageRoot`'s HEAD against
+ * its configured upstream (a checkout-currency question). Distinct axes,
+ * same `packageRoot` parameter.
+ *
+ *   - `not-a-checkout` — `packageRoot` is not inside a git working tree (an
+ *     npm-registry/tarball install, or an unpacked global/local npm
+ *     package). Nothing to report — the expected, healthy shape for an
+ *     installed CLI. This is what makes the check NOT fire for npm-installed
+ *     consumers.
+ *   - `no-upstream`    — inside a git working tree, but the current branch
+ *     has no configured upstream (`@{u}` unresolvable — includes a detached
+ *     HEAD). Honest-unknown, never reported as current.
+ *   - `unreadable`     — an upstream is configured but the count itself
+ *     could not be read (git error). Honest-unknown.
+ *   - `ok`             — `commitCount` is the number of commits reachable
+ *     from `upstream` that HEAD lacks (`git rev-list --count
+ *     HEAD..<upstream>`). `0` IS current; any other number is the signal,
+ *     reported as-is — no invented "stale enough" threshold.
+ *
+ * Every git call here is read-only and local (`rev-parse`, `rev-list`) —
+ * this function never fetches. `upstream` names the ref the comparison
+ * actually ran against (typically `origin/<branch>`); that ref is only as
+ * fresh as the last fetch, which is a fact about the ref, not something
+ * this function can improve on without violating "must not fetch
+ * implicitly."
+ */
+export type CheckoutCurrencyResult =
+  | { readonly kind: 'not-a-checkout' }
+  | { readonly kind: 'no-upstream' }
+  | { readonly kind: 'unreadable'; readonly reason: string }
+  | { readonly kind: 'ok'; readonly upstream: string; readonly commitCount: number };
+
+/** Run a read-only git subcommand in `cwd`; null on any failure. Never mutates git state. */
+function tryGit(args: readonly string[], cwd: string): string | null {
+  try {
+    return execFileSync('git', [...args], {
+      cwd,
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Determine how far `packageRoot`'s HEAD is behind its configured upstream.
+ * Ancestor-aware — unlike `detectStaleDist`'s `existsSync(join(dir, '.git'))`
+ * gate, `git rev-parse --is-inside-work-tree` walks UP from `packageRoot`
+ * the same way every other git command does. That difference matters for
+ * THIS CLI's own real layout: `packageRoot` (from `findCliPackageRoot`) is
+ * `packages/macf/` in a dev/npm-link install, and `.git/` lives at the
+ * monorepo root — one level up, not inside `packages/macf/` itself. A
+ * direct-existence gate never detects that as a checkout at all, which is
+ * exactly how #144's build-freshness check "never reaches" the real
+ * monorepo checkout shape (see groundnuty/macf#1376).
+ */
+export function detectCheckoutCurrency(packageRoot: string): CheckoutCurrencyResult {
+  const insideWorkTree = tryGit(['rev-parse', '--is-inside-work-tree'], packageRoot);
+  if (insideWorkTree !== 'true') {
+    return { kind: 'not-a-checkout' };
+  }
+
+  const upstream = tryGit(['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'], packageRoot);
+  if (upstream === null || upstream.length === 0) {
+    return { kind: 'no-upstream' };
+  }
+
+  const countRaw = tryGit(['rev-list', '--count', `HEAD..${upstream}`], packageRoot);
+  if (countRaw === null || !/^\d+$/.test(countRaw)) {
+    return {
+      kind: 'unreadable',
+      reason: `\`git rev-list --count HEAD..${upstream}\` did not return a readable count`,
+    };
+  }
+
+  return { kind: 'ok', upstream, commitCount: Number(countRaw) };
+}
