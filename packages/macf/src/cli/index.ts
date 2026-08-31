@@ -1319,7 +1319,7 @@ program
   .option('--project <name>', 'Project name for the v3 router caller\'s required `project` input (defaults to the repo name). Must match the agents\' macf-agent.json project. v3+ only.')
   .option('--registry-type <type>', 'Registry scope for the v3 router\'s registry-api-path: repo, org, or profile. v3+ only. ' +
     'Omitted (the common case): derived from a live GitHub owner-type check — org scope for an Organization owner, ' +
-    'profile scope for a User owner (groundnuty/macf#810) — never the self-pointing repo scope.')
+    'profile scope for a User owner — never the self-pointing repo scope.')
   .option('--registry-org <org>', 'Org login (for --registry-type org)')
   .option('--registry-user <user>', 'User login (for --registry-type profile)')
   .option('--force', 'Overwrite existing files', false)
