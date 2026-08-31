@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, rmSync, existsSync, readFileSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { parse as parseYaml } from 'yaml';
-import { generateWorkflow, generateAgentConfig, patchAgentConfig, createLabel, repoInit, isV3PlusActionsVersion, isBundleCapableActionsVersion, isRunnerRunsOnCapableActionsVersion } from '../../src/cli/commands/repo-init.js';
+import { generateWorkflow, generateAgentConfig, patchAgentConfig, createLabel, repoInit, isV3PlusActionsVersion, isBundleCapableActionsVersion, isRunnerRunsOnCapableActionsVersion, fetchOwnerType } from '../../src/cli/commands/repo-init.js';
 import { ALL_ROUTING_SECRET_NAMES } from '../../src/cli/bootstrap/apply-routing-secrets.js';
 
 function tempDir(): string {
@@ -1284,7 +1284,11 @@ describe('createLabel', () => {
   });
 
   it('returns "created" on 201', async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201 }) as typeof fetch;
+    // status 201 (label creation) + ok/json (macf#810's default owner-type
+    // lookup at `GET /users/<owner>`) — Organization is an arbitrary,
+    // internally-consistent choice for tests that don't assert on the
+    // resulting registry-api-path.
+    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201, ok: true, json: async () => ({ type: 'Organization' }) }) as typeof fetch;
     const result = await createLabel('owner', 'repo', 'token', {
       name: 'test', color: 'fbca04', description: 'Test label',
     });
@@ -1329,6 +1333,55 @@ describe('createLabel', () => {
   });
 });
 
+describe('fetchOwnerType (groundnuty/macf#810)', () => {
+  const originalFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  it('returns "org" for an Organization account', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ type: 'Organization' }),
+    }) as typeof fetch;
+    await expect(fetchOwnerType('acme-org')).resolves.toBe('org');
+  });
+
+  it('returns "user" for a User account', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ type: 'User' }),
+    }) as typeof fetch;
+    await expect(fetchOwnerType('groundnuty')).resolves.toBe('user');
+  });
+
+  it('returns "unknown" on a non-OK response (e.g. 404)', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({ ok: false, status: 404 }) as typeof fetch;
+    await expect(fetchOwnerType('nonexistent')).resolves.toBe('unknown');
+  });
+
+  it('returns "unknown" for a type that is neither "User" nor "Organization"', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ type: 'Bot' }),
+    }) as typeof fetch;
+    await expect(fetchOwnerType('some-bot')).resolves.toBe('unknown');
+  });
+
+  it('returns "unknown" (never throws) when the network call itself rejects', async () => {
+    globalThis.fetch = vi.fn().mockRejectedValue(new Error('ECONNREFUSED')) as typeof fetch;
+    await expect(fetchOwnerType('unreachable')).resolves.toBe('unknown');
+  });
+
+  it('queries GET /users/<owner>', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ type: 'Organization' }) });
+    globalThis.fetch = fetchMock as typeof fetch;
+    await fetchOwnerType('acme-org');
+    expect(fetchMock).toHaveBeenCalledWith('https://api.github.com/users/acme-org', expect.anything());
+  });
+});
+
 describe('repoInit integration', () => {
   let dir: string;
   const originalFetch = globalThis.fetch;
@@ -1346,7 +1399,11 @@ describe('repoInit integration', () => {
   });
 
   it('creates workflow and config files', async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201 }) as typeof fetch;
+    // status 201 (label creation) + ok/json (macf#810's default owner-type
+    // lookup at `GET /users/<owner>`) — Organization is an arbitrary,
+    // internally-consistent choice for tests that don't assert on the
+    // resulting registry-api-path.
+    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201, ok: true, json: async () => ({ type: 'Organization' }) }) as typeof fetch;
 
     await repoInit(dir, {
       repo: 'owner/test-repo',
@@ -1359,7 +1416,11 @@ describe('repoInit integration', () => {
   });
 
   it('writes correct workflow content', async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201 }) as typeof fetch;
+    // status 201 (label creation) + ok/json (macf#810's default owner-type
+    // lookup at `GET /users/<owner>`) — Organization is an arbitrary,
+    // internally-consistent choice for tests that don't assert on the
+    // resulting registry-api-path.
+    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201, ok: true, json: async () => ({ type: 'Organization' }) }) as typeof fetch;
 
     await repoInit(dir, {
       repo: 'owner/test-repo',
@@ -1377,7 +1438,11 @@ describe('repoInit integration', () => {
   // file but are unread under v3"), and the Tailscale pair must state the
   // routing consequence rather than reading as a bland tidy-up item.
   it('omits AGENT_SSH_KEY for a v3+ pin and states the TS_OAUTH consequence (macf#1109)', async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201 }) as typeof fetch;
+    // status 201 (label creation) + ok/json (macf#810's default owner-type
+    // lookup at `GET /users/<owner>`) — Organization is an arbitrary,
+    // internally-consistent choice for tests that don't assert on the
+    // resulting registry-api-path.
+    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201, ok: true, json: async () => ({ type: 'Organization' }) }) as typeof fetch;
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     try {
       await repoInit(dir, { repo: 'owner/test-repo', actionsVersion: 'v3.4.1', force: false });
@@ -1393,7 +1458,11 @@ describe('repoInit integration', () => {
   });
 
   it('keeps AGENT_SSH_KEY for a v1.x pin — still genuinely consumed by Stage-2 SSH+tmux routing (macf#1109)', async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201 }) as typeof fetch;
+    // status 201 (label creation) + ok/json (macf#810's default owner-type
+    // lookup at `GET /users/<owner>`) — Organization is an arbitrary,
+    // internally-consistent choice for tests that don't assert on the
+    // resulting registry-api-path.
+    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201, ok: true, json: async () => ({ type: 'Organization' }) }) as typeof fetch;
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     try {
       await repoInit(dir, { repo: 'owner/test-repo', actionsVersion: 'v1', force: false });
@@ -1408,7 +1477,11 @@ describe('repoInit integration', () => {
   // generateWorkflow wiring, exercised at the repoInit() integration
   // layer (real filesystem, real generated content on disk).
   it('threads routingRunnerRunsOn through to the on-disk workflow for an accepting pin (macf#1368)', async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201 }) as typeof fetch;
+    // status 201 (label creation) + ok/json (macf#810's default owner-type
+    // lookup at `GET /users/<owner>`) — Organization is an arbitrary,
+    // internally-consistent choice for tests that don't assert on the
+    // resulting registry-api-path.
+    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201, ok: true, json: async () => ({ type: 'Organization' }) }) as typeof fetch;
 
     await repoInit(dir, {
       repo: 'owner/test-repo',
@@ -1425,7 +1498,11 @@ describe('repoInit integration', () => {
   });
 
   it('states the reason on stderr when routingRunnerRunsOn is declared but the pin cannot accept it (macf#1368)', async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201 }) as typeof fetch;
+    // status 201 (label creation) + ok/json (macf#810's default owner-type
+    // lookup at `GET /users/<owner>`) — Organization is an arbitrary,
+    // internally-consistent choice for tests that don't assert on the
+    // resulting registry-api-path.
+    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201, ok: true, json: async () => ({ type: 'Organization' }) }) as typeof fetch;
     const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     try {
       await repoInit(dir, {
@@ -1448,7 +1525,11 @@ describe('repoInit integration', () => {
   });
 
   it('does not warn when routingRunnerRunsOn is undeclared (the common case)', async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201 }) as typeof fetch;
+    // status 201 (label creation) + ok/json (macf#810's default owner-type
+    // lookup at `GET /users/<owner>`) — Organization is an arbitrary,
+    // internally-consistent choice for tests that don't assert on the
+    // resulting registry-api-path.
+    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201, ok: true, json: async () => ({ type: 'Organization' }) }) as typeof fetch;
     const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     try {
       await repoInit(dir, {
@@ -1467,7 +1548,11 @@ describe('repoInit integration', () => {
   });
 
   it('skips existing files without --force', async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201 }) as typeof fetch;
+    // status 201 (label creation) + ok/json (macf#810's default owner-type
+    // lookup at `GET /users/<owner>`) — Organization is an arbitrary,
+    // internally-consistent choice for tests that don't assert on the
+    // resulting registry-api-path.
+    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201, ok: true, json: async () => ({ type: 'Organization' }) }) as typeof fetch;
 
     // First run
     await repoInit(dir, { repo: 'owner/r', actionsVersion: 'v1', force: false });
@@ -1480,7 +1565,11 @@ describe('repoInit integration', () => {
   });
 
   it('overwrites with --force', async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201 }) as typeof fetch;
+    // status 201 (label creation) + ok/json (macf#810's default owner-type
+    // lookup at `GET /users/<owner>`) — Organization is an arbitrary,
+    // internally-consistent choice for tests that don't assert on the
+    // resulting registry-api-path.
+    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201, ok: true, json: async () => ({ type: 'Organization' }) }) as typeof fetch;
 
     await repoInit(dir, { repo: 'owner/r', actionsVersion: 'v1', force: false });
     await repoInit(dir, { repo: 'owner/r', actionsVersion: 'v2', force: true });
@@ -1490,7 +1579,11 @@ describe('repoInit integration', () => {
   });
 
   it('expands --agents into config entries', async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201 }) as typeof fetch;
+    // status 201 (label creation) + ok/json (macf#810's default owner-type
+    // lookup at `GET /users/<owner>`) — Organization is an arbitrary,
+    // internally-consistent choice for tests that don't assert on the
+    // resulting registry-api-path.
+    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201, ok: true, json: async () => ({ type: 'Organization' }) }) as typeof fetch;
 
     await repoInit(dir, {
       repo: 'owner/r',
@@ -1504,7 +1597,11 @@ describe('repoInit integration', () => {
   });
 
   it('adds new agents to existing config WITHOUT --force (#82)', async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201 }) as typeof fetch;
+    // status 201 (label creation) + ok/json (macf#810's default owner-type
+    // lookup at `GET /users/<owner>`) — Organization is an arbitrary,
+    // internally-consistent choice for tests that don't assert on the
+    // resulting registry-api-path.
+    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201, ok: true, json: async () => ({ type: 'Organization' }) }) as typeof fetch;
 
     // First run: create config with one agent.
     await repoInit(dir, {
@@ -1540,7 +1637,11 @@ describe('repoInit integration', () => {
   });
 
   it('normalizes a pre-existing double-prefixed agent-config key on re-run (macf#805)', async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201 }) as typeof fetch;
+    // status 201 (label creation) + ok/json (macf#810's default owner-type
+    // lookup at `GET /users/<owner>`) — Organization is an arbitrary,
+    // internally-consistent choice for tests that don't assert on the
+    // resulting registry-api-path.
+    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201, ok: true, json: async () => ({ type: 'Organization' }) }) as typeof fetch;
 
     // Simulate the icsoc-2026 pre-DR-032-fix on-disk state: the map key
     // itself carries the `<project>-` App-handle prefix instead of the bare
@@ -1574,7 +1675,11 @@ describe('repoInit integration', () => {
   });
 
   it('--session-name applied on existing config WITHOUT --force (#82)', async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201 }) as typeof fetch;
+    // status 201 (label creation) + ok/json (macf#810's default owner-type
+    // lookup at `GET /users/<owner>`) — Organization is an arbitrary,
+    // internally-consistent choice for tests that don't assert on the
+    // resulting registry-api-path.
+    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201, ok: true, json: async () => ({ type: 'Organization' }) }) as typeof fetch;
 
     // Create config with two un-grouped agents.
     await repoInit(dir, {
@@ -1602,7 +1707,11 @@ describe('repoInit integration', () => {
 
   it('workflow file still respects --force semantic even after #82', async () => {
     // #82 only loosens the CONFIG file's --force gate; workflow stays gated.
-    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201 }) as typeof fetch;
+    // status 201 (label creation) + ok/json (macf#810's default owner-type
+    // lookup at `GET /users/<owner>`) — Organization is an arbitrary,
+    // internally-consistent choice for tests that don't assert on the
+    // resulting registry-api-path.
+    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201, ok: true, json: async () => ({ type: 'Organization' }) }) as typeof fetch;
     await repoInit(dir, { repo: 'owner/r', actionsVersion: 'v1', force: false });
 
     // Second run: change actionsVersion, no --force.
@@ -1694,11 +1803,31 @@ describe('repoInit integration', () => {
   });
 
   // macf#566 — v3 caller generation (project + registry-api-path).
-  it('v3 pin defaults project to repo name + repo-scoped registry-api-path', async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201 }) as typeof fetch;
+  // macf#810 — the UNSET-registryType default is no longer `repo` scope
+  // (self-pointing at the calling repo's own registry — the per-repo drift
+  // this issue exists to close). It's derived from a live `GET
+  // /users/<owner>` account-type check: decisive pair below covers both
+  // branches (org-owned, user-owned), plus the honest-unknown refusal.
+  function mockFetchWithOwnerType(ownerType: 'Organization' | 'User' | null): void {
+    globalThis.fetch = vi.fn().mockImplementation((url: string) => {
+      if (String(url).includes('/users/')) {
+        if (ownerType === null) {
+          // Simulates an undeterminable owner type (e.g. a 404, or a shape
+          // GitHub never actually returns) — never a network throw, which
+          // fetchOwnerType already covers via its try/catch.
+          return Promise.resolve({ ok: true, json: async () => ({ type: 'Bot' }) });
+        }
+        return Promise.resolve({ ok: true, json: async () => ({ type: ownerType }) });
+      }
+      return Promise.resolve({ status: 201, ok: true }); // label creation
+    }) as typeof fetch;
+  }
+
+  it('v3 pin defaults an org-owned fleet to org scope (groundnuty/macf#810)', async () => {
+    mockFetchWithOwnerType('Organization');
 
     await repoInit(dir, {
-      repo: 'owner/test-repo',
+      repo: 'acme-org/test-repo',
       actionsVersion: 'v3.3.0',
       force: false,
     });
@@ -1707,7 +1836,70 @@ describe('repoInit integration', () => {
     expect(wf).toContain('@v3.3.0');
     expect(wf).toContain('    with:');
     expect(wf).toContain('      project: test-repo');
-    expect(wf).toContain('      registry-api-path: /repos/owner/test-repo');
+    expect(wf).toContain('      registry-api-path: /orgs/acme-org');
+    expect(wf).not.toContain('registry-api-path: /repos/acme-org/test-repo'); // NOT the old self-pointing default
+  });
+
+  it('v3 pin defaults a user-owned fleet to profile scope (groundnuty/macf#810)', async () => {
+    mockFetchWithOwnerType('User');
+
+    await repoInit(dir, {
+      repo: 'groundnuty/test-repo',
+      actionsVersion: 'v3.3.0',
+      force: false,
+    });
+
+    const wf = readFileSync(join(dir, '.github', 'workflows', 'agent-router.yml'), 'utf-8');
+    expect(wf).toContain('      registry-api-path: /repos/groundnuty/groundnuty');
+    expect(wf).not.toContain('registry-api-path: /repos/groundnuty/test-repo'); // NOT the old self-pointing default
+    expect(wf).not.toContain('registry-api-path: /orgs/groundnuty'); // NOT org scope — /orgs/<user> 404s
+  });
+
+  it('v3 pin refuses to guess when the owner type cannot be determined (groundnuty/macf#810)', async () => {
+    mockFetchWithOwnerType(null);
+
+    await expect(repoInit(dir, {
+      repo: 'mystery-owner/test-repo',
+      actionsVersion: 'v3.3.0',
+      force: false,
+    })).rejects.toThrow(/Could not determine whether "mystery-owner" is a GitHub User or Organization/);
+
+    // Both explicit escape hatches must be named — the honest-unknown
+    // requirement is "name the two options", not merely "refuse".
+    await expect(repoInit(dir, {
+      repo: 'mystery-owner/test-repo',
+      actionsVersion: 'v3.3.0',
+      force: false,
+    })).rejects.toThrow(/--registry-type org --registry-org mystery-owner.*--registry-type profile --registry-user mystery-owner/s);
+
+    // And it must NOT have silently fallen back to /orgs/ before throwing —
+    // no workflow file should exist from either failed attempt.
+    expect(existsSync(join(dir, '.github', 'workflows', 'agent-router.yml'))).toBe(false);
+  });
+
+  // Mutation check (per assert-the-wrong-path.md): if the owner-type
+  // branch in buildRoutingRegistry were deleted or swapped (e.g. `ownerType
+  // === 'org'` accidentally routed to profile scope, or vice versa), THIS
+  // pair is what would catch it — the two tests above assert the org/user
+  // branches individually, and this one asserts they are NOT interchangeable.
+  it('org-owned and user-owned defaults are not interchangeable (mutation check for macf#810)', async () => {
+    mockFetchWithOwnerType('Organization');
+    await repoInit(dir, { repo: 'acme-org/test-repo', actionsVersion: 'v3.3.0', force: false });
+    const orgWf = readFileSync(join(dir, '.github', 'workflows', 'agent-router.yml'), 'utf-8');
+
+    rmSync(join(dir, '.github'), { recursive: true, force: true });
+
+    mockFetchWithOwnerType('User');
+    await repoInit(dir, { repo: 'acme-org/test-repo', actionsVersion: 'v3.3.0', force: false });
+    const userWf = readFileSync(join(dir, '.github', 'workflows', 'agent-router.yml'), 'utf-8');
+
+    // Same owner login, opposite live account type -> opposite scope form.
+    // A mutant that swapped the org/user branches (or collapsed them to a
+    // constant) would make these two identical; this test fails on that
+    // mutant with a clear diff, which is the point of naming it here.
+    expect(orgWf).toContain('registry-api-path: /orgs/acme-org');
+    expect(userWf).toContain('registry-api-path: /repos/acme-org/acme-org');
+    expect(orgWf).not.toBe(userWf);
   });
 
   // macf#797 — a floating v3+ pin is resolved to an immutable full tag at
@@ -1721,7 +1913,8 @@ describe('repoInit integration', () => {
           json: async () => [{ name: 'v3.4.1' }, { name: 'v3.4.0' }, { name: 'v3.3.0' }, { name: 'v3' }],
         });
       }
-      return Promise.resolve({ status: 201, ok: true }); // label creation
+      // label creation + the default registry-api-path owner-type lookup (macf#810)
+      return Promise.resolve({ status: 201, ok: true, json: async () => ({ type: 'Organization' }) });
     }) as typeof fetch;
 
     await repoInit(dir, { repo: 'owner/test-repo', actionsVersion: 'v3', force: false });
@@ -1738,7 +1931,8 @@ describe('repoInit integration', () => {
       if (String(url).includes('macf-actions/tags')) {
         return Promise.reject(new Error('ECONNREFUSED'));
       }
-      return Promise.resolve({ status: 201, ok: true }); // label creation
+      // label creation + the default registry-api-path owner-type lookup (macf#810)
+      return Promise.resolve({ status: 201, ok: true, json: async () => ({ type: 'Organization' }) });
     }) as typeof fetch;
 
     const result = await repoInit(dir, { repo: 'owner/test-repo', actionsVersion: 'v3', force: false });
@@ -1750,7 +1944,11 @@ describe('repoInit integration', () => {
   });
 
   it('v3 pin + profile scope emits /repos/<user>/<user>', async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201 }) as typeof fetch;
+    // status 201 (label creation) + ok/json (macf#810's default owner-type
+    // lookup at `GET /users/<owner>`) — Organization is an arbitrary,
+    // internally-consistent choice for tests that don't assert on the
+    // resulting registry-api-path.
+    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201, ok: true, json: async () => ({ type: 'Organization' }) }) as typeof fetch;
 
     await repoInit(dir, {
       repo: 'groundnuty/macf',
@@ -1766,7 +1964,11 @@ describe('repoInit integration', () => {
   });
 
   it('v3 pin + org scope emits /orgs/<org>', async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201 }) as typeof fetch;
+    // status 201 (label creation) + ok/json (macf#810's default owner-type
+    // lookup at `GET /users/<owner>`) — Organization is an arbitrary,
+    // internally-consistent choice for tests that don't assert on the
+    // resulting registry-api-path.
+    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201, ok: true, json: async () => ({ type: 'Organization' }) }) as typeof fetch;
 
     await repoInit(dir, {
       repo: 'acme/widget',
@@ -1781,7 +1983,11 @@ describe('repoInit integration', () => {
   });
 
   it('v3 pin honours an explicit --project override', async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201 }) as typeof fetch;
+    // status 201 (label creation) + ok/json (macf#810's default owner-type
+    // lookup at `GET /users/<owner>`) — Organization is an arbitrary,
+    // internally-consistent choice for tests that don't assert on the
+    // resulting registry-api-path.
+    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201, ok: true, json: async () => ({ type: 'Organization' }) }) as typeof fetch;
 
     await repoInit(dir, {
       repo: 'owner/some-repo',
@@ -1795,7 +2001,11 @@ describe('repoInit integration', () => {
   });
 
   it('v1 pin emits no v3 with: block (back-compat preserved)', async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201 }) as typeof fetch;
+    // status 201 (label creation) + ok/json (macf#810's default owner-type
+    // lookup at `GET /users/<owner>`) — Organization is an arbitrary,
+    // internally-consistent choice for tests that don't assert on the
+    // resulting registry-api-path.
+    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201, ok: true, json: async () => ({ type: 'Organization' }) }) as typeof fetch;
 
     await repoInit(dir, {
       repo: 'owner/test-repo',
@@ -1810,7 +2020,11 @@ describe('repoInit integration', () => {
   });
 
   it('v3 pin + org scope without --registry-org throws', async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201 }) as typeof fetch;
+    // status 201 (label creation) + ok/json (macf#810's default owner-type
+    // lookup at `GET /users/<owner>`) — Organization is an arbitrary,
+    // internally-consistent choice for tests that don't assert on the
+    // resulting registry-api-path.
+    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201, ok: true, json: async () => ({ type: 'Organization' }) }) as typeof fetch;
 
     await expect(repoInit(dir, {
       repo: 'acme/widget',
@@ -1821,7 +2035,11 @@ describe('repoInit integration', () => {
   });
 
   it('v3 pin + local scope is rejected (no GitHub-Actions routing path)', async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201 }) as typeof fetch;
+    // status 201 (label creation) + ok/json (macf#810's default owner-type
+    // lookup at `GET /users/<owner>`) — Organization is an arbitrary,
+    // internally-consistent choice for tests that don't assert on the
+    // resulting registry-api-path.
+    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201, ok: true, json: async () => ({ type: 'Organization' }) }) as typeof fetch;
 
     await expect(repoInit(dir, {
       repo: 'owner/r',
