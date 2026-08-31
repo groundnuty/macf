@@ -46,10 +46,26 @@ export interface RepoInitOptions {
   readonly project?: string;
   /**
    * Registry scope for the v3 reusable workflow's `registry-api-path` input
-   * (DR-006). One of `repo` (default), `org`, or `profile`. Mirrors
-   * `macf init`'s `--registry-type`. Only consumed when the pinned actions
-   * version is v3+; v1.x routing reads addressing from agent-config.json,
-   * not the registry.
+   * (DR-006). One of `repo`, `org`, or `profile`. Mirrors `macf init`'s
+   * `--registry-type`. Only consumed when the pinned actions version is
+   * v3+; v1.x routing reads addressing from agent-config.json, not the
+   * registry.
+   *
+   * **Omitted (the common case) is NOT the same as `repo` (groundnuty/macf#810).**
+   * A fleet's registry is meant to be fleet-scoped — every agent's caller
+   * pointing `registry-api-path` at ONE shared scope, so a registry write
+   * (e.g. a rotated CA cert) is visible to every sibling agent. `repo`
+   * scope self-points at the calling repo's own variables; N agent repos
+   * each defaulting to `repo` produces N independent scopes, which is
+   * exactly the per-repo drift DR-006 exists to avoid (verified live: every
+   * agent repo on `macf-trial`/`macf-fresh` pointed at itself). So when this
+   * field is left unset, `buildRoutingRegistry` derives the scope from a
+   * LIVE fact — the owner account's GitHub type (`GET /users/<owner>`) —
+   * rather than defaulting to `repo`: an Organization owner gets `org`
+   * scope, a User owner gets `profile` scope (an org-scope default would
+   * 404 unconditionally against a User account). `repo` is still reachable
+   * by passing it explicitly — the DR-006 "fallback/edge cases" scope
+   * remains available, it just is no longer silently the default.
    */
   readonly registryType?: string;
   /** Org login for `--registry-type org`. */
@@ -191,17 +207,79 @@ export function isRunnerRunsOnCapableActionsVersion(version: string): boolean {
 }
 
 /**
+ * Live GitHub account-type read via the public `/users/{owner}` endpoint —
+ * `.type` is `"Organization"` for an org-owned login, `"User"` for a
+ * personal one (GitHub exposes orgs under the same `/users` path for
+ * either kind). Unauthenticated-readable, so this resolves even before
+ * `repoInit` has minted any token — label creation, the first thing in this
+ * file that needs one, runs strictly later (see `repoInit`'s body). An
+ * ambient `GH_TOKEN` is attached when present purely to raise the rate
+ * limit; it is never required.
+ *
+ * Never throws — any network failure, non-OK response, or a `.type` that is
+ * neither `"User"` nor `"Organization"` degrades to `'unknown'`, which
+ * {@link buildRoutingRegistry} treats as a hard, loud refusal rather than a
+ * silent guess (groundnuty/macf#810's honest-unknown requirement: never
+ * default to `/orgs/` and let it 404 later, at the router's own registry
+ * read).
+ *
+ * Deliberately a SEPARATE implementation from `bootstrap/manifest-scaffold.ts`'s
+ * own `fetchOwnerType` (same discriminator — `GET /users/{account}` →
+ * `.type`). That helper shells out to the `gh` CLI; every other GitHub read
+ * in THIS file (and every existing `repo-init.test.ts` mock) goes through
+ * `proxyAwareFetch`/`globalThis.fetch`. Two implementations of one fact
+ * check, kept because each matches its own file's transport convention — a
+ * third instance would be the signal to extract a shared helper instead.
+ */
+export async function fetchOwnerType(owner: string): Promise<'user' | 'org' | 'unknown'> {
+  try {
+    const headers: Record<string, string> = { 'Accept': 'application/vnd.github+json' };
+    const token = process.env['GH_TOKEN'];
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+    const res = await proxyAwareFetch(`https://api.github.com/users/${owner}`, { headers });
+    if (!res.ok) return 'unknown';
+    const body = (await res.json()) as { type?: unknown };
+    if (body.type === 'Organization') return 'org';
+    if (body.type === 'User') return 'user';
+    return 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
+/**
  * Build the registry config that the v3 caller's `registry-api-path` is
  * derived from. Mirrors `macf init`'s `--registry-type` switch + reuses the
  * canonical `registryPathPrefix` mapping (DR-006). `local` registries have no
  * GitHub-Actions routing path, so they are rejected here.
+ *
+ * groundnuty/macf#810 — when `opts.registryType` is unset, the scope is NOT
+ * a fixed default; it's derived from the owner's live GitHub account type
+ * (see {@link fetchOwnerType}'s doc for why `repo` is the wrong default and
+ * why the discriminator must be a fact, not a guess). Org owner → `org`
+ * scope; User owner → `profile` scope (DR-006 — `/orgs/<user>` 404s
+ * unconditionally against a User account); undeterminable → throw, naming
+ * both explicit forms so the caller can choose rather than silently
+ * receiving a scope that only fails later.
  */
-function buildRoutingRegistry(
+async function buildRoutingRegistry(
   opts: RepoInitOptions,
   owner: string,
   repoName: string,
-): RegistryConfig {
-  const regType = opts.registryType ?? 'repo';
+): Promise<RegistryConfig> {
+  const regType = opts.registryType;
+  if (regType === undefined) {
+    const ownerType = await fetchOwnerType(owner);
+    if (ownerType === 'org') return { type: 'org', org: owner };
+    if (ownerType === 'user') return { type: 'profile', user: owner };
+    throw new Error(
+      `Could not determine whether "${owner}" is a GitHub User or Organization ` +
+        '(GET /users/<owner> failed, or returned a "type" that was neither). repo-init ' +
+        'refuses to guess the default registry-api-path scope — pass one explicitly: ' +
+        `--registry-type org --registry-org ${owner} (org scope, "/orgs/${owner}"), or ` +
+        `--registry-type profile --registry-user ${owner} (profile scope, "/repos/${owner}/${owner}").`,
+    );
+  }
   switch (regType) {
     case 'org':
       if (!opts.registryOrg) throw new Error('--registry-org required for org registry');
@@ -214,7 +292,7 @@ function buildRoutingRegistry(
     case 'local':
       throw new Error(
         'local registry has no GitHub-Actions routing path; macf-actions v3 routing ' +
-          'requires a GitHub-backed registry. Use --registry-type repo (default), org, or profile.',
+          'requires a GitHub-backed registry. Use --registry-type repo, org, or profile.',
       );
     default:
       throw new Error(`Unknown registry type: "${regType}" (expected repo, org, or profile)`);
@@ -950,7 +1028,7 @@ export async function repoInit(
     if (!isValidProjectName(project)) {
       throw new Error(`Invalid project name "${project}": must match [a-zA-Z0-9_-]+`);
     }
-    const registry = buildRoutingRegistry(opts, owner!, repoName!);
+    const registry = await buildRoutingRegistry(opts, owner!, repoName!);
     v3Inputs = { project, registryApiPath: registryPathPrefix(registry) };
 
     // groundnuty/macf#1368 — thread the manifest's declared runner intent
