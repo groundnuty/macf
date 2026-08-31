@@ -2439,7 +2439,7 @@ function printDistributionFixLine(target: '.claude/scripts/' | '.claude/rules/',
     );
     console.log('    Fix: update the CLI FIRST (pull + rebuild this checkout, or install a current');
     console.log(`    CLI release), THEN run ${refreshCmd}. Do not run it alone while the CLI is`);
-    console.log('    the stale party — see groundnuty/macf#1383.');
+    console.log('    the stale party — that would overwrite current files with the stale copy.');
     return;
   }
 

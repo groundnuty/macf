@@ -156,9 +156,12 @@ describe('runDoctor — rule-currency WARN composed with checkout currency (grou
     expect(section).toMatch(/1 commit\(s\) behind/);
     expect(section).toContain('origin/main');
     // 3. The corrected remedy — CLI-first, never plain `macf update` alone.
+    // No internal issue citation (macf#1061 "explain, don't cite" — this is
+    // user-facing CLI output, not a code comment): the explanation stands
+    // on its own instead of pointing at groundnuty/macf#1383.
     expect(section).toMatch(/THE INSTALLED CLI is probably STALE/);
     expect(section).toMatch(/update the CLI FIRST/);
-    expect(section).toContain('groundnuty/macf#1383');
+    expect(section).not.toMatch(/\bmacf#\d+\b/);
     // The unconditional pre-#1383 remedy must NOT appear verbatim in this branch.
     expect(section).not.toContain(
       'Fix: run `macf update` (or `macf rules refresh --dir .`) to bring .claude/rules/ current.',
