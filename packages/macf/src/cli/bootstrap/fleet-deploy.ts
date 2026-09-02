@@ -84,6 +84,8 @@ import { secretFingerprint } from './fleet-lock.js';
 import type { InitOptions } from '../commands/init.js';
 import { defaultAgentKeyPath, legacyAgentKeyPath, legacyProjectAgentKeyPath } from '../commands/init.js';
 import { caCertPath, caKeyPath, legacyProjectCaCertPath, legacyProjectCaKeyPath, agentCertPath, agentKeyPath } from '../config.js';
+import type { VersionSet } from '../version-resolver.js';
+import { resolveLockstepVersionsOrThrow } from '../version-resolver.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -942,6 +944,26 @@ export interface FleetDeployDeps {
    * this, via `provisionedThisRunRoles(result)`.
    */
   readonly rolesProvisionedThisApplyRun?: ReadonlySet<string>;
+  /**
+   * Resolves the `{cli, plugin, actions}` version triple to pass to
+   * `initAgent` ONLY when `manifest.versions` is undeclared (macf#1406 —
+   * "no opinion" per `version-target.ts`'s own doc, so this run resolves
+   * "whatever the CLI currently latest-resolves to" rather than pinning
+   * nothing). Defaults to the REAL {@link resolveLockstepVersionsOrThrow}
+   * (network I/O — a genuine leaf, same shape as `mintCloneToken`/
+   * `cloneRepo` above). **Tests SHOULD override this** whenever their
+   * fixture manifest omits `versions:` — every existing test's fixture
+   * declares `versions: { macf, actions }`, so this seam is unreached by
+   * them and stays a real, uninjected network call only for a fixture that
+   * deliberately exercises the undeclared-versions path.
+   *
+   * See {@link deployAgent}'s own call site for why `manifest.versions`
+   * being declared bypasses this ENTIRELY (both `cliVersion` AND
+   * `pluginVersion` are then derived straight from the manifest, in
+   * lockstep, with zero network calls) — this seam only fires for the
+   * "the manifest genuinely has no opinion" branch.
+   */
+  readonly resolveVersions?: () => Promise<VersionSet>;
 }
 
 export type FleetDeployOutcome =
@@ -1428,6 +1450,33 @@ export async function deployAgent(
     const keyDestPath = agentKeyPath(destDir);
     const certPreExisted = ca.status !== 'vault-absent' && existsSync(certDestPath) && existsSync(keyDestPath);
 
+    // macf#1406 — `pluginVersion` MUST always be passed in lockstep with
+    // `cliVersion`, never left for `initAgent`'s own `resolveVersions()` to
+    // fill in independently. `FleetVersionsSchema` has no `plugin` field
+    // (both `macf` and `actions` are required together when `versions:` is
+    // declared at all — see the schema's own doc), so lockstep IS the rule,
+    // not a fallback for a missing manifest field.
+    //
+    // Declared `manifest.versions` → derive both from it directly, ZERO
+    // network calls (this is the concrete #1406 bug: previously `cliVersion`
+    // /`actionsVersion` were forwarded from here but `pluginVersion` was
+    // not, so `initAgent`'s `allSet` check was false, it fell into its own
+    // `resolveLatestVersions()`, THAT network call failed in this deploy
+    // context — no token — and `plugin` silently landed on the hardcoded
+    // `FALLBACK_VERSIONS.plugin` ('0.2.0', a plugin with zero PreToolUse
+    // hooks) sitting next to a real, current `cliVersion`).
+    //
+    // Undeclared `manifest.versions` ("no opinion" — `version-target.ts`'s
+    // own doc) → resolve `{cli, plugin, actions}` HERE, loud-fail on
+    // network trouble ({@link resolveLockstepVersionsOrThrow}, DR-044
+    // Decision 6), and pass all three explicit. This makes `initAgent`'s
+    // OWN `allSet` check true unconditionally from this caller — its
+    // internal warn-and-degrade `resolveVersions()` path is never reached
+    // by a `fleet deploy` call, declared versions or not.
+    const versions: VersionSet = manifest.versions
+      ? { cli: manifest.versions.macf, plugin: manifest.versions.macf, actions: manifest.versions.actions }
+      : await (deps.resolveVersions ?? resolveLockstepVersionsOrThrow)();
+
     await deps.initAgent(destDir, {
       project: manifest.metadata.name,
       role,
@@ -1448,8 +1497,9 @@ export async function deployAgent(
       // the protection this option exists for is for a human re-running
       // `macf init` directly, not for this automated path.
       force: true,
-      ...(manifest.versions?.macf !== undefined ? { cliVersion: manifest.versions.macf } : {}),
-      ...(manifest.versions?.actions !== undefined ? { actionsVersion: manifest.versions.actions } : {}),
+      cliVersion: versions.cli,
+      pluginVersion: versions.plugin,
+      actionsVersion: versions.actions,
       ...registryOpts,
     });
     log(`Role "${role}": macf init completed at ${destDir}.`);
