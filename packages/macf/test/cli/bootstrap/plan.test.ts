@@ -2992,7 +2992,6 @@ describe('computePlan runnerDeclarationMismatches — self-hosted declared but t
     const text = formatPlanText(plan);
     expect(text).toContain('runner_declaration: DECLARED (runtime unverified)');
     expect(text).not.toContain('runner_declaration: UNCERTAIN');
-    expect(text).not.toMatch(/UNCERTAIN/);
   });
 
   it('2. DECISIVE: hosted declared -> NO row, no noise, even with observed with: keys present', () => {

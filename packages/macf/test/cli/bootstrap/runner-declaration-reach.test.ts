@@ -225,6 +225,18 @@ describe('runnerDeclarationTag — the operator-facing wording (groundnuty/macf#
       expect(runnerDeclarationTag(verdict)).not.toBe('UNCERTAIN');
     }
   });
+
+  // The issue's own AC: "`HONOURED` is reserved for whatever future check
+  // can observe a run" — nothing in this static module may emit the bare
+  // word today. Exact equality, not a substring/regex match — `NOT HONOURED`
+  // legitimately CONTAINS `HONOURED`, so a `not.toMatch(/HONOURED/)` form
+  // would fail on a correct implementation (assert-the-wrong-path.md: pick
+  // the assertion a wrong implementation can't also satisfy).
+  it('AC: bare "HONOURED" is reserved — no verdict tags to it today', () => {
+    for (const verdict of ['not-applicable', 'unknown', 'not-honoured', 'honoured'] as const) {
+      expect(runnerDeclarationTag(verdict)).not.toBe('HONOURED');
+    }
+  });
 });
 
 describe('evaluateRunnerDeclarationReach — not-applicable + honest-unknown floor', () => {
