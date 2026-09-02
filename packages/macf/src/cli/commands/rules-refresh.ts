@@ -18,17 +18,34 @@
  * dependence on App credentials, registry, certs, or pin state.
  */
 import { existsSync, statSync } from 'node:fs';
-import { copyCanonicalRules, copyCanonicalScripts } from '../rules.js';
+import { resolveCanonicalBranch } from '../config.js';
+import { copyCanonicalAssetsGuarded } from '../canonical-overwrite-guard.js';
 import { fetchProjectRules, PROJECT_RULES_SOURCE_ENV } from '../project-rules.js';
 import { reportSeedPromptResponses, seedPromptResponsesConfig } from '../prompt-responses.js';
 import { reportSeedStallSignatures, seedStallSignaturesConfig } from '../stall-signatures.js';
 import { installGhTokenHook, installStartupPickupHook, installPluginSkillPermissions, installSandboxFdAllowRead, installSandboxExcludedCommands } from '../settings-writer.js';
+
+export interface RulesRefreshOptions {
+  /**
+   * Deliberate-downgrade escape for the #1386-class stale-CLI-overwrite
+   * guard (#1401 — this command has no `.macf/macf-agent.json` to read a
+   * `canonicalBranch` override from, so it always judges against `main`
+   * unless `MACF_CANONICAL_BRANCH` is set). Mirrors `macf update --force` /
+   * `macf init --force`'s escape hatch for the same guard.
+   */
+  readonly force?: boolean;
+}
 
 export interface RulesRefreshResult {
   readonly rules: readonly string[];
   readonly scripts: readonly string[];
   readonly projectRules: readonly string[];
   readonly hookInstalled: boolean;
+  /**
+   * `true` when the stale-CLI-overwrite guard refused AND `force` was not
+   * set, so neither rules nor scripts were copied this run (#1401).
+   */
+  readonly refused: boolean;
 }
 
 /**
@@ -36,9 +53,15 @@ export interface RulesRefreshResult {
  * exist and be a directory. Returns copied filenames for caller logging.
  *
  * Unlike `macf update`, this does not read `.macf/macf-agent.json` — it
- * runs against any Claude Code workspace, MACF-init'd or not.
+ * runs against any Claude Code workspace, MACF-init'd or not (including
+ * `groundnuty/macf` itself — see this file's own top-of-file doc comment).
+ * That is precisely why this command is exposed to the #1386 stale-CLI-
+ * overwrite hazard just as much as `macf update`: it exists to write INTO
+ * an already-populated, possibly hand-curated `.claude/` — routed through
+ * `copyCanonicalAssetsGuarded` (#1401) with the same refuse/force/proceed
+ * semantics `update` and `init` use.
  */
-export function rulesRefresh(targetDir: string): RulesRefreshResult {
+export function rulesRefresh(targetDir: string, options: RulesRefreshOptions = {}): RulesRefreshResult {
   if (!existsSync(targetDir)) {
     throw new Error(`Target directory does not exist: ${targetDir}`);
   }
@@ -46,8 +69,22 @@ export function rulesRefresh(targetDir: string): RulesRefreshResult {
     throw new Error(`Target is not a directory: ${targetDir}`);
   }
 
-  const rules = copyCanonicalRules(targetDir);
-  const scripts = copyCanonicalScripts(targetDir);
+  const canonicalBranch = resolveCanonicalBranch(null);
+  const copyOutcome = copyCanonicalAssetsGuarded(targetDir, {
+    canonicalBranch,
+    force: options.force,
+  });
+  if (copyOutcome.guard.kind === 'refuse') {
+    if (copyOutcome.copied) {
+      console.warn(`Warning: --force overriding a stale-CLI overwrite refusal: ${copyOutcome.guard.detail}`);
+    } else {
+      console.error(`Refused: ${copyOutcome.guard.detail}`);
+    }
+  } else if (copyOutcome.guard.kind === 'unknown') {
+    console.warn(`Warning: ${copyOutcome.guard.detail}`);
+  }
+  const rules = copyOutcome.rules;
+  const scripts = copyOutcome.scripts;
 
   // Seed (if absent) / validate (if present) the interactive-prompt
   // auto-responder allowlist (.claude/.macf/prompt-responses.json, DR-033 /
@@ -106,7 +143,10 @@ export function rulesRefresh(targetDir: string): RulesRefreshResult {
   if (rules.length > 0) {
     console.log(`Refreshed ${rules.length} canonical rule file(s) in .claude/rules/:`);
     for (const name of rules) console.log(`  ${name}`);
-  } else {
+  } else if (copyOutcome.copied) {
+    // Distinct from a REFUSED copy (guard.kind === 'refuse' && !copied,
+    // already reported via console.error above) — this branch is the
+    // genuine "CLI installed without the rules payload" edge case.
     console.log('No canonical rule files found in CLI package (nothing to copy).');
   }
 
@@ -126,5 +166,5 @@ export function rulesRefresh(targetDir: string): RulesRefreshResult {
     for (const name of projectRules) console.log(`  ${name}`);
   }
 
-  return { rules, scripts, projectRules, hookInstalled: true };
+  return { rules, scripts, projectRules, hookInstalled: true, refused: !copyOutcome.copied };
 }

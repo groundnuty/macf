@@ -7,10 +7,12 @@ import {
   agentCertPath, agentKeyPath,
   isValidProjectName, tokenSourceFromConfig,
   ownerAccountFromRegistry, resolveExistingCaPaths,
+  resolveCanonicalBranch,
 } from '../config.js';
 import { createCA, loadCA } from '@groundnuty/macf-core';
 import { generateAgentCert } from '@groundnuty/macf-core';
-import { copyCanonicalRules, copyCanonicalScripts } from '../rules.js';
+import { findCliPackageRoot } from '../rules.js';
+import { copyCanonicalAssetsGuarded } from '../canonical-overwrite-guard.js';
 import { seedProjectRulesDir } from '../project-rules.js';
 import { reportSeedPromptResponses, seedPromptResponsesConfig } from '../prompt-responses.js';
 import { reportSeedStallSignatures, seedStallSignaturesConfig } from '../stall-signatures.js';
@@ -804,11 +806,33 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
     }
   }
 
-  // Copy canonical coordination rules into <workspace>/.claude/rules/
-  // (single source of truth shipped with the CLI; refreshed by `macf update`)
-  const copiedRules = copyCanonicalRules(absDir);
-  if (copiedRules.length > 0) {
-    console.log(`  Rules: copied ${copiedRules.length} canonical rule file(s) to .claude/rules/`);
+  // Copy canonical coordination rules + helper scripts into
+  // <workspace>/.claude/{rules,scripts}/ (single source of truth shipped
+  // with the CLI; refreshed by `macf update`). `macf init` is NOT only a
+  // fresh-directory operation — a re-init over an already-initialized
+  // workspace (plain re-run, or `--force` migration) reaches this same
+  // call, so it is exposed to the exact stale-CLI-overwrite hazard #1386
+  // fixed for `macf update` alone. `#1401` routes it through the same
+  // guarded helper (`opts.force` doubles as this guard's deliberate-
+  // downgrade escape, same flag `refuseUnmanagedClaudeShWithoutForce`
+  // above already reuses for a different init-time refusal).
+  const canonicalBranch = resolveCanonicalBranch(config);
+  const copyOutcome = copyCanonicalAssetsGuarded(absDir, {
+    packageRoot: findCliPackageRoot(),
+    canonicalBranch,
+    force: opts.force,
+  });
+  if (copyOutcome.guard.kind === 'refuse') {
+    if (copyOutcome.copied) {
+      console.warn(`  Warning: --force overriding a stale-CLI overwrite refusal: ${copyOutcome.guard.detail}`);
+    } else {
+      console.error(`  Refused: ${copyOutcome.guard.detail}`);
+    }
+  } else if (copyOutcome.guard.kind === 'unknown') {
+    console.warn(`  Warning: ${copyOutcome.guard.detail}`);
+  }
+  if (copyOutcome.rules.length > 0) {
+    console.log(`  Rules: copied ${copyOutcome.rules.length} canonical rule file(s) to .claude/rules/`);
   }
 
   // Seed the project-tier rule subdir (.claude/rules/project/) with a generic,
@@ -821,12 +845,11 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
   const seeded = seedProjectRulesDir(absDir);
   console.log(`  Rules: seeded project-tier example to .claude/rules/project/${seeded}`);
 
-  // Copy canonical helper scripts (e.g., tmux-send-to-claude.sh) into
-  // <workspace>/.claude/scripts/. Hooks in settings.local.json.example
-  // call these by relative path.
-  const copiedScripts = copyCanonicalScripts(absDir);
-  if (copiedScripts.length > 0) {
-    console.log(`  Scripts: copied ${copiedScripts.length} helper script(s) to .claude/scripts/`);
+  // Helper scripts (e.g., tmux-send-to-claude.sh) landed in
+  // <workspace>/.claude/scripts/ alongside the rules above — hooks in
+  // settings.local.json.example call these by relative path.
+  if (copyOutcome.scripts.length > 0) {
+    console.log(`  Scripts: copied ${copyOutcome.scripts.length} helper script(s) to .claude/scripts/`);
   }
 
   // Seed the interactive-prompt auto-responder allowlist
