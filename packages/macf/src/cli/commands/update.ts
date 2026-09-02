@@ -62,6 +62,7 @@ import { installGhTokenHook, installStartupPickupHook, installPluginSkillPermiss
 import { detectStaleDist, detectUnknownFreshness } from '../build-info.js';
 import {
   fetchPluginToWorkspace, workspacePluginDir, stripPluginMcpServers, linkPluginCliDist,
+  readInstalledPluginVersion,
 } from '../plugin-fetcher.js';
 import { writeMcpJsonChannelServer, readMcpJsonChannelServerVersion } from '../mcp-json.js';
 import { resolvePluginUpdateTarget } from '../plugin-hook-resolver.js';
@@ -165,15 +166,48 @@ export function buildDiff(
   });
 }
 
+/** Why {@link checkPluginRepairNeeded} decided a re-fetch is warranted — feeds the repair log line so the operator sees a reason, not just an action (DR-044 Decision 6's "cleanest reason" clause). */
+export type PluginRepairReason = 'missing' | 'empty' | 'unreadable' | 'mismatch';
+
+export interface PluginRepairCheck {
+  readonly needsRepair: boolean;
+  readonly reason?: PluginRepairReason;
+  /** Human-readable detail for the reason (e.g. "recorded 0.2.60, installed 0.2.0"). Absent when `needsRepair` is false. */
+  readonly detail?: string;
+}
+
 /**
- * Does the .macf/plugin/ dir need a re-fetch? True if the dir doesn't
- * exist OR exists but is empty. `existsSync` alone returns true for an
- * empty dir, which misses the repair case (e.g. workspaces init'd before
- * #60 merged where the directory was created but never populated).
+ * Does the MOUNTED plugin dir need a re-fetch to converge on the recorded
+ * pin? Four distinct reasons, not a boolean (groundnuty/macf#1419):
+ *
+ * - `missing` / `empty` — the pre-existing checks (dir absent, or present
+ *   but empty — e.g. workspaces init'd before #60 merged where the
+ *   directory was created but never populated).
+ * - `unreadable` — the dir has SOME content but `.claude-plugin/plugin.json`
+ *   can't be parsed for a version (corrupt manifest).
+ * - `mismatch` — the load-bearing new case. A non-empty dir with a
+ *   READABLE manifest is not proof of currency: `#1419`'s repro is a
+ *   deploy whose plugin fetch failed at v0.2.60, leaving a STALE v0.2.0
+ *   manifest on disk from an earlier attempt while `macf-agent.json`
+ *   recorded 0.2.60 as if the fetch had succeeded. The old boolean check
+ *   only asked "is the dir empty," which this state answers "no" —
+ *   `macf update` then reported "✓ up to date" forever, and the warning's
+ *   own promised retry path (`macf update`) never actually retried.
+ *   Comparing the recorded pin against the OBSERVED installed version (via
+ *   {@link readInstalledPluginVersion}, the one reader both `init` and
+ *   `update` share — DR-044's "one reader, never a second" lesson) closes
+ *   that gap: a mismatch is treated exactly like a missing dir.
  */
-function pluginDirNeedsRepair(dir: string): boolean {
-  if (!existsSync(dir)) return true;
-  return readdirSync(dir).length === 0;
+export function checkPluginRepairNeeded(projectDir: string, targetDir: string, pin: string): PluginRepairCheck {
+  if (!existsSync(targetDir)) return { needsRepair: true, reason: 'missing' };
+  if (readdirSync(targetDir).length === 0) return { needsRepair: true, reason: 'empty' };
+  const installed = readInstalledPluginVersion(projectDir, { targetDir });
+  if (installed.status === 'absent') return { needsRepair: true, reason: 'missing', detail: installed.path };
+  if (installed.status === 'unreadable') return { needsRepair: true, reason: 'unreadable', detail: installed.reason };
+  if (installed.version !== pin) {
+    return { needsRepair: true, reason: 'mismatch', detail: `recorded ${pin}, installed ${installed.version}` };
+  }
+  return { needsRepair: false };
 }
 
 /**
@@ -585,21 +619,33 @@ export async function update(
     console.warn(`Warning: CA key migration check failed: ${msg}`);
   }
 
-  // Repair-case plugin fetch: if the MOUNTED plugin dir is absent or empty,
-  // fetch the currently-pinned version regardless of whether anything is
-  // being bumped. Runs before every short-circuit so workspaces init'd
-  // before #60 merged (empty plugin dir) don't require `rm -rf + macf
-  // update` to self-heal. See #62. We skip this if config.versions is
-  // missing — legacy configs are handled by the error path below. Gated on
-  // `pluginTarget.dir` (macf#889): an undeterminable mount already warned
-  // loudly above — skip rather than guess at a default.
-  if (config.versions && pluginTarget.dir && pluginDirNeedsRepair(pluginTarget.dir)) {
-    try {
-      fetchPluginToWorkspace(projectDir, config.versions.plugin, { targetDir: pluginTarget.dir });
-      console.log(`Repaired ${pluginTarget.dir} with macf-agent@v${config.versions.plugin}`);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.warn(`Warning: plugin repair fetch failed: ${msg}`);
+  // Repair-case plugin fetch: converge the MOUNTED plugin dir on the
+  // recorded pin when it isn't there yet — absent, empty, unreadable, OR
+  // (groundnuty/macf#1419) recorded-but-not-actually-installed. Runs before
+  // every short-circuit so workspaces init'd before #60 merged (empty
+  // plugin dir) don't require `rm -rf + macf update` to self-heal (#62),
+  // AND so a workspace whose `macf init`/`fleet deploy` plugin fetch failed
+  // — leaving `versions.plugin` recording the pin it never installed — gets
+  // repaired on the very next `macf update`, which is the retry path
+  // `init`'s own failure message names. Before #1419's fix this block only
+  // asked "is the dir empty," so a workspace with a STALE manifest from an
+  // earlier successful fetch (non-empty dir, wrong version) silently never
+  // re-fetched — `macf update` reported "✓ up to date" against a disk that
+  // was anything but. We skip this if config.versions is missing — legacy
+  // configs are handled by the error path below. Gated on `pluginTarget.dir`
+  // (macf#889): an undeterminable mount already warned loudly above — skip
+  // rather than guess at a default.
+  if (config.versions && pluginTarget.dir) {
+    const repairCheck = checkPluginRepairNeeded(projectDir, pluginTarget.dir, config.versions.plugin);
+    if (repairCheck.needsRepair) {
+      const reasonText = repairCheck.detail ? `${repairCheck.reason} — ${repairCheck.detail}` : repairCheck.reason;
+      try {
+        fetchPluginToWorkspace(projectDir, config.versions.plugin, { targetDir: pluginTarget.dir });
+        console.log(`Repaired ${pluginTarget.dir} with macf-agent@v${config.versions.plugin} (${reasonText})`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`Warning: plugin repair fetch failed (${reasonText}): ${msg}`);
+      }
     }
   }
 

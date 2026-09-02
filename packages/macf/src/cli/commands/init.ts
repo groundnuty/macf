@@ -560,6 +560,32 @@ function localCaKeyPath(registryPath: string, project: string): string {
  * "rejects before writing any workspace state" test) so a refusal never
  * leaves a half-reinitialized workspace behind.
  */
+/**
+ * Turn a recorded plugin-fetch failure into a thrown Error at one of
+ * `initAgent`'s two exit points (groundnuty/macf#1419). Deferred rather than
+ * thrown at the fetch's own catch site so the REST of the workspace
+ * (cert, env files, launcher, `.mcp.json`) still gets built first — a
+ * plugin failure must not degrade into a WORSE half-initialized workspace.
+ *
+ * The thrown message carries the tag + underlying error and no internal
+ * issue/DR citations (`no-internal-citations-in-user-facing-output.test.ts`)
+ * — it reaches `index.ts`'s top-level `.catch()` verbatim for a direct
+ * `macf init` run, and via `deployAgent`'s own try/catch becomes a `fleet
+ * deploy` role's `status: 'failed'` `reason` for the in-process caller —
+ * so a human reading stderr and a script reading the JSON outcome both get
+ * the same honest, actionable summary instead of a bare "materialized".
+ */
+function throwIfPluginFetchFailed(
+  pluginFetchFailure: { readonly tag: string; readonly detail: string } | undefined,
+  absDir: string,
+): void {
+  if (pluginFetchFailure === undefined) return;
+  throw new Error(
+    `Workspace at ${absDir} initialized WITHOUT its plugin — macf-agent@${pluginFetchFailure.tag} ` +
+      `fetch failed: ${pluginFetchFailure.detail}. Retry with \`macf update\` once the issue is resolved.`,
+  );
+}
+
 function refuseUnmanagedClaudeShWithoutForce(absDir: string, force: boolean): void {
   if (force) return;
   const claudeShPath = join(absDir, 'claude.sh');
@@ -909,9 +935,21 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
 
   // Fetch the macf-agent plugin at the pinned version and place it at
   // .macf/plugin/ so claude.sh can use --plugin-dir (per DR-013).
-  // Network failures here don't abort init — the workspace is usable
-  // without the plugin (degrades to rules-only mode), and the user can
-  // re-try with `macf update` once connectivity is back.
+  //
+  // A network failure here does NOT abort init immediately (groundnuty/
+  // macf#1419) — the rest of the workspace (cert, env files, launcher,
+  // .mcp.json) still gets built, because aborting mid-function would leave
+  // a WORSE half-initialized workspace than a plugin-less one. But this is
+  // NOT the pre-#1419 "warn and quietly succeed" shape either: the failure
+  // is recorded here and the deferred throw at both of this function's
+  // exit points (the local-registry `return` below and the natural
+  // GitHub-mode end) turns the overall run into a non-zero-exit failure —
+  // "materialized WITHOUT its plugin" is the true summary, not
+  // "initialized." A silent `exit 0` here is exactly the DR-044 Decision 6
+  // violation this fix exists to close: a script driving `macf init`/`macf
+  // fleet deploy` (in-process — see `deployAgent`) must see failure at the
+  // process-exit-code level, not only in scrollback a human might not read.
+  let pluginFetchFailure: { readonly tag: string; readonly detail: string } | undefined;
   try {
     fetchPluginToWorkspace(absDir, versions.plugin);
     // Strip mcpServers from the fetched local plugin.json copy (DR-022
@@ -943,6 +981,7 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
     );
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
+    pluginFetchFailure = { tag: `v${versions.plugin}`, detail: msg };
     console.warn(`  Warning: plugin fetch failed: ${msg}`);
     console.warn(`  You can retry later with \`macf update\` once the issue is resolved.`);
   }
@@ -971,6 +1010,7 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
     console.log(`  Cert:   ${agentCertPath(absDir)}`);
     console.log(`  Launcher: ${claudeShPath}`);
     console.log(`  Registry: ${registry.path}`);
+    throwIfPluginFetchFailed(pluginFetchFailure, absDir);
     return;
   }
 
@@ -1000,6 +1040,8 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
       console.warn(`  Re-run with \`macf init --migrate-from <path>\` after fixing the source.`);
     }
   }
+
+  throwIfPluginFetchFailed(pluginFetchFailure, absDir);
 }
 
 /**
