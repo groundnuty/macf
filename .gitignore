@@ -6,6 +6,22 @@
 # to refuse with a dirty-tree error. Both agents hit this same day
 # — see `project_untracked_coordination_artifact.md`.
 .claude/rules/
+
+# `.claude/scripts/*.sh` are MANAGED (DR-029 amendment, macf#598): tool-written
+# copies of `packages/macf/plugin/scripts/` + `packages/macf/scripts/`,
+# installed by `macf update` / `rules refresh`. Tracking installed output
+# creates a second writer alongside the tool — `git checkout`/`reset` and
+# `macf update` disagree, and nothing arbitrates; a `reset --hard` silently
+# reinstalled two-month-stale hooks THREE TIMES in one day and blocked every
+# `gh` call each time (groundnuty/macf#1392). The design surface stays
+# `plugin/scripts/` (+ `packages/macf/scripts/`) — reviewed, tracked, source.
+# `macf-statusline.sh` has no canonical source (hand-authored, workspace-only
+# statusline customization — operator-preserved per the same taxonomy) and
+# stays tracked despite living in this directory; the negation below is
+# belt-and-suspenders since an already-tracked file isn't affected by a
+# later-added ignore rule.
+.claude/scripts/*
+!.claude/scripts/macf-statusline.sh
 node_modules/
 dist/
 *.tsbuildinfo
