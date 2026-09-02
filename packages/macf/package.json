@@ -12,6 +12,7 @@
   "files": [
     "dist/",
     "plugin/rules/",
+    "plugin/scripts/",
     "scripts/"
   ],
   "repository": {

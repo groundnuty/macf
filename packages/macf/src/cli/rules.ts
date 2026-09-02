@@ -33,6 +33,7 @@
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { PACKAGE_VERSION } from '../package-version.js';
 
 const MANAGED_HEADER = [
   '<!--',
@@ -69,18 +70,55 @@ export function canonicalRulesDir(packageRoot: string = findCliPackageRoot()): s
 }
 
 /**
+ * Refuse loudly, before writing anything, when a directory `copyCanonicalRules`
+ * / `copyCanonicalScripts` is about to read from does not exist on this CLI
+ * install.
+ *
+ * Historically each copy primitive skipped a missing source dir individually
+ * (`if (!existsSync(dir)) continue`) and returned/reported success over
+ * nothing written — correct in isolation (an optional dir really might be
+ * absent), but wrong once EVERY listed dir is a required canonical source: a
+ * real CLI install always ships all of them (`package.json` `files[]`), so an
+ * absent one is a packaging defect, not an expected state. groundnuty/macf#1403
+ * is the concrete instance — every npm-published CLI through 0.2.59 shipped
+ * `plugin/rules/` + `scripts/` but never `plugin/scripts/` (the `files[]`
+ * entry was never added when the 7 load-bearing hooks moved there in #749),
+ * so `copyCanonicalScripts` silently wrote 0 of the 14 scripts that live
+ * there and told every caller it succeeded.
+ *
+ * Deliberately narrow: this asserts the SOURCE DIRECTORY exists, not that it
+ * has anything left to copy — a source dir that exists but yields zero
+ * files needing a refresh (everything already current, or genuinely empty)
+ * stays silent, exactly as before. Only "the canonical source itself is
+ * missing" is loud. Matches the ratified failure policy in DR-044 Decision 6
+ * ("fail loudly and eagerly ... the cleanest, simplest reasons ... as fast
+ * as possible") — one aggregated error naming every missing dir, not one
+ * error per dir.
+ */
+function assertCanonicalSourceDirsExist(dirs: readonly string[]): void {
+  const missing = dirs.filter((dir) => !existsSync(dir));
+  if (missing.length === 0) return;
+  throw new Error(
+    `macf v${PACKAGE_VERSION}: canonical source director${missing.length === 1 ? 'y' : 'ies'} missing from ` +
+    `this CLI install: ${missing.join(', ')}. This CLI cannot distribute the files it ships from here — ` +
+    'reinstall @groundnuty/macf or file a packaging bug against groundnuty/macf. (groundnuty/macf#1403)',
+  );
+}
+
+/**
  * Copy every .md file from the canonical rules dir to <workspace>/.claude/rules/.
  * Existing files are overwritten (the canonical source wins).
  *
- * Returns the list of copied filenames (basenames). Returns empty array if
- * the canonical dir doesn't exist (e.g. CLI installed without the rules
- * payload — unlikely but safe to handle).
+ * Returns the list of copied filenames (basenames). Throws when the
+ * canonical dir doesn't exist — see `assertCanonicalSourceDirsExist` — a
+ * missing canonical source is always a packaging defect on a real CLI
+ * install, never a state to silently tolerate.
  */
 export function copyCanonicalRules(workspaceDir: string, options: {
   readonly canonicalDir?: string;
 } = {}): readonly string[] {
   const sourceDir = options.canonicalDir ?? canonicalRulesDir();
-  if (!existsSync(sourceDir)) return [];
+  assertCanonicalSourceDirsExist([sourceDir]);
 
   const targetDir = join(resolve(workspaceDir), '.claude', 'rules');
   mkdirSync(targetDir, { recursive: true });
@@ -208,9 +246,11 @@ const PLUGIN_SCRIPTS_EXCLUDED_FROM_COMPAT: ReadonlySet<string> = new Set(['mark-
  * source already documents managed status.
  *
  * Returns copied basenames (deduplicated across both source dirs, though
- * no overlap is expected in practice). Missing source dirs are skipped
- * individually (not a hard failure) — the target dir is created only if at
- * least one source dir exists and yields a script to copy.
+ * no overlap is expected in practice). Throws (`assertCanonicalSourceDirsExist`)
+ * when EITHER source dir doesn't exist — a real CLI install always ships
+ * both, so a missing one is a packaging defect (groundnuty/macf#1403), not a
+ * state to silently tolerate. Naming BOTH in one error when both are absent,
+ * per DR-044 Decision 6's "one reason, once" failure policy.
  */
 /**
  * Scripts that live in the canonical dir for co-location but are REPO-LOCAL
@@ -237,13 +277,13 @@ export function copyCanonicalScripts(workspaceDir: string, options: {
     { dir: options.canonicalDir ?? canonicalScriptsDir(), excluded: CANONICAL_SCRIPTS_REPO_LOCAL },
     { dir: options.pluginScriptsDir ?? canonicalPluginScriptsDir(), excluded: PLUGIN_SCRIPTS_EXCLUDED_FROM_COMPAT },
   ];
+  assertCanonicalSourceDirsExist(sourceDirs.map(({ dir }) => dir));
 
   const targetDir = join(resolve(workspaceDir), '.claude', 'scripts');
+  mkdirSync(targetDir, { recursive: true });
   const copied: string[] = [];
 
   for (const { dir: sourceDir, excluded } of sourceDirs) {
-    if (!existsSync(sourceDir)) continue;
-    mkdirSync(targetDir, { recursive: true });
     for (const entry of readdirSync(sourceDir, { withFileTypes: true })) {
       if (!entry.isFile() || !entry.name.endsWith('.sh')) continue;
       if (excluded.has(entry.name)) continue;
