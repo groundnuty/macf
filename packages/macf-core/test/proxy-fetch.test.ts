@@ -116,7 +116,15 @@ describe('proxyAwareFetch — decisive pair (macf#1144)', () => {
     } catch (err) {
       expect((err as Error).message).toMatch(/fetch failed/);
       const cause = (err as Error).cause as { code?: string } | undefined;
-      expect(cause?.code).toBe('ENOTFOUND');
+      // getaddrinfo's DNS-resolution failure surfaces as ENOTFOUND (host
+      // definitively not found) or EAI_AGAIN (temporary resolver failure,
+      // e.g. under a sandboxed/stressed resolver) for the SAME unresolvable
+      // host — both are DNS-class failures from the default (no-dispatcher)
+      // path. Neither is a proxy-connection error (ECONNREFUSED/ECONNRESET/
+      // EPROTO/etc.), which remains the discrimination this test proves:
+      // targeting a real closed local port instead of UNROUTABLE_TARGET
+      // reliably yields ECONNREFUSED, and the assertion below fails on it.
+      expect(['ENOTFOUND', 'EAI_AGAIN']).toContain(cause?.code);
     }
   });
 });
