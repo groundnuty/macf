@@ -1698,6 +1698,156 @@ export function checkDistributedRuleCurrency(
 }
 
 /**
+ * One canonically-distributed `.claude/scripts/` or `.claude/rules/` file
+ * found tracked in git in this workspace (groundnuty/macf#1411). `path` is
+ * workspace-relative, always forward-slash (matching `git ls-files`'
+ * own output convention regardless of host OS), e.g.
+ * `.claude/scripts/check-gh-token.sh`.
+ */
+export interface ManagedFileGitTrackingFinding {
+  readonly path: string;
+}
+
+/**
+ * Result of the managed-file-git-tracking assertion (groundnuty/macf#1411).
+ *
+ * The currency checks above (`checkDistributedScriptCurrency` /
+ * `checkDistributedRuleCurrency`) answer "do the on-disk bytes match
+ * canonical right now?" — a workspace whose managed copy is BOTH current
+ * AND tracked in git reports the identical PASS as one that is current and
+ * merely untracked. Only the second is actually safe: a tracked copy is a
+ * SECOND writer racing the tool (`macf update`) — the moment someone runs
+ * `git checkout .` / `git reset --hard` / re-clones, whatever was last
+ * committed silently overwrites the current copy, with no error and no
+ * currency-check firing until the *next* `macf doctor` run notices the
+ * bytes drifted again. This check is independent of content-currency: it
+ * fires on git STATE (is this path in the index at all), not on whether the
+ * tracked bytes happen to be stale — a file that is currently
+ * byte-identical to canonical but still tracked is exactly the "safe until
+ * the next reset" trap this exists to catch before it bites.
+ *
+ *   - `PASS`    — no canonically-distributed file is tracked in git (either
+ *                 none exist yet, or every one that exists is untracked /
+ *                 gitignored).
+ *   - `WARN`    — at least one is tracked; `findings` names each one.
+ *   - `UNKNOWN` — `workspaceDir` is not inside a git work tree, or `git`
+ *                 itself isn't on PATH. NEVER PASS in this branch — an
+ *                 undeterminable git state must never be reported as safe.
+ *
+ * Reads the exact same distributed-name populations the currency checks
+ * use (`listDistributedScriptNames` / `listDistributedRuleNames`) — never
+ * hand-enumerated — so a name excluded there (an operator-preserved script
+ * with no canonical source, a repo-local dev script) is out of scope here
+ * too, by construction, with no separate exclusion list to maintain.
+ */
+export interface ManagedFileGitTrackingCheckResult {
+  readonly status: 'PASS' | 'WARN' | 'UNKNOWN';
+  readonly findings: readonly ManagedFileGitTrackingFinding[];
+  readonly detail: string;
+}
+
+/**
+ * Run `git ls-files` ONCE against every pathspec in `pathspecs`
+ * (workspace-relative, forward-slash), returning the tracked subset — or
+ * `null` when `workspaceDir` is not inside a git work tree, or `git` itself
+ * isn't on PATH (ENOENT). One subprocess call regardless of how many names
+ * are being checked, rather than one `git ls-files --error-unmatch <path>`
+ * call per canonically-distributed file.
+ *
+ * `git ls-files` queries the INDEX, not the working tree — a file staged/
+ * committed but since `rm`'d off disk without `git rm` still reports
+ * tracked, which is correct for this check's purpose: the hazard is "will a
+ * reset/checkout resurrect this," not "does it currently exist on disk."
+ * `-z` (NUL-separated output) sidesteps any newline-in-path ambiguity in
+ * the parse, though no canonical name is expected to contain one.
+ */
+function listTrackedManagedPaths(
+  workspaceDir: string,
+  pathspecs: readonly string[],
+): readonly string[] | null {
+  if (pathspecs.length === 0) return [];
+  try {
+    const out = execFileSync('git', ['ls-files', '-z', '--', ...pathspecs], {
+      cwd: workspaceDir,
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    return out.split('\0').filter((s) => s.length > 0);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * `.claude/scripts/` + `.claude/rules/` sibling of the two currency checks
+ * above, asserting git-tracking-state instead of byte-currency (see
+ * `ManagedFileGitTrackingCheckResult`'s doc comment for the full
+ * rationale). Deliberately does NOT gate on `.macf/` presence the way the
+ * currency checks do — whether a workspace's canonically-named file is
+ * tracked in git is a hazard regardless of whether `macf update` has ever
+ * touched this workspace; an unmanaged workspace with a hand-placed,
+ * git-tracked `check-gh-token.sh` is exactly as exposed to the "next reset
+ * resurrects a stale copy" trap as a managed one.
+ */
+export function checkManagedFilesGitTracking(
+  workspaceDir: string,
+  options: {
+    readonly canonicalDir?: string;
+    readonly pluginScriptsDir?: string;
+    readonly rulesDir?: string;
+  } = {},
+): ManagedFileGitTrackingCheckResult {
+  const absDir = resolve(workspaceDir);
+  const scriptNames = listDistributedScriptNames({
+    ...(options.canonicalDir !== undefined ? { canonicalDir: options.canonicalDir } : {}),
+    ...(options.pluginScriptsDir !== undefined ? { pluginScriptsDir: options.pluginScriptsDir } : {}),
+  });
+  const ruleNames = listDistributedRuleNames({
+    ...(options.rulesDir !== undefined ? { canonicalDir: options.rulesDir } : {}),
+  });
+
+  const allPaths = [
+    ...scriptNames.map((name) => `.claude/scripts/${name}`),
+    ...ruleNames.map((name) => `.claude/rules/${name}`),
+  ];
+
+  if (allPaths.length === 0) {
+    return { status: 'PASS', findings: [], detail: 'no canonically-distributed files to check' };
+  }
+
+  const tracked = listTrackedManagedPaths(absDir, allPaths);
+  if (tracked === null) {
+    return {
+      status: 'UNKNOWN',
+      findings: [],
+      detail:
+        `${absDir} is not a git repository, or git is not on PATH — can't determine whether its ` +
+        'canonically-distributed .claude/scripts/ or .claude/rules/ files are tracked in git',
+    };
+  }
+
+  if (tracked.length === 0) {
+    return {
+      status: 'PASS',
+      findings: [],
+      detail: 'no canonically-distributed .claude/scripts/ or .claude/rules/ file is tracked in git',
+    };
+  }
+
+  const findings: ManagedFileGitTrackingFinding[] = [...tracked]
+    .sort((a, b) => a.localeCompare(b))
+    .map((path) => ({ path }));
+  return {
+    status: 'WARN',
+    findings,
+    detail:
+      `${findings.length} canonically-distributed file(s) are tracked in git — the next ` +
+      'git checkout/reset or fresh clone will silently reinstall whatever was last committed, ' +
+      'even if the working copy is current right now',
+  };
+}
+
+/**
  * Result of the Framework-checkout-currency assertion (groundnuty/macf#1376
  * — a repo checkout of the macf framework's own source has no way to learn
  * it is behind canonical: `checkDistributedScriptCurrency`/
@@ -2106,6 +2256,11 @@ export interface RunDoctorOptions {
  *     same consistency reason as disk-space above.
  *   - The early-return path (no macf-agent.json) always returns 1 regardless
  *     of disk-space status — unrelated to whether the disk itself is full.
+ *   - Managed-file-git-tracking (groundnuty/macf#1411 — a canonically-
+ *     distributed `.claude/scripts/` or `.claude/rules/` file tracked in
+ *     git, so a future reset/checkout would silently reinstall it) has no
+ *     FAIL tier — WARN and UNKNOWN do NOT affect the exit code, same
+ *     warn-only posture as the sibling currency checks it sits beside.
  */
 export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Promise<number> {
   const config = readAgentConfig(projectDir);
@@ -2136,6 +2291,14 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
     console.log('Distributed rule currency');
     console.log('──────────────────────────────────────────────────────────────');
     printRuleCurrencySection(checkDistributedRuleCurrency(projectDir), checkoutCurrency);
+    // groundnuty/macf#1411: same reachable-without-config reasoning as the
+    // two currency sections above — `checkManagedFilesGitTracking` doesn't
+    // gate on `.macf/` at all (see its own doc comment), so it's reachable
+    // here for free too.
+    console.log('');
+    console.log('Managed file git tracking');
+    console.log('──────────────────────────────────────────────────────────────');
+    printManagedFileGitTrackingSection(checkManagedFilesGitTracking(projectDir));
     // groundnuty/macf#1376: unlike the two currency checks above, this one
     // never gates on `.macf/` presence — `resolveCanonicalBranch(null)` is a
     // pure function of env + a null config (defaults to 'main'), so it's
@@ -2280,6 +2443,11 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
   console.log('Distributed rule currency');
   console.log('──────────────────────────────────────────────────────────────');
   printRuleCurrencySection(checkDistributedRuleCurrency(projectDir), checkoutCurrency);
+
+  console.log('');
+  console.log('Managed file git tracking');
+  console.log('──────────────────────────────────────────────────────────────');
+  printManagedFileGitTrackingSection(checkManagedFilesGitTracking(projectDir));
 
   console.log('');
   console.log('Framework checkout currency');
@@ -2580,6 +2748,33 @@ function printRuleCurrencySection(check: RuleCurrencyCheckResult, checkoutCurren
   }
   const staleCount = check.findings.filter((f) => f.reason === 'stale').length;
   printDistributionFixLine('.claude/rules/', checkoutCurrency, staleCount);
+}
+
+/**
+ * Print the groundnuty/macf#1411 managed-file-git-tracking report section
+ * for `check`. Names each tracked file, then a remedy that covers both
+ * directory shapes it can fire on: `.claude/rules/` (ignored whole,
+ * per-file names never appear in the pattern) and `.claude/scripts/*`
+ * (ignored with a negation, so an operator-authored script kept outside
+ * the canonical set can still be tracked deliberately).
+ */
+function printManagedFileGitTrackingSection(check: ManagedFileGitTrackingCheckResult): void {
+  if (check.status === 'UNKNOWN') {
+    console.log(`  ? ${check.detail}  [UNKNOWN]`);
+    return;
+  }
+  if (check.status === 'PASS') {
+    console.log(`  ✓ ${check.detail}  [PASS]`);
+    return;
+  }
+  console.log(`  ⚠ ${check.detail}  [WARN]`);
+  for (const f of check.findings) {
+    console.log(`    ✗ ${f.path} — tracked in git`);
+  }
+  console.log('    Fix: untrack each file (`git rm --cached <path>`), then add a `.gitignore` rule so a');
+  console.log('    fresh checkout never re-adds it: ignore the whole `.claude/rules/` directory for rule');
+  console.log('    files, or `.claude/scripts/*` (plus a negation line for any hand-authored script you');
+  console.log('    deliberately want tracked) for script files.');
 }
 
 /** Print the groundnuty/macf#1376 Framework-checkout-currency report section for `check`. */
