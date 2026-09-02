@@ -185,7 +185,7 @@ import { describeRunnerPlatformEndpointResolution, type RunnerPlatformEndpointRe
 // wrapper `checkRunnerDeclarationReach`) stays the standalone `macf routing
 // runner-declaration-check` CLI's own import, never `plan.ts`'s — see that
 // function's doc for why plan deliberately uses the sibling.
-import { evaluateRunnerDeclarationReachFromObservation, type RunnerDeclarationFinding } from './runner-declaration-reach.js';
+import { evaluateRunnerDeclarationReachFromObservation, runnerDeclarationTag, type RunnerDeclarationFinding } from './runner-declaration-reach.js';
 // groundnuty/macf#1220 / #1129 / #1229 / DR-043 Amendment P2 — row 3 of the
 // reconciler verb matrix (`update` never COMPUTED for a REUSED resource).
 // `install-scope-coverage.ts` value-imports `type { Presence }` from THIS
@@ -3325,30 +3325,16 @@ export function formatScopeCredentialLines(notices: readonly ScopeCredentialNoti
  * groundnuty/macf#1335 — one line per {@link RunnerDeclarationFinding} in
  * {@link FleetPlan.runnerDeclarationMismatches} (already excludes
  * `'not-applicable'` — `computePlan` filters it before this array is ever
- * built). Tagged with the SAME verdict vocabulary the standalone `macf
- * routing runner-declaration-check` CLI uses (`NOT HONOURED` / `UNKNOWN` /
- * `UNCERTAIN`) — one source of truth for what these words mean, whether the
- * operator reads a `plan` render or runs that command directly.
+ * built). Tagged via {@link runnerDeclarationTag} — the SAME import the
+ * standalone `macf routing runner-declaration-check` CLI uses
+ * (`NOT HONOURED` / `UNKNOWN` / `DECLARED (runtime unverified)`) — a real
+ * single source of truth for what these words mean (groundnuty/macf#1421:
+ * this used to be two hand-synced copies of the same switch, which is
+ * exactly how one of them went stale), whether the operator reads a `plan`
+ * render or runs that command directly.
  */
 export function formatRunnerDeclarationLines(findings: readonly RunnerDeclarationFinding[]): readonly string[] {
   return findings.map((f) => `runner_declaration: ${runnerDeclarationTag(f.verdict)} — ${f.message}`);
-}
-
-function runnerDeclarationTag(verdict: RunnerDeclarationFinding['verdict']): string {
-  switch (verdict) {
-    case 'not-honoured':
-      return 'NOT HONOURED';
-    case 'unknown':
-      return 'UNKNOWN';
-    case 'honoured':
-      return 'UNCERTAIN';
-    case 'not-applicable':
-      // Never reached — `computePlan` filters this verdict out before it
-      // ever reaches `FleetPlan.runnerDeclarationMismatches`; kept here so
-      // this switch stays exhaustive over `RunnerDeclarationVerdict` rather
-      // than relying on that invariant silently.
-      return 'N/A';
-  }
 }
 
 /**

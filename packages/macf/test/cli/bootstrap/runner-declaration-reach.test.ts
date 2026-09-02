@@ -22,6 +22,7 @@ import {
   evaluateRunnerDeclarationReach,
   evaluateRunnerDeclarationReachFromObservation,
   checkRunnerDeclarationReach,
+  runnerDeclarationTag,
   KNOWN_NON_RUNNER_INTENT_WITH_KEYS,
 } from '../../../src/cli/bootstrap/runner-declaration-reach.js';
 import type { RunnerDeclarationDeps } from '../../../src/cli/bootstrap/runner-declaration-reach.js';
@@ -92,6 +93,39 @@ jobs:
       - uses: actions/checkout@v4
 `;
 
+// groundnuty/macf#1421 — the REAL shape observed live on `macf-trial`
+// (`with: runner-runs-on: self-hosted` at a runner-runs-on-capable pin,
+// `v3.5.0`+): a capable pin whose `with:` block actually carries the
+// `runner-runs-on` input.
+const CAPABLE_PIN_WITH_RUNNER_RUNS_ON_YAML = `name: Agent Router
+
+jobs:
+  route:
+    uses: groundnuty/macf-actions/.github/workflows/agent-router.yml@v3.5.0
+    with:
+      project: myproject
+      registry-api-path: /orgs/myorg
+      runner-runs-on: self-hosted
+    secrets:
+      MACF_ROUTING_BUNDLE: \${{ secrets.MACF_ROUTING_BUNDLE }}
+`;
+
+// The same pin (capable, >= v3.5.0), but the input is ABSENT — the
+// generator never emitted it (e.g. the manifest didn't declare
+// `routing.runner.runs_on: self-hosted` at generation time). Capability
+// alone doesn't confer the verdict; the input has to actually be there.
+const CAPABLE_PIN_WITHOUT_RUNNER_RUNS_ON_YAML = `name: Agent Router
+
+jobs:
+  route:
+    uses: groundnuty/macf-actions/.github/workflows/agent-router.yml@v3.5.0
+    with:
+      project: myproject
+      registry-api-path: /orgs/myorg
+    secrets:
+      MACF_ROUTING_BUNDLE: \${{ secrets.MACF_ROUTING_BUNDLE }}
+`;
+
 describe('extractCallerWithKeys (pure)', () => {
   it("today's real caller shape: pin + exactly [project, registry-api-path]", () => {
     const parsed = extractCallerWithKeys(TODAYS_CALLER_YAML);
@@ -150,6 +184,46 @@ describe('evaluateRunnerDeclarationReach — decisive pair', () => {
     const finding = evaluateRunnerDeclarationReach('groundnuty/x', 'self-hosted', LEGACY_CALLER_YAML);
     expect(finding.verdict).toBe('not-honoured');
     expect(finding.message).toContain('no with: block at all');
+  });
+});
+
+/**
+ * groundnuty/macf#1421 — `UNCERTAIN` read as "we could not tell what the
+ * declaration is" for a verdict that is actually certain (the declaration
+ * IS present); only the router's RUNTIME behaviour is unverified. The
+ * decisive TRIPLE this issue's own AC names, run through the REAL
+ * `runner-runs-on` key and the REAL capability threshold (`v3.5.0`) —
+ * `runnerDeclarationTag` is what an operator actually reads, so these
+ * assert the tag word, not just the machine-verdict.
+ */
+describe('runnerDeclarationTag — the operator-facing wording (groundnuty/macf#1421)', () => {
+  it('1. DECISIVE: capable pin + runner-runs-on present -> DECLARED (runtime unverified), never UNCERTAIN', () => {
+    const finding = evaluateRunnerDeclarationReach('groundnuty/x', 'self-hosted', CAPABLE_PIN_WITH_RUNNER_RUNS_ON_YAML);
+    expect(finding.verdict).toBe('honoured');
+    expect(runnerDeclarationTag(finding.verdict)).toBe('DECLARED (runtime unverified)');
+    expect(runnerDeclarationTag(finding.verdict)).not.toBe('UNCERTAIN');
+  });
+
+  it('2. DECISIVE: capable pin + runner-runs-on ABSENT -> NOT HONOURED — capability alone never confers the verdict', () => {
+    const finding = evaluateRunnerDeclarationReach('groundnuty/x', 'self-hosted', CAPABLE_PIN_WITHOUT_RUNNER_RUNS_ON_YAML);
+    expect(finding.verdict).toBe('not-honoured');
+    expect(runnerDeclarationTag(finding.verdict)).toBe('NOT HONOURED');
+  });
+
+  it('3. DECISIVE: incapable pin (v3.4.2), same with: shape as case 2 -> NOT HONOURED, unchanged by this issue', () => {
+    const finding = evaluateRunnerDeclarationReach('groundnuty/x', 'self-hosted', TODAYS_CALLER_YAML);
+    expect(finding.verdict).toBe('not-honoured');
+    expect(runnerDeclarationTag(finding.verdict)).toBe('NOT HONOURED');
+  });
+
+  it('MUTATION GUARD: collapsing DECLARED back into the old UNCERTAIN wording fails this — the tag must be exactly "DECLARED (runtime unverified)" for the honoured verdict, "N/A" for not-applicable, and never "UNCERTAIN" for anything', () => {
+    expect(runnerDeclarationTag('honoured')).toBe('DECLARED (runtime unverified)');
+    expect(runnerDeclarationTag('not-honoured')).toBe('NOT HONOURED');
+    expect(runnerDeclarationTag('unknown')).toBe('UNKNOWN');
+    expect(runnerDeclarationTag('not-applicable')).toBe('N/A');
+    for (const verdict of ['not-applicable', 'unknown', 'not-honoured', 'honoured'] as const) {
+      expect(runnerDeclarationTag(verdict)).not.toBe('UNCERTAIN');
+    }
   });
 });
 

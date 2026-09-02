@@ -2957,6 +2957,44 @@ describe('computePlan runnerDeclarationMismatches — self-hosted declared but t
     expect(text).toContain('groundnuty/icsoc-2026-experiment');
   });
 
+  // groundnuty/macf#1421 — `UNCERTAIN` read as "we could not tell what the
+  // declaration is" for a verdict that is actually certain (only the
+  // router's RUNTIME behaviour is unverified). Drives the REAL `plan`
+  // renderer (`formatPlanText`), not just the classifier, per the issue's
+  // own requirement that the fix reach `plan`'s actual output.
+  it('1b. DECISIVE: self-hosted declared + installed router with: keys DO convey it -> a plan row reads "DECLARED (runtime unverified)", never "UNCERTAIN"', () => {
+    const observed: ObservedState = {
+      ...EMPTY_OBSERVED,
+      agents: {
+        'science-agent': {
+          app: 'present',
+          install: 'present',
+          repo: 'present',
+          fingerprints: {},
+          actionsPin: 'v3.5.0',
+          routerWithKeys: ['project', 'registry-api-path', 'runner-runs-on'],
+        },
+        'code-agent': {
+          app: 'present',
+          install: 'present',
+          repo: 'present',
+          fingerprints: {},
+          actionsPin: 'v3.5.0',
+          routerWithKeys: ['project', 'registry-api-path', 'runner-runs-on'],
+        },
+      },
+    };
+    const plan = computePlan(manifest, observed);
+    expect(plan.runnerDeclarationMismatches).toHaveLength(2);
+    const finding = plan.runnerDeclarationMismatches.find((f) => f.repo === 'groundnuty/icsoc-2026-science-agent');
+    expect(finding?.verdict).toBe('honoured');
+
+    const text = formatPlanText(plan);
+    expect(text).toContain('runner_declaration: DECLARED (runtime unverified)');
+    expect(text).not.toContain('runner_declaration: UNCERTAIN');
+    expect(text).not.toMatch(/UNCERTAIN/);
+  });
+
   it('2. DECISIVE: hosted declared -> NO row, no noise, even with observed with: keys present', () => {
     const hostedManifest = baseManifest({ routing: { runner: { runs_on: 'ubuntu-latest', warm: 1 } } });
     const observed: ObservedState = {
