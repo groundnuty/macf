@@ -577,17 +577,22 @@ function fmt(f: WhoamiField): string {
   return f.value === 'unknown' ? 'unknown' : `${f.value}  (source: ${f.source})`;
 }
 
-function formatPeersSection(peers: PeersResult): string[] {
+/** Exported (macf#1393) so the peer-rendering vocabulary — incl. the
+ * `agentName` 'unknown'-not-'—' choice — is directly unit-testable, the
+ * same way `fleet.ts` exports `buildFleetRows` for its own row-rendering
+ * tests, rather than only reachable through `formatWhoamiReport`. */
+export function formatPeersSection(peers: PeersResult): string[] {
   const lines: string[] = ['Peers (read from the registry):'];
   switch (peers.kind) {
     case 'found':
       lines.push(`  source: ${peers.source}`);
       for (const p of peers.peers) {
         // agent_name (macf#1393): the OTEL wire identity alongside the
-        // registry key. '—' when the entry predates the field — never
-        // defaulted to `p.name`.
+        // registry key. 'unknown' — this file's existing vocabulary for
+        // "can't tell" (see `fmt()` + the `unreadable` branch below) —
+        // when the entry predates the field. Never defaulted to `p.name`.
         lines.push(
-          `  ${p.name.padEnd(24)} agent_name=${(p.agentName ?? '—').padEnd(24)} ${p.host}:${p.port}  (${p.type})`,
+          `  ${p.name.padEnd(24)} agent_name=${(p.agentName ?? 'unknown').padEnd(24)} ${p.host}:${p.port}  (${p.type})`,
         );
       }
       break;

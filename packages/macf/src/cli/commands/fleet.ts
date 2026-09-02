@@ -270,7 +270,11 @@ export function buildFleetRows(
   return statuses.map((s) => {
     // Registry-sourced, not health-derived — known (or honestly unknown)
     // regardless of online/offline, unlike the health-body columns below.
-    const agentName = s.agentName ?? '—';
+    // 'unknown' (not '—') on purpose (macf#1393): '—' below means
+    // "offline, nothing to report" — reusing it here would collapse "the
+    // registry never recorded a name" into that same not-applicable glyph,
+    // exactly the ambiguity this field exists to remove.
+    const agentName = s.agentName ?? 'unknown';
     const where = `${s.host}:${s.port}`;
     const liveness = formatLiveness(s.online, s.liveness);
     if (!s.online || !s.health) {

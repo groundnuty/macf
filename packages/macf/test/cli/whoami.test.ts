@@ -15,6 +15,7 @@ import {
   buildIdentityReport,
   classifyTokenType,
   extractSubjectCNFromNodeCert,
+  formatPeersSection,
   readAgentCertInfo,
   readPeersFromRegistry,
   resolveRegistryConfigForPeers,
@@ -401,6 +402,34 @@ describe('readPeersFromRegistry — mutation guard: empty and unreadable must ne
     expect(emptyResult.kind).not.toBe(unreadableResult.kind);
     expect(emptyResult.kind).toBe('empty');
     expect(unreadableResult.kind).toBe('unreadable');
+  });
+});
+
+describe('formatPeersSection — agent_name rendering (macf#1393)', () => {
+  it('renders agent_name beside the label, and "unknown" (never "—") when absent', async () => {
+    const fakeRegistry: Pick<Registry, 'list'> = {
+      list: async () => [
+        {
+          name: 'science-agent',
+          info: fakeAgentInfo({ host: '10.0.0.5', port: 8443, agent_name: 'macf-science-agent' }),
+        },
+        {
+          name: 'writing-agent',
+          // No agent_name — a pre-existing entry.
+          info: fakeAgentInfo({ host: '10.0.0.6', port: 8444, type: 'worker' }),
+        },
+      ],
+    };
+    const peers = await readPeersFromRegistry(fakeRegistry, 'config');
+
+    const lines = formatPeersSection(peers);
+
+    expect(lines.find((l) => l.includes('science-agent'))).toContain('agent_name=macf-science-agent');
+    const writingLine = lines.find((l) => l.startsWith('  writing-agent'));
+    expect(writingLine).toContain('agent_name=unknown');
+    // '—' is this file's offline/not-applicable glyph elsewhere — must never
+    // leak into the agent_name column, which has its own honest-unknown word.
+    expect(writingLine).not.toContain('—');
   });
 });
 

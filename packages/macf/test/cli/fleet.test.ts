@@ -287,7 +287,7 @@ describe('buildFleetRows / formatFleetTable', () => {
     const rows = buildFleetRows(statuses, NOW);
     expect(rows[1]).toEqual([
       'SCIENCE_AGENT',
-      '—', // AGENT-NAME (macf#1393): absent → honestly unknown, not defaulted
+      'unknown', // AGENT-NAME (macf#1393): absent → honestly unknown, not defaulted (never '—' — that means offline/n-a)
       '100.64.0.2:4200',
       'offline',
       '—',
