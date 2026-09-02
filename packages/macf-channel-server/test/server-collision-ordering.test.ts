@@ -57,4 +57,18 @@ describe('server.ts collision/serve/register ordering (macf#424 assumption 2)', 
     );
     expect(checkBlock).toContain('PACKAGE_VERSION');
   });
+
+  it('the agentInfo literal fed to registerWithTakeover carries agent_name from config.agentName (macf#1393)', () => {
+    // Reachability from the REAL registration path, not just the composer in
+    // isolation: `agentInfo` is built once, right above `registerWithTakeover(`
+    // — assert the field lives INSIDE that literal (between its `const
+    // agentInfo:` declaration and the `registerWithTakeover(` call that
+    // consumes it), not merely present somewhere else in the file.
+    const agentInfoIdx = SERVER_SOURCE.indexOf('const agentInfo: AgentInfo = {');
+    const registerIdx = SERVER_SOURCE.indexOf('registerWithTakeover(');
+    expect(agentInfoIdx).toBeGreaterThan(-1);
+    expect(registerIdx).toBeGreaterThan(agentInfoIdx);
+    const agentInfoLiteral = SERVER_SOURCE.slice(agentInfoIdx, registerIdx);
+    expect(agentInfoLiteral).toContain('agent_name: config.agentName');
+  });
 });

@@ -828,13 +828,20 @@ async function main(): Promise<void> {
     );
   }
 
-  // P2: Register in GitHub variable (use advertiseHost, not bind address)
+  // P2: Register in GitHub variable (use advertiseHost, not bind address).
+  // `agent_name` (groundnuty/macf#1393) is ADDITIVE alongside the registry
+  // KEY (routingLabel) — it records the OTEL wire identity so telemetry
+  // consumers (e.g. macf-devops-toolkit's fleet diagnostic) can query the
+  // name the wire actually carries instead of resolving it via a same-core
+  // string heuristic. The two are allowed to differ by design; see
+  // AgentInfoSchema's `agent_name` doc comment.
   const agentInfo: AgentInfo = {
     host: config.advertiseHost,
     port: actualPort,
     type: config.agentType as 'permanent' | 'worker',
     instance_id: config.instanceId,
     started: new Date().toISOString(),
+    agent_name: config.agentName,
   };
 
   // P2: Over-register the slot (groundnuty/macf#702 — the devops 8h-outage
