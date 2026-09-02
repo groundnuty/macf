@@ -15,6 +15,7 @@ import {
   buildIdentityReport,
   classifyTokenType,
   extractSubjectCNFromNodeCert,
+  formatPeersSection,
   readAgentCertInfo,
   readPeersFromRegistry,
   resolveRegistryConfigForPeers,
@@ -304,10 +305,20 @@ describe('readPeersFromRegistry — decisive pair (macf#672)', () => {
       list: async () => [
         {
           name: 'science-agent',
-          info: fakeAgentInfo({ host: '10.0.0.5', port: 8443, type: 'permanent', started: '2026-08-31T00:00:00.000Z' }),
+          info: fakeAgentInfo({
+            host: '10.0.0.5',
+            port: 8443,
+            type: 'permanent',
+            started: '2026-08-31T00:00:00.000Z',
+            // macf#1393 decisive pair (1/2): names differ — agent_name
+            // carries the OTEL wire identity distinct from the registry key.
+            agent_name: 'macf-science-agent',
+          }),
         },
         {
           name: 'writing-agent',
+          // macf#1393 decisive pair (2/2): a pre-existing entry with no
+          // `agent_name` — must read as unknown, not defaulted to the name.
           info: fakeAgentInfo({ host: '10.0.0.6', port: 8444, type: 'worker', started: '2026-08-31T01:00:00.000Z' }),
         },
       ],
@@ -318,8 +329,22 @@ describe('readPeersFromRegistry — decisive pair (macf#672)', () => {
     expect(result.kind).toBe('found');
     expect(result.source).toBe('config');
     expect(result.peers).toEqual([
-      { name: 'science-agent', host: '10.0.0.5', port: 8443, type: 'permanent', started: '2026-08-31T00:00:00.000Z' },
-      { name: 'writing-agent', host: '10.0.0.6', port: 8444, type: 'worker', started: '2026-08-31T01:00:00.000Z' },
+      {
+        name: 'science-agent',
+        agentName: 'macf-science-agent',
+        host: '10.0.0.5',
+        port: 8443,
+        type: 'permanent',
+        started: '2026-08-31T00:00:00.000Z',
+      },
+      {
+        name: 'writing-agent',
+        agentName: null,
+        host: '10.0.0.6',
+        port: 8444,
+        type: 'worker',
+        started: '2026-08-31T01:00:00.000Z',
+      },
     ]);
   });
 
@@ -377,6 +402,34 @@ describe('readPeersFromRegistry — mutation guard: empty and unreadable must ne
     expect(emptyResult.kind).not.toBe(unreadableResult.kind);
     expect(emptyResult.kind).toBe('empty');
     expect(unreadableResult.kind).toBe('unreadable');
+  });
+});
+
+describe('formatPeersSection — agent_name rendering (macf#1393)', () => {
+  it('renders agent_name beside the label, and "unknown" (never "—") when absent', async () => {
+    const fakeRegistry: Pick<Registry, 'list'> = {
+      list: async () => [
+        {
+          name: 'science-agent',
+          info: fakeAgentInfo({ host: '10.0.0.5', port: 8443, agent_name: 'macf-science-agent' }),
+        },
+        {
+          name: 'writing-agent',
+          // No agent_name — a pre-existing entry.
+          info: fakeAgentInfo({ host: '10.0.0.6', port: 8444, type: 'worker' }),
+        },
+      ],
+    };
+    const peers = await readPeersFromRegistry(fakeRegistry, 'config');
+
+    const lines = formatPeersSection(peers);
+
+    expect(lines.find((l) => l.includes('science-agent'))).toContain('agent_name=macf-science-agent');
+    const writingLine = lines.find((l) => l.startsWith('  writing-agent'));
+    expect(writingLine).toContain('agent_name=unknown');
+    // '—' is this file's offline/not-applicable glyph elsewhere — must never
+    // leak into the agent_name column, which has its own honest-unknown word.
+    expect(writingLine).not.toContain('—');
   });
 });
 

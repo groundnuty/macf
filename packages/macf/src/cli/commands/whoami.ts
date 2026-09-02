@@ -376,6 +376,13 @@ export type PeersKind = 'found' | 'empty' | 'unreadable' | 'skipped';
 
 export interface PeerSummary {
   readonly name: string;
+  /**
+   * The registry entry's `agent_name` (groundnuty/macf#1393) — the OTEL wire
+   * identity, distinct from `name` (the registry key / routing label). `null`
+   * when the entry predates the field — honestly unknown, NEVER defaulted to
+   * `name` (see AgentInfoSchema's `agent_name` doc comment).
+   */
+  readonly agentName: string | null;
   readonly host: string;
   readonly port: number;
   readonly type: string;
@@ -499,6 +506,9 @@ export async function readPeersFromRegistry(
     kind: 'found',
     peers: peers.map((p) => ({
       name: p.name,
+      // Honest-unknown floor (groundnuty/macf#1393): absence reads as
+      // `null`, never defaulted to `p.name` (the routing label).
+      agentName: p.info.agent_name ?? null,
       host: p.info.host,
       port: p.info.port,
       type: p.info.type,
@@ -567,13 +577,23 @@ function fmt(f: WhoamiField): string {
   return f.value === 'unknown' ? 'unknown' : `${f.value}  (source: ${f.source})`;
 }
 
-function formatPeersSection(peers: PeersResult): string[] {
+/** Exported (macf#1393) so the peer-rendering vocabulary — incl. the
+ * `agentName` 'unknown'-not-'—' choice — is directly unit-testable, the
+ * same way `fleet.ts` exports `buildFleetRows` for its own row-rendering
+ * tests, rather than only reachable through `formatWhoamiReport`. */
+export function formatPeersSection(peers: PeersResult): string[] {
   const lines: string[] = ['Peers (read from the registry):'];
   switch (peers.kind) {
     case 'found':
       lines.push(`  source: ${peers.source}`);
       for (const p of peers.peers) {
-        lines.push(`  ${p.name.padEnd(24)} ${p.host}:${p.port}  (${p.type})`);
+        // agent_name (macf#1393): the OTEL wire identity alongside the
+        // registry key. 'unknown' — this file's existing vocabulary for
+        // "can't tell" (see `fmt()` + the `unreadable` branch below) —
+        // when the entry predates the field. Never defaulted to `p.name`.
+        lines.push(
+          `  ${p.name.padEnd(24)} agent_name=${(p.agentName ?? 'unknown').padEnd(24)} ${p.host}:${p.port}  (${p.type})`,
+        );
       }
       break;
     case 'empty':

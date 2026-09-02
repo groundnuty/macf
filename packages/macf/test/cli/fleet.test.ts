@@ -31,8 +31,15 @@ import type { GuestProbeFn } from '../../src/cli/commands/fleet-guests.js';
 const NOW = Date.parse('2026-06-26T12:00:00Z');
 const isoInDays = (d: number): string => new Date(NOW + d * 86_400_000).toISOString();
 
-function info(host: string, port: number): AgentInfo {
-  return { host, port, type: 'permanent', instance_id: `${host}-${port}`, started: isoInDays(-1) };
+function info(host: string, port: number, agentName?: string): AgentInfo {
+  return {
+    host,
+    port,
+    type: 'permanent',
+    instance_id: `${host}-${port}`,
+    started: isoInDays(-1),
+    ...(agentName !== undefined ? { agent_name: agentName } : {}),
+  };
 }
 
 /** An online `/health` body carrying the (not-yet-typed) `state` + `otel` fields. */
@@ -187,6 +194,24 @@ describe('gatherFleetStatus', () => {
     expect(statuses[1]).toMatchObject({ name: 'SCIENCE_AGENT', liveness: 'unknown' });
   });
 
+  it('DECISIVE PAIR (macf#1393): propagates `info.agent_name` to `agentName` — differs from the routing label, and absent reads null (never defaulted to `name`)', async () => {
+    const peers = [
+      // Names differ (science-shaped): registry key is the routing label,
+      // agent_name is the OTEL wire identity.
+      { name: 'SCIENCE_AGENT', info: info('100.64.0.2', 4200, 'macf-science-agent') },
+      // Names coincide (code-shaped): both present, equal.
+      { name: 'CODE_AGENT', info: info('127.0.0.1', 4100, 'CODE_AGENT') },
+      // Pre-existing entry, `agent_name` never written — absence, not equality.
+      { name: 'OLD_AGENT', info: info('127.0.0.1', 4900) },
+    ];
+    const probe: FleetProbeFn = async () => null;
+
+    const statuses = await gatherFleetStatus(peers, probe);
+    expect(statuses[0]).toMatchObject({ name: 'SCIENCE_AGENT', agentName: 'macf-science-agent' });
+    expect(statuses[1]).toMatchObject({ name: 'CODE_AGENT', agentName: 'CODE_AGENT' });
+    expect(statuses[2]).toMatchObject({ name: 'OLD_AGENT', agentName: null });
+  });
+
   it('degrades a peer whose probe REJECTS instead of aborting the join (#609)', async () => {
     const peers = [
       { name: 'CODE_AGENT', info: info('127.0.0.1', 4100) },
@@ -214,6 +239,10 @@ describe('buildFleetRows / formatFleetTable', () => {
   const statuses: readonly FleetAgentStatus[] = [
     {
       name: 'CODE_AGENT',
+      // Decisive-pair case 1 (macf#1393): the OTEL wire name DIFFERS from
+      // the registry key/routing label — must render as its own value, not
+      // fall back to `name`.
+      agentName: 'macf-code-agent',
       host: '127.0.0.1',
       port: 4100,
       online: true,
@@ -226,6 +255,9 @@ describe('buildFleetRows / formatFleetTable', () => {
     },
     {
       name: 'SCIENCE_AGENT',
+      // Decisive-pair case 2: a pre-existing entry with no `agent_name` —
+      // must render as unknown ('—'), never defaulted to `name`.
+      agentName: null,
       host: '100.64.0.2',
       port: 4200,
       online: false,
@@ -238,6 +270,7 @@ describe('buildFleetRows / formatFleetTable', () => {
     const rows = buildFleetRows(statuses, NOW);
     expect(rows[0]).toEqual([
       'CODE_AGENT',
+      'macf-code-agent', // AGENT-NAME (macf#1393): differs from NAME, shown as-is
       '127.0.0.1:4100',
       'online',
       '0.2.38', // /health.version (macf#682)
@@ -254,6 +287,7 @@ describe('buildFleetRows / formatFleetTable', () => {
     const rows = buildFleetRows(statuses, NOW);
     expect(rows[1]).toEqual([
       'SCIENCE_AGENT',
+      'unknown', // AGENT-NAME (macf#1393): absent → honestly unknown, not defaulted (never '—' — that means offline/n-a)
       '100.64.0.2:4200',
       'offline',
       '—',
@@ -266,10 +300,21 @@ describe('buildFleetRows / formatFleetTable', () => {
     ]);
   });
 
+  it('shows the AGENT-NAME registry field regardless of online/offline — it is registry-, not health-, sourced', () => {
+    // The offline row above still shows its known `agentName` when the entry
+    // carries one — only ABSENCE renders as '—', not offline-ness.
+    const offlineWithName: FleetAgentStatus[] = [
+      { ...statuses[1]!, agentName: 'macf-science-agent' },
+    ];
+    const rows = buildFleetRows(offlineWithName, NOW);
+    expect(rows[0]![1]).toBe('macf-science-agent');
+  });
+
   it('degrades an online agent whose /health omits version to `?` (back-compat)', () => {
     const noVersion: FleetAgentStatus[] = [
       {
         name: 'OLD_AGENT',
+        agentName: null,
         host: '127.0.0.1',
         port: 4400,
         online: true,
@@ -282,13 +327,14 @@ describe('buildFleetRows / formatFleetTable', () => {
       },
     ];
     const rows = buildFleetRows(noVersion, NOW);
-    expect(rows[0]![3]).toBe('?'); // VERSION column
+    expect(rows[0]![4]).toBe('?'); // VERSION column (shifted by the new AGENT-NAME column)
   });
 
   it('produces an aligned table with a header + separator', () => {
     const out = formatFleetTable(statuses, NOW);
     const lines = out.split('\n');
     expect(lines[0]).toContain('NAME');
+    expect(lines[0]).toContain('AGENT-NAME');
     expect(lines[0]).toContain('CERT-EXPIRY');
     expect(lines).toHaveLength(4); // header + separator + 2 rows
     expect(out).toContain('busy 18m on turn 7');
@@ -300,8 +346,8 @@ describe('fleetStatusToJson', () => {
   it('carries the raw /health body (incl. state/otel) through untouched', () => {
     const health = onlineHealth({ state: 'busy', otel: { endpoint_reachable: false } });
     const json = fleetStatusToJson([
-      { name: 'CODE_AGENT', host: '127.0.0.1', port: 4100, online: true, health },
-      { name: 'SCIENCE_AGENT', host: '100.64.0.2', port: 4200, online: false, health: null },
+      { name: 'CODE_AGENT', agentName: null, host: '127.0.0.1', port: 4100, online: true, health },
+      { name: 'SCIENCE_AGENT', agentName: null, host: '100.64.0.2', port: 4200, online: false, health: null },
     ]) as { agents: ReadonlyArray<Record<string, unknown>> };
 
     expect(json.agents).toHaveLength(2);
@@ -314,8 +360,8 @@ describe('fleetStatusToJson', () => {
 
   it('surfaces version as a top-level per-agent field (macf#682)', () => {
     const json = fleetStatusToJson([
-      { name: 'CODE_AGENT', host: '127.0.0.1', port: 4100, online: true, health: onlineHealth() },
-      { name: 'SCIENCE_AGENT', host: '100.64.0.2', port: 4200, online: false, health: null },
+      { name: 'CODE_AGENT', agentName: null, host: '127.0.0.1', port: 4100, online: true, health: onlineHealth() },
+      { name: 'SCIENCE_AGENT', agentName: null, host: '100.64.0.2', port: 4200, online: false, health: null },
     ]) as { agents: ReadonlyArray<Record<string, unknown>> };
 
     // Online agent → its /health.version; offline → null (nothing to report).
@@ -325,12 +371,52 @@ describe('fleetStatusToJson', () => {
 
   it('carries `liveness` as an ADDITIVE field — `status` keeps its existing online/offline meaning (macf#959)', () => {
     const json = fleetStatusToJson([
-      { name: 'CODE_AGENT', host: '127.0.0.1', port: 4100, online: true, health: onlineHealth(), liveness: 'online' },
-      { name: 'SCIENCE_AGENT', host: '100.64.0.2', port: 4200, online: false, health: null, liveness: 'degraded' },
+      {
+        name: 'CODE_AGENT',
+        agentName: null,
+        host: '127.0.0.1',
+        port: 4100,
+        online: true,
+        health: onlineHealth(),
+        liveness: 'online',
+      },
+      {
+        name: 'SCIENCE_AGENT',
+        agentName: null,
+        host: '100.64.0.2',
+        port: 4200,
+        online: false,
+        health: null,
+        liveness: 'degraded',
+      },
     ]) as { agents: ReadonlyArray<Record<string, unknown>> };
 
     expect(json.agents[0]).toMatchObject({ status: 'online', liveness: 'online' });
     expect(json.agents[1]).toMatchObject({ status: 'offline', liveness: 'degraded' });
+  });
+
+  it('carries `agent_name` as an ADDITIVE field (macf#1393) — decisive pair: differs, and absent-as-null', () => {
+    const json = fleetStatusToJson([
+      {
+        name: 'CODE_AGENT',
+        agentName: 'macf-code-agent', // differs from the registry key/routing label
+        host: '127.0.0.1',
+        port: 4100,
+        online: true,
+        health: onlineHealth(),
+      },
+      {
+        name: 'SCIENCE_AGENT',
+        agentName: null, // pre-existing entry, field never written — unknown
+        host: '100.64.0.2',
+        port: 4200,
+        online: false,
+        health: null,
+      },
+    ]) as { agents: ReadonlyArray<Record<string, unknown>> };
+
+    expect(json.agents[0]).toMatchObject({ name: 'CODE_AGENT', agent_name: 'macf-code-agent' });
+    expect(json.agents[1]).toMatchObject({ name: 'SCIENCE_AGENT', agent_name: null });
   });
 });
 
