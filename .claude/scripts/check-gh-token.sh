@@ -66,19 +66,68 @@ if [[ "$COMMAND" =~ (^|[[:space:];|&])(sudo[[:space:]]+|env[[:space:]]+([A-Za-z_
 fi
 
 # Check GH_TOKEN: must be present AND match the bot-token shape
-# ^ghs_[A-Za-z0-9_]+$. Prefix-only check (`${GH_TOKEN:0:4} == ghs_`)
+# ^ghs_[A-Za-z0-9._-]+$. Prefix-only check (`${GH_TOKEN:0:4} == ghs_`)
 # was bypassable by `GH_TOKEN='ghs_; rm -rf <sentinel>'` — the first
 # four chars matched, the rest never validated. Surfaced as Pattern B's
 # 1/10 anomaly in the §4.4 failure-injection sprint (paper-research §27);
 # canonical-rule update in #364, this script in #365.
 # ghp_/gho_/ghu_ are user tokens; empty falls through to stored
 # `gh auth login` (user). Either case fires the trap.
+# GitHub changed the App installation-token format 2026-04-24
+# (github.blog/changelog/2026-04-24-notice-about-upcoming-new-format-...):
+# new tokens are `ghs_<app-id>_<JWT>` — still ghs_-prefixed but now
+# contain dots + dashes and vary in length (~380-520 chars) vs the old
+# opaque 40-char alnum form. GitHub's guidance is to treat the token as
+# opaque and not hardcode length/format — so this predicate validates
+# only what we own: non-empty, `ghs_` prefix, and an injection-safe
+# charset (rejects whitespace/`;`/`$`/`(`/`)`/`|`/`&`/backtick/quotes).
+# The charset, not the length, was always the injection-safety
+# invariant. This predicate MUST stay byte-identical to the launch-time
+# check in claude-sh.ts (`launchTokenValidationLines`) — see #825/#826.
 # Note: `${GH_TOKEN:-}` expansion is mandatory under `set -u`; a bare
 # `${GH_TOKEN:0:4}` errors with "unbound variable" when the env var
 # is unset, which is exactly the case we need to handle.
 GH_TOKEN_VALUE="${GH_TOKEN:-}"
 TOKEN_PREFIX="${GH_TOKEN_VALUE:0:4}"
-if [[ -z "$GH_TOKEN_VALUE" ]] || [[ ! "$GH_TOKEN_VALUE" =~ ^ghs_[A-Za-z0-9_]+$ ]]; then
+if [[ -z "$GH_TOKEN_VALUE" ]] || [[ ! "$GH_TOKEN_VALUE" =~ ^ghs_[A-Za-z0-9._-]+$ ]]; then
+  # groundnuty/macf#1360 — branch on the discriminator this hook ALREADY has.
+  # A `ghs_` prefix that fails the full-shape check is almost never an
+  # attribution trap: `ghs_` IS a bot installation token by definition. It is
+  # far more likely that THIS COPY of the validator is stale — a widened
+  # pattern that never reached this workspace. Saying "you would post as the
+  # USER" while printing `GH_TOKEN prefix: ghs_` contradicts the evidence on
+  # screen, and prescribes the one remedy that cannot help: regenerating a
+  # token that was already valid. That cost the auditor two sessions and two
+  # wrong diagnoses before anyone suspected the validator.
+  if [[ "$TOKEN_PREFIX" == "ghs_" ]]; then
+    cat >&2 <<ERR
+BLOCKED by MACF attribution-trap hook — but your token is probably FINE and THIS SCRIPT is probably STALE.
+
+Command: ${COMMAND}
+GH_TOKEN prefix: ghs_ (a bot installation token — NOT the attribution trap)
+This copy's pattern: ^ghs_[A-Za-z0-9._-]+\$
+
+Your token carries the bot prefix but did not match the pattern above. A
+`ghs_` token is a bot installation token by definition, so the likely cause
+is that this workspace's copy of check-gh-token.sh predates a widening of
+that pattern (gh-token v2.x mints a ~383-char \`ghs_<app>_<JWT>\` containing
+dots and hyphens; see groundnuty/macf#827 and #1360).
+
+Fix — refresh the DISTRIBUTED SCRIPTS first, then retry. Do NOT regenerate
+the token; that is not the problem:
+
+  macf update            # or, for a non-init'd workspace:
+  macf rules refresh --dir .
+
+If the pattern above already accepts your token's shape and it still blocks,
+THEN the token is genuinely malformed — refresh it via the fail-loud helper
+as described in .claude/rules/gh-token-refresh.md.
+
+Override (ONLY for intentional user-attributed ops):
+  export MACF_SKIP_TOKEN_CHECK=1
+ERR
+    exit 2
+  fi
   cat >&2 <<ERR
 BLOCKED by MACF attribution-trap hook: this command would post as the USER, not the BOT.
 
@@ -98,8 +147,23 @@ Fix — refresh the bot token via the fail-loud helper:
 If the helper is missing, restore it:
   macf rules refresh --dir .
 
-Override (ONLY for intentional user-attributed ops like onboarding):
-  export MACF_SKIP_TOKEN_CHECK=1
+If GH_TOKEN is persistently bad in THIS session's ambient env (not just this
+one command) — e.g. a corrupt/inherited value from a relaunch or resume path
+— the in-session fixes above cannot reach the process env this hook reads.
+The sanctioned recovery is a relaunch: exit this session and run ./claude.sh
+again. Since macf#821, claude.sh full-shape-validates GH_TOKEN at the launch
+boundary (before exec) and re-mints or aborts loudly rather than starting a
+session this hook would then deadlock.
+
+Override (ONLY for intentional user-attributed ops like onboarding) is
+launch-time / operator only: MACF_SKIP_TOKEN_CHECK is read from THIS
+session's process env, fixed when ./claude.sh launched it. An in-session
+\`export MACF_SKIP_TOKEN_CHECK=1\` from a Bash tool call does NOT reach
+it — Bash-tool commands run in a separate subshell that never persists
+into the session's env. To use it: set MACF_SKIP_TOKEN_CHECK=1 in the
+launch env (or the workspace's .claude/.macf/env.* files) BEFORE running
+./claude.sh, then relaunch. Need it mid-session? Ask the operator to set
+it + relaunch, or route the specific op through the operator directly.
 ERR
   exit 2
 fi
