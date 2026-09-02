@@ -3347,20 +3347,6 @@ export async function runBootstrapApply(
     process.stderr.write(`${ageRecipientsRecordAbsentNotice()}\n`);
   }
 
-  // groundnuty/macf#1389 — the `#1330`-shaped federated-CA-trust
-  // enumerate-and-name consent notices, same unconditional-including-`--dry-run`
-  // placement as the age_recipients checks immediately above: a NEW project
-  // grant or a CHANGED bundle is named HERE, ahead of the real publish call
-  // (`apply-fleet.ts`'s `applyFleet`, which logs the identical notices again
-  // via `deps.log` right before it actually runs `publishFederatedTrustLegs`)
-  // — so a `--dry-run` operator sees the same names a real run would act on,
-  // never only after the fact. Reads the SAME local `readFleetLock` this
-  // block already established as the plan-preview's lock source (never a
-  // GitHub call).
-  for (const notice of federatedTrustNotices(reconcileFederatedTrustVerdicts(manifest.trust?.federated_cas ?? [], readFleetLock(manifestPath)?.federated_ca_trust))) {
-    process.stderr.write(`${notice}\n`);
-  }
-
   if (opts.dryRun !== true) {
     // groundnuty/macf#1197 — the aggregate-fail-loud check (Pattern D,
     // silent-fallback-hazards.md): every REQUIRED operator-secrets-file key
@@ -3421,6 +3407,28 @@ export async function runBootstrapApply(
 
   try {
     const observed = await resolved.observe(manifest);
+
+    // groundnuty/macf#1389 — the `#1330`-shaped federated-CA-trust
+    // enumerate-and-name consent notices, `--dry-run` ONLY (deliberately
+    // NOT the same unconditional placement `ageRecipientsRecordAbsentNotice`
+    // above uses). Reason: a REAL run gets its OWN, authoritative notices
+    // from `apply-fleet.ts`'s `applyFleet` (via `deps.log`, sourced from the
+    // FRESHLY-CLONED control-repo lock it self-heals against right before
+    // publishing) — printing a SECOND set here, from `observed.lock` (which
+    // prefers a LOCAL manifest-adjacent file when one exists, per
+    // `observer.ts::resolveObservedFleetLock`'s doc, and can therefore be
+    // stale relative to that fresh clone on a real run), risks a
+    // contradictory pair: this block says "never approved" while the run
+    // itself correctly stays silent because the control-repo copy already
+    // has it. A `--dry-run` has no later authoritative read to contradict —
+    // it mutates nothing — so `observed.lock` (the SAME field `macf
+    // bootstrap plan` renders these notices from, see `commands/bootstrap.ts`)
+    // is the best available signal there, and printing it is safe.
+    if (opts.dryRun === true) {
+      for (const notice of federatedTrustNotices(reconcileFederatedTrustVerdicts(manifest.trust?.federated_cas ?? [], observed.lock?.federated_ca_trust))) {
+        process.stderr.write(`${notice}\n`);
+      }
+    }
     // groundnuty/macf#1220 / #1129 / #1229 / DR-043 Amendment P2 — this
     // preview intentionally passes NO `installScopeCoverage` (the 3rd
     // `computePlan` param, defaulting to `[]`), so it never shows an

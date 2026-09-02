@@ -135,12 +135,21 @@ export function formatFederatedCaTrustNotice(verdict: FederatedCaTrustVerdict): 
       return undefined;
 
     case 'new':
+      // Deliberately does NOT assert "publishing it now" — this notice is
+      // computed and logged BEFORE the registry create call runs (name
+      // before grant), so it cannot know whether that call will actually
+      // create the variable (the ordinary case) or find it ALREADY present
+      // (a fleet federating this project before #1389 shipped, or an
+      // operator hand-set copy — `federatedTrustLockUpdates`'s own doc,
+      // "first run baselines rather than refuses"). Both outcomes result in
+      // this fingerprint becoming the recorded approved baseline; only the
+      // registry WRITE differs, and this text stays neutral on that.
       return (
         `federated peer "${verdict.project}": NEW federated-CA trust grant — this fleet has never recorded an ` +
         `approved ca_bundle for it before (fingerprint ${verdict.liveFingerprint}). This is a grant of CA trust to ` +
         `a party this fleet may not have vetted: any agent trusting this fleet's routing scope will now accept ` +
-        `mTLS connections signed by this CA. Publishing it to registry variable "${varName}" and recording it as ` +
-        'the approved baseline.'
+        `mTLS connections signed by this CA. Registry variable "${varName}" will be created from it if not already ` +
+        'present (create-only), and this fingerprint will be recorded as the approved baseline either way.'
       );
 
     case 'changed':

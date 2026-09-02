@@ -2806,17 +2806,28 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
   });
 
   describe('groundnuty/macf#1389 — federated-CA-trust enumerate-and-name consent notices at plan-preview time', () => {
-    /** A `fleet.lock` recording `federated_ca_trust`, written next to `file` — same "next to the manifest, what readFleetLock(manifestPath) reads" shape `writePriorLock` establishes in the #1230 block immediately above, applied to the new field. */
-    function writeFederatedCaTrustLock(file: string, entries: readonly { project: string; ca_bundle_fingerprint: string }[]): void {
-      const lines = entries.map((e) => `  - project: ${e.project}\n    ca_bundle_fingerprint: ${e.ca_bundle_fingerprint}`).join('\n');
-      const body = `schema_version: 1\nfleet: demo-fleet\nagents: []\nfederated_ca_trust:\n${lines}\n`;
-      writeFileSync(join(dirname(file), 'fleet.lock'), body, 'utf-8');
-    }
-
     const FLEET_YAML_WITH_FEDERATED_CA = `${FLEET_YAML}trust:\n  federated_cas:\n    - project: ppam-2026\n      ca_bundle: GUEST-CERT-PEM\n`;
 
+    /**
+     * `--dry-run`-only placement (groundnuty/macf#1389's own call-site
+     * doc): the notice reads `observed.lock` — the SAME field
+     * `resolveObservedFleetLock` (observer.ts) populates, local-file-first
+     * then a live control-repo fallback — never a raw `readFleetLock`
+     * re-read of its own. So this fixture injects `lock` through the
+     * `observe` mock's returned `ObservedState`, exactly the way every
+     * other observed-state-dependent test in this file does, rather than
+     * writing a local `fleet.lock` next to the manifest (that file is no
+     * longer what this code path reads).
+     */
+    function observedWith(federatedCaTrust: readonly { project: string; ca_bundle_fingerprint: string }[] | undefined): ObservedState {
+      return {
+        ...EMPTY_OBSERVED,
+        lock: federatedCaTrust === undefined ? null : { schema_version: 1, fleet: 'demo-fleet', agents: [], federated_ca_trust: [...federatedCaTrust] },
+      };
+    }
+
     it('DECISIVE (1): a NEW federated_cas project is NAMED on stderr, and that notice is written BEFORE observe (the first GitHub-touching step) runs — name before grant, not merely "both happen somewhere"', async () => {
-      const file = writeManifest(FLEET_YAML_WITH_FEDERATED_CA); // no fleet.lock at all — never approved
+      const file = writeManifest(FLEET_YAML_WITH_FEDERATED_CA); // observed.lock will be null — never approved
       // One shared sequence: both the notice write AND the observe call
       // push a marker into it, so ORDER (not just presence) is what this
       // test actually pins.
@@ -2834,7 +2845,7 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
           {
             observe: () => {
               sequence.push('observe');
-              return Promise.resolve(EMPTY_OBSERVED);
+              return Promise.resolve(observedWith(undefined));
             },
           },
         );
@@ -2842,12 +2853,19 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       } finally {
         writeSpy.mockRestore();
       }
-      expect(sequence).toEqual(['notice', 'observe']);
+      // The notice is computed from `observed.lock`, so it necessarily
+      // prints AFTER `observe` resolves — "before" here means before any
+      // FURTHER processing (computePlan, the identity preview, the
+      // pre-approval render below), not before observe itself (that
+      // ordering belongs to the age_recipients preflight, which is a
+      // REFUSAL and genuinely needs to precede every GitHub call — see this
+      // notice's own call-site doc for why that constraint doesn't apply
+      // here).
+      expect(sequence).toEqual(['observe', 'notice']);
     });
 
     it('DECISIVE (2): a manifest UNCHANGED from the pinned fingerprint writes NOTHING to stderr — no prompt, no noise', async () => {
       const file = writeManifest(FLEET_YAML_WITH_FEDERATED_CA);
-      writeFederatedCaTrustLock(file, [{ project: 'ppam-2026', ca_bundle_fingerprint: secretFingerprint('GUEST-CERT-PEM') }]);
       const rawWrites: string[] = [];
       const writeSpy = vi
         .spyOn(process.stderr, 'write')
@@ -2856,7 +2874,10 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
           return true;
         });
       try {
-        const code = await runBootstrapApply({ file, dryRun: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) });
+        const code = await runBootstrapApply(
+          { file, dryRun: true },
+          { observe: () => Promise.resolve(observedWith([{ project: 'ppam-2026', ca_bundle_fingerprint: secretFingerprint('GUEST-CERT-PEM') }])) },
+        );
         expect(code).toBe(0);
         expect(rawWrites.join('')).not.toContain('federated peer "ppam-2026"');
       } finally {
@@ -2866,7 +2887,6 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
 
     it('a CHANGED bundle for an already-approved project is surfaced on stderr, naming BOTH the recorded and the newly-declared fingerprint', async () => {
       const file = writeManifest(FLEET_YAML_WITH_FEDERATED_CA); // declares CERT text "GUEST-CERT-PEM"
-      writeFederatedCaTrustLock(file, [{ project: 'ppam-2026', ca_bundle_fingerprint: secretFingerprint('OLD-DIFFERENT-CERT') }]);
       const rawWrites: string[] = [];
       const writeSpy = vi
         .spyOn(process.stderr, 'write')
@@ -2875,7 +2895,10 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
           return true;
         });
       try {
-        const code = await runBootstrapApply({ file, dryRun: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) });
+        const code = await runBootstrapApply(
+          { file, dryRun: true },
+          { observe: () => Promise.resolve(observedWith([{ project: 'ppam-2026', ca_bundle_fingerprint: secretFingerprint('OLD-DIFFERENT-CERT') }])) },
+        );
         expect(code).toBe(0);
         const output = rawWrites.join('');
         expect(output).toContain('CHANGED');
@@ -2896,12 +2919,33 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
           return true;
         });
       try {
-        const code = await runBootstrapApply({ file, dryRun: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) });
+        const code = await runBootstrapApply({ file, dryRun: true }, { observe: () => Promise.resolve(observedWith(undefined)) });
         expect(code).toBe(0);
         expect(rawWrites.join('')).not.toContain('federated-CA');
       } finally {
         writeSpy.mockRestore();
       }
+    });
+
+    it('a REAL (non-dry-run) apply prints NO plan-preview notice from this call site — only applyFleet\'s own, control-repo-sourced notice fires (avoids the stale-local-vs-fresh-clone contradiction)', async () => {
+      const file = writeManifest(FLEET_YAML_WITH_FEDERATED_CA); // observed.lock null — would print "NEW" under dry-run
+      const rawWrites: string[] = [];
+      const writeSpy = vi
+        .spyOn(process.stderr, 'write')
+        .mockImplementation((chunk: string | Uint8Array) => {
+          rawWrites.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf-8'));
+          return true;
+        });
+      try {
+        await runBootstrapApply({ file, yes: true }, { observe: () => Promise.resolve(observedWith(undefined)) }, fakeMutateDeps(file));
+      } finally {
+        writeSpy.mockRestore();
+      }
+      // This call site's OWN text never fires on a real run — whatever
+      // `applyFleet` itself logs (captured via `logs`, not `errs`/stderr in
+      // this harness — see `fakeMutateDeps`) is a separate, later assertion
+      // this file's `applyFleet`-integration tests own, not this one.
+      expect(rawWrites.join('')).not.toContain('NEW federated-CA trust grant');
     });
   });
 

@@ -42,6 +42,7 @@ import type { OperatorInputSource } from '../bootstrap/operator-secrets-file.js'
 import { formatOperatorInputProvenanceLine, readOperatorSecretsFile, resolveOperatorInput } from '../bootstrap/operator-secrets-file.js';
 import type { Presence } from '../bootstrap/plan.js';
 import { computeInstallScopeCoverage, formatInstallScopeCoverageLines, installScopeCoverageEntryToJson } from '../bootstrap/install-scope-coverage.js';
+import { reconcileFederatedTrustVerdicts, federatedTrustNotices } from '../bootstrap/apply-federated-trust.js';
 
 export interface RunBootstrapPlanOptions {
   readonly file: string;
@@ -336,6 +337,22 @@ export async function runBootstrapPlan(
     // of whether the flags were given.
     const installScopeCoverageLines = formatInstallScopeCoverageLines(installScopeCoverage);
 
+    // groundnuty/macf#1389 — the `#1330`-shaped federated-CA-trust
+    // enumerate-and-name consent notices. `plan` is the OTHER read-only
+    // preview surface this issue's own "plan rendering" requirement covers
+    // — `bootstrap-apply.ts`'s `--dry-run` render is not the only place an
+    // operator previews a run (`macf bootstrap plan` predates `apply
+    // --dry-run` and stays the canonical read-only command, per this file's
+    // own module doc). Reads `observed.lock` — the SAME field
+    // `fleet.lock source:` immediately above already renders — never a
+    // second, raw local-file read; see `bootstrap-apply.ts`'s call-site doc
+    // for why `observed.lock` (not a fresh-control-repo-clone read) is the
+    // correct source for a read-only preview command specifically (there is
+    // no later, more-authoritative read for THIS command to contradict).
+    const federatedCaTrustNotices = federatedTrustNotices(
+      reconcileFederatedTrustVerdicts(manifest.trust?.federated_cas ?? [], observed.lock?.federated_ca_trust),
+    );
+
     if (opts.json) {
       console.log(
         JSON.stringify(
@@ -352,6 +369,7 @@ export async function runBootstrapPlan(
             ...(Object.keys(installScopeCoverage).length > 0
               ? { install_scope_coverage: Object.values(installScopeCoverage).map(installScopeCoverageEntryToJson) }
               : {}),
+            ...(federatedCaTrustNotices.length > 0 ? { federated_ca_trust_notices: federatedCaTrustNotices } : {}),
           },
           null,
           2,
@@ -375,6 +393,10 @@ export async function runBootstrapPlan(
       if (installScopeCoverageLines.length > 0) {
         console.log('');
         console.log(installScopeCoverageLines.join('\n'));
+      }
+      if (federatedCaTrustNotices.length > 0) {
+        console.log('');
+        console.log(federatedCaTrustNotices.join('\n'));
       }
     }
     return 0;

@@ -12,6 +12,7 @@ import { operatorInputProvenance, resolveDeps, runBootstrapPlan, type BootstrapP
 import type { ObservedState } from '../../src/cli/bootstrap/plan.js';
 import { parseFleetManifest } from '../../src/cli/bootstrap/fleet-manifest.js';
 import { resolveRunnerPlatformEndpointWithProvenance } from '../../src/cli/bootstrap/runner-platform.js';
+import { secretFingerprint } from '../../src/cli/bootstrap/fleet-lock.js';
 
 // groundnuty/macf#1357 made `defaults.app_manifest` / `agents[].profile`
 // `.optional()`; omitted here (the new ordinary case) so this fixture's own
@@ -499,6 +500,84 @@ describe('runBootstrapPlan', () => {
     };
     const agentSecrets = json.plan.find((i) => i.kind === 'secret_fingerprint');
     expect(agentSecrets?.reason).not.toContain('[vault:');
+  });
+
+  // groundnuty/macf#1389 — the `#1330`-shaped federated-CA-trust
+  // enumerate-and-name consent notices, reaching `macf bootstrap plan` too
+  // (this issue's "plan rendering" requirement is not satisfied by `apply
+  // --dry-run` alone — `plan` is the OTHER, canonical read-only preview
+  // command, predating `--dry-run` per this file's own module doc). Reads
+  // `observed.lock`, the SAME field `fleet.lock source:` already renders —
+  // never a second raw local-file read.
+  describe('federated-CA-trust notices (groundnuty/macf#1389)', () => {
+    const VALID_FLEET_YAML_WITH_FEDERATED_CA = `${VALID_FLEET_YAML}trust:\n  federated_cas:\n    - project: ppam-2026\n      ca_bundle: GUEST-CERT-PEM\n`;
+
+    it('DECISIVE (1) --json: a NEW project is named under federated_ca_trust_notices', async () => {
+      const { dir, file } = writeManifest(VALID_FLEET_YAML_WITH_FEDERATED_CA);
+      dirs.push(dir);
+      logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const deps: BootstrapPlanDeps = { observe: async () => EMPTY_OBSERVED }; // lock: null — never approved
+      const code = await runBootstrapPlan({ file, json: true }, deps);
+      expect(code).toBe(0);
+      const json = JSON.parse(logSpy.mock.calls.flat().join('')) as { federated_ca_trust_notices?: readonly string[] };
+      expect(json.federated_ca_trust_notices).toHaveLength(1);
+      expect(json.federated_ca_trust_notices?.[0]).toContain('NEW federated-CA trust grant');
+      expect(json.federated_ca_trust_notices?.[0]).toContain('ppam-2026');
+    });
+
+    it('DECISIVE (1) text: the SAME notice renders in plain-text mode', async () => {
+      const { dir, file } = writeManifest(VALID_FLEET_YAML_WITH_FEDERATED_CA);
+      dirs.push(dir);
+      logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const deps: BootstrapPlanDeps = { observe: async () => EMPTY_OBSERVED };
+      const code = await runBootstrapPlan({ file }, deps);
+      expect(code).toBe(0);
+      const out = logSpy.mock.calls.flat().join('\n');
+      expect(out).toContain('NEW federated-CA trust grant');
+      expect(out).toContain('ppam-2026');
+    });
+
+    it('DECISIVE (2): a manifest UNCHANGED from the pinned fingerprint carries NO federated_ca_trust_notices key at all (never a fabricated empty array) — no prompt, no noise', async () => {
+      const { dir, file } = writeManifest(VALID_FLEET_YAML_WITH_FEDERATED_CA);
+      dirs.push(dir);
+      logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const observed: ObservedState = {
+        ...EMPTY_OBSERVED,
+        lock: {
+          schema_version: 1,
+          fleet: 'icsoc-2026',
+          agents: [],
+          federated_ca_trust: [{ project: 'ppam-2026', ca_bundle_fingerprint: secretFingerprint('GUEST-CERT-PEM') }],
+        },
+      };
+      const deps: BootstrapPlanDeps = { observe: async () => observed };
+      const jsonCode = await runBootstrapPlan({ file, json: true }, deps);
+      expect(jsonCode).toBe(0);
+      const json = JSON.parse(logSpy.mock.calls.flat().join('')) as Record<string, unknown>;
+      expect('federated_ca_trust_notices' in json).toBe(false);
+      logSpy.mockClear();
+      const textCode = await runBootstrapPlan({ file }, deps);
+      expect(textCode).toBe(0);
+      const out = logSpy.mock.calls.flat().join('\n');
+      // NOT a bare `not.toContain('federated-CA')` — the pre-existing #810
+      // `federated_ca` plan-item row legitimately renders "registry
+      // federated-CA var ..." for the SAME declared project regardless of
+      // this notice, so that substring is present either way. Assert THIS
+      // notice's own wording is absent instead.
+      expect(out).not.toContain('NEW federated-CA trust grant');
+      expect(out).not.toContain('CHANGED');
+    });
+
+    it('a manifest with no trust.federated_cas at all carries no notices key (silent when nothing is declared)', async () => {
+      const { dir, file } = writeManifest(VALID_FLEET_YAML); // no trust: section
+      dirs.push(dir);
+      logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const deps: BootstrapPlanDeps = { observe: async () => EMPTY_OBSERVED };
+      const code = await runBootstrapPlan({ file, json: true }, deps);
+      expect(code).toBe(0);
+      const json = JSON.parse(logSpy.mock.calls.flat().join('')) as Record<string, unknown>;
+      expect('federated_ca_trust_notices' in json).toBe(false);
+    });
   });
 });
 
