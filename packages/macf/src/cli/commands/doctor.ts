@@ -1522,8 +1522,8 @@ export function checkDistributedScriptCurrency(
       detail:
         `this CLI install (${cliVersionLabel()}) is missing its canonical script source ${missingDir} — ` +
         'some canonically-distributed scripts (potentially including PreToolUse guard hooks) cannot be ' +
-        'verified or refreshed from here; reinstall @groundnuty/macf or file a packaging bug ' +
-        '(groundnuty/macf#1403)',
+        'verified or refreshed from here; reinstall @groundnuty/macf, or if reinstalling does not fix ' +
+        'it, file a packaging bug against groundnuty/macf',
     };
   }
 

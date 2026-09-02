@@ -101,7 +101,8 @@ function assertCanonicalSourceDirsExist(dirs: readonly string[]): void {
   throw new Error(
     `macf v${PACKAGE_VERSION}: canonical source director${missing.length === 1 ? 'y' : 'ies'} missing from ` +
     `this CLI install: ${missing.join(', ')}. This CLI cannot distribute the files it ships from here — ` +
-    'reinstall @groundnuty/macf or file a packaging bug against groundnuty/macf. (groundnuty/macf#1403)',
+    'reinstall @groundnuty/macf, or if reinstalling does not fix it, file a packaging bug against ' +
+    'groundnuty/macf.',
   );
 }
 
