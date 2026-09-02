@@ -22,6 +22,7 @@ import { join } from 'node:path';
 import { applyFleet, shouldWriteBatchedFleetLock, type FleetApplyDeps, type VaultApplyOutcome } from '../../../src/cli/bootstrap/apply-fleet.js';
 import type { FleetAgent, FleetLock, FleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import { parseFleetLock, parseFleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
+import { secretFingerprint } from '../../../src/cli/bootstrap/fleet-lock.js';
 import type { AgentApplyDeps } from '../../../src/cli/bootstrap/apply-agent.js';
 import type { AgentRepoDeps, RepoInitStepDeps } from '../../../src/cli/bootstrap/apply-repo-init.js';
 import { repoInit as realRepoInit } from '../../../src/cli/commands/repo-init.js';
@@ -4411,6 +4412,153 @@ agents:
       expect(result.ca.registryLeg.status).toBe('created');
       expect(result.federatedTrust['ppam-2026']?.status).toBe('failed');
       expect(applyExitCode(result, [], undefined)).toBe(1);
+    });
+  });
+
+  // --- groundnuty/macf#1389 — the `#1330`-shaped enumerate-and-name consent
+  // gate, through the REAL applyFleet orchestration (not a direct unit call
+  // — apply-federated-trust.test.ts covers `reconcileFederatedTrustVerdicts`
+  // / `federatedTrustNotices` / `federatedTrustLockUpdates` in isolation;
+  // THIS suite proves the wiring point: apply-fleet.ts actually calls them,
+  // in the right order, against the manifest's real fleet.lock). ---
+  describe('federated CA trust — enumerate-and-name consent gate (groundnuty/macf#1389)', () => {
+    it('DECISIVE (1): a NEW project is NAMED in the log BEFORE the registry create call runs, and the new baseline reaches fleet.lock', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest: FleetManifest = {
+        ...manifestWith([CODE_AGENT]),
+        trust: { federated_cas: [{ project: 'ppam-2026', ca_bundle: 'GUEST-CERT-PEM' }] },
+      };
+      const logs: string[] = [];
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+        trustDeps: trustDepsFor({}),
+        log: (l) => {
+          logs.push(l);
+        },
+      };
+
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      const noticeIndex = logs.findIndex((l) => l.includes('NEW federated-CA trust grant'));
+      const legIndex = logs.findIndex((l) => l.includes('Federated-CA registry leg (ppam-2026): created'));
+      expect(noticeIndex).toBeGreaterThanOrEqual(0);
+      expect(legIndex).toBeGreaterThanOrEqual(0);
+      // NAME BEFORE GRANT — the notice's log line precedes the leg-status
+      // log line in the SAME log stream, not merely "both present somewhere."
+      expect(noticeIndex).toBeLessThan(legIndex);
+
+      expect(result.finalLock?.federated_ca_trust).toEqual([{ project: 'ppam-2026', ca_bundle_fingerprint: secretFingerprint('GUEST-CERT-PEM') }]);
+      // Reaches the WRITTEN FILE too, not merely the in-memory result.
+      const written = parseFleetLock(readFileSync(result.lockPath, 'utf-8'));
+      expect(written.federated_ca_trust).toEqual([{ project: 'ppam-2026', ca_bundle_fingerprint: secretFingerprint('GUEST-CERT-PEM') }]);
+    });
+
+    it('DECISIVE (2): a manifest UNCHANGED from the pinned set logs NO notice, and fleet.lock is untouched (no lock write at all for this leg)', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest: FleetManifest = {
+        ...manifestWith([CODE_AGENT]),
+        trust: { federated_cas: [{ project: 'ppam-2026', ca_bundle: 'GUEST-CERT-PEM' }] },
+      };
+      const priorLock: FleetLock = {
+        schema_version: 1,
+        fleet: manifest.metadata.name,
+        agents: [{ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' }],
+        federated_ca_trust: [{ project: 'ppam-2026', ca_bundle_fingerprint: secretFingerprint('GUEST-CERT-PEM') }],
+      };
+      const logs: string[] = [];
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'reused', 'app-code-agent', 'install-1'), manifestPath),
+        trustDeps: trustDepsFor({ checkRegistryPresence: async () => 'present' }),
+        log: (l) => {
+          logs.push(l);
+        },
+      };
+
+      const result = await applyFleet(manifest, manifestPath, priorLock, deps);
+
+      expect(logs.some((l) => l.includes('federated peer "ppam-2026"'))).toBe(false);
+      // Carried forward UNCHANGED — same fingerprint, not re-recorded.
+      expect(result.finalLock?.federated_ca_trust).toEqual([{ project: 'ppam-2026', ca_bundle_fingerprint: secretFingerprint('GUEST-CERT-PEM') }]);
+    });
+
+    it('a CHANGED bundle for an existing project is surfaced as a change in the log, and fleet.lock keeps pointing at the OLD fingerprint (never silently kept, never silently overwritten)', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest: FleetManifest = {
+        ...manifestWith([CODE_AGENT]),
+        trust: { federated_cas: [{ project: 'ppam-2026', ca_bundle: 'NEW-DIFFERENT-CERT-PEM' }] },
+      };
+      const priorLock: FleetLock = {
+        schema_version: 1,
+        fleet: manifest.metadata.name,
+        agents: [{ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' }],
+        federated_ca_trust: [{ project: 'ppam-2026', ca_bundle_fingerprint: secretFingerprint('OLD-CERT-PEM') }],
+      };
+      const logs: string[] = [];
+      let createCalled = false;
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'reused', 'app-code-agent', 'install-1'), manifestPath),
+        trustDeps: trustDepsFor({
+          checkRegistryPresence: async () => 'present', // the create-only floor: variable already exists
+          createRegistryVariable: async () => {
+            createCalled = true;
+            return 'created';
+          },
+        }),
+        log: (l) => {
+          logs.push(l);
+        },
+      };
+
+      const result = await applyFleet(manifest, manifestPath, priorLock, deps);
+
+      expect(logs.some((l) => l.includes('CHANGED') && l.includes('ppam-2026'))).toBe(true);
+      expect(createCalled).toBe(false); // create-only floor — never overwritten
+      expect(result.federatedTrust['ppam-2026']).toEqual({ status: 'already-present' });
+      // The lock STILL records the OLD fingerprint — a caller re-reading it
+      // next run gets 'changed' again, not a silently-absorbed 'noop'.
+      expect(result.finalLock?.federated_ca_trust).toEqual([{ project: 'ppam-2026', ca_bundle_fingerprint: secretFingerprint('OLD-CERT-PEM') }]);
+    });
+
+    it('no lock entry at all (a fleet that federated this project before #1389 shipped) baselines on first touch rather than refusing', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest: FleetManifest = {
+        ...manifestWith([CODE_AGENT]),
+        trust: { federated_cas: [{ project: 'ppam-2026', ca_bundle: 'PRE-EXISTING-CERT-PEM' }] },
+      };
+      // priorLock exists (this fleet has been applied before) but has never
+      // recorded federated_ca_trust — the pre-#1389 shape.
+      const priorLock: FleetLock = {
+        schema_version: 1,
+        fleet: manifest.metadata.name,
+        agents: [{ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' }],
+      };
+      const logs: string[] = [];
+      const deps: FleetApplyDeps = {
+        ...baseDeps(agentDepsFor('code-agent', 'reused', 'app-code-agent', 'install-1'), manifestPath),
+        trustDeps: trustDepsFor({ checkRegistryPresence: async () => 'present' }), // registry var predates this mechanism
+        log: (l) => {
+          logs.push(l);
+        },
+      };
+
+      const result = await applyFleet(manifest, manifestPath, priorLock, deps);
+
+      expect(logs.some((l) => l.includes('NEW federated-CA trust grant'))).toBe(true);
+      expect(result.federatedTrust['ppam-2026']).toEqual({ status: 'already-present' });
+      // Baselined, not refused — apply proceeded to completion.
+      expect(result.finalLock?.federated_ca_trust).toEqual([
+        { project: 'ppam-2026', ca_bundle_fingerprint: secretFingerprint('PRE-EXISTING-CERT-PEM') },
+      ]);
+    });
+
+    it('an ordinary re-apply with NO trust.federated_cas declared writes no federated_ca_trust key at all', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]);
+      const deps = baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath);
+
+      const result = await applyFleet(manifest, manifestPath, null, deps);
+
+      expect(result.finalLock?.federated_ca_trust).toBeUndefined();
     });
   });
 

@@ -77,6 +77,7 @@ import { ROUTER_APP_ROLE } from '../../src/cli/bootstrap/apply-router-app.js';
 import { REGISTRY_SCOPE_UNSATISFIABLE_CODE } from '../../src/cli/bootstrap/registry-scope-preflight.js';
 import { AGE_RECIPIENTS_NARROWED_CODE } from '../../src/cli/bootstrap/age-recipients-narrowing.js';
 import { AGE_RECIPIENTS_NARROWING_OVERRIDE_TEXT } from '../../src/cli/bootstrap/fleet-manifest.js';
+import { secretFingerprint } from '../../src/cli/bootstrap/fleet-lock.js';
 import { upgradeFleets } from '@groundnuty/macf-core';
 import type { ApplyVersionPhaseDeps, ApplyVersionPhaseResult } from '../../src/cli/bootstrap/apply-version.js';
 
@@ -2801,6 +2802,106 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       expect(code).toBe(1);
       expect(errs.join('\n')).toContain(AGE_RECIPIENT_B);
       expect(errs.join('\n')).toContain('does not revoke');
+    });
+  });
+
+  describe('groundnuty/macf#1389 — federated-CA-trust enumerate-and-name consent notices at plan-preview time', () => {
+    /** A `fleet.lock` recording `federated_ca_trust`, written next to `file` — same "next to the manifest, what readFleetLock(manifestPath) reads" shape `writePriorLock` establishes in the #1230 block immediately above, applied to the new field. */
+    function writeFederatedCaTrustLock(file: string, entries: readonly { project: string; ca_bundle_fingerprint: string }[]): void {
+      const lines = entries.map((e) => `  - project: ${e.project}\n    ca_bundle_fingerprint: ${e.ca_bundle_fingerprint}`).join('\n');
+      const body = `schema_version: 1\nfleet: demo-fleet\nagents: []\nfederated_ca_trust:\n${lines}\n`;
+      writeFileSync(join(dirname(file), 'fleet.lock'), body, 'utf-8');
+    }
+
+    const FLEET_YAML_WITH_FEDERATED_CA = `${FLEET_YAML}trust:\n  federated_cas:\n    - project: ppam-2026\n      ca_bundle: GUEST-CERT-PEM\n`;
+
+    it('DECISIVE (1): a NEW federated_cas project is NAMED on stderr, and that notice is written BEFORE observe (the first GitHub-touching step) runs — name before grant, not merely "both happen somewhere"', async () => {
+      const file = writeManifest(FLEET_YAML_WITH_FEDERATED_CA); // no fleet.lock at all — never approved
+      // One shared sequence: both the notice write AND the observe call
+      // push a marker into it, so ORDER (not just presence) is what this
+      // test actually pins.
+      const sequence: string[] = [];
+      const writeSpy = vi
+        .spyOn(process.stderr, 'write')
+        .mockImplementation((chunk: string | Uint8Array) => {
+          const text = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf-8');
+          if (text.includes('NEW federated-CA trust grant')) sequence.push('notice');
+          return true;
+        });
+      try {
+        const code = await runBootstrapApply(
+          { file, dryRun: true },
+          {
+            observe: () => {
+              sequence.push('observe');
+              return Promise.resolve(EMPTY_OBSERVED);
+            },
+          },
+        );
+        expect(code).toBe(0);
+      } finally {
+        writeSpy.mockRestore();
+      }
+      expect(sequence).toEqual(['notice', 'observe']);
+    });
+
+    it('DECISIVE (2): a manifest UNCHANGED from the pinned fingerprint writes NOTHING to stderr — no prompt, no noise', async () => {
+      const file = writeManifest(FLEET_YAML_WITH_FEDERATED_CA);
+      writeFederatedCaTrustLock(file, [{ project: 'ppam-2026', ca_bundle_fingerprint: secretFingerprint('GUEST-CERT-PEM') }]);
+      const rawWrites: string[] = [];
+      const writeSpy = vi
+        .spyOn(process.stderr, 'write')
+        .mockImplementation((chunk: string | Uint8Array) => {
+          rawWrites.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf-8'));
+          return true;
+        });
+      try {
+        const code = await runBootstrapApply({ file, dryRun: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) });
+        expect(code).toBe(0);
+        expect(rawWrites.join('')).not.toContain('federated peer "ppam-2026"');
+      } finally {
+        writeSpy.mockRestore();
+      }
+    });
+
+    it('a CHANGED bundle for an already-approved project is surfaced on stderr, naming BOTH the recorded and the newly-declared fingerprint', async () => {
+      const file = writeManifest(FLEET_YAML_WITH_FEDERATED_CA); // declares CERT text "GUEST-CERT-PEM"
+      writeFederatedCaTrustLock(file, [{ project: 'ppam-2026', ca_bundle_fingerprint: secretFingerprint('OLD-DIFFERENT-CERT') }]);
+      const rawWrites: string[] = [];
+      const writeSpy = vi
+        .spyOn(process.stderr, 'write')
+        .mockImplementation((chunk: string | Uint8Array) => {
+          rawWrites.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf-8'));
+          return true;
+        });
+      try {
+        const code = await runBootstrapApply({ file, dryRun: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) });
+        expect(code).toBe(0);
+        const output = rawWrites.join('');
+        expect(output).toContain('CHANGED');
+        expect(output).toContain(secretFingerprint('OLD-DIFFERENT-CERT'));
+        expect(output).toContain(secretFingerprint('GUEST-CERT-PEM'));
+      } finally {
+        writeSpy.mockRestore();
+      }
+    });
+
+    it('a manifest with no trust.federated_cas at all writes nothing (silent when nothing is declared, same convention as every other section)', async () => {
+      const file = writeManifest(); // no trust: section
+      const rawWrites: string[] = [];
+      const writeSpy = vi
+        .spyOn(process.stderr, 'write')
+        .mockImplementation((chunk: string | Uint8Array) => {
+          rawWrites.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf-8'));
+          return true;
+        });
+      try {
+        const code = await runBootstrapApply({ file, dryRun: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) });
+        expect(code).toBe(0);
+        expect(rawWrites.join('')).not.toContain('federated-CA');
+      } finally {
+        writeSpy.mockRestore();
+      }
     });
   });
 

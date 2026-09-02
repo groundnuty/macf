@@ -516,6 +516,89 @@ describe('composeFleetLock — collaborators (groundnuty/macf#1330 — federated
   });
 });
 
+describe('composeFleetLock — federated_ca_trust (groundnuty/macf#1389 — federated-CA-bundle approved fingerprints)', () => {
+  it('is undefined when neither previous nor fresh has ever recorded a federated-CA-trust fingerprint', () => {
+    const { lock } = composeFleetLock({ fleet: 'demo-fleet', previous: null, agentUpdates: {} });
+    expect(lock.federated_ca_trust).toBeUndefined();
+  });
+
+  it('a first-recorded project is written verbatim', () => {
+    const { lock } = composeFleetLock({
+      fleet: 'demo-fleet',
+      previous: null,
+      agentUpdates: {},
+      federatedCaTrust: [{ project: 'ppam-2026', caBundleFingerprint: 'sha256:aaa' }],
+    });
+    expect(lock.federated_ca_trust).toEqual([{ project: 'ppam-2026', ca_bundle_fingerprint: 'sha256:aaa' }]);
+  });
+
+  it('an UNTOUCHED project (this run records a DIFFERENT project) carries forward verbatim — never pruned', () => {
+    const previous: FleetLock = {
+      schema_version: 1,
+      fleet: 'demo-fleet',
+      agents: [],
+      federated_ca_trust: [{ project: 'ppam-2026', ca_bundle_fingerprint: 'sha256:aaa' }],
+    };
+    const { lock } = composeFleetLock({
+      fleet: 'demo-fleet',
+      previous,
+      agentUpdates: {},
+      federatedCaTrust: [{ project: 'other-fleet', caBundleFingerprint: 'sha256:bbb' }],
+    });
+    expect(lock.federated_ca_trust).toEqual([
+      { project: 'other-fleet', ca_bundle_fingerprint: 'sha256:bbb' },
+      { project: 'ppam-2026', ca_bundle_fingerprint: 'sha256:aaa' },
+    ]);
+  });
+
+  it('DECISIVE: a project present in `fresh` REPLACES its prior fingerprint WHOLESALE, never accumulates — a CHANGED-then-re-approved bundle must overwrite the old fingerprint on disk, not sit alongside it', () => {
+    const previous: FleetLock = {
+      schema_version: 1,
+      fleet: 'demo-fleet',
+      agents: [],
+      federated_ca_trust: [{ project: 'ppam-2026', ca_bundle_fingerprint: 'sha256:old' }],
+    };
+    const { lock } = composeFleetLock({
+      fleet: 'demo-fleet',
+      previous,
+      agentUpdates: {},
+      federatedCaTrust: [{ project: 'ppam-2026', caBundleFingerprint: 'sha256:new' }],
+    });
+    expect(lock.federated_ca_trust).toEqual([{ project: 'ppam-2026', ca_bundle_fingerprint: 'sha256:new' }]);
+  });
+
+  it('carries every project forward UNCHANGED when a write touches nothing federated-CA-trust-related (federatedCaTrust omitted entirely)', () => {
+    const previous: FleetLock = {
+      schema_version: 1,
+      fleet: 'demo-fleet',
+      agents: [],
+      federated_ca_trust: [{ project: 'ppam-2026', ca_bundle_fingerprint: 'sha256:aaa' }],
+    };
+    const { lock } = composeFleetLock({
+      fleet: 'demo-fleet',
+      previous,
+      agentUpdates: { 'code-agent': { appId: '1', installId: '2' } },
+    });
+    expect(lock.federated_ca_trust).toEqual([{ project: 'ppam-2026', ca_bundle_fingerprint: 'sha256:aaa' }]);
+  });
+
+  it('sorts by project for deterministic output regardless of input/previous order', () => {
+    const previous: FleetLock = {
+      schema_version: 1,
+      fleet: 'demo-fleet',
+      agents: [],
+      federated_ca_trust: [{ project: 'zzz-fleet', ca_bundle_fingerprint: 'sha256:zzz' }],
+    };
+    const { lock } = composeFleetLock({
+      fleet: 'demo-fleet',
+      previous,
+      agentUpdates: {},
+      federatedCaTrust: [{ project: 'aaa-fleet', caBundleFingerprint: 'sha256:aaa' }],
+    });
+    expect(lock.federated_ca_trust?.map((c) => c.project)).toEqual(['aaa-fleet', 'zzz-fleet']);
+  });
+});
+
 describe('serializeFleetLock', () => {
   // groundnuty/macf#1310 — this fixture DELIBERATELY declares its
   // fleet-level fingerprints under the DEPRECATED bare `fingerprints` key
@@ -662,6 +745,28 @@ describe('serializeFleetLock', () => {
     const parsed = JSON.parse(serializeFleetLock(lock)) as Record<string, unknown>;
     expect('collaborators' in parsed).toBe(false);
   });
+
+  // groundnuty/macf#1389 — same allowlist-drop shape as `collaborators`
+  // immediately above, applied to the new `federated_ca_trust` field.
+  it('federated_ca_trust round-trips through parseFleetLock unchanged, SORTED by project (allowlist-drop regression pin)', () => {
+    const withFederatedCaTrust: FleetLock = {
+      ...lock,
+      federated_ca_trust: [
+        { project: 'zzz-fleet', ca_bundle_fingerprint: 'sha256:zzz' },
+        { project: 'ppam-2026', ca_bundle_fingerprint: 'sha256:ppam' },
+      ],
+    };
+    const roundTripped = parseFleetLock(serializeFleetLock(withFederatedCaTrust));
+    expect(roundTripped.federated_ca_trust).toEqual([
+      { project: 'ppam-2026', ca_bundle_fingerprint: 'sha256:ppam' },
+      { project: 'zzz-fleet', ca_bundle_fingerprint: 'sha256:zzz' },
+    ]);
+  });
+
+  it('omits the "federated_ca_trust" key entirely when absent (never a fabricated empty array)', () => {
+    const parsed = JSON.parse(serializeFleetLock(lock)) as Record<string, unknown>;
+    expect('federated_ca_trust' in parsed).toBe(false);
+  });
 });
 
 describe('writeFleetLock (thin I/O leaf)', () => {
@@ -771,6 +876,52 @@ describe('writeFleetLock (thin I/O leaf)', () => {
       writeFleetLock(path, lock);
       const raw = JSON.parse(readFileSync(path, 'utf-8')) as Record<string, unknown>;
       expect('collaborators' in raw).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // groundnuty/macf#1389 DECISIVE — same "assert the WRITTEN FILE, not the
+  // composer's return value" discipline the `collaborators` decisive test
+  // immediately above establishes, applied to the new `federated_ca_trust`
+  // field. Reads the RAW JSON bytes off disk directly (not through
+  // `parseFleetLock`'s schema-tolerant re-validation) — the strongest
+  // possible pin against `serializeFleetLock`'s hand-built `ordered`
+  // allowlist silently dropping `federated_ca_trust` before the write.
+  // Mutation check performed manually: commenting out the
+  // `if (validated.federated_ca_trust !== undefined) { ordered.federated_ca_trust = ... }`
+  // block in `serializeFleetLock` (fleet-lock.ts) makes this test fail (raw
+  // parsed JSON has no "federated_ca_trust" key).
+  it('DECISIVE: a federated-CA-trust fingerprint reaches the WRITTEN FILE on disk under "federated_ca_trust", readable as a raw key', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'macf-fleet-lock-test-'));
+    try {
+      const path = join(dir, 'fleet.lock');
+      const { lock } = composeFleetLock({
+        fleet: 'demo-fleet',
+        previous: null,
+        agentUpdates: {},
+        federatedCaTrust: [{ project: 'ppam-2026', caBundleFingerprint: 'sha256:aaa' }],
+      });
+      writeFleetLock(path, lock);
+      const raw = JSON.parse(readFileSync(path, 'utf-8')) as { federated_ca_trust?: { project: string; ca_bundle_fingerprint: string }[] };
+      expect(raw.federated_ca_trust).toEqual([{ project: 'ppam-2026', ca_bundle_fingerprint: 'sha256:aaa' }]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a lock recording no federated-CA trust writes NO "federated_ca_trust" key at all', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'macf-fleet-lock-test-'));
+    try {
+      const path = join(dir, 'fleet.lock');
+      const { lock } = composeFleetLock({
+        fleet: 'demo-fleet',
+        previous: null,
+        agentUpdates: { 'code-agent': { appId: '1', installId: '2' } },
+      });
+      writeFleetLock(path, lock);
+      const raw = JSON.parse(readFileSync(path, 'utf-8')) as Record<string, unknown>;
+      expect('federated_ca_trust' in raw).toBe(false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

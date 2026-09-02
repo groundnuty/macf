@@ -146,6 +146,7 @@ import { checkRegistryScopePreflight } from '../bootstrap/registry-scope-preflig
 // reads `fleet.lock` (a local file, never a GitHub call) via `readFleetLock`
 // (already imported above from `observer.js`) to compare against.
 import { ageRecipientsRecordAbsent, ageRecipientsRecordAbsentNotice, checkAgeRecipientsNarrowing } from '../bootstrap/age-recipients-narrowing.js';
+import { reconcileFederatedTrustVerdicts, federatedTrustNotices } from '../bootstrap/apply-federated-trust.js';
 import type { DeployFlagsEcho, RemainingDeployReport, RemainingDeployStep } from '../bootstrap/remaining-deploy.js';
 import { computeRemainingDeploy, formatRemainingDeployLines } from '../bootstrap/remaining-deploy.js';
 import type { ApplyDeployPhaseDeps, DeployPhaseAgentResult } from '../bootstrap/apply-deploy.js';
@@ -3344,6 +3345,20 @@ export async function runBootstrapApply(
   // migration cycle in which every fleet is in it.
   if (ageRecipientsRecordAbsent(readFleetLock(manifestPath))) {
     process.stderr.write(`${ageRecipientsRecordAbsentNotice()}\n`);
+  }
+
+  // groundnuty/macf#1389 — the `#1330`-shaped federated-CA-trust
+  // enumerate-and-name consent notices, same unconditional-including-`--dry-run`
+  // placement as the age_recipients checks immediately above: a NEW project
+  // grant or a CHANGED bundle is named HERE, ahead of the real publish call
+  // (`apply-fleet.ts`'s `applyFleet`, which logs the identical notices again
+  // via `deps.log` right before it actually runs `publishFederatedTrustLegs`)
+  // — so a `--dry-run` operator sees the same names a real run would act on,
+  // never only after the fact. Reads the SAME local `readFleetLock` this
+  // block already established as the plan-preview's lock source (never a
+  // GitHub call).
+  for (const notice of federatedTrustNotices(reconcileFederatedTrustVerdicts(manifest.trust?.federated_cas ?? [], readFleetLock(manifestPath)?.federated_ca_trust))) {
+    process.stderr.write(`${notice}\n`);
   }
 
   if (opts.dryRun !== true) {

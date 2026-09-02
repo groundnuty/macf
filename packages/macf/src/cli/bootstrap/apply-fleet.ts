@@ -280,7 +280,7 @@ import { publishCaCertLegs, redactCaResolve, resolveCaCert, skippedCaPublish } f
 // groundnuty/macf#810 — the fleet-level trust-material publish, same
 // registry scope + create-only shape as the CA cert legs immediately above.
 import type { FederatedTrustPublishResult } from './apply-federated-trust.js';
-import { publishFederatedTrustLegs } from './apply-federated-trust.js';
+import { publishFederatedTrustLegs, reconcileFederatedTrustVerdicts, federatedTrustNotices, federatedTrustLockUpdates } from './apply-federated-trust.js';
 import type { EnsureVariableOutcome } from './ensure-variable.js';
 import type { RunnerRegistrationDeps, RunnerRequirementOutcome, RunnerTokenPollOptions, TrustedActorsReconcileDeps } from './apply-routing.js';
 import {
@@ -810,7 +810,11 @@ export interface FleetApplyResult {
    * applies" convention as `ca.repoLegs` on a fleet with zero agents (never
    * an omitted field). See `apply-federated-trust.ts`'s module doc for the
    * scope this does NOT cover (no repo legs, no per-agent
-   * `.github/macf-fleet.json` change, no `#1330` consent gate).
+   * `.github/macf-fleet.json` change). The `#1330`-shaped enumerate-and-name
+   * consent gate (groundnuty/macf#1389) runs alongside this publish — its
+   * notices are logged via `deps.log`, not carried on this field — see
+   * `applyFleet`'s own call site (`reconcileFederatedTrustVerdicts` /
+   * `federatedTrustNotices` / `federatedTrustLockUpdates`).
    */
   readonly federatedTrust: FederatedTrustPublishResult;
   /**
@@ -2510,6 +2514,14 @@ export async function applyFleet(
   // `apply-ca.ts::skippedCaPublish`); this call site currently has no
   // precondition that would need it.
   const federatedCas = manifest.trust?.federated_cas ?? [];
+  // groundnuty/macf#1389 — the `#1330`-shaped enumerate-and-name consent
+  // gate: diff every declared entry against `fleet.lock`'s recorded
+  // `federated_ca_trust[]` and log the notice BEFORE the publish call below
+  // runs (name before grant — a NEW project's grant, or an EXISTING
+  // project's declared-bundle divergence, is visible in this run's output
+  // ahead of the registry write it accompanies, never buried after it).
+  const federatedTrustVerdicts = reconcileFederatedTrustVerdicts(federatedCas, currentLock?.federated_ca_trust);
+  for (const notice of federatedTrustNotices(federatedTrustVerdicts)) deps.log(notice);
   const federatedTrustPublish: FederatedTrustPublishResult = await publishFederatedTrustLegs(federatedCas, manifest.owner.registry, deps.trustDeps);
   for (const entry of federatedCas) {
     const leg = federatedTrustPublish[entry.project];
@@ -2521,6 +2533,29 @@ export async function applyFleet(
       `Federated-CA registry leg (${entry.project}): ${leg.status}` +
         (leg.status === 'failed' || leg.status === 'skipped' ? ` — ${leg.reason}` : '.'),
     );
+  }
+  // groundnuty/macf#1389 — record the new approved baseline for whichever
+  // projects `federatedTrustLockUpdates` decides actually reflect this run's
+  // published state (see that function's own doc — NOT every non-noop
+  // verdict; a `'changed'` verdict left `'already-present'` by the
+  // create-only floor above must NOT be recorded, or the lock would silently
+  // claim a bundle was granted that the registry never actually received).
+  // Unconditional write (no `shouldWriteBatchedFleetLock` gate) — same
+  // "independent of mint/vault/durability ordering" reasoning the publish
+  // call above already follows; skipped entirely when there is nothing to
+  // record, so an ordinary re-apply over an already-approved fleet writes no
+  // extra lock churn.
+  const federatedCaTrustUpdates = federatedTrustLockUpdates(federatedTrustVerdicts, federatedTrustPublish);
+  if (federatedCaTrustUpdates.length > 0) {
+    const composedTrust = composeFleetLock({
+      fleet: manifest.metadata.name,
+      previous: currentLock,
+      agentUpdates: {},
+      federatedCaTrust: federatedCaTrustUpdates,
+    });
+    writeFleetLock(lockPath, composedTrust.lock);
+    currentLock = composedTrust.lock;
+    identityChanges.push(...composedTrust.identityChanges);
   }
 
   // --- groundnuty/macf#1074: the unified six-secret routing publish ---
