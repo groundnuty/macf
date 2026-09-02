@@ -347,7 +347,10 @@ export async function update(
   // + .claude/scripts/ entries added above (macf#1413) — the prevent-side
   // companion to #1411's after-the-fact detector. Idempotent + append-only;
   // see `updateGitignore`'s doc comment in init.ts for the invariants.
-  updateGitignore(projectDir);
+  const gitignoreAdded = updateGitignore(projectDir);
+  if (gitignoreAdded.length > 0) {
+    console.log(`Repaired .gitignore: added ${gitignoreAdded.join(', ')}`);
+  }
 
   // Seed (if absent) / validate (if present) the interactive-prompt
   // auto-responder allowlist (.claude/.macf/prompt-responses.json, DR-033 /

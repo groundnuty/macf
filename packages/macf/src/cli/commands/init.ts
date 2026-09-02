@@ -742,7 +742,7 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
   // Generate claude.sh launcher.
   const claudeShPath = writeClaudeSh(absDir, config);
 
-  // Add .macf/ to .gitignore
+  // Add .macf/, .claude/rules/, .claude/scripts/ to .gitignore (macf#1413).
   updateGitignore(absDir);
 
   // Register in global index (macf#1135). `addToAgentsIndex` writes to
@@ -1183,17 +1183,35 @@ const MACF_GITIGNORE_ENTRIES = ['.macf/', '.claude/rules/', '.claude/scripts/'] 
  * writes/updates `.gitignore` unconditionally, same as it always has —
  * a workspace that isn't a git repo just gets an inert file.
  */
-export function updateGitignore(projectDir: string): void {
+export function updateGitignore(projectDir: string): readonly string[] {
   const gitignorePath = join(projectDir, '.gitignore');
 
   if (existsSync(gitignorePath)) {
     const content = readFileSync(gitignorePath, 'utf-8');
-    const missing = MACF_GITIGNORE_ENTRIES.filter((entry) => !content.includes(entry));
+    // Line-exact membership, not `content.includes(entry)` (a coarse
+    // substring check — Pattern B, silent-fallback-hazards.md): `.claude/
+    // rules/project/` (DR-026 F3 / macf#501's real, shipped project-tier
+    // subdir) CONTAINS `.claude/rules/` as a substring, so a workspace
+    // that only has the narrower project-tier line ignored would read as
+    // "already covered" and never get the directory-wide entry appended
+    // — silently leaving the universal-tier rule files (which live
+    // directly under `.claude/rules/`, not under `project/`) untracked
+    // by any ignore rule. Trimmed non-empty lines only; a trailing
+    // comment or negation on the same physical line as an entry is not
+    // this function's problem to parse — it just won't count as a match,
+    // which means the canonical entry gets appended again (idempotent
+    // no-op in gitignore semantics, never a correctness issue).
+    const presentLines = new Set(
+      content.split('\n').map((line) => line.trim()).filter((line) => line.length > 0),
+    );
+    const missing = MACF_GITIGNORE_ENTRIES.filter((entry) => !presentLines.has(entry));
     if (missing.length > 0) {
       appendFileSync(gitignorePath, `\n# MACF agent data\n${missing.join('\n')}\n`);
     }
+    return missing;
   } else {
     writeFileSync(gitignorePath, `# MACF agent data\n${MACF_GITIGNORE_ENTRIES.join('\n')}\n`);
+    return MACF_GITIGNORE_ENTRIES;
   }
 }
 

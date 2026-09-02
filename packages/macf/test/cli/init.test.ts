@@ -349,6 +349,59 @@ describe('macf init', () => {
     expect(gitignore.match(/\.macf\//g)).toHaveLength(1);
   });
 
+  // A coarse `content.includes(entry)` substring check would treat
+  // `.claude/rules/project/` (the real, shipped project-tier subdir —
+  // DR-026 F3 / macf#501, seeded by `initAgent` itself a few lines below
+  // this call) as already covering `.claude/rules/`, since the former
+  // contains the latter as a substring. That would silently skip
+  // appending the directory-wide entry, leaving the universal-tier rule
+  // files (which live directly under `.claude/rules/*.md`, not under
+  // `project/`) untracked by any ignore rule. Membership must be
+  // line-exact.
+  it('appends .claude/rules/ even when only the narrower project-tier subdir is already ignored (macf#1413)', async () => {
+    writeFileSync(join(dir, '.gitignore'), '.macf/\n.claude/rules/project/\n');
+
+    await initAgent(dir, {
+      project: 'T',
+      role: 'a',
+      appId: '1',
+      installId: '2',
+      keyPath: 'k',
+      registryType: 'repo',
+      registryRepo: 'o/r',
+    });
+
+    const lines = readFileSync(join(dir, '.gitignore'), 'utf-8')
+      .split('\n')
+      .map((l) => l.trim());
+    expect(lines).toContain('.claude/rules/');
+    expect(lines).toContain('.claude/rules/project/'); // original line untouched
+  });
+
+  // Regression pin for "preserve the file's trailing-newline state": a
+  // .gitignore whose last line has no trailing newline must not get the
+  // appended block glued onto that line.
+  it('does not glue the appended block onto a final line lacking a trailing newline (macf#1413)', async () => {
+    writeFileSync(join(dir, '.gitignore'), '.macf/\ndist/'); // no trailing \n
+
+    await initAgent(dir, {
+      project: 'T',
+      role: 'a',
+      appId: '1',
+      installId: '2',
+      keyPath: 'k',
+      registryType: 'repo',
+      registryRepo: 'o/r',
+    });
+
+    const lines = readFileSync(join(dir, '.gitignore'), 'utf-8')
+      .split('\n')
+      .map((l) => l.trim());
+    expect(lines).toContain('dist/');
+    expect(lines).toContain('.claude/rules/');
+    expect(lines).toContain('.claude/scripts/');
+  });
+
   it('rejects missing required registry options', async () => {
     await expect(initAgent(dir, {
       project: 'T',
