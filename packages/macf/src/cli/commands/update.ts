@@ -54,6 +54,7 @@ import { readAgentConfig, writeAgentConfig, tokenSourceFromConfig, resolveCanoni
 import { resolveLatestVersions } from '../version-resolver.js';
 import { findCliPackageRoot } from '../rules.js';
 import { copyCanonicalAssetsGuarded } from '../canonical-overwrite-guard.js';
+import { updateGitignore } from './init.js';
 import { fetchProjectRules, PROJECT_RULES_SOURCE_ENV } from '../project-rules.js';
 import { reportSeedPromptResponses, seedPromptResponsesConfig } from '../prompt-responses.js';
 import { reportSeedStallSignatures, seedStallSignaturesConfig } from '../stall-signatures.js';
@@ -340,6 +341,15 @@ export async function update(
   }
   if (outcome.scripts.length > 0) {
     console.log(`Refreshed ${outcome.scripts.length} helper script(s) in .claude/scripts/`);
+  }
+
+  // Repair .gitignore on a workspace whose copy predates the .claude/rules/
+  // + .claude/scripts/ entries added above (macf#1413) — the prevent-side
+  // companion to #1411's after-the-fact detector. Idempotent + append-only;
+  // see `updateGitignore`'s doc comment in init.ts for the invariants.
+  const gitignoreAdded = updateGitignore(projectDir);
+  if (gitignoreAdded.length > 0) {
+    console.log(`Repaired .gitignore: added ${gitignoreAdded.join(', ')}`);
   }
 
   // Seed (if absent) / validate (if present) the interactive-prompt

@@ -297,6 +297,40 @@ describe('update command', () => {
     expect(allLogs).not.toContain('Skipped due to fetch failure');
   });
 
+  // macf#1413 — `update` is the repair path for a workspace whose
+  // .gitignore predates the .claude/rules/ + .claude/scripts/ entries
+  // (added by `updateGitignore`, shared with `init`). Runs on every
+  // invocation, independent of version-pin state (unlike --dry-run's
+  // gate, which only applies to the bump path much later in the run).
+  it('repairs a legacy .gitignore (only .macf/) by appending the two new entries (macf#1413)', async () => {
+    writeConfig(dir, { cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
+    mockFetchReturning({ cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
+    writeFileSync(join(dir, '.gitignore'), '.macf/\nnode_modules/\n');
+
+    const code = await update(dir, { all: false, cli: false, plugin: false, actions: false, yes: false, dryRun: false });
+    expect(code).toBe(0);
+
+    const gitignore = readFileSync(join(dir, '.gitignore'), 'utf-8');
+    expect(gitignore.startsWith('.macf/\nnode_modules/\n')).toBe(true);
+    expect(gitignore).toContain('.claude/rules/');
+    expect(gitignore).toContain('.claude/scripts/');
+    expect(gitignore.match(/\.macf\//g)).toHaveLength(1);
+  });
+
+  // Decisive pair, update side: a .gitignore already carrying all three
+  // entries comes out byte-identical after `update`, same invariant as
+  // `init`.
+  it('leaves a .gitignore already carrying all three entries byte-identical after update (macf#1413)', async () => {
+    writeConfig(dir, { cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
+    mockFetchReturning({ cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
+    const existing = '# MACF agent data\n.macf/\n.claude/rules/\n.claude/scripts/\n';
+    writeFileSync(join(dir, '.gitignore'), existing);
+
+    const code = await update(dir, { all: false, cli: false, plugin: false, actions: false, yes: false, dryRun: false });
+    expect(code).toBe(0);
+    expect(readFileSync(join(dir, '.gitignore'), 'utf-8')).toBe(existing);
+  });
+
   it('--all --yes bumps all out-of-date components', async () => {
     writeConfig(dir, { cli: '0.1.0', plugin: '0.1.0', actions: 'v1' });
     mockFetchReturning({ cli: '0.3.0', plugin: '0.2.0', actions: 'v2' });
