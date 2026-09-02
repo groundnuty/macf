@@ -127,6 +127,42 @@ describe('checkDistributedScriptCurrency (groundnuty/macf#1362)', () => {
     expect(result.findings).toEqual([]);
   });
 
+  // groundnuty/macf#1403 — the actual bug shape: ONE source dir present
+  // (the legacy `scripts/`), the OTHER absent (`plugin/scripts/` — omitted
+  // from `package.json` files[] on every published CLI through 0.2.59).
+  // Before the fix, this silently narrowed `names` to whatever the present
+  // dir alone contains and reported PASS/WARN against that narrowed
+  // population — an "8/8 match" green report while 14 scripts (including
+  // the entire PreToolUse guard family) went uncompared. Must be FAIL, and
+  // must NOT be conflated with UNKNOWN (both-missing, above) or PASS.
+  it('FAIL: exactly ONE source dir exists — never silently narrows the comparison population, never PASS (the real macf#1403 shape)', () => {
+    mkdirSync(join(tmpRoot, '.macf'), { recursive: true });
+    const missingPlugin = join(tmpRoot, 'plugin-does-not-exist');
+
+    const result = checkDistributedScriptCurrency(tmpRoot, {
+      canonicalDir: fakeCanonical,
+      pluginScriptsDir: missingPlugin,
+    });
+    expect(result.status).toBe('FAIL');
+    expect(result.status).not.toBe('PASS');
+    expect(result.status).not.toBe('UNKNOWN');
+    expect(result.status).not.toBe('WARN');
+    expect(result.findings).toEqual([]);
+    expect(result.detail).toContain(missingPlugin);
+  });
+
+  it('FAIL: symmetric — only the LEGACY dir is absent, plugin dir present', () => {
+    mkdirSync(join(tmpRoot, '.macf'), { recursive: true });
+    const missingLegacy = join(tmpRoot, 'legacy-does-not-exist');
+
+    const result = checkDistributedScriptCurrency(tmpRoot, {
+      canonicalDir: missingLegacy,
+      pluginScriptsDir: fakePluginScripts,
+    });
+    expect(result.status).toBe('FAIL');
+    expect(result.detail).toContain(missingLegacy);
+  });
+
   it('WARN: a canonically-distributed script entirely absent from a managed workspace is reported missing (distinct from stale)', () => {
     mkdirSync(join(tmpRoot, '.macf'), { recursive: true });
     mkdirSync(join(tmpRoot, '.claude', 'scripts'), { recursive: true });

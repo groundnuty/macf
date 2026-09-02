@@ -1435,9 +1435,22 @@ export interface ScriptCurrencyFinding {
  *                 canonical content is indeterminate. NEVER PASS in this
  *                 branch — an undeterminable canonical must never be
  *                 reported as "current".
+ *   - `FAIL`    — exactly ONE of the two canonical script source dirs exists
+ *                 (groundnuty/macf#1403 — every npm-published CLI through
+ *                 0.2.59 shipped the legacy `scripts/` dir but never
+ *                 `plugin/scripts/`, the home of 14 canonical scripts
+ *                 including the entire PreToolUse guard family). This is
+ *                 NOT the same as `UNKNOWN`: with one dir present, `names`
+ *                 above would silently narrow to whatever THAT dir alone
+ *                 contains, and the comparison below would report PASS/WARN
+ *                 against a population that quietly excludes every script
+ *                 the missing dir was supposed to contribute — exactly the
+ *                 "8/8 match" green report that hid this bug. NEVER PASS or
+ *                 silently narrow in this branch — a partially-packaged CLI
+ *                 must say so, naming which dir is missing.
  */
 export interface ScriptCurrencyCheckResult {
-  readonly status: 'PASS' | 'WARN' | 'INFO' | 'UNKNOWN';
+  readonly status: 'PASS' | 'WARN' | 'INFO' | 'UNKNOWN' | 'FAIL';
   readonly checkedCount: number;
   readonly totalCount: number;
   readonly findings: readonly ScriptCurrencyFinding[];
@@ -1479,7 +1492,10 @@ export function checkDistributedScriptCurrency(
 
   const legacyDir = options.canonicalDir ?? canonicalScriptsDir();
   const pluginDir = options.pluginScriptsDir ?? canonicalPluginScriptsDir();
-  if (!existsSync(legacyDir) && !existsSync(pluginDir)) {
+  const legacyExists = existsSync(legacyDir);
+  const pluginExists = existsSync(pluginDir);
+
+  if (!legacyExists && !pluginExists) {
     return {
       status: 'UNKNOWN',
       checkedCount: 0,
@@ -1488,6 +1504,26 @@ export function checkDistributedScriptCurrency(
       detail:
         "this CLI install's canonical script source directories could not be located — " +
         "can't determine whether distributed scripts are current",
+    };
+  }
+
+  // Exactly one present (groundnuty/macf#1403): a partial-packaging defect,
+  // NOT the "compare against what's here" degradation `listDistributedScriptNames`
+  // would otherwise apply. Naming the missing dir directly, before that
+  // function ever runs, so the comparison below is never silently narrowed
+  // to a population missing everything the absent dir was supposed to hold.
+  if (legacyExists !== pluginExists) {
+    const missingDir = legacyExists ? pluginDir : legacyDir;
+    return {
+      status: 'FAIL',
+      checkedCount: 0,
+      totalCount: 0,
+      findings: [],
+      detail:
+        `this CLI install (${cliVersionLabel()}) is missing its canonical script source ${missingDir} — ` +
+        'some canonically-distributed scripts (potentially including PreToolUse guard hooks) cannot be ' +
+        'verified or refreshed from here; reinstall @groundnuty/macf, or if reinstalling does not fix ' +
+        'it, file a packaging bug against groundnuty/macf',
     };
   }
 
@@ -2062,6 +2098,12 @@ export interface RunDoctorOptions {
  *     the exit code — same warn-only posture as the other WARN-tier checks
  *     in this report; a status literally named FAIL does, for consistency
  *     with every other FAIL in this function.
+ *   - Distributed-script-currency FAIL (groundnuty/macf#1403 — exactly one of
+ *     the two canonical script source dirs missing from this CLI install) →
+ *     1. WARN (both dirs present, some workspace copy stale/missing), INFO,
+ *     and UNKNOWN (neither dir present) do NOT affect the exit code — same
+ *     warn-only posture as the sibling currency checks; FAIL does, for the
+ *     same consistency reason as disk-space above.
  *   - The early-return path (no macf-agent.json) always returns 1 regardless
  *     of disk-space status — unrelated to whether the disk itself is full.
  */
@@ -2231,7 +2273,8 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
   console.log('');
   console.log('Distributed script currency');
   console.log('──────────────────────────────────────────────────────────────');
-  printScriptCurrencySection(checkDistributedScriptCurrency(projectDir), checkoutCurrency);
+  const scriptCurrencyCheck = checkDistributedScriptCurrency(projectDir);
+  printScriptCurrencySection(scriptCurrencyCheck, checkoutCurrency);
 
   console.log('');
   console.log('Distributed rule currency');
@@ -2312,7 +2355,13 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
   // that stayed cosmetic would be the silent-fallback shape this repo's own
   // rules catalog: a name that implies consequence with none attached.
   const diskSpaceFailed = diskSpaceCheck.status === 'FAIL';
-  return permissionsFailed || sandboxFailed || roleErrored || diskSpaceFailed ? 1 : 0;
+  // groundnuty/macf#1403: same discipline — a partially-packaged CLI (one of
+  // the two canonical script source dirs missing) means some canonically-
+  // distributed scripts, potentially including PreToolUse guard hooks, are
+  // silently unverifiable and unrefreshable from this install. FAIL here
+  // must cost the exit code, not just the printed line.
+  const scriptCurrencyFailed = scriptCurrencyCheck.status === 'FAIL';
+  return permissionsFailed || sandboxFailed || roleErrored || diskSpaceFailed || scriptCurrencyFailed ? 1 : 0;
 }
 
 /** Print the macf#554/#556 OTEL launch-boundary report line for `check`. */
@@ -2487,6 +2536,14 @@ function printScriptCurrencySection(check: ScriptCurrencyCheckResult, checkoutCu
   }
   if (check.status === 'UNKNOWN') {
     console.log(`  ? ${check.detail}  [UNKNOWN]`);
+    return;
+  }
+  // groundnuty/macf#1403: a partially-packaged CLI (one of the two canonical
+  // script source dirs missing) — distinct from both PASS (everything
+  // current) and WARN (both dirs present, some workspace copy is stale or
+  // missing). No findings to list; the detail line names the missing dir.
+  if (check.status === 'FAIL') {
+    console.log(`  ✗ ${check.detail}  [FAIL]`);
     return;
   }
   if (check.status === 'PASS') {
