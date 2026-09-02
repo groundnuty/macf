@@ -217,6 +217,9 @@ What the flags actually control:
               AND env-file refresh (operator opt-out for hand-modified
               launchers; does NOT roll back already-migrated workspaces)
   --dry-run   show diff + would-bump list, write nothing
+  --force     overwrite canonical rules/scripts even when the installed CLI's
+              own checkout is behind its canonical branch and would revert an
+              existing workspace file to older content
 
 Implication for reproducible bootstrap (cv-e2e-test, harness pinning, etc.):
   The CLI BINARY's installed version determines what claude.sh template lands.
@@ -240,6 +243,14 @@ Implication for reproducible bootstrap (cv-e2e-test, harness pinning, etc.):
   // canonical `--no-` semantic holds. See macf#347.
   .option('--no-migrate-env-files', 'Skip the monolithic-to-multi-file claude.sh migration AND env-file refresh (operator opt-out)')
   .option('--dry-run', 'Show the diff but do not write the config', false)
+  .option(
+    '--force',
+    'Overwrite canonical rules/scripts even when the installed CLI\'s own checkout is behind its ' +
+      'canonical branch and doing so would revert an existing workspace file to older content. ' +
+      'Without this, that specific overwrite is refused (loud, non-fatal to the rest of this run) ' +
+      '— a deliberate downgrade, not the default.',
+    false,
+  )
   .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd)')
   .action(async (opts) => {
     // Commander's --no-<flag> convention: opts.migrateEnvFiles = true by
@@ -253,6 +264,7 @@ Implication for reproducible bootstrap (cv-e2e-test, harness pinning, etc.):
       cli: opts.cli,
       plugin: opts.plugin,
       actions: opts.actions,
+      force: opts.force,
       yes: opts.yes,
       dryRun: opts.dryRun,
       confirm: opts.confirm,

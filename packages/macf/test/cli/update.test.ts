@@ -2,8 +2,9 @@
  * Tests for macf update command — PR #5 of P6 expansion.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { existsSync, mkdirSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 
 // Stub the plugin fetcher for the whole file — otherwise any test that
@@ -53,8 +54,29 @@ vi.mock('node:readline', () => ({
   }),
 }));
 
+// `findCliPackageRoot` wrapped in `vi.fn()` (delegating to the real
+// implementation by default, same shape as the `mcp-json.js` mock above) so
+// the #1386 guard-integration tests can override JUST that one call —
+// `update.ts` imports `findCliPackageRoot` from THIS module and calls it
+// once at its own top level, so redirecting it here redirects the value
+// `checkCanonicalOverwriteSafety` is asked to judge. `copyCanonicalRules` /
+// `copyCanonicalScripts` themselves are left real + unmocked: their OWN
+// internal default-parameter resolution of `findCliPackageRoot()` is a
+// same-module self-call vitest's mock does not intercept, so they always
+// copy from THIS repo's real canonical sources regardless of this mock —
+// exactly what makes the reachability assertions below meaningful (a
+// removed guard would make the real copy actually land).
+vi.mock('../../src/cli/rules.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/cli/rules.js')>();
+  return {
+    ...actual,
+    findCliPackageRoot: vi.fn(actual.findCliPackageRoot),
+  };
+});
+
 import { update, buildDiff, renderDiff } from '../../src/cli/commands/update.js';
 import { agentConfigPath } from '../../src/cli/config.js';
+import { findCliPackageRoot } from '../../src/cli/rules.js';
 import { fetchPluginToWorkspace, stripPluginMcpServers, linkPluginCliDist } from '../../src/cli/plugin-fetcher.js';
 import { mcpJsonPath, readMcpJsonChannelServerVersion, MCP_SERVER_NAME } from '../../src/cli/mcp-json.js';
 import type { ResolvedVersions } from '../../src/cli/version-resolver.js';
@@ -1060,6 +1082,150 @@ describe('update command', () => {
       expect(readFileSync(join(dir, 'claude.sh'), 'utf-8')).toBe(customLauncher);
       // No env files written under .claude/.macf/ either.
       expect(existsSync(join(dir, '.claude', '.macf', 'env.identity'))).toBe(false);
+    });
+  });
+
+  describe('canonical-overwrite guard integration (groundnuty/macf#1386)', () => {
+    // Local git-fixture helpers, matching the shape build-info.test.ts /
+    // doctor-checkout-currency.test.ts / canonical-overwrite-guard.test.ts
+    // already use — never invents a second staleness notion to test
+    // against, just a local copy of the same fixture-building idiom.
+    function git(cwd: string, ...args: string[]): string {
+      return execFileSync('git', args, { cwd, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+    }
+    function gitUserConfig(cwd: string): void {
+      git(cwd, 'config', 'user.email', 'test@example.invalid');
+      git(cwd, 'config', 'user.name', 'Test');
+      git(cwd, 'config', 'commit.gpgsign', 'false');
+    }
+    function writePackageJson(pkgDir: string, name = '@fake-scope/fake-cli'): void {
+      mkdirSync(pkgDir, { recursive: true });
+      writeFileSync(join(pkgDir, 'package.json'), JSON.stringify({ name, version: '0.0.0' }));
+    }
+    /** A stale fake CLI checkout: `behindBy` commits behind origin/main, with a `plugin/rules/coordination.md` seed of arbitrary content — the REFUSE branch never reads its bytes (the copy is skipped entirely), only its existence matters for enumeration. */
+    function makeStaleFakeCliCheckout(pkgDir: string, remote: string, behindBy: number): void {
+      mkdirSync(remote, { recursive: true });
+      git(remote, 'init', '-q', '--bare', '--initial-branch=main');
+      writePackageJson(pkgDir);
+      git(pkgDir, 'init', '-q', '-b', 'main');
+      gitUserConfig(pkgDir);
+      git(pkgDir, 'commit', '-q', '--allow-empty', '-m', 'initial');
+      git(pkgDir, 'remote', 'add', 'origin', remote);
+      git(pkgDir, 'push', '-q', '-u', 'origin', 'main');
+      // A uniquely-named throwaway clone (not a fixed name under /tmp) so
+      // sequential/parallel invocations in this describe block never race
+      // on the same path; self-cleaned so callers don't have to.
+      const throwaway = join(dirname(remote), `throwaway-clone-${Math.random().toString(36).slice(2)}`);
+      git(dirname(remote), 'clone', '-q', remote, throwaway);
+      gitUserConfig(throwaway);
+      for (let i = 0; i < behindBy; i++) {
+        git(throwaway, 'commit', '-q', '--allow-empty', '-m', `advance ${i}`);
+      }
+      git(throwaway, 'push', '-q', 'origin', 'HEAD:main');
+      rmSync(throwaway, { recursive: true, force: true });
+      git(pkgDir, 'fetch', '-q', 'origin');
+      mkdirSync(join(pkgDir, 'plugin', 'rules'), { recursive: true });
+      writeFileSync(join(pkgDir, 'plugin', 'rules', 'coordination.md'), '<!-- fake stale canonical -->\nirrelevant — the refuse branch never writes this\n');
+    }
+
+    it('REACHABILITY: refuses through the real `update()` command — a pre-existing workspace rule is left untouched when the installed CLI checkout is stale', async () => {
+      writeConfig(dir, { cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
+      mockFetchReturning({ cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
+
+      const fakeRoot = join(dir, '..', `fake-stale-cli-${Math.random().toString(36).slice(2)}`);
+      const remote = join(dir, '..', `fake-stale-remote-${Math.random().toString(36).slice(2)}.git`);
+      // A deliberately unusual count (never a small single-digit ambient
+      // drift) — this repo's OWN checkout may itself be a few commits
+      // behind origin/main at test-run time (e.g. between fetches), and if
+      // `mockReturnValueOnce` were ever silently bypassed the guard would
+      // fall through to judging THIS real checkout instead of the fixture.
+      // A distinctive count makes that failure mode assert-visible instead
+      // of coincidentally passing.
+      makeStaleFakeCliCheckout(fakeRoot, remote, 37);
+      vi.mocked(findCliPackageRoot).mockReturnValueOnce(fakeRoot);
+
+      mkdirSync(join(dir, '.claude', 'rules'), { recursive: true });
+      const sentinel = '<!-- test -->\nWORKSPACE HAS SOMETHING NEWER — must survive\n';
+      writeFileSync(join(dir, '.claude', 'rules', 'coordination.md'), sentinel);
+
+      const code = await update(dir, { all: false, cli: false, plugin: false, actions: false, yes: true, dryRun: false, force: false });
+
+      // The real copyCanonicalRules (unmocked; uses the REAL findCliPackageRoot
+      // internally regardless of the mock above — see the top-of-file mock
+      // comment) would overwrite this file with THIS repo's actual
+      // coordination.md content if the guard did not skip the call. A
+      // mutant that always proceeds makes this assertion fail.
+      expect(readFileSync(join(dir, '.claude', 'rules', 'coordination.md'), 'utf-8')).toBe(sentinel);
+      const allErrors = errorSpy.mock.calls.flat().join('\n');
+      expect(allErrors).toMatch(/Refused:/);
+      expect(allErrors).toMatch(/37 commit\(s\) behind/);
+      expect(allErrors).toContain(join('.claude', 'rules', 'coordination.md'));
+      expect(code).toBe(0); // the rest of the run still completes normally
+
+      rmSync(fakeRoot, { recursive: true, force: true });
+      rmSync(remote, { recursive: true, force: true });
+    });
+
+    it('--force overrides the refusal — the file IS overwritten, with a warning noting the override', async () => {
+      writeConfig(dir, { cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
+      mockFetchReturning({ cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
+
+      const fakeRoot = join(dir, '..', `fake-stale-cli-force-${Math.random().toString(36).slice(2)}`);
+      const remote = join(dir, '..', `fake-stale-remote-force-${Math.random().toString(36).slice(2)}.git`);
+      // Distinctive count — see the REACHABILITY test above for why.
+      makeStaleFakeCliCheckout(fakeRoot, remote, 41);
+      vi.mocked(findCliPackageRoot).mockReturnValueOnce(fakeRoot);
+
+      mkdirSync(join(dir, '.claude', 'rules'), { recursive: true });
+      const sentinel = '<!-- test -->\nWORKSPACE HAS SOMETHING NEWER — should be overwritten by --force\n';
+      writeFileSync(join(dir, '.claude', 'rules', 'coordination.md'), sentinel);
+
+      // console.warn isn't covered by the outer describe's logSpy/errorSpy
+      // (those cover console.log/console.error only) — same local-warnSpy
+      // pattern the other warning-assertion tests in this file already use.
+      // Read .mock.calls BEFORE mockRestore() — mockRestore() also clears
+      // recorded calls, same as mockReset().
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      let code: number;
+      let warnOut: string;
+      try {
+        code = await update(dir, { all: false, cli: false, plugin: false, actions: false, yes: true, dryRun: false, force: true });
+        warnOut = warnSpy.mock.calls.flat().map(String).join('\n');
+      } finally {
+        warnSpy.mockRestore();
+      }
+
+      expect(readFileSync(join(dir, '.claude', 'rules', 'coordination.md'), 'utf-8')).not.toBe(sentinel);
+      expect(warnOut).toMatch(/--force overriding a stale-CLI overwrite refusal/);
+      // The count must be the FIXTURE's (41), not some other value — proves
+      // the warning is reporting on the mocked fake checkout, not a
+      // coincidentally-matching real one.
+      expect(warnOut).toMatch(/41 commit\(s\) behind/);
+      expect(code).toBe(0);
+
+      rmSync(fakeRoot, { recursive: true, force: true });
+      rmSync(remote, { recursive: true, force: true });
+    });
+
+    it('npm-installed CLI (no .git checkout) proceeds normally — no refusal, real canonical content lands', async () => {
+      writeConfig(dir, { cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
+      mockFetchReturning({ cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
+
+      const fakeRoot = join(dir, '..', `fake-npm-install-${Math.random().toString(36).slice(2)}`);
+      writePackageJson(fakeRoot); // no git init at all — the plain npm-install shape
+      vi.mocked(findCliPackageRoot).mockReturnValueOnce(fakeRoot);
+
+      mkdirSync(join(dir, '.claude', 'rules'), { recursive: true });
+      const sentinel = 'PRE-EXISTING GARBAGE — should be overwritten normally\n';
+      writeFileSync(join(dir, '.claude', 'rules', 'coordination.md'), sentinel);
+
+      const code = await update(dir, { all: false, cli: false, plugin: false, actions: false, yes: true, dryRun: false, force: false });
+
+      expect(readFileSync(join(dir, '.claude', 'rules', 'coordination.md'), 'utf-8')).not.toBe(sentinel);
+      expect(errorSpy.mock.calls.flat().join('\n')).not.toMatch(/Refused:/);
+      expect(code).toBe(0);
+
+      rmSync(fakeRoot, { recursive: true, force: true });
     });
   });
 });
