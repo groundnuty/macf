@@ -1328,10 +1328,11 @@ rules
   .command('refresh')
   .description('Copy canonical rules + helper scripts into a workspace\'s .claude/ (does NOT require macf init)')
   .option('--dir <path>', 'Target workspace directory (defaults to current working directory)')
+  .option('--force', 'Overwrite even if the installed CLI checkout is behind canonical (deliberate downgrade, #1386/#1401)', false)
   .action((opts) => {
     const target = opts.dir ? resolve(opts.dir) : process.cwd();
     try {
-      rulesRefresh(target);
+      rulesRefresh(target, { force: opts.force });
     } catch (err) {
       console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
       process.exitCode = 1;

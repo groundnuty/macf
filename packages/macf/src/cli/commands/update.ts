@@ -23,11 +23,12 @@
  *                                   pin-bump fetch handled separately)
  *
  *    `.claude/rules/` + `.claude/scripts/` specifically are guarded by
- *    `checkCanonicalOverwriteSafety` (#1386): when the installed CLI's own
- *    checkout is behind its canonical branch AND that would overwrite an
- *    existing workspace file with different (older) content, the copy is
- *    REFUSED (loud, non-fatal to the rest of this run) instead of silently
- *    reverting it. `--force` overrides.
+ *    `copyCanonicalAssetsGuarded` / `checkCanonicalOverwriteSafety` (#1386,
+ *    shared with `init` + `rules refresh` as of #1401): when the installed
+ *    CLI's own checkout is behind its canonical branch AND that would
+ *    overwrite an existing workspace file with different (older) content,
+ *    the copy is REFUSED (loud, non-fatal to the rest of this run) instead
+ *    of silently reverting it. `--force` overrides.
  *
  * 2. **Flag-gated version bumps** — `--cli` / `--plugin` / `--actions`
  *    select which version pins in macf-agent.json get bumped to latest;
@@ -51,8 +52,8 @@ import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { readAgentConfig, writeAgentConfig, tokenSourceFromConfig, resolveCanonicalBranch } from '../config.js';
 import { resolveLatestVersions } from '../version-resolver.js';
-import { copyCanonicalRules, copyCanonicalScripts, findCliPackageRoot } from '../rules.js';
-import { checkCanonicalOverwriteSafety } from '../canonical-overwrite-guard.js';
+import { findCliPackageRoot } from '../rules.js';
+import { copyCanonicalAssetsGuarded } from '../canonical-overwrite-guard.js';
 import { fetchProjectRules, PROJECT_RULES_SOURCE_ENV } from '../project-rules.js';
 import { reportSeedPromptResponses, seedPromptResponsesConfig } from '../prompt-responses.js';
 import { reportSeedStallSignatures, seedStallSignaturesConfig } from '../stall-signatures.js';
@@ -313,31 +314,32 @@ export async function update(
   // canonical branch, the assumption inverts: refuse rather than silently
   // revert an existing workspace file to older content. `--force` is the
   // deliberate-downgrade escape; an undeterminable reference point (no
-  // origin remote, unfetched ref) never blocks the write — see
+  // origin remote, unfetched ref) never blocks the write. `#1401` moved the
+  // guard-then-copy sequence itself into `copyCanonicalAssetsGuarded`
+  // (shared with `init` + `rules refresh`, which had this exact same
+  // unguarded call — see that function's doc comment) — see
   // `checkCanonicalOverwriteSafety`'s doc comment for the full rationale.
   const canonicalBranch = resolveCanonicalBranch(config);
-  const overwriteGuard = checkCanonicalOverwriteSafety(projectDir, cliPackageRoot, canonicalBranch);
-  let skipCanonicalCopy = false;
-  if (overwriteGuard.kind === 'refuse') {
-    if (opts.force) {
-      console.warn(`Warning: --force overriding a stale-CLI overwrite refusal: ${overwriteGuard.detail}`);
+  const outcome = copyCanonicalAssetsGuarded(projectDir, {
+    packageRoot: cliPackageRoot,
+    canonicalBranch,
+    force: opts.force,
+  });
+  if (outcome.guard.kind === 'refuse') {
+    if (outcome.copied) {
+      console.warn(`Warning: --force overriding a stale-CLI overwrite refusal: ${outcome.guard.detail}`);
     } else {
-      skipCanonicalCopy = true;
-      console.error(`Refused: ${overwriteGuard.detail}`);
+      console.error(`Refused: ${outcome.guard.detail}`);
     }
-  } else if (overwriteGuard.kind === 'unknown') {
-    console.warn(`Warning: ${overwriteGuard.detail}`);
+  } else if (outcome.guard.kind === 'unknown') {
+    console.warn(`Warning: ${outcome.guard.detail}`);
   }
 
-  if (!skipCanonicalCopy) {
-    const refreshedRules = copyCanonicalRules(projectDir);
-    if (refreshedRules.length > 0) {
-      console.log(`Refreshed ${refreshedRules.length} canonical rule file(s) in .claude/rules/`);
-    }
-    const refreshedScripts = copyCanonicalScripts(projectDir);
-    if (refreshedScripts.length > 0) {
-      console.log(`Refreshed ${refreshedScripts.length} helper script(s) in .claude/scripts/`);
-    }
+  if (outcome.rules.length > 0) {
+    console.log(`Refreshed ${outcome.rules.length} canonical rule file(s) in .claude/rules/`);
+  }
+  if (outcome.scripts.length > 0) {
+    console.log(`Refreshed ${outcome.scripts.length} helper script(s) in .claude/scripts/`);
   }
 
   // Seed (if absent) / validate (if present) the interactive-prompt
