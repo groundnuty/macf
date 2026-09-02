@@ -458,7 +458,8 @@ export async function resolveLockstepVersionsOrThrow(): Promise<VersionSet> {
     throw new VersionResolutionError(
       'lockstep_versions_unresolvable',
       'fleet deploy: version resolution failed — refusing to silently pin the hardcoded default ' +
-        `versions (DR-044 Decision 6 — fail loud, fail fast):\n${failures.join('\n')}`,
+        `versions, since an unattended deploy landing on a mismatched pin is worse than an explicit ` +
+        `failure naming exactly what to fix:\n${failures.join('\n')}`,
     );
   }
 
