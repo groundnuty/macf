@@ -4,6 +4,46 @@ All notable changes to the `macf` CLI. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.60] — 2026-09-02
+
+**The release that makes the guards real.** Every npm release since the hooks moved to
+`plugin/scripts/` shipped none of them, and the fleet deploy pinned every consumer a
+hookless plugin — so no npm-installed CLI could install a PreToolUse guard, and no deployed
+agent had one in effect. Both found by measurement on the first fleet about to run, both
+fixed here, both now asserted by tests on the seam.
+
+### Fixed
+
+- **The published package omitted `plugin/scripts/`** — `files[]` was never updated when
+  the hooks moved there. `rules refresh` copied nothing and reported success; `doctor`
+  reported `8/8 scripts match` because it counted only what the package had. Now packaged;
+  a test discovers every canonical source directory the copy primitives read and asserts
+  each is in `files[]` **and runs a real `npm pack --dry-run`** to assert the guard script is
+  in the tarball; the copy primitives fail loudly when a source directory is absent;
+  `doctor` reports a missing source directory as FAIL. (#1408)
+- **The fleet deploy never passed a plugin version**, so the resolver's lookup failed in the
+  deploy context and silently fell back to `plugin: 0.2.0` — a plugin with no hooks. The
+  deploy now derives the plugin pin from `versions.macf` in lockstep with zero network
+  calls; when the manifest declares no versions, resolution failure refuses the fallback
+  loudly, naming the value it would have used and why. (#1407)
+- **The LGTM merge gate read the PR number from the wrong line** of a multi-line command —
+  every earlier line survived its line-oriented strip, so a stray `exit 1` became "PR #1",
+  a 404, and the gate's fail-open branch: it verified nothing. It now isolates the merge line
+  first, fails **closed** when the extracted number is not a pull request, and its refresh
+  diagnostic names the missing variable instead of asserting a rotated key. (#1410)
+- **`macf rules refresh` and a re-run `macf init` wrote canonical copies unguarded** — the
+  stale-CLI refusal from 0.2.59 covered only `update`. Every writer now goes through one
+  guarded helper, and a source-shape test forbids a direct call from any command.
+  `rules refresh --force` added. (#1405)
+- The substrate workspace's last tracked canonical rule copy is untracked; `.claude/rules/`
+  now holds hand-authored files only. (#1402)
+
+### Added
+
+- **A SessionStart step that warns when the workspace's registered PreToolUse guard scripts
+  or the token minter are missing** — plugin-hosted, so it survives the deletions that
+  removed the workspace-hosted hooks; never blocks; silent when all present. (#1404)
+
 ## [0.2.59] — 2026-08-31
 
 **The fleet-provisioning CLI, hardened by three weeks of live use.** 178 commits
