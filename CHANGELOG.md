@@ -4,6 +4,134 @@ All notable changes to the `macf` CLI. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.59] — 2026-08-31
+
+**The fleet-provisioning CLI, hardened by three weeks of live use.** 178 commits
+since 0.2.58. Nearly every entry below came from an operator running `macf
+bootstrap apply` against a real fleet and finding the tool lying — not from a
+test. The three fleets in the `macf-experiment` org were scaled, re-applied,
+and torn down against this code; the consent gate was rebuilt from fourteen
+defects observed in one evening.
+
+### Added
+
+- **The registry entry carries `agent_name` beside `routing_label`** — for an agent
+  whose two names legitimately differ (science), a telemetry consumer can query the
+  key the wire actually uses instead of resolving it by string heuristic. Optional;
+  absence reads as `unknown`, never as the label. Shown by `fleet status` and
+  `whoami --peers`. (#1398)
+- **`trust.federated_cas` widening is consented, not silent.** `fleet.lock` pins the
+  last-approved set by bundle fingerprint; a new peer project is named before it is
+  granted and a changed bundle surfaces as a change. First run baselines. (#1400)
+- **`macf whoami`** reads an agent's identity — project, role, routing label,
+  registry scope, App ids, cert CN, versions — from configuration and reports
+  every field with its source (`config` / `env` / `default` / `unknown`),
+  never inferring one. Lists registered peers from the registry, distinguishing
+  *none registered* from *could not look*. (#1377, #1381, #1382)
+- **`apply` is a reconciler.** DR-043 Amendment P: the verb matrix keys on
+  `fleet.lock` as the third fact, so *not ours* and *ours-but-unwanted* are
+  finally distinguishable. `update` is computed for reused resources, the
+  negative diff yields `delete` or `orphan` per resource class on the
+  revival-cost axis, and every deletion is enumerated in the consent text.
+  Orphans are rendered, never silently left. (#1261, #1270, #1286, #1292, #1294)
+- **Fleet-level trust.** `trust.federated_cas` returns — landing *with* its
+  enforcement this time — as the `collaborators[]` triple minus the registry:
+  a project name and an inline CA bundle, published once at fleet scope. (#1387)
+- **The vault records who can decrypt it.** `fleet.lock` carries
+  `age_recipients`; narrowing the set is refused as a revocation that does not
+  revoke, and a federated peer's recipient set is pinned and diffed. (#1252,
+  #1260, #1273, #1350)
+- **One operator-inputs file** — `KEY=value`, per scope with a per-fleet
+  override, resolved per key, with a template naming every credential the tool
+  cannot mint. Tailscale OAuth is accepted on a cold start. (#1188, #1228)
+- **The consent gate is an interactive loop** that announces before opening a
+  browser, uses one message source for terminal and page, names only the
+  missing repo on a resumed gate, really waits, and lets you check again or
+  cancel from the page. `apply` presents the install-widen gate when a fleet
+  scales instead of merely reporting the drift. (#1164, #1174, #1177, #1180,
+  #1181, #1182, #1225, #1233)
+- **`doctor` gained four honest checks**: disk headroom so `ENOSPC` names
+  itself; whether distributed scripts and rules match the CLI's canonical;
+  whether a repo checkout is behind `origin/main`; and a lint for a
+  project-prefixed routing label. (#1130, #1364, #1366, #1378)
+- **Three PreToolUse hooks that never block**: a closing condition is graded
+  when written and surfaced when closed; closing an issue names the open
+  issues still waiting on it. A reporter-side stall sweep composes at startup.
+  (#1222, #1247, #1287, #1388)
+- **Routing:** `MACF_ROUTING_BUNDLE` single-secret form; `repo-init` emits the
+  runner declaration the router now accepts, so a self-hosted fleet cannot fall
+  back to a metered runner. (#1118, #1369)
+- `fleet.lock` records each agent's repo; `plan` scaffolds a manifest draft
+  from live state and discloses the control repo it may write to; a scoped
+  control-repo init verb. (#1152, #1166, #1300, #1349)
+
+### Fixed
+
+- **`macf update` overwrote newer workspace files with older canonical copies when the
+  CLI's own checkout was behind `origin/main`** — deleting, among others, the rule that
+  names wrong remedies. It now refuses that specific overwrite, naming the files and
+  the lag (`--force` to downgrade deliberately); identical content and npm installs are
+  unaffected. (#1397)
+- The substrate workspace no longer tracks its installed `.claude/scripts/` copies in
+  git — they are tool-written, and a `git reset` was re-installing two-month-old hooks
+  over current ones. (#1395)
+- **`repo-init` self-pointed the registry scope**, ignoring the manifest's
+  declared target, and defaulted to `/orgs/<owner>` — which 404s on a User
+  account. Scope is now derived from the owner type, and `apply` carries the
+  declared repo through. The router had already been reading from the
+  registry for five days; reader and writer finally agree. (#1373, #1375)
+- **The CA was written into every agent repo** — four identical copies per
+  fleet. It is written once at the fleet registry scope; the superseded copies
+  are orphaned, not deleted, because the transitional fallback still reads
+  them. (#1288, #1347, #1390)
+- **`doctor`'s currency verdict sent readers to `macf update` when the CLI was
+  the stale party** — which would have overwritten newer files with older
+  ones. The verdict now names its reference point, its lag, and says *update
+  the CLI first*. (#1384)
+- **A fleet verdict said "provisioned" while routing was dead**; it now
+  inherits its weakest component, counts org-visible secrets, and follows the
+  pinned router's actual requirements. (#1216, #1218, #1226, #1246, #1258)
+- **`apply` on an established fleet could never create control-repo labels**
+  — both credential sources were structurally unavailable on a re-run. Two
+  fixes shipped merged-green-and-inert before the third read the self-healed
+  lock. (#1224, #1234, #1237, #1243)
+- **`app_manifest` and `profile` were mandatory and inert**; they are optional
+  and disclosed, closing the last two undisclosed fields. `shared.*` is
+  disclosed when declared. (#1356, #1371)
+- **Agent identity was not established on resumed sessions**; a stale token
+  hook told you to refresh a valid token instead of saying the script was
+  stale; the prompt watcher re-triggered on its own output and submitted into
+  a pane that was not ready. (#1301, #1315, #1352, #1361)
+- **Every dependabot PR was born red** because the router's gate excluded the
+  only action it was for. (#1367)
+- A missing runner token no longer aborts unrelated legs; runner presence is
+  consulted before refusing; `apply` waits for a provisioned runner and
+  resumes if interrupted; a partial or mixed-version roll exits non-zero.
+  (#1150, #1163, #1210, #1213, #1217)
+- Owner-scoped CA and App-key paths; `init` preserves operator-managed env
+  files and gates its `claude.sh` overwrite behind `--force`; explicit
+  `--dir` wins over ambient workspace env. (#1115, #1121, #1127, #1159, #1275)
+- `routing doctor` audits the routing table against reality and checks pin
+  correctness, not just consistency; a dead agent is distinguished from a
+  busy one. (#1126, #1132, #1192, #1199, #1204)
+- **Release tooling**: publish acceptance is separated from registry
+  availability, the registry check retries with a bound, and releases are
+  gated on harness-compatibility drift. (#1106, #1134, #1295, #1312)
+
+### Security
+
+- **`repo-init` now treats `macf-actions v3.5.0` as the first pin that accepts the
+  runner declaration.** The constant was deliberately `undefined` until a released tag
+  carried the input; with the tag cut, a self-hosted fleet pinned to it gets
+  `runner-runs-on` emitted and the router fails closed instead of routing to a metered
+  runner. Until this flip, pinning the new tag changed nothing. (#1399)
+- **A self-hosted fleet on a router pin that cannot honour it is refused**,
+  and `plan` surfaces a runner mismatch unasked — a declared self-hosted
+  runner must never silently route to a metered one. (#1227, #1334, #1339)
+- Router secrets are passed by name, never `secrets: inherit`; `plan` reports
+  per-repo routing-secret asymmetry. (#1341, #1342)
+- Every App-install gate enforces `repository_selection`. (#1136)
+
 ## [0.2.58] — 2026-08-21
 
 **Six silent-failure and operator-facing fixes**, spanning the LGTM merge gate, the
