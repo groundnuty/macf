@@ -85,9 +85,34 @@ fi
 # the first bare integer token (not preceded by `=` so it's not a flag
 # value like `--retries=3`).
 PR_NUMBER=""
+# groundnuty/macf#1409 defect 1: `sed` is line-oriented (it applies its
+# substitution independently to EACH line of a multi-line $COMMAND, then
+# prints every line — matched-and-stripped or not). Stripping the
+# `gh pr merge ` prefix against the WHOLE (possibly multi-line) $COMMAND
+# therefore leaves every line BEFORE the actual merge line completely
+# untouched in the output, and the forward token walk below then finds
+# the first bare integer on ANY earlier line — not necessarily the PR
+# number (a `seq 1 8` or a `|| exit 1` on a preamble line reproduces
+# this). The `[[ "$COMMAND" =~ $GH_MERGE_PATTERN ]]` match above is NOT
+# line-oriented (bash's `=~` matches over the whole string), which is
+# why detection above already worked on multi-line commands while
+# extraction below did not.
+#
+# Fix: isolate the SINGLE line that actually contains the merge
+# invocation first — `grep -E` IS line-oriented, so feeding it the same
+# two patterns used for detection correctly selects only that line even
+# though the multi-line string as a whole is what matched above — then
+# run the existing sed strip against that line alone.
+MERGE_LINE="$(grep -E "${GH_MERGE_PATTERN}|${SHELL_C_GH_MERGE_PATTERN}" <<<"$COMMAND" 2>/dev/null | head -n1 || echo "")"
+if [[ -z "$MERGE_LINE" ]]; then
+  # Unreachable in practice — $COMMAND already matched one of the two
+  # patterns above (or we would have exited 0 already). Guard anyway:
+  # fail open rather than operate on an empty line.
+  exit 0
+fi
 # Strip leading wrappers up to and including `gh pr merge`. Use sed
 # with extended regex to find the gh-pr-merge prefix and remove it.
-TAIL="$(sed -E 's/^.*gh[[:space:]]+pr[[:space:]]+merge[[:space:]]+//' <<<"$COMMAND" 2>/dev/null || echo "")"
+TAIL="$(sed -E 's/^.*gh[[:space:]]+pr[[:space:]]+merge[[:space:]]+//' <<<"$MERGE_LINE" 2>/dev/null || echo "")"
 if [[ -z "$TAIL" ]]; then
   # No tail after `gh pr merge` — likely the operator is invoking with
   # no args (interactive prompt). Allow; the command will fail at gh
@@ -247,14 +272,21 @@ fi
 #
 # Posture past that retry (macf#938's actual decision point): the ORIGINAL
 # "any failure (gh missing, network, 404, auth) → fail-open" blanket is now
-# split in two —
-#   - other_failed (gh missing / network down / 404 / malformed args):
-#     UNCHANGED — still fails open. A hook that blocks every merge because
-#     GitHub itself is unreachable would be its own outage, and `gh pr
-#     merge` needs that same connectivity to succeed anyway, so failing
-#     open here doesn't let a merge through GitHub couldn't also perform.
+# split in three —
+#   - not_found (the extracted PR number does not resolve to a pull
+#     request — groundnuty/macf#1409 defect 1's fallback): fails CLOSED.
+#     Before the line-isolation fix above, EVERY multi-line merge command
+#     could extract the wrong number and land here; even after that fix,
+#     a wrong-line extraction bug or a genuinely stale PR number must not
+#     silently verify nothing — see the dedicated branch below.
+#   - other_failed (gh missing / network down / malformed args / a real
+#     infrastructure 404 that ISN'T the not_found shape above): UNCHANGED
+#     — still fails open. A hook that blocks every merge because GitHub
+#     itself is unreachable would be its own outage, and `gh pr merge`
+#     needs that same connectivity to succeed anyway, so failing open
+#     here doesn't let a merge through GitHub couldn't also perform.
 #   - auth_failed (the credential is expired/invalid AND a refresh attempt
-#     also failed to fix it): fails CLOSED instead. This is NOT "GitHub is
+#     also failed to fix it): fails CLOSED. This is NOT "GitHub is
 #     unreachable" — it is "this workspace's credential is broken", which
 #     is a locally fixable condition, not an outage. A merge gate that
 #     cannot ask GitHub whether an approval exists must not read that
@@ -268,19 +300,27 @@ GH_RC=0
 # shellcheck disable=SC2086
 PR_JSON="$(macf_hook_gh pr view "$PR_NUMBER" $REPO_FLAG --json author,reviews,comments)" || GH_RC=$?
 
+# Signature of gh's own "this number isn't a pull request" response — the
+# GraphQL form (`gh pr view` always queries via GraphQL) reads "Could not
+# resolve to a PullRequest with the number of N. (repository.pullRequest)"
+# (verified live, gh 2.95.0); the REST-shaped "Not Found (HTTP 404)" form
+# is matched too, belt-and-suspenders, in case a future gh version or a
+# different endpoint shape surfaces this differently. Deliberately narrow
+# — must NOT match generic infra text like "network is down" or "Permission
+# denied" (missing-gh-binary), which stay in the unchanged other_failed
+# fail-open path below.
+PR_NOT_FOUND_PATTERN='[Cc]ould not resolve to a [Pp]ull ?[Rr]equest|[Nn]ot Found \(HTTP 404\)'
+
 if [[ "$GH_RC" -eq 1 ]]; then
   cat >&2 <<ERR
 BLOCKED by MACF lgtm-gate hook: could not verify PR #${PR_NUMBER}'s review
-state. ${PR_JSON}
+state — ${PR_JSON}
 
 This is NOT "no approval exists" — it is "the check could not ask GitHub".
-The credential this hook needs to verify a merge is expired or invalid, and
-refreshing it did not fix it. A merge gate that cannot verify must not
-silently allow the merge through.
-
-Likely causes: this workspace's APP_ID / INSTALL_ID / KEY_PATH are wrong,
-the App's private key was rotated without updating this workspace, or
-GitHub's own auth service is down (rare).
+A merge gate that cannot verify must not silently allow the merge through.
+See the diagnostic above for the specific cause (it names the failure —
+a missing launch-env variable, a bad/rotated App key, or GitHub's own auth
+service being down — rather than guessing here).
 
 Fix the credential, then retry the merge:
   GH_TOKEN=\$("\$MACF_WORKSPACE_DIR/.claude/scripts/macf-gh-token.sh" \\
@@ -292,10 +332,36 @@ missing-LGTM block) is launch-time / operator only: MACF_SKIP_LGTM_CHECK=1, set
 before ./claude.sh launches.
 ERR
   exit 2
+elif [[ "$GH_RC" -eq 2 ]] && [[ "$PR_JSON" =~ $PR_NOT_FOUND_PATTERN ]]; then
+  # groundnuty/macf#1409 defect 1's fallback: the number this hook
+  # extracted from the command does not resolve to a pull request. This
+  # must NOT fall into the generic other_failed fail-open branch below —
+  # that was exactly how the wrong-line-extraction bug went undetected
+  # (a 404 on the wrong number silently verified nothing). Distinct from
+  # both "no approval exists" and "credential failed".
+  cat >&2 <<ERR
+BLOCKED by MACF lgtm-gate hook: could not resolve which PR this command
+merges (extracted #${PR_NUMBER} is not a pull request).
+
+${PR_JSON}
+
+A merge gate that cannot identify which PR a command targets must not
+guess, and must not silently allow the merge through. If PR #${PR_NUMBER}
+is genuinely wrong, this hook misread the PR number out of the command
+(e.g. from a multi-line or otherwise unusual invocation) — please report
+the exact \`gh pr merge\` command as a bug (groundnuty/macf#1409). If
+#${PR_NUMBER} really is the intended PR, confirm it exists and is a pull
+request (not an issue) on the target repo before retrying.
+
+Override (ONLY for a reporter-sanctioned exception, same escape hatch as a
+missing-LGTM block) is launch-time / operator only: MACF_SKIP_LGTM_CHECK=1, set
+before ./claude.sh launches.
+ERR
+  exit 2
 elif [[ "$GH_RC" -ne 0 ]]; then
   # other_failed — unchanged posture: a genuine infrastructure failure
-  # (network down, gh missing, malformed args, a real 404) still fails
-  # open, exactly as before this fix.
+  # (network down, gh missing, malformed args) still fails open, exactly
+  # as before this fix.
   exit 0
 fi
 

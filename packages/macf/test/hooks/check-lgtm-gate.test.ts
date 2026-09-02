@@ -675,6 +675,59 @@ describe('check-lgtm-gate.sh (hook)', () => {
       });
       expect(r.status).toBe(0);
     });
+
+    it('DECISIVE (groundnuty/macf#1409 defect 1): a multi-line command extracts the PR number from the MERGE line, not an earlier line', () => {
+      // Reproduction straight from the issue: a preamble line containing
+      // a bare integer (from `seq 1 8`) precedes the actual merge line.
+      // `sed`'s line-oriented strip used to leave the preamble line
+      // untouched, and the forward token walk found "1" first — a
+      // number that isn't the PR being merged. Stub BOTH "1" (approved
+      // — would WRONGLY allow the merge if the bug regressed) and
+      // "1407" (no reviews — correctly BLOCKS) so the assertion is
+      // decisive about which number the hook actually queried, not just
+      // "some exit code came back."
+      const r = runHook({
+        command: 'for i in $(seq 1 8); do :; done\nGH_TOKEN=x gh pr merge 1407 --repo owner/repo --squash',
+        stubGh: {
+          '1': {
+            authorLogin: 'app/macf-code-agent',
+            reviews: [{ authorLogin: 'macf-science-agent', state: 'APPROVED' }],
+          },
+          '1407': { authorLogin: 'app/macf-code-agent', reviews: [] },
+        },
+      });
+      expect(r.status).toBe(2);
+      expect(r.stderr).toMatch(/PR #1407/);
+      expect(r.stderr).toMatch(/no non-author APPROVED/i);
+    });
+
+    it('a single-line command is unaffected by the merge-line isolation fix', () => {
+      const r = runHook({
+        command: 'gh pr merge 1408 --repo owner/repo --squash',
+        stubGh: {
+          '1408': {
+            authorLogin: 'app/macf-code-agent',
+            reviews: [{ authorLogin: 'macf-science-agent', state: 'APPROVED' }],
+          },
+        },
+      });
+      expect(r.status).toBe(0);
+    });
+
+    it('a multi-line command with the merge on the FIRST line (preamble after) still extracts correctly', () => {
+      // Symmetric case to the decisive test above — the merge line need
+      // not be last. `head -n1` on the grep match picks the first LINE
+      // that matches the merge pattern, which is this one (the only
+      // line that matches at all).
+      const r = runHook({
+        command: 'gh pr merge 1409 --repo owner/repo --squash\necho done afterwards',
+        stubGh: {
+          '1409': { authorLogin: 'app/macf-code-agent', reviews: [] },
+        },
+      });
+      expect(r.status).toBe(2);
+      expect(r.stderr).toMatch(/PR #1409/);
+    });
   });
 
   describe('defense-in-depth — fail-open on infrastructure errors', () => {
@@ -744,6 +797,71 @@ describe('check-lgtm-gate.sh (hook)', () => {
         input: '',
         env: { PATH: process.env['PATH'] ?? '' },
         encoding: 'utf-8',
+      });
+      expect(r.status).toBe(0);
+    });
+  });
+
+  describe('PR-not-found fails CLOSED (groundnuty/macf#1409 defect 1 fallback)', () => {
+    // `gh pr view` always queries via GraphQL, so a nonexistent-as-PR
+    // number (an issue number, a stale/deleted PR, or a wrong-line
+    // extraction) surfaces as this exact shape — verified live against
+    // gh 2.95.0: `GraphQL: Could not resolve to a PullRequest with the
+    // number of N. (repository.pullRequest)`, exit 1. This is distinct
+    // from BOTH the generic StubMap `null` shape used in the
+    // "defense-in-depth" describe block above (a plain "not found" stub
+    // message that must NOT trigger this branch — it stays fail-open,
+    // unchanged) and from the auth-failure shape (HTTP 401 / Bad
+    // credentials) used in "credential-refresh" below.
+    function makeNotFoundStubGhDir(): string {
+      const dir = mkdtempSync(join(tmpdir(), 'macf-lgtm-notfound-gh-'));
+      const stubScript = `#!/usr/bin/env bash
+if [[ "\${1:-}" == "pr" && "\${2:-}" == "view" ]]; then
+  echo "GraphQL: Could not resolve to a PullRequest with the number of 1. (repository.pullRequest)" >&2
+  exit 1
+fi
+exit 64
+`;
+      const ghPath = join(dir, 'gh');
+      writeFileSync(ghPath, stubScript);
+      chmodSync(ghPath, 0o755);
+      return dir;
+    }
+
+    it('blocks (fails CLOSED) when the extracted PR number is not a pull request — distinct message', () => {
+      const stubDir = makeNotFoundStubGhDir();
+      try {
+        const r = spawnSync('bash', [HOOK_SCRIPT], {
+          input: JSON.stringify({
+            session_id: 'test',
+            tool_name: 'Bash',
+            tool_input: { command: 'gh pr merge 1 --repo owner/repo --squash' },
+          }),
+          env: { PATH: `${stubDir}:${process.env['PATH'] ?? ''}` },
+          encoding: 'utf-8',
+        });
+        expect(r.status).toBe(2);
+        // The block text wraps at 80 cols, so allow whitespace (incl. a
+        // newline) between "command" and "merges".
+        expect(r.stderr).toMatch(/could not resolve which PR this command\s+merges/i);
+        expect(r.stderr).toMatch(/extracted #1 is not a pull request/i);
+        // Distinct from the other two BLOCKED messages this hook can emit.
+        expect(r.stderr).not.toMatch(/no non-author APPROVED/i);
+        expect(r.stderr).not.toMatch(/could not verify PR #1's review/i);
+      } finally {
+        rmSync(stubDir, { recursive: true, force: true });
+      }
+    });
+
+    it('a generic (non-GraphQL-shaped) gh failure for the same PR number stays fail-open, unchanged', () => {
+      // Sanity check on the detection pattern's narrowness: the
+      // StubMap `null` shape (used throughout this file) emits a
+      // generic "stub gh: PR N not found" message that must NOT match
+      // the GraphQL not-found signature — confirms the new branch is
+      // additive, not a widening of what already fails open.
+      const r = runHook({
+        command: 'gh pr merge 1 --repo owner/repo --squash',
+        stubGh: { '1': null },
       });
       expect(r.status).toBe(0);
     });
@@ -879,6 +997,57 @@ JSON_EOF
         expect(r.stderr).toMatch(/could not verify/i);
       } finally {
         rmSync(ws, { recursive: true, force: true });
+      }
+    });
+
+    it('defect 2 (groundnuty/macf#1409): with no workspace at all, the diagnostic names the helper as unreachable — not a rotated-key guess', () => {
+      // Same fixture as the "DECISIVE" test above (no `workspace` passed
+      // to runTokenAwareHook, so neither MACF_WORKSPACE_DIR nor
+      // APP_ID/INSTALL_ID/KEY_PATH are set) — asserts the SPECIFIC,
+      // cause-naming diagnostic text this fix adds, distinct from the
+      // "vars present but the helper itself failed" case above and the
+      // "helper reachable but vars absent" case below.
+      const r = runTokenAwareHook({ ambientToken: EXPIRED, pr: WITH_APPROVAL });
+      expect(r.status).toBe(2);
+      expect(r.stderr).toMatch(/token-minting helper \(macf-gh-token\.sh\) was not found/i);
+    });
+
+    it('defect 2 (groundnuty/macf#1409): the incident\'s actual root cause — a reachable helper but APP_ID/INSTALL_ID/KEY_PATH absent — names the missing vars and does NOT blame a rotated key', () => {
+      // Reproduces the issue's diagnosed root cause precisely: the
+      // hook's launch env carried MACF_WORKSPACE_DIR (so the refresh
+      // helper IS discoverable and, per `makeWorkspace({ succeeds: true
+      // })`, would succeed if invoked) but not the App identity vars
+      // the helper needs to mint a token. Before this fix, this
+      // situation surfaced the same generic "...and the App private key
+      // in this workspace" line as every other refresh failure — wrong
+      // diagnosis, since nothing here is rotated; the vars are just
+      // absent from this session's launch env.
+      const ws = makeWorkspace({ succeeds: true });
+      const stubDir = makeTokenAwareStubGhDir(WITH_APPROVAL);
+      try {
+        const r = spawnSync('bash', [HOOK_SCRIPT], {
+          input: JSON.stringify({
+            session_id: 'test',
+            tool_name: 'Bash',
+            tool_input: { command: 'gh pr merge 900 --repo owner/repo --squash' },
+          }),
+          env: {
+            PATH: `${stubDir}:${process.env['PATH'] ?? ''}`,
+            GH_TOKEN: EXPIRED,
+            MACF_WORKSPACE_DIR: ws,
+            // APP_ID / INSTALL_ID / KEY_PATH deliberately OMITTED.
+          },
+          encoding: 'utf-8',
+        });
+        expect(r.status).toBe(2);
+        expect(r.stderr).toMatch(/missing:.*APP_ID/);
+        expect(r.stderr).toMatch(/INSTALL_ID/);
+        expect(r.stderr).toMatch(/KEY_PATH/);
+        expect(r.stderr).toMatch(/not a rotated key/i);
+        expect(r.stderr).not.toMatch(/private key was rotated/i);
+      } finally {
+        rmSync(ws, { recursive: true, force: true });
+        rmSync(stubDir, { recursive: true, force: true });
       }
     });
 

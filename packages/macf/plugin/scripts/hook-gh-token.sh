@@ -55,15 +55,28 @@
 #                       produce a token) hit an authentication failure.
 #                       stdout = a short, human-readable, TOKEN-FREE
 #                       diagnostic line (NOT gh's stdout, which is empty on
-#                       a failed call anyway). Callers MUST treat this as
-#                       "could not verify", never as "verified fine" — see
-#                       check-lgtm-gate.sh for the load-bearing case this
-#                       distinction exists for.
+#                       a failed call anyway). groundnuty/macf#1409: this
+#                       diagnostic now NAMES the specific cause (which
+#                       launch-env var was absent, vs. the helper itself
+#                       failing, vs. the helper being missing) rather than
+#                       a single generic "check your credential" line —
+#                       callers should surface it verbatim rather than
+#                       inventing their own guess (e.g. "rotated key").
+#                       Callers MUST treat this as "could not verify",
+#                       never as "verified fine" — see check-lgtm-gate.sh
+#                       for the load-bearing case this distinction exists
+#                       for.
 #     2  other_failed   gh failed for a reason that is not authentication
 #                       (network down, 404, malformed args, gh missing,
 #                       etc.) — unchanged posture from before this file
 #                       existed. stdout = a short diagnostic line, same
-#                       shape as auth_failed.
+#                       shape as auth_failed. This function does NOT
+#                       distinguish a "not a pull request" 404 from any
+#                       other other_failed cause — a caller that needs
+#                       that distinction (check-lgtm-gate.sh does, per
+#                       groundnuty/macf#1409) inspects this diagnostic
+#                       text itself rather than this file growing a new
+#                       return code for one caller's classification.
 #
 #   Callers under `set -e` must guard the call the same way any other
 #   command whose non-zero exit is meaningful would be guarded:
@@ -73,11 +86,13 @@
 #   the calling script before it gets a chance to branch on the failure —
 #   see feedback_set_e_bare_substitution_aborts.md.)
 #
-# Refs: groundnuty/macf#938 (this file); macf#317 (the refresh pattern this
-# mirrors for the channel-server); silent-fallback-hazards.md Instance 1
-# (expiry sub-case); pr-discipline.md's fail-open posture (the paragraph
-# this narrows — an expired/invalid credential is fixable, unlike a
-# genuinely unreachable GitHub).
+# Refs: groundnuty/macf#938 (this file); groundnuty/macf#1409 (diagnostic
+# naming — this file's cause-specific stderr text, "diagnostics only" per
+# that issue's scope); macf#317 (the refresh pattern this mirrors for the
+# channel-server); silent-fallback-hazards.md Instance 1 (expiry sub-case);
+# pr-discipline.md's fail-open posture (the paragraph this narrows — an
+# expired/invalid credential is fixable, unlike a genuinely unreachable
+# GitHub).
 
 # Detect an authentication-failure shape in gh's stderr. Matches both the
 # REST-endpoint form (`gh: Bad credentials (HTTP 401)`) and the GraphQL
@@ -116,21 +131,57 @@ _macf_hook_token_helper_path() {
 # nothing can accidentally end up inside a variable a caller might log or
 # echo). On any failure (helper missing, APP_ID/INSTALL_ID/KEY_PATH unset,
 # the helper itself errors, or its output isn't shaped like an installation
-# token) prints nothing and returns 1. NEVER prints the token to stderr or
-# to any diagnostic string anywhere in this file.
+# token) prints nothing to stdout, WRITES A ONE-LINE CAUSE TO STDERR (never
+# the token — that path is unaffected by this), and returns 1.
+#
+# groundnuty/macf#1409 defect 2: this used to fail silently (`return 1`
+# with no diagnostic), which forced the caller in macf_hook_gh below to
+# guess a single generic cause ("...and the App private key in this
+# workspace") regardless of what actually went wrong. The observed
+# incident's real cause was the hook's LAUNCH ENV never carrying
+# APP_ID/INSTALL_ID/KEY_PATH at all — not a rotated key — so the stderr
+# line here now says WHICH of the three was absent, distinctly from "the
+# helper itself failed" (bad key / wrong App / installation ID) and from
+# "the helper wasn't even found".
 _macf_hook_refresh_token() {
   local helper token rc=0
-  helper="$(_macf_hook_token_helper_path)" || return 1
-  if [[ -z "${APP_ID:-}" || -z "${INSTALL_ID:-}" || -z "${KEY_PATH:-}" ]]; then
+  helper="$(_macf_hook_token_helper_path)" || {
+    echo "the token-minting helper (macf-gh-token.sh) was not found in this workspace (checked MACF_WORKSPACE_DIR, CLAUDE_PROJECT_DIR, and .)" >&2
+    return 1
+  }
+
+  local missing=()
+  [[ -z "${APP_ID:-}" ]] && missing+=("APP_ID")
+  [[ -z "${INSTALL_ID:-}" ]] && missing+=("INSTALL_ID")
+  [[ -z "${KEY_PATH:-}" ]] && missing+=("KEY_PATH")
+  if [[ "${#missing[@]}" -gt 0 ]]; then
+    # NOTE: `IFS=', '; "${missing[*]}"` would NOT work here — `${array[*]}`
+    # joins using only the FIRST character of IFS, so a 2-char separator
+    # silently degrades to a 1-char one. Join explicitly instead.
+    local joined="" item
+    for item in "${missing[@]}"; do
+      if [[ -n "$joined" ]]; then
+        joined+=", "
+      fi
+      joined+="$item"
+    done
+    echo "this hook's launch environment is missing: ${joined} — not a rotated key; set these in the workspace's .claude/.macf/env.* files (or the launch env) and relaunch" >&2
     return 1
   fi
+
   token="$("$helper" --app-id "$APP_ID" --install-id "$INSTALL_ID" --key "$KEY_PATH" 2>/dev/null)" || rc=$?
-  [[ "$rc" -eq 0 ]] || return 1
+  if [[ "$rc" -ne 0 ]]; then
+    echo "the token-minting helper (macf-gh-token.sh) exited non-zero — the App private key may be missing, wrong, or rotated, or APP_ID/INSTALL_ID may be incorrect for this workspace" >&2
+    return 1
+  fi
   # Full-shape check, matching the canonical predicate (`^ghs_[A-Za-z0-9._-]+$`,
   # claude-sh.ts / check-gh-token.sh) — NOT a prefix check. Widened for the v3
   # installation-token format (`ghs_<install-id>_<JWT>`, dot-separated JWT
   # segments) alongside the classic opaque form.
-  [[ "$token" =~ ^ghs_[A-Za-z0-9._-]+$ ]] || return 1
+  if ! [[ "$token" =~ ^ghs_[A-Za-z0-9._-]+$ ]]; then
+    echo "the token-minting helper produced output that isn't shaped like an installation token" >&2
+    return 1
+  fi
   printf '%s' "$token"
 }
 
@@ -162,8 +213,21 @@ macf_hook_gh() {
   # exactly once and retry exactly once. No further retries: a second
   # failure past a fresh mint means the problem isn't the ambient token's
   # staleness.
-  local fresh=""
-  fresh="$(_macf_hook_refresh_token)" || fresh=""
+  #
+  # Capture _macf_hook_refresh_token's stderr diagnostic (groundnuty/macf#1409
+  # defect 2) via a second temp file — a plain `2>&1` merge would risk the
+  # diagnostic text ending up interleaved into `fresh` (stdout carries the
+  # token on success), and this function's contract is that stdout NEVER
+  # carries anything but the token or nothing.
+  local fresh="" refresh_diag="" refresh_errfile=""
+  refresh_errfile="$(mktemp 2>/dev/null)" || refresh_errfile=""
+  if [[ -n "$refresh_errfile" ]]; then
+    fresh="$(_macf_hook_refresh_token 2>"$refresh_errfile")" || fresh=""
+    refresh_diag="$(cat "$refresh_errfile" 2>/dev/null || true)"
+    rm -f "$refresh_errfile"
+  else
+    fresh="$(_macf_hook_refresh_token 2>/dev/null)" || fresh=""
+  fi
   if [[ -n "$fresh" ]]; then
     : > "$errfile"
     rc=0
@@ -183,6 +247,10 @@ macf_hook_gh() {
   fi
 
   rm -f "$errfile"
-  printf 'the ambient GitHub token is expired or invalid, and refreshing it failed — check APP_ID/INSTALL_ID/KEY_PATH and the App private key in this workspace'
+  if [[ -n "$refresh_diag" ]]; then
+    printf 'the ambient GitHub token is expired or invalid, and refreshing it failed: %s' "$(tr '\n' ' ' <<<"$refresh_diag" | cut -c1-220)"
+  else
+    printf 'the ambient GitHub token is expired or invalid, and refreshing it failed'
+  fi
   return 1
 }
