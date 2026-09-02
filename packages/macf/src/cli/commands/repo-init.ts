@@ -178,31 +178,41 @@ export function isBundleCapableActionsVersion(version: string): boolean {
  * declared-self-hosted fleet's job rather than silently relocating it to a
  * metered `ubuntu-latest` runner.
  *
- * Deliberately `undefined`, NOT a guessed tag. Verified live 2026-08-30
- * (`gh api repos/groundnuty/macf-actions/tags`): the latest RELEASED full
- * tag is `v3.4.2`, cut before #83 merged — #83 landed on macf-actions'
- * `main` (commit `7316fec2`) and has not shipped in any tag yet. This is
- * the exact class {@link MIN_BUNDLE_CAPABLE_ACTIONS_VERSION} warns about:
- * that constant named `v3.5.0` while no such tag existed, so every real
- * pin fell through its gate and the fix it guarded was unreachable for
- * months (see the `generateWorkflow — explicit six-secret emission for a
- * v3+ non-bundle pin` test block's own citation of that incident). This
- * constant does not repeat the mistake — it stays `undefined` (meaning NO
- * released tag is treated as capable) until an operator bumps it to the
- * real tag once macf-actions actually cuts a release containing #83
- * (`git tag --contains 7316fec2` on that repo names it).
+ * Bumped to `v3.5.0` 2026-09-02 — verified live, not guessed: `gh api
+ * repos/groundnuty/macf-actions/compare/7316fec...v3.5.0 --jq .status`
+ * returned `"ahead"` (`v3.5.0`'s history contains commit `7316fec2`, i.e.
+ * #83), and `gh api
+ * repos/groundnuty/macf-actions/contents/.github/workflows/agent-router.yml?ref=v3.5.0`
+ * decoded to a workflow body containing 7 occurrences of `runner-runs-on`.
+ * `v3.5.0` is a real released tag shipping #83.
+ *
+ * History — why this constant sat at `undefined` before today, and why the
+ * type annotation stays `string | undefined` rather than narrowing to
+ * `string` (an operator may need to unset it again the same way): verified
+ * live 2026-08-30 (`gh api repos/groundnuty/macf-actions/tags`), the latest
+ * RELEASED full tag was then `v3.4.2`, cut before #83 merged — #83 had
+ * landed only on macf-actions' `main` (commit `7316fec2`) and had not
+ * shipped in any tag. This is the exact class
+ * {@link MIN_BUNDLE_CAPABLE_ACTIONS_VERSION} warns about: that constant
+ * named `v3.5.0` while no such tag existed, so every real pin fell through
+ * its gate and the fix it guarded was unreachable for months (see the
+ * `generateWorkflow — explicit six-secret emission for a v3+ non-bundle
+ * pin` test block's own citation of that incident). This constant avoided
+ * repeating the mistake by staying `undefined` (meaning NO released tag was
+ * treated as capable) until an operator verified — with the two live reads
+ * above — that a real released tag actually shipped #83, and bumped it.
  * {@link isRunnerRunsOnCapableActionsVersion} treats `main` as capable
  * regardless — the same "dev branch always current" convention
  * {@link isV3PlusActionsVersion} and {@link isBundleCapableActionsVersion}
  * already use.
  */
-export const MIN_RUNNER_RUNS_ON_CAPABLE_ACTIONS_VERSION: string | undefined = undefined;
+export const MIN_RUNNER_RUNS_ON_CAPABLE_ACTIONS_VERSION: string | undefined = 'v3.5.0';
 
 /**
  * True only for `main`, or a FULLY-PINNED tag at/above
- * {@link MIN_RUNNER_RUNS_ON_CAPABLE_ACTIONS_VERSION} once that constant
- * names a real released tag (it does not today — see its doc). Compares
- * major.minor.PATCH, unlike {@link isBundleCapableActionsVersion}'s
+ * {@link MIN_RUNNER_RUNS_ON_CAPABLE_ACTIONS_VERSION} (`v3.5.0` as of
+ * 2026-09-02 — see that constant's doc for the live verification).
+ * Compares major.minor.PATCH, unlike {@link isBundleCapableActionsVersion}'s
  * major.minor-only comparison: #83 could ship as a patch release of the
  * existing v3.4 line just as easily as a new minor, and this function must
  * not treat an already-released PATCH below the eventual threshold (e.g.
@@ -1083,9 +1093,10 @@ export async function repoInit(
         // above, a maintainer-facing surface, for the actual references).
         process.stderr.write(
           `Warning: routing.runner.runs_on is declared ("${opts.routingRunnerRunsOn}") but the pinned macf-actions ` +
-            `router "${pinnedVersion}" does not accept the runner-runs-on input — no released macf-actions tag does ` +
-            'yet; only the unreleased "main" carries it. The generated agent-router.yml will NOT declare this ' +
-            'runner intent to the router; re-run repo-init once macf-actions releases a capable tag.\n',
+            `router "${pinnedVersion}" does not accept the runner-runs-on input — that requires macf-actions ` +
+            `${MIN_RUNNER_RUNS_ON_CAPABLE_ACTIONS_VERSION} or later (or the unreleased "main"). The generated ` +
+            'agent-router.yml will NOT declare this runner intent to the router; re-run repo-init with an ' +
+            `actionsVersion pin at or above ${MIN_RUNNER_RUNS_ON_CAPABLE_ACTIONS_VERSION}.\n`,
         );
       }
     }

@@ -505,16 +505,23 @@ describe('isBundleCapableActionsVersion (groundnuty/macf#1112)', () => {
   });
 });
 
-// groundnuty/macf#1368 — verified live 2026-08-30 (`gh api
-// repos/groundnuty/macf-actions/tags`): the latest RELEASED full tag is
-// v3.4.2, cut before macf-actions#83 merged. #83 landed only on main
-// (7316fec2). So NO released tag accepts `runner-runs-on` today — every
-// full tag, including the newest one, must read false here. This is the
-// decisive difference from `isBundleCapableActionsVersion` above: that
-// predicate's threshold names a version (`v3.5.0`) the constant COULD be
-// bumped to reflect once released; this one is pinned to `undefined`
-// (see the constant's own doc for why — repeating #1338's mistake is
-// exactly what this issue exists to avoid).
+// groundnuty/macf#1368 — verified live 2026-09-02 (`gh api
+// repos/groundnuty/macf-actions/compare/7316fec...v3.5.0 --jq .status` ->
+// "ahead"; `gh api .../contents/.github/workflows/agent-router.yml?ref=v3.5.0`
+// decodes to a body containing `runner-runs-on`): macf-actions v3.5.0 is a
+// real released tag shipping #83, so
+// `MIN_RUNNER_RUNS_ON_CAPABLE_ACTIONS_VERSION` was bumped from `undefined`
+// to `'v3.5.0'` (see the constant's own doc for the full history — this is
+// the moment `isBundleCapableActionsVersion`'s doc warned about avoiding:
+// bump only once the tag is verified to actually exist and actually carry
+// the feature, never guess ahead of the release). `v3.4.2` and `v3.4.9`
+// both fail on the MINOR check (4 < 5) at this threshold — neither
+// exercises the function's PATCH-level branch (that only fires once
+// MIN's own patch is nonzero, which `v3.5.0`'s isn't; see
+// `isRunnerRunsOnCapableActionsVersion`'s own doc for why the comparison
+// is major.minor.PATCH regardless — a future minor bump with a nonzero
+// patch, e.g. `v3.6.2`, is where this table would need a same-minor
+// below-patch row to actually cover that branch).
 describe('isRunnerRunsOnCapableActionsVersion (groundnuty/macf#1368)', () => {
   it.each([
     ['main', true],
@@ -524,8 +531,11 @@ describe('isRunnerRunsOnCapableActionsVersion (groundnuty/macf#1368)', () => {
     ['v3.4.0', false],
     ['v3.4.1', false],
     ['v3.4.2', false],
-    ['v3.5.0', false],
-    ['v4.0.0', false],
+    ['v3.4.9', false],
+    ['v3.5.0', true],
+    ['v3.5.1', true],
+    ['v3.6.0', true],
+    ['v4.0.0', true],
   ] as const)('%s -> %s', (ver, expected) => {
     expect(isRunnerRunsOnCapableActionsVersion(ver)).toBe(expected);
   });
@@ -551,6 +561,27 @@ describe('generateWorkflow — runner-runs-on emission (groundnuty/macf#1368)', 
     });
   });
 
+  // `main` in DECISIVE 1 above bypasses MIN_RUNNER_RUNS_ON_CAPABLE_ACTIONS_VERSION
+  // entirely (isRunnerRunsOnCapableActionsVersion short-circuits `main` to
+  // true regardless of the constant's value) — it does NOT prove the real
+  // threshold governs emission. This test pins to the LITERAL threshold
+  // value ('v3.5.0'), not a reference to the constant itself — pinning to
+  // the constant would make this circular (version === MIN is trivially
+  // >= MIN for any value the constant could hold, so the assertion would
+  // pass no matter what MIN_RUNNER_RUNS_ON_CAPABLE_ACTIONS_VERSION says).
+  // Mutate the constant to `undefined` OR to a version above 'v3.5.0'
+  // (e.g. 'v3.6.0') and this test fails, where DECISIVE 1 (pinned to
+  // `main`) would not have caught either regression.
+  it('DECISIVE 1b: the threshold pin itself (not just "main") emits runner-runs-on', () => {
+    const yaml = generateWorkflow('v3.5.0', { ...v3Inputs, runnerRunsOn: 'self-hosted' });
+    const parsed = parseYaml(yaml) as { jobs: { route: { with: unknown } } };
+    expect(parsed.jobs.route.with).toEqual({
+      project: v3Inputs.project,
+      'registry-api-path': v3Inputs.registryApiPath,
+      'runner-runs-on': 'self-hosted',
+    });
+  });
+
   it('DECISIVE 2: declares nothing -> generated caller byte-identical to today', () => {
     const withoutField = generateWorkflow('main', v3Inputs);
     const withUndefinedField = generateWorkflow('main', { ...v3Inputs, runnerRunsOn: undefined });
@@ -559,11 +590,12 @@ describe('generateWorkflow — runner-runs-on emission (groundnuty/macf#1368)', 
   });
 
   it('a pin below the accepting version does not emit the key even when declared', () => {
-    // v3.4.2 is the newest RELEASED tag as of this test's writing and does
-    // NOT carry runner-runs-on (verified live — see the module doc); "the
-    // reason is stated" is asserted at the repoInit() integration layer
-    // below (generateWorkflow is a pure string generator with no I/O to
-    // state a reason through).
+    // v3.4.2 predates macf-actions#83 and does NOT carry runner-runs-on
+    // (verified live — see the module doc); a genuinely incapable pin,
+    // not a stand-in for "no released tag is capable" (that state no
+    // longer holds — v3.5.0 is). "The reason is stated" is asserted at
+    // the repoInit() integration layer below (generateWorkflow is a pure
+    // string generator with no I/O to state a reason through).
     const yaml = generateWorkflow('v3.4.2', { ...v3Inputs, runnerRunsOn: 'self-hosted' });
     expect(yaml).not.toContain('runner-runs-on');
     const parsed = parseYaml(yaml) as { jobs: { route: { with: unknown } } };
