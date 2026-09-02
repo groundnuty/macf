@@ -1134,7 +1134,14 @@ describe('update command', () => {
 
       const fakeRoot = join(dir, '..', `fake-stale-cli-${Math.random().toString(36).slice(2)}`);
       const remote = join(dir, '..', `fake-stale-remote-${Math.random().toString(36).slice(2)}.git`);
-      makeStaleFakeCliCheckout(fakeRoot, remote, 2);
+      // A deliberately unusual count (never a small single-digit ambient
+      // drift) — this repo's OWN checkout may itself be a few commits
+      // behind origin/main at test-run time (e.g. between fetches), and if
+      // `mockReturnValueOnce` were ever silently bypassed the guard would
+      // fall through to judging THIS real checkout instead of the fixture.
+      // A distinctive count makes that failure mode assert-visible instead
+      // of coincidentally passing.
+      makeStaleFakeCliCheckout(fakeRoot, remote, 37);
       vi.mocked(findCliPackageRoot).mockReturnValueOnce(fakeRoot);
 
       mkdirSync(join(dir, '.claude', 'rules'), { recursive: true });
@@ -1151,7 +1158,7 @@ describe('update command', () => {
       expect(readFileSync(join(dir, '.claude', 'rules', 'coordination.md'), 'utf-8')).toBe(sentinel);
       const allErrors = errorSpy.mock.calls.flat().join('\n');
       expect(allErrors).toMatch(/Refused:/);
-      expect(allErrors).toMatch(/2 commit\(s\) behind/);
+      expect(allErrors).toMatch(/37 commit\(s\) behind/);
       expect(allErrors).toContain(join('.claude', 'rules', 'coordination.md'));
       expect(code).toBe(0); // the rest of the run still completes normally
 
@@ -1165,7 +1172,8 @@ describe('update command', () => {
 
       const fakeRoot = join(dir, '..', `fake-stale-cli-force-${Math.random().toString(36).slice(2)}`);
       const remote = join(dir, '..', `fake-stale-remote-force-${Math.random().toString(36).slice(2)}.git`);
-      makeStaleFakeCliCheckout(fakeRoot, remote, 1);
+      // Distinctive count — see the REACHABILITY test above for why.
+      makeStaleFakeCliCheckout(fakeRoot, remote, 41);
       vi.mocked(findCliPackageRoot).mockReturnValueOnce(fakeRoot);
 
       mkdirSync(join(dir, '.claude', 'rules'), { recursive: true });
@@ -1189,6 +1197,10 @@ describe('update command', () => {
 
       expect(readFileSync(join(dir, '.claude', 'rules', 'coordination.md'), 'utf-8')).not.toBe(sentinel);
       expect(warnOut).toMatch(/--force overriding a stale-CLI overwrite refusal/);
+      // The count must be the FIXTURE's (41), not some other value — proves
+      // the warning is reporting on the mocked fake checkout, not a
+      // coincidentally-matching real one.
+      expect(warnOut).toMatch(/41 commit\(s\) behind/);
       expect(code).toBe(0);
 
       rmSync(fakeRoot, { recursive: true, force: true });
