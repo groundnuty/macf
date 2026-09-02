@@ -86,6 +86,15 @@ const SILENT_LOGGER: Logger = { info: () => {}, warn: () => {}, error: () => {} 
 /** One agent's roster + reachability + raw self-report body. */
 export interface FleetAgentStatus {
   readonly name: string;
+  /**
+   * The registry entry's `agent_name` (groundnuty/macf#1393) — the OTEL wire
+   * identity, distinct from `name` (the registry KEY, i.e. `routing_label`).
+   * `null` when the entry predates the field, or the entry's own agent_name
+   * write path predates it — an honestly-unknown state, NEVER defaulted to
+   * `name`/`routing_label` (that assumption is exactly what this field
+   * exists to remove; see AgentInfoSchema's doc comment).
+   */
+  readonly agentName: string | null;
   readonly host: string;
   readonly port: number;
   readonly online: boolean;
@@ -184,6 +193,9 @@ export async function gatherFleetStatus(
       const session = online ? null : await safeSessionProbe(probeSession, peer.name);
       return {
         name: peer.name,
+        // Honest-unknown floor (groundnuty/macf#1393): absence reads as
+        // `null`, never defaulted to `peer.name` (the routing label).
+        agentName: peer.info.agent_name ?? null,
         host: peer.info.host,
         port: peer.info.port,
         online,
@@ -227,6 +239,7 @@ export function formatVersion(raw: unknown): string {
 
 const HEADERS = [
   'NAME',
+  'AGENT-NAME',
   'HOST:PORT',
   'STATUS',
   'VERSION',
@@ -255,14 +268,18 @@ export function buildFleetRows(
   now: number,
 ): readonly (readonly string[])[] {
   return statuses.map((s) => {
+    // Registry-sourced, not health-derived — known (or honestly unknown)
+    // regardless of online/offline, unlike the health-body columns below.
+    const agentName = s.agentName ?? '—';
     const where = `${s.host}:${s.port}`;
     const liveness = formatLiveness(s.online, s.liveness);
     if (!s.online || !s.health) {
-      return [s.name, where, 'offline', '—', '—', '—', '—', '—', '—', liveness];
+      return [s.name, agentName, where, 'offline', '—', '—', '—', '—', '—', '—', liveness];
     }
     const h = s.health;
     return [
       s.name,
+      agentName,
       where,
       'online',
       formatVersion(rawField(h, 'version')),
@@ -301,6 +318,11 @@ export function fleetStatusToJson(
       const version = rawField(s.health, 'version');
       return {
         name: s.name,
+        // Additive field (macf#1393) — the registry entry's `agent_name`
+        // (the OTEL wire identity), distinct from `name` (the routing
+        // label / registry key). `null` = honestly unknown, never defaulted
+        // to `name`.
+        agent_name: s.agentName,
         host: s.host,
         port: s.port,
         status: s.online ? 'online' : 'offline',

@@ -376,6 +376,13 @@ export type PeersKind = 'found' | 'empty' | 'unreadable' | 'skipped';
 
 export interface PeerSummary {
   readonly name: string;
+  /**
+   * The registry entry's `agent_name` (groundnuty/macf#1393) — the OTEL wire
+   * identity, distinct from `name` (the registry key / routing label). `null`
+   * when the entry predates the field — honestly unknown, NEVER defaulted to
+   * `name` (see AgentInfoSchema's `agent_name` doc comment).
+   */
+  readonly agentName: string | null;
   readonly host: string;
   readonly port: number;
   readonly type: string;
@@ -499,6 +506,9 @@ export async function readPeersFromRegistry(
     kind: 'found',
     peers: peers.map((p) => ({
       name: p.name,
+      // Honest-unknown floor (groundnuty/macf#1393): absence reads as
+      // `null`, never defaulted to `p.name` (the routing label).
+      agentName: p.info.agent_name ?? null,
       host: p.info.host,
       port: p.info.port,
       type: p.info.type,
@@ -573,7 +583,12 @@ function formatPeersSection(peers: PeersResult): string[] {
     case 'found':
       lines.push(`  source: ${peers.source}`);
       for (const p of peers.peers) {
-        lines.push(`  ${p.name.padEnd(24)} ${p.host}:${p.port}  (${p.type})`);
+        // agent_name (macf#1393): the OTEL wire identity alongside the
+        // registry key. '—' when the entry predates the field — never
+        // defaulted to `p.name`.
+        lines.push(
+          `  ${p.name.padEnd(24)} agent_name=${(p.agentName ?? '—').padEnd(24)} ${p.host}:${p.port}  (${p.type})`,
+        );
       }
       break;
     case 'empty':
