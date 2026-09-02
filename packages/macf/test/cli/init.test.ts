@@ -278,6 +278,77 @@ describe('macf init', () => {
     expect(matches).toHaveLength(1);
   });
 
+  // macf#1413 — prevent-side companion to #1411: consumer workspaces never
+  // had a .gitignore entry for the two directories `init`/`update` manage
+  // (.claude/rules/, .claude/scripts/), so a `git add -A` tracks every
+  // managed hook/rule and a later reset/clone silently reinstalls stale
+  // content over what `macf update` writes.
+  it('adds .claude/rules/ and .claude/scripts/ to .gitignore alongside .macf/ on a fresh init (macf#1413)', async () => {
+    await initAgent(dir, {
+      project: 'T',
+      role: 'a',
+      appId: '1',
+      installId: '2',
+      keyPath: 'k',
+      registryType: 'repo',
+      registryRepo: 'o/r',
+    });
+
+    const gitignore = readFileSync(join(dir, '.gitignore'), 'utf-8');
+    expect(gitignore).toContain('.macf/');
+    expect(gitignore).toContain('.claude/rules/');
+    expect(gitignore).toContain('.claude/scripts/');
+  });
+
+  // Decisive pair, half 2: a .gitignore that already carries all three
+  // entries must come out byte-identical — no rewrite, no reordering, no
+  // touched trailing-newline state.
+  it('leaves a .gitignore already carrying all three entries byte-identical (macf#1413)', async () => {
+    const existing = '# MACF agent data\n.macf/\n.claude/rules/\n.claude/scripts/\n';
+    writeFileSync(join(dir, '.gitignore'), existing);
+
+    await initAgent(dir, {
+      project: 'T',
+      role: 'a',
+      appId: '1',
+      installId: '2',
+      keyPath: 'k',
+      registryType: 'repo',
+      registryRepo: 'o/r',
+    });
+
+    expect(readFileSync(join(dir, '.gitignore'), 'utf-8')).toBe(existing);
+  });
+
+  // A .gitignore that predates macf#1413 (only .macf/, plus operator lines)
+  // must be repaired by appending the two new entries — never touching or
+  // reordering the operator's own lines.
+  it('appends missing entries to a legacy .gitignore without disturbing operator lines (macf#1413)', async () => {
+    const legacy = '.macf/\nnode_modules/\ndist/\n';
+    writeFileSync(join(dir, '.gitignore'), legacy);
+
+    await initAgent(dir, {
+      project: 'T',
+      role: 'a',
+      appId: '1',
+      installId: '2',
+      keyPath: 'k',
+      registryType: 'repo',
+      registryRepo: 'o/r',
+    });
+
+    const gitignore = readFileSync(join(dir, '.gitignore'), 'utf-8');
+    // Operator content is untouched + still leads the file, in order.
+    expect(gitignore.startsWith(legacy)).toBe(true);
+    expect(gitignore).toContain('.claude/rules/');
+    expect(gitignore).toContain('.claude/scripts/');
+    const lines = gitignore.split('\n');
+    expect(lines.indexOf('node_modules/')).toBeLessThan(lines.indexOf('.claude/rules/'));
+    expect(lines.indexOf('dist/')).toBeLessThan(lines.indexOf('.claude/rules/'));
+    // No duplicate .macf/ entry introduced by the repair.
+    expect(gitignore.match(/\.macf\//g)).toHaveLength(1);
+  });
+
   it('rejects missing required registry options', async () => {
     await expect(initAgent(dir, {
       project: 'T',

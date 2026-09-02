@@ -1155,17 +1155,45 @@ async function initLocalModeCertsAndRegistry(
   });
 }
 
-function updateGitignore(projectDir: string): void {
+/**
+ * Directories `macf init` / `macf update` manage on a consumer workspace
+ * that must never be tracked by the workspace's own git repo — `.macf/`
+ * (agent data: certs, registry cache) plus, as of macf#1413, the two
+ * canonical-asset directories `macf init`/`update` write and overwrite on
+ * every run: `.claude/rules/` and `.claude/scripts/`. Every file under
+ * either of those two directories is macf-managed (see `rules.ts`'s doc
+ * comment — there is no operator-authored file living there for `init` to
+ * carve out a negation for), so a plain directory ignore is correct; no
+ * `!`-negation idiom is needed. Without this, a workspace that stages
+ * `.claude/` (e.g. a broad `git add -A`) tracks every managed hook/rule
+ * script, and a later `git reset --hard` / fresh clone silently reinstalls
+ * whatever was last committed over what `macf update` wrote — the
+ * two-writers hazard macf#1392 closed for the substrate but never blocked
+ * by default for a consumer workspace (macf#1411 detects the symptom;
+ * this is the prevent-side companion).
+ */
+const MACF_GITIGNORE_ENTRIES = ['.macf/', '.claude/rules/', '.claude/scripts/'] as const;
+
+/**
+ * Idempotently ensures `MACF_GITIGNORE_ENTRIES` are present in the
+ * workspace's `.gitignore`. Append-only: existing bytes (operator lines,
+ * ordering, trailing-newline state) are never rewritten — a missing entry
+ * is appended as a new block, and when every entry is already present the
+ * file isn't touched at all (byte-identical). No git-repo check: this
+ * writes/updates `.gitignore` unconditionally, same as it always has —
+ * a workspace that isn't a git repo just gets an inert file.
+ */
+export function updateGitignore(projectDir: string): void {
   const gitignorePath = join(projectDir, '.gitignore');
-  const entry = '.macf/';
 
   if (existsSync(gitignorePath)) {
     const content = readFileSync(gitignorePath, 'utf-8');
-    if (!content.includes(entry)) {
-      appendFileSync(gitignorePath, `\n# MACF agent data\n${entry}\n`);
+    const missing = MACF_GITIGNORE_ENTRIES.filter((entry) => !content.includes(entry));
+    if (missing.length > 0) {
+      appendFileSync(gitignorePath, `\n# MACF agent data\n${missing.join('\n')}\n`);
     }
   } else {
-    writeFileSync(gitignorePath, `# MACF agent data\n${entry}\n`);
+    writeFileSync(gitignorePath, `# MACF agent data\n${MACF_GITIGNORE_ENTRIES.join('\n')}\n`);
   }
 }
 
