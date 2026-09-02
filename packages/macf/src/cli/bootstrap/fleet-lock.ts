@@ -35,7 +35,7 @@
  */
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-import type { FleetLock, FleetLockAgent, FleetLockCollaborator, FleetVersions, ScopeCredentialMarker } from './fleet-manifest.js';
+import type { FleetLock, FleetLockAgent, FleetLockCollaborator, FleetLockFederatedCa, FleetVersions, ScopeCredentialMarker } from './fleet-manifest.js';
 import { FLEET_LOCK_SCHEMA_VERSION, FleetLockSchema, effectiveFleetFingerprints, parseFleetLock } from './fleet-manifest.js';
 
 /**
@@ -188,6 +188,28 @@ export interface ComposeFleetLockInput {
    * {@link serializeFleetLock}'s own).
    */
   readonly collaboratorRecipients?: readonly FederatedCollaboratorRecipientsUpdate[];
+  /**
+   * groundnuty/macf#1389 — the last-approved `ca_bundle` FINGERPRINT THIS run
+   * is recording per declared `trust.federated_cas[]` project. `undefined`
+   * when this run touched no federated-CA-trust state at all — same
+   * untouched-carries-forward convention {@link collaboratorRecipients}
+   * immediately above follows, applied to CA trust instead of vault-decrypt
+   * recipients ({@link mergeFederatedCaTrust} — never replace the whole
+   * array wholesale, since an update to project A must never drop project
+   * B's already-recorded entry).
+   *
+   * A caller includes an entry here ONLY for a project this run actually
+   * PUBLISHED a fresh `ca_bundle` for (`federated-ca-trust.ts`'s guard row
+   * `'new'`, or a `'changed'` row whose registry variable was manually
+   * cleared and re-created this run) — never for a project whose registry
+   * leg reported `'already-present'` this run while the manifest's declared
+   * bundle DIFFERS from what was last approved (that is the `'changed'`
+   * row's whole point: the lock must keep pointing at the OLD approved
+   * fingerprint so every subsequent apply keeps surfacing the divergence,
+   * rather than silently absorbing an unwritten change into "approved").
+   * See `apply-fleet.ts`'s `applyFleet` call site for the exact condition.
+   */
+  readonly federatedCaTrust?: readonly FederatedCaTrustUpdate[];
 }
 
 /**
@@ -202,6 +224,21 @@ export interface ComposeFleetLockInput {
 export interface FederatedCollaboratorRecipientsUpdate {
   readonly project: string;
   readonly ageRecipients: readonly string[];
+}
+
+/**
+ * One declared `trust.federated_cas[]` project's freshly-approved `ca_bundle`
+ * fingerprint (groundnuty/macf#1389) — the camelCase "what apply
+ * resolved/approved this run" shape {@link composeFleetLock} turns into a
+ * full {@link FleetLockFederatedCa}. `caBundleFingerprint` is the value to
+ * RECORD (already computed via `federated-ca-trust.ts::reconcileFederatedCaTrust`
+ * — this type carries no consent state of its own; a caller decides whether
+ * to include an entry at all, per {@link ComposeFleetLockInput.federatedCaTrust}'s
+ * doc on WHEN that is safe).
+ */
+export interface FederatedCaTrustUpdate {
+  readonly project: string;
+  readonly caBundleFingerprint: string;
 }
 
 /**
@@ -328,6 +365,31 @@ function mergeFederatedCollaborators(
   const byProject = new Map<string, FleetLockCollaborator>((previous ?? []).map((c) => [c.project, c]));
   for (const update of fresh ?? []) {
     byProject.set(update.project, { project: update.project, age_recipients: [...update.ageRecipients] });
+  }
+  const merged = [...byProject.values()].sort((a, b) => a.project.localeCompare(b.project));
+  return merged.length > 0 ? merged : undefined;
+}
+
+/**
+ * Merge fresh {@link FederatedCaTrustUpdate}s into previously-recorded
+ * {@link FleetLockFederatedCa}s, BY PROJECT — SAME shape
+ * {@link mergeFederatedCollaborators} immediately above establishes, applied
+ * to CA-trust fingerprints instead of vault-decrypt recipient sets (groundnuty/
+ * macf#1389): a project present in `fresh` ALWAYS wins wholesale for that one
+ * entry; a project only in `previous` (this run touched a DIFFERENT
+ * project's trust, or none at all) is carried forward untouched, never
+ * pruned. Sorted by project for {@link serializeFleetLock}'s determinism
+ * contract. Returns `undefined` (never `[]`) when the merged result is
+ * empty, same "omit rather than write a vacuous array" convention every
+ * other merge in this module establishes.
+ */
+function mergeFederatedCaTrust(
+  previous: readonly FleetLockFederatedCa[] | undefined,
+  fresh: readonly FederatedCaTrustUpdate[] | undefined,
+): FleetLockFederatedCa[] | undefined {
+  const byProject = new Map<string, FleetLockFederatedCa>((previous ?? []).map((c) => [c.project, c]));
+  for (const update of fresh ?? []) {
+    byProject.set(update.project, { project: update.project, ca_bundle_fingerprint: update.caBundleFingerprint });
   }
   const merged = [...byProject.values()].sort((a, b) => a.project.localeCompare(b.project));
   return merged.length > 0 ? merged : undefined;
@@ -465,6 +527,7 @@ export function composeFleetLock(input: ComposeFleetLockInput): ComposeFleetLock
     input.ageRecipientsRemovedByOverride,
   );
   const collaborators = mergeFederatedCollaborators(input.previous?.collaborators, input.collaboratorRecipients);
+  const federatedCaTrust = mergeFederatedCaTrust(input.previous?.federated_ca_trust, input.federatedCaTrust);
 
   const composed: FleetLock = {
     schema_version: FLEET_LOCK_SCHEMA_VERSION,
@@ -476,6 +539,7 @@ export function composeFleetLock(input: ComposeFleetLockInput): ComposeFleetLock
     ...(ageRecipients !== undefined ? { age_recipients: ageRecipients } : {}),
     ...(ageRecipientsRemovedByOverride !== undefined ? { age_recipients_removed_by_override: ageRecipientsRemovedByOverride } : {}),
     ...(collaborators !== undefined ? { collaborators } : {}),
+    ...(federatedCaTrust !== undefined ? { federated_ca_trust: federatedCaTrust } : {}),
   };
 
   return { lock: FleetLockSchema.parse(composed), identityChanges };
@@ -543,6 +607,15 @@ function orderedCollaborator(collaborator: FleetLockCollaborator): FleetLockColl
 }
 
 /**
+ * `FleetLockFederatedCa` with its fields in `FleetLockFederatedCaSchema`'s
+ * declared order (groundnuty/macf#1389) — same defensive re-ordering
+ * `orderedCollaborator` applies for its sibling field.
+ */
+function orderedFederatedCaTrust(entry: FleetLockFederatedCa): FleetLockFederatedCa {
+  return { project: entry.project, ca_bundle_fingerprint: entry.ca_bundle_fingerprint };
+}
+
+/**
  * Serialize a `FleetLock` deterministically — stable key order (matching
  * `FleetLockSchema`'s declared field order top-to-bottom, `agents[]` sorted
  * by `role`, every fingerprint map sorted by secret name) + a trailing
@@ -571,6 +644,7 @@ export function serializeFleetLock(lock: FleetLock): string {
     age_recipients?: string[];
     age_recipients_removed_by_override?: string[];
     collaborators?: FleetLockCollaborator[];
+    federated_ca_trust?: FleetLockFederatedCa[];
   } = {
     schema_version: validated.schema_version,
     fleet: validated.fleet,
@@ -606,6 +680,13 @@ export function serializeFleetLock(lock: FleetLock): string {
   // (`orderedCollaborator`'s own doc).
   if (validated.collaborators !== undefined) {
     ordered.collaborators = [...validated.collaborators].sort((a, b) => a.project.localeCompare(b.project)).map(orderedCollaborator);
+  }
+  // groundnuty/macf#1389 — sorted by project, same reasoning `collaborators`
+  // immediately above already applies; each entry has no verbatim-order
+  // sub-field to preserve (`orderedFederatedCaTrust`'s own doc — a single
+  // required fingerprint, not an ordered set).
+  if (validated.federated_ca_trust !== undefined) {
+    ordered.federated_ca_trust = [...validated.federated_ca_trust].sort((a, b) => a.project.localeCompare(b.project)).map(orderedFederatedCaTrust);
   }
   return `${JSON.stringify(ordered, null, 2)}\n`;
 }

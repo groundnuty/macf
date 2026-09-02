@@ -146,6 +146,7 @@ import { checkRegistryScopePreflight } from '../bootstrap/registry-scope-preflig
 // reads `fleet.lock` (a local file, never a GitHub call) via `readFleetLock`
 // (already imported above from `observer.js`) to compare against.
 import { ageRecipientsRecordAbsent, ageRecipientsRecordAbsentNotice, checkAgeRecipientsNarrowing } from '../bootstrap/age-recipients-narrowing.js';
+import { reconcileFederatedTrustVerdicts, federatedTrustNotices } from '../bootstrap/apply-federated-trust.js';
 import type { DeployFlagsEcho, RemainingDeployReport, RemainingDeployStep } from '../bootstrap/remaining-deploy.js';
 import { computeRemainingDeploy, formatRemainingDeployLines } from '../bootstrap/remaining-deploy.js';
 import type { ApplyDeployPhaseDeps, DeployPhaseAgentResult } from '../bootstrap/apply-deploy.js';
@@ -3406,6 +3407,28 @@ export async function runBootstrapApply(
 
   try {
     const observed = await resolved.observe(manifest);
+
+    // groundnuty/macf#1389 — the `#1330`-shaped federated-CA-trust
+    // enumerate-and-name consent notices, `--dry-run` ONLY (deliberately
+    // NOT the same unconditional placement `ageRecipientsRecordAbsentNotice`
+    // above uses). Reason: a REAL run gets its OWN, authoritative notices
+    // from `apply-fleet.ts`'s `applyFleet` (via `deps.log`, sourced from the
+    // FRESHLY-CLONED control-repo lock it self-heals against right before
+    // publishing) — printing a SECOND set here, from `observed.lock` (which
+    // prefers a LOCAL manifest-adjacent file when one exists, per
+    // `observer.ts::resolveObservedFleetLock`'s doc, and can therefore be
+    // stale relative to that fresh clone on a real run), risks a
+    // contradictory pair: this block says "never approved" while the run
+    // itself correctly stays silent because the control-repo copy already
+    // has it. A `--dry-run` has no later authoritative read to contradict —
+    // it mutates nothing — so `observed.lock` (the SAME field `macf
+    // bootstrap plan` renders these notices from, see `commands/bootstrap.ts`)
+    // is the best available signal there, and printing it is safe.
+    if (opts.dryRun === true) {
+      for (const notice of federatedTrustNotices(reconcileFederatedTrustVerdicts(manifest.trust?.federated_cas ?? [], observed.lock?.federated_ca_trust))) {
+        process.stderr.write(`${notice}\n`);
+      }
+    }
     // groundnuty/macf#1220 / #1129 / #1229 / DR-043 Amendment P2 — this
     // preview intentionally passes NO `installScopeCoverage` (the 3rd
     // `computePlan` param, defaulting to `[]`), so it never shows an

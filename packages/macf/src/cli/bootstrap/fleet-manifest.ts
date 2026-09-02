@@ -850,6 +850,41 @@ export const FleetLockCollaboratorSchema = z
 export type FleetLockCollaborator = z.infer<typeof FleetLockCollaboratorSchema>;
 
 /**
+ * groundnuty/macf#1389 — the last-APPROVED `ca_bundle` FINGERPRINT for ONE
+ * declared `trust.federated_cas[]` PROJECT (`project` matches
+ * {@link FleetFederatedCaSchema.project}). Sibling to
+ * {@link FleetLockCollaboratorSchema} — SAME "the lock pins the
+ * last-approved FACT, the manifest declares INTENT" split that field's own
+ * doc establishes (`#1330`'s ruling), applied to CA trust material instead
+ * of vault-decrypt recipients. See `federated-ca-trust.ts` for the guard
+ * that diffs this against the manifest's current declaration.
+ *
+ * **Fingerprint, not the bundle itself — unlike `FleetLockCollaboratorSchema.age_recipients`
+ * (which records the recipient PUBLIC KEYS verbatim, because a reader needs
+ * the keys themselves to reason about who can decrypt).** A `ca_bundle`'s
+ * only use HERE is change-detection: "is this the same bundle we last
+ * approved?" A `sha256:<hex>` digest ({@link secretFingerprint} —
+ * `fleet-lock.ts`, already used for non-secret PEM material elsewhere, e.g.
+ * `vault-read.ts`) answers that without duplicating a (potentially
+ * multi-cert) PEM chain into `fleet.lock` on top of its ALREADY-authoritative
+ * home — the registry variable itself, which `apply-federated-trust.ts`
+ * publishes the raw `ca_bundle` to. `fleet.lock` only ever needs to compare,
+ * never to re-serve the material.
+ *
+ * `undefined` for a project absent from {@link FleetLockSchema.federated_ca_trust}
+ * means "never approved/recorded yet" — honest unknown, mirroring
+ * {@link FleetLockCollaboratorSchema}'s own "no entry = never federated"
+ * convention, NEVER coerced to an empty-string fingerprint.
+ */
+export const FleetLockFederatedCaSchema = z
+  .object({
+    project: z.string().min(1),
+    ca_bundle_fingerprint: z.string().min(1),
+  })
+  .strict();
+export type FleetLockFederatedCa = z.infer<typeof FleetLockFederatedCaSchema>;
+
+/**
  * groundnuty/macf#1162 — provenance-only marker for a credential this fleet
  * holds a LOCAL COPY of rather than one it minted/confirmed itself (today:
  * only the router App's `'vault-reused'` cross-fleet-shared-scope outcome —
@@ -1025,6 +1060,36 @@ export const FleetLockSchema = z
      * same precedent `scope_credentials` / `age_recipients` already set.
      */
     collaborators: z.array(FleetLockCollaboratorSchema).optional(),
+    /**
+     * groundnuty/macf#1389 — the last-APPROVED `ca_bundle` fingerprint PER
+     * DECLARED `trust.federated_cas[]` PROJECT ({@link FleetLockFederatedCaSchema},
+     * keyed by `project`) — distinct from {@link collaborators} immediately
+     * above (which records a federated PEER's vault-decrypt recipient set,
+     * `#1330`; CA trust and vault-decrypt trust are separate concerns per
+     * `apply-federated-trust.ts`'s own module doc). See that schema's doc for
+     * why the value lives here (fact, last-approved) rather than solely in
+     * `fleet.yaml`'s `trust.federated_cas[].ca_bundle` (intent, currently
+     * declared) — `federated-ca-trust.ts`'s guard diffs the two.
+     *
+     * `undefined` when this fleet has never approved a `ca_bundle` for ANY
+     * project — distinct from `[]`, which this field never takes at the
+     * array level (an empty array here would mean "approved zero projects,"
+     * indistinguishable from "never touched"; same "omit rather than write a
+     * vacuous empty collection" convention {@link collaborators} follows for
+     * the identical reason). Per-entry, there is no `[]`-vs-absent split
+     * (unlike {@link FleetLockCollaboratorSchema.age_recipients}) — a
+     * `ca_bundle_fingerprint` is a required, non-empty string; the ENTRY's
+     * absence from this array is what "never approved" means for one
+     * project.
+     *
+     * Sorted by `project` for {@link serializeFleetLock}'s determinism
+     * contract — same reasoning {@link collaborators} sorting by `project`
+     * already applies at this array's sibling level.
+     *
+     * Added as a NEW optional field, no `FLEET_LOCK_SCHEMA_VERSION` bump —
+     * same precedent {@link collaborators} / `scope_credentials` already set.
+     */
+    federated_ca_trust: z.array(FleetLockFederatedCaSchema).optional(),
   })
   .strict();
 

@@ -912,6 +912,60 @@ agents: []
     });
   });
 
+  // groundnuty/macf#1389 — FleetLockSchema gains an optional
+  // `federated_ca_trust` array, the LAST-APPROVED `ca_bundle` FINGERPRINT per
+  // declared `trust.federated_cas[]` project (see
+  // `FleetLockFederatedCaSchema`'s own doc for why THIS lives on the lock as
+  // a fingerprint, not the manifest's `FleetFederatedCaSchema` and not the
+  // raw bundle). Sibling to `collaborators` immediately above — same "the
+  // lock pins the last-approved fact" split, different trust surface.
+  describe('federated_ca_trust (groundnuty/macf#1389 — federated-CA-bundle approved fingerprints)', () => {
+    it('parses a lock declaring an approved federated-CA-trust fingerprint', () => {
+      const withEntry = `${VALID_LOCK_YAML}federated_ca_trust:\n  - project: ppam-2026\n    ca_bundle_fingerprint: sha256:abc123\n`;
+      const lock = parseFleetLock(withEntry);
+      expect(lock.federated_ca_trust).toEqual([{ project: 'ppam-2026', ca_bundle_fingerprint: 'sha256:abc123' }]);
+    });
+
+    // DECISIVE: every existing fleet's lock predates this field — a lock
+    // with no `federated_ca_trust:` key at all must parse with the field
+    // UNDEFINED, never a fabricated empty array. Same `#1252`/`#1330` lesson
+    // restated for CA-trust fingerprints.
+    it('DECISIVE: a lock with no "federated_ca_trust" key parses fine, with federated_ca_trust undefined — never fabricated', () => {
+      const lock = parseFleetLock(VALID_LOCK_YAML);
+      expect(lock.federated_ca_trust).toBeUndefined();
+      expect('federated_ca_trust' in lock).toBe(false);
+    });
+
+    it('rejects a federated_ca_trust entry missing ca_bundle_fingerprint entirely (required, unlike the entry\'s own presence in the array)', () => {
+      const missing = `${VALID_LOCK_YAML}federated_ca_trust:\n  - project: ppam-2026\n`;
+      expect(() => parseFleetLock(missing)).toThrow();
+    });
+
+    it('rejects a federated_ca_trust entry with an empty-string project (min(1), same discipline as agents[].role)', () => {
+      const bad = `${VALID_LOCK_YAML}federated_ca_trust:\n  - project: ""\n    ca_bundle_fingerprint: sha256:abc\n`;
+      expect(() => parseFleetLock(bad)).toThrow();
+    });
+
+    it('rejects a federated_ca_trust entry with an empty-string ca_bundle_fingerprint (min(1) — required non-empty, unlike a per-entry age_recipients array which CAN be a real [])', () => {
+      const bad = `${VALID_LOCK_YAML}federated_ca_trust:\n  - project: ppam-2026\n    ca_bundle_fingerprint: ""\n`;
+      expect(() => parseFleetLock(bad)).toThrow();
+    });
+
+    it('rejects an unknown key inside a federated_ca_trust entry (typo protection, same .strict() discipline as every other lock sub-schema)', () => {
+      const bad = `${VALID_LOCK_YAML}federated_ca_trust:\n  - project: ppam-2026\n    ca_bundle_fingerprint: sha256:abc\n    ca_bundle: "not-a-lock-field"\n`;
+      expect(() => parseFleetLock(bad)).toThrow();
+    });
+
+    it('parses multiple declared projects, each with its own independently-recorded fingerprint', () => {
+      const multi = `${VALID_LOCK_YAML}federated_ca_trust:\n  - project: ppam-2026\n    ca_bundle_fingerprint: sha256:aaa\n  - project: other-fleet\n    ca_bundle_fingerprint: sha256:bbb\n`;
+      const lock = parseFleetLock(multi);
+      expect(lock.federated_ca_trust).toEqual([
+        { project: 'ppam-2026', ca_bundle_fingerprint: 'sha256:aaa' },
+        { project: 'other-fleet', ca_bundle_fingerprint: 'sha256:bbb' },
+      ]);
+    });
+  });
+
   // groundnuty/macf#1310 — `fleet_fingerprints` (fleet-level) vs
   // `fingerprints` (per-agent, unchanged) naming-collision fix. Science's
   // ruling: "fingerprints at fleet level and fingerprints per agent should
