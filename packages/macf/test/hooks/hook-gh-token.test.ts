@@ -20,7 +20,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { findCliPackageRoot } from '../../src/cli/rules.js';
@@ -61,15 +61,38 @@ ${successArm}
   return dir;
 }
 
-/** A workspace carrying `.claude/scripts/macf-gh-token.sh`. */
-function makeWorkspace(opts: { readonly succeeds: boolean }): string {
+/** Where a `recordKeyArg` workspace's helper stub writes the exact `--key`
+ * value it was invoked with, so a test can assert the RESOLVED (not the
+ * raw, possibly-relative) path reached the helper. */
+function keyArgSeenPath(ws: string): string {
+  return join(ws, 'key-arg-seen.txt');
+}
+
+/** A workspace carrying `.claude/scripts/macf-gh-token.sh`. When
+ * `recordKeyArg` is set, the stub scans its own args for `--key` and
+ * writes the following arg verbatim to `keyArgSeenPath(ws)` before doing
+ * anything else — order-agnostic (doesn't assume `--key` is any
+ * particular positional slot), per groundnuty/macf#1414's decisive pair:
+ * proving the helper was invoked with the RESOLVED absolute path, not the
+ * relative KEY_PATH the hook's env carried. */
+function makeWorkspace(opts: { readonly succeeds: boolean; readonly recordKeyArg?: boolean }): string {
   const ws = mkdtempSync(join(tmpdir(), 'macf-hookgh-ws-'));
   const scriptsDir = join(ws, '.claude', 'scripts');
   mkdirSync(scriptsDir, { recursive: true });
   const helperPath = join(scriptsDir, 'macf-gh-token.sh');
+  const recordSnippet = opts.recordKeyArg
+    ? `while [[ $# -gt 0 ]]; do
+  if [[ "$1" == "--key" ]]; then
+    printf '%s' "$2" > '${keyArgSeenPath(ws)}'
+    break
+  fi
+  shift
+done
+`
+    : '';
   const helperScript = opts.succeeds
-    ? `#!/usr/bin/env bash\necho "${FRESH}"\n`
-    : `#!/usr/bin/env bash\necho "stub helper: refresh failed (bad key)" >&2\nexit 1\n`;
+    ? `#!/usr/bin/env bash\n${recordSnippet}echo "${FRESH}"\n`
+    : `#!/usr/bin/env bash\n${recordSnippet}echo "stub helper: refresh failed (bad key)" >&2\nexit 1\n`;
   writeFileSync(helperPath, helperScript);
   chmodSync(helperPath, 0o755);
   return ws;
@@ -83,6 +106,15 @@ function runMacfHookGh(opts: {
   readonly ghArgs: readonly string[];
   readonly stubDir: string;
   readonly workspace?: string;
+  /** Overrides/additions applied on top of the base env — e.g. a relative
+   * KEY_PATH, or an explicit CLAUDE_PROJECT_DIR, for #1414's resolution
+   * tests. Applied AFTER the `workspace` block's defaults, so a key here
+   * always wins over the workspace-mode default for the same name. */
+  readonly extraEnv?: Record<string, string>;
+  /** cwd the driver script runs from — the third resolution candidate
+   * ($PWD) in `_macf_hook_resolve_key_path`. Defaults to this process's
+   * cwd when omitted. */
+  readonly cwd?: string;
 }): { readonly exitCode: number; readonly stdout: string; readonly stderr: string } {
   const driverDir = mkdtempSync(join(tmpdir(), 'macf-hookgh-driver-'));
   const driverPath = join(driverDir, 'driver.sh');
@@ -111,8 +143,9 @@ printf '\\n===EXIT:%s===\\n' "$RC"
     env['INSTALL_ID'] = 'test-install-id';
     env['KEY_PATH'] = '/irrelevant-to-the-stub.pem';
   }
+  Object.assign(env, opts.extraEnv ?? {});
   try {
-    const r = spawnSync('bash', [driverPath], { env, encoding: 'utf-8' });
+    const r = spawnSync('bash', [driverPath], { env, encoding: 'utf-8', cwd: opts.cwd });
     const stdout = r.stdout ?? '';
     const match = /^(.*)\n===EXIT:(-?\d+)===\n?$/s.exec(stdout);
     if (!match) {
@@ -170,12 +203,21 @@ describe('hook-gh-token.sh — macf_hook_gh', () => {
     });
 
     it('the refresh helper\'s own failure (nonzero exit, no token produced) is handled and surfaced as auth_failed (1)', () => {
+      // Uses the default absolute KEY_PATH ('/irrelevant-to-the-stub.pem')
+      // that makeWorkspace()'s caller-side default sets — so this is the
+      // "key resolved fine, helper itself failed" branch, and per
+      // groundnuty/macf#1414's diagnostic-naming requirement its message
+      // must be textually distinct from the "key file was not found"
+      // branch exercised below (a caller reading the diagnostic needs to
+      // tell "check the key/App-id" apart from "check KEY_PATH/cwd").
       const stubDir = makeStubGhDir();
       const ws = makeWorkspace({ succeeds: false });
       try {
         const r = runMacfHookGh({ ambientToken: EXPIRED, ghArgs: ['api', 'repos/o/r/issues/1'], stubDir, workspace: ws });
         expect(r.exitCode).toBe(1);
         expect(r.stdout).toMatch(/refreshing it failed/i);
+        expect(r.stdout).toMatch(/exited non-zero/i);
+        expect(r.stdout).not.toMatch(/private key file was not found/i);
       } finally {
         rmSync(stubDir, { recursive: true, force: true });
         rmSync(ws, { recursive: true, force: true });
@@ -292,6 +334,131 @@ printf '\\n===EXIT:%s===\\n' "$RC"
       } finally {
         rmSync(stubDir, { recursive: true, force: true });
         rmSync(ws, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // groundnuty/macf#1414: a relative KEY_PATH used to be handed straight to
+  // the minting helper unresolved. The hook runs BEFORE the intercepted
+  // command's own `cd`, in whatever cwd the persistent shell happens to be
+  // sitting in — so a relative KEY_PATH only ever resolved by accident, when
+  // that cwd was the workspace root. These tests exercise the resolution
+  // chain ($MACF_WORKSPACE_DIR -> $CLAUDE_PROJECT_DIR -> $PWD) directly.
+  describe('KEY_PATH resolution (#1414)', () => {
+    it('DECISIVE 1: relative KEY_PATH + a foreign cwd + MACF_WORKSPACE_DIR set — the helper is invoked with the ABSOLUTE resolved path, and refresh succeeds', () => {
+      const ws = makeWorkspace({ succeeds: true, recordKeyArg: true });
+      // The key file lives at the workspace root, matching the issue's own
+      // measured shape (KEY_PATH='.github-app-key.pem').
+      const relativeKey = '.github-app-key.pem';
+      writeFileSync(join(ws, relativeKey), 'dummy-pem-content-not-parsed-by-the-stub');
+      const stubDir = makeStubGhDir();
+      // A cwd that is NOT the workspace and does NOT itself carry a file
+      // named `.github-app-key.pem` — proves resolution isn't accidentally
+      // succeeding off $PWD.
+      const foreignCwd = mkdtempSync(join(tmpdir(), 'macf-hookgh-foreign-cwd-'));
+      try {
+        const r = runMacfHookGh({
+          ambientToken: EXPIRED,
+          ghArgs: ['api', 'repos/o/r/issues/1'],
+          stubDir,
+          workspace: ws,
+          extraEnv: { KEY_PATH: relativeKey },
+          cwd: foreignCwd,
+        });
+        expect(r.exitCode).toBe(0);
+        expect(r.stdout).toBe(`saw-token:${FRESH}`);
+        const keyArgSeen = readFileSync(keyArgSeenPath(ws), 'utf-8');
+        expect(keyArgSeen).toBe(join(ws, relativeKey));
+      } finally {
+        rmSync(stubDir, { recursive: true, force: true });
+        rmSync(ws, { recursive: true, force: true });
+        rmSync(foreignCwd, { recursive: true, force: true });
+      }
+    });
+
+    it('DECISIVE 2: absolute KEY_PATH is passed through byte-identical, regardless of whether it exists on disk', () => {
+      const ws = makeWorkspace({ succeeds: true, recordKeyArg: true });
+      const stubDir = makeStubGhDir();
+      try {
+        // makeWorkspace's default env sets KEY_PATH='/irrelevant-to-the-
+        // stub.pem' — an absolute path that does NOT exist anywhere. If
+        // absolute paths were existence-checked (they must not be, to
+        // preserve pre-#1414 behavior for operator-absolute paths like
+        // /etc/macf/keys/...), this would incorrectly fail resolution
+        // before ever reaching the helper.
+        const r = runMacfHookGh({ ambientToken: EXPIRED, ghArgs: ['api', 'repos/o/r/issues/1'], stubDir, workspace: ws });
+        expect(r.exitCode).toBe(0);
+        const keyArgSeen = readFileSync(keyArgSeenPath(ws), 'utf-8');
+        expect(keyArgSeen).toBe('/irrelevant-to-the-stub.pem');
+      } finally {
+        rmSync(stubDir, { recursive: true, force: true });
+        rmSync(ws, { recursive: true, force: true });
+      }
+    });
+
+    it('a relative KEY_PATH found in NONE of the three candidates — the diagnostic names every path tried, distinct from "helper exited non-zero", and the helper is never invoked', () => {
+      // Calls _macf_hook_refresh_token DIRECTLY rather than through
+      // macf_hook_gh: the top-level wrapper truncates its combined message
+      // to 220 chars (`cut -c1-220`, pre-existing #1409 behavior, out of
+      // scope here), which on a long $TMPDIR could clip one of the three
+      // full candidate paths before this test ever sees it. Going straight
+      // to the function this issue actually changes proves the real
+      // property (every path is named in the RAW diagnostic) without
+      // coupling the assertion to an unrelated truncation budget.
+      const ws = makeWorkspace({ succeeds: true, recordKeyArg: true }); // helper WOULD succeed — must never be reached
+      const projectDir = mkdtempSync(join(tmpdir(), 'macf-hookgh-project-dir-'));
+      const foreignCwd = mkdtempSync(join(tmpdir(), 'macf-hookgh-foreign-cwd2-'));
+      const relativeKey = 'nonexistent-key.pem';
+      const driverDir = mkdtempSync(join(tmpdir(), 'macf-hookgh-driver3-'));
+      try {
+        const driverPath = join(driverDir, 'driver.sh');
+        writeFileSync(
+          driverPath,
+          `#!/usr/bin/env bash
+set -uo pipefail
+source '${LIB_SCRIPT}'
+OUT="$(_macf_hook_refresh_token 2>&1 1>/dev/null)"
+RC=$?
+printf '%s' "$OUT"
+printf '\\n===EXIT:%s===\\n' "$RC"
+`
+        );
+        chmodSync(driverPath, 0o755);
+        const r = spawnSync('bash', [driverPath], {
+          env: {
+            PATH: process.env['PATH'] ?? '',
+            MACF_WORKSPACE_DIR: ws,
+            APP_ID: 'test-app-id',
+            INSTALL_ID: 'test-install-id',
+            KEY_PATH: relativeKey,
+            CLAUDE_PROJECT_DIR: projectDir,
+          },
+          cwd: foreignCwd,
+          encoding: 'utf-8',
+        });
+        const stdout = r.stdout ?? '';
+        const match = /^(.*)\n===EXIT:(-?\d+)===\n?$/s.exec(stdout);
+        expect(match).not.toBeNull();
+        expect(Number(match?.[2])).toBe(1);
+        const diag = match?.[1] ?? '';
+        expect(diag).toMatch(/private key file was not found/i);
+        // Distinct from the "helper exited non-zero" branch — a caller
+        // must be able to tell "fix KEY_PATH/cwd" apart from "fix the
+        // key/App-id", per #1414's diagnostic-naming requirement.
+        expect(diag).not.toMatch(/exited non-zero/i);
+        // Names every candidate actually tried — all three resolution
+        // bases, not just the first.
+        expect(diag).toContain(join(ws, relativeKey));
+        expect(diag).toContain(join(projectDir, relativeKey));
+        expect(diag).toContain(join(foreignCwd, relativeKey));
+        // The helper must never have run — its recordKeyArg stub would
+        // have written this file had it been invoked.
+        expect(existsSync(keyArgSeenPath(ws))).toBe(false);
+      } finally {
+        rmSync(ws, { recursive: true, force: true });
+        rmSync(projectDir, { recursive: true, force: true });
+        rmSync(foreignCwd, { recursive: true, force: true });
+        rmSync(driverDir, { recursive: true, force: true });
       }
     });
   });

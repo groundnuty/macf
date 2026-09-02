@@ -88,8 +88,14 @@
 #
 # Refs: groundnuty/macf#938 (this file); groundnuty/macf#1409 (diagnostic
 # naming — this file's cause-specific stderr text, "diagnostics only" per
-# that issue's scope); macf#317 (the refresh pattern this mirrors for the
-# channel-server); silent-fallback-hazards.md Instance 1 (expiry sub-case);
+# that issue's scope); groundnuty/macf#1414 (KEY_PATH resolution — a
+# relative KEY_PATH broke whenever the hook ran from a cwd other than the
+# workspace root, because it was passed to the minting helper unresolved;
+# see _macf_hook_resolve_key_path below); macf#317 (the refresh pattern
+# this mirrors for the channel-server); silent-fallback-hazards.md
+# Instance 1 (expiry sub-case); gh-token-attribution-traps.md mode 6 (a
+# relative key/helper path breaking on `cd` — #1414 is this mode
+# recurring one level down from #161's claude.sh-launch-time fix);
 # pr-discipline.md's fail-open posture (the paragraph this narrows — an
 # expired/invalid credential is fixable, unlike a genuinely unreachable
 # GitHub).
@@ -123,6 +129,75 @@ _macf_hook_token_helper_path() {
       return 0
     fi
   done
+  return 1
+}
+
+# Resolve $KEY_PATH the same way _macf_hook_token_helper_path (above)
+# resolves the HELPER's own path — groundnuty/macf#1414. The PreToolUse
+# hook runs BEFORE the intercepted command's own `cd`, in whatever cwd the
+# Bash tool's persistent shell happens to be sitting in at that moment
+# (a worktree, $TMPDIR, another repo for cross-repo work) — frequently NOT
+# the workspace root. A relative KEY_PATH handed straight to the minting
+# helper only resolves by accident, when that cwd happens to be the root.
+# This is gh-token-attribution-traps.md mode 6 (a relative path breaking
+# on `cd`) recurring one level below #161's claude.sh-launch-time
+# absolutisation, which evidently doesn't reach every session's env.
+#
+# An absolute KEY_PATH (leading "/") is NEVER touched — operators may
+# point it outside the workspace entirely (e.g. /etc/macf/keys/...), and
+# existence isn't checked for that case either: an absolute path that
+# doesn't exist is left for the helper itself to report, same as before
+# this function existed.
+#
+# For a relative KEY_PATH, tries, in order: $MACF_WORKSPACE_DIR, then
+# $CLAUDE_PROJECT_DIR, then the current directory — first candidate whose
+# file actually exists wins. Deliberately uses "$PWD" rather than the
+# literal "." _macf_hook_token_helper_path uses for its own last resort:
+# that function only ever needs "." to work as a lookup path; this one
+# also has to PRINT the candidates it tried when none exist, and "./foo"
+# in a diagnostic is far less useful than the real absolute directory the
+# hook was actually sitting in.
+#
+# On success: echoes the resolved absolute path on stdout, returns 0.
+# On failure: echoes the list of candidate paths actually tried (comma-
+# separated) on stdout, returns 1 — the caller folds this into a "key file
+# was not found" diagnostic, distinct from a helper that ran and failed
+# for its own reasons (bad PEM, wrong App/install ID). Deliberately stdout
+# not stderr here (unlike _macf_hook_refresh_token's diagnostics): this
+# function is always called from inside a `$(...)` capture in the caller,
+# never surfaced directly to a human, and never carries token material —
+# only filesystem paths — so there is nothing to protect by segregating
+# the streams.
+_macf_hook_resolve_key_path() {
+  local key="$1" base candidate joined="" already t
+  local -a tried=()
+
+  if [[ "$key" == /* ]]; then
+    printf '%s' "$key"
+    return 0
+  fi
+
+  for base in "${MACF_WORKSPACE_DIR:-}" "${CLAUDE_PROJECT_DIR:-}" "${PWD:-}"; do
+    [[ -z "$base" ]] && continue
+    candidate="${base%/}/${key}"
+    if [[ -f "$candidate" ]]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+    already=0
+    for t in "${tried[@]}"; do
+      [[ "$t" == "$candidate" ]] && { already=1; break; }
+    done
+    [[ "$already" -eq 0 ]] && tried+=("$candidate")
+  done
+
+  for candidate in "${tried[@]}"; do
+    if [[ -n "$joined" ]]; then
+      joined+=", "
+    fi
+    joined+="$candidate"
+  done
+  printf '%s' "$joined"
   return 1
 }
 
@@ -169,9 +244,20 @@ _macf_hook_refresh_token() {
     return 1
   fi
 
-  token="$("$helper" --app-id "$APP_ID" --install-id "$INSTALL_ID" --key "$KEY_PATH" 2>/dev/null)" || rc=$?
+  # groundnuty/macf#1414: resolve a relative KEY_PATH before handing it to
+  # the helper — see _macf_hook_resolve_key_path above for why. An
+  # absolute KEY_PATH passes through byte-identical (existence unchecked,
+  # same as before this resolution step existed).
+  local resolved_key="" key_rc=0
+  resolved_key="$(_macf_hook_resolve_key_path "$KEY_PATH")" || key_rc=$?
+  if [[ "$key_rc" -ne 0 ]]; then
+    echo "the App private key file was not found — tried: ${resolved_key} (KEY_PATH='${KEY_PATH}' is relative; set it to an absolute path, or ensure the key exists at one of the paths above)" >&2
+    return 1
+  fi
+
+  token="$("$helper" --app-id "$APP_ID" --install-id "$INSTALL_ID" --key "$resolved_key" 2>/dev/null)" || rc=$?
   if [[ "$rc" -ne 0 ]]; then
-    echo "the token-minting helper (macf-gh-token.sh) exited non-zero — the App private key may be missing, wrong, or rotated, or APP_ID/INSTALL_ID may be incorrect for this workspace" >&2
+    echo "the token-minting helper (macf-gh-token.sh) exited non-zero using key '${resolved_key}' — the key may be wrong or rotated, or APP_ID/INSTALL_ID may be incorrect for this workspace" >&2
     return 1
   fi
   # Full-shape check, matching the canonical predicate (`^ghs_[A-Za-z0-9._-]+$`,
