@@ -101,6 +101,7 @@ import { initAgent as realInitAgent } from '../../../src/cli/commands/init.js';
 import { agentCertPath, agentKeyPath, caCertPath, caDir, readAgentsIndex, writeAgentsIndex } from '../../../src/cli/config.js';
 import { resolveAgeGate } from './age-binary-gate.js';
 import { toVariableSegment, createCA, caCertFingerprint } from '@groundnuty/macf-core';
+import { VersionResolutionError } from '../../../src/cli/version-resolver.js';
 
 const HAS_AGE = resolveAgeGate('fleet-deploy.test.ts', 2);
 
@@ -998,6 +999,130 @@ describe('deployAgent — offline (injected readVault/cloneRepo/initAgent)', () 
 
     expect(outcome.status).toBe('deployed');
     expect(mintCalled).toBe(false);
+  });
+});
+
+// --- Version pin lockstep — pluginVersion in lockstep with cliVersion (macf#1406) ---
+//
+// The concrete bug: `fleet-deploy.ts` forwarded `cliVersion`/`actionsVersion`
+// from `manifest.versions` but never `pluginVersion`, so `initAgent`'s own
+// `resolveVersions()` saw `allSet === false`, fell into its network-fetch
+// path, THAT failed in the deploy context (no token), and `plugin` silently
+// landed on the hardcoded `FALLBACK_VERSIONS.plugin` ('0.2.0' — a plugin
+// with ZERO PreToolUse hooks) sitting next to a real, current `cliVersion`.
+// Consumer workspaces deployed unguarded and reported success.
+
+describe('deployAgent — plugin version pin in lockstep with cli (macf#1406)', () => {
+  it('DECISIVE (a): manifest declares versions.macf → initAgent receives pluginVersion in LOCKSTEP, and the network resolver is never even reached', async () => {
+    const dir = scratchDir();
+    const destDir = join(dir, 'workspace');
+    const keyDir = scratchDir();
+    const keyPath = join(keyDir, `${ROLE}.pem`);
+    const initCalls: { dir: string; opts: InitOptions }[] = [];
+
+    const outcome = await deployAgent(
+      AGENT,
+      manifestWith(),
+      destDir,
+      { vaultPath: '/fake/vault.age', identityPath: '/fake/key.txt' },
+      {
+        readVault: async () => vaultRawFor('111', '222', PEM),
+        cloneRepo: async (_url, d) => mkdirSync(d, { recursive: true }),
+        mintCloneToken: async () => FAKE_TOKEN,
+        initAgent: fakeInitAgent(initCalls),
+        keyPathFor: () => keyPath,
+        resolveVersions: async () => {
+          throw new Error('must not be called — manifest.versions is declared, so lockstep derivation needs zero network resolution');
+        },
+      },
+    );
+
+    expect(outcome.status).toBe('deployed');
+    expect(initCalls).toHaveLength(1);
+    // MUTATION CHECK: dropping `pluginVersion: versions.plugin` from the
+    // `deps.initAgent(...)` call site in `fleet-deploy.ts` makes `opts`
+    // lack the key entirely — `toMatchObject` requires it present with
+    // this exact value, so that mutation fails THIS assertion.
+    expect(initCalls[0]?.opts).toMatchObject({
+      cliVersion: '0.2.56',
+      pluginVersion: '0.2.56',
+      actionsVersion: 'v3.4.1',
+    });
+  });
+
+  it('DECISIVE (b): manifest with NO versions: block still locksteps plugin to whatever the resolver returns for cli — never the hardcoded 0.2.0', async () => {
+    const dir = scratchDir();
+    const destDir = join(dir, 'workspace');
+    const keyDir = scratchDir();
+    const keyPath = join(keyDir, `${ROLE}.pem`);
+    const initCalls: { dir: string; opts: InitOptions }[] = [];
+    const { versions: _versions, ...manifestNoVersions } = manifestWith();
+
+    const outcome = await deployAgent(
+      AGENT,
+      manifestNoVersions as FleetManifest,
+      destDir,
+      { vaultPath: '/fake/vault.age', identityPath: '/fake/key.txt' },
+      {
+        readVault: async () => vaultRawFor('111', '222', PEM),
+        cloneRepo: async (_url, d) => mkdirSync(d, { recursive: true }),
+        mintCloneToken: async () => FAKE_TOKEN,
+        initAgent: fakeInitAgent(initCalls),
+        keyPathFor: () => keyPath,
+        resolveVersions: async () => ({ cli: '9.9.9', plugin: '9.9.9', actions: 'v9' }),
+      },
+    );
+
+    expect(outcome.status).toBe('deployed');
+    expect(initCalls).toHaveLength(1);
+    expect(initCalls[0]?.opts).toMatchObject({
+      cliVersion: '9.9.9',
+      pluginVersion: '9.9.9',
+      actionsVersion: 'v9',
+    });
+    expect(initCalls[0]?.opts.pluginVersion).not.toBe('0.2.0');
+  });
+
+  it('DECISIVE (c): a resolver failure (no explicit manifest pin) surfaces as a FAILED outcome naming the fallback + cause — initAgent is never reached, so a hookless 0.2.0 plugin never lands on disk', async () => {
+    const dir = scratchDir();
+    const destDir = join(dir, 'workspace');
+    const keyDir = scratchDir();
+    const keyPath = join(keyDir, `${ROLE}.pem`);
+    const initCalls: { dir: string; opts: InitOptions }[] = [];
+    const { versions: _versions, ...manifestNoVersions } = manifestWith();
+
+    const outcome = await deployAgent(
+      AGENT,
+      manifestNoVersions as FleetManifest,
+      destDir,
+      { vaultPath: '/fake/vault.age', identityPath: '/fake/key.txt' },
+      {
+        readVault: async () => vaultRawFor('111', '222', PEM),
+        cloneRepo: async (_url, d) => mkdirSync(d, { recursive: true }),
+        mintCloneToken: async () => FAKE_TOKEN,
+        initAgent: fakeInitAgent(initCalls),
+        keyPathFor: () => keyPath,
+        resolveVersions: async () => {
+          throw new VersionResolutionError(
+            'lockstep_versions_unresolvable',
+            'fleet deploy: version resolution failed — refusing to silently pin the hardcoded default ' +
+              'versions (DR-044 Decision 6 — fail loud, fail fast):\n' +
+              '  - cli+plugin: network fetch failed (registry.npmjs.org: ECONNREFUSED) — refusing the ' +
+              'hardcoded fallback ("0.2.59" / "0.2.0"; plugin locksteps to cli, so a cli lookup failure ' +
+              'means plugin has no real pin either)',
+          );
+        },
+      },
+    );
+
+    expect(outcome.status).toBe('failed');
+    if (outcome.status === 'failed') {
+      expect(outcome.reason).toContain('0.2.0');
+      expect(outcome.reason).toContain('ECONNREFUSED');
+    }
+    // The decisive absence: initAgent must never be reached — a
+    // half-resolved version pin must not become a deployed workspace.
+    expect(initCalls).toHaveLength(0);
   });
 });
 

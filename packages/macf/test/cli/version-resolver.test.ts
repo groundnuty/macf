@@ -1,6 +1,8 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import {
   resolveLatestVersions,
+  resolveLockstepVersionsOrThrow,
+  VersionResolutionError,
   fetchLatestCliVersion,
   fetchLatestPluginVersion,
   fetchLatestActionsVersion,
@@ -307,6 +309,101 @@ describe('resolveLatestVersions', () => {
     expect(result.versions.plugin).toBe('0.1.0');
     expect(result.versions.actions).toBe('v1');
   });
+});
+
+describe('resolveLockstepVersionsOrThrow (macf#1406)', () => {
+  it('derives plugin from cli — NEVER independently fetches the marketplace repo (lockstep, not a second lookup that happens to agree)', async () => {
+    const calledUrls: string[] = [];
+    globalThis.fetch = vi.fn().mockImplementation((url: string) => {
+      calledUrls.push(url);
+      if (url.includes('registry.npmjs.org')) {
+        return Promise.resolve({ ok: true, status: 200, json: async () => ({ 'dist-tags': { latest: '0.9.9' } }) });
+      }
+      if (url.includes('macf-actions')) {
+        return Promise.resolve({ ok: true, status: 200, json: async () => ({ tag_name: 'v5.0.0' }) });
+      }
+      // A call to the marketplace repo here means the implementation
+      // regressed to an independent plugin lookup instead of deriving
+      // plugin from cli — fail loud rather than let it silently succeed.
+      return Promise.reject(new Error(`unexpected fetch to ${url} — plugin must be DERIVED from cli`));
+    }) as typeof fetch;
+
+    const result = await resolveLockstepVersionsOrThrow();
+    expect(result).toEqual({ cli: '0.9.9', plugin: '0.9.9', actions: 'v5' });
+    expect(calledUrls.some((u) => u.includes('macf-marketplace'))).toBe(false);
+  });
+
+  // DECISIVE (macf#1406) — a real pin was expected (no explicit version
+  // available to the caller) and the lookup failed: this MUST reject
+  // naming the fallback it would have used and why, never silently return
+  // FALLBACK_VERSIONS. This is the exact hazard the issue reports: a
+  // 0.2.0 plugin landing silently beside a real cliVersion.
+  it('DECISIVE — cli lookup failure REJECTS naming the cli+plugin fallback and the cause, never silently returns it', async () => {
+    globalThis.fetch = vi.fn().mockImplementation((url: string) => {
+      if (url.includes('registry.npmjs.org')) return Promise.reject(new Error('ECONNREFUSED'));
+      return Promise.resolve({ ok: true, status: 200, json: async () => ({ tag_name: 'v5.0.0' }) });
+    }) as typeof fetch;
+
+    await expect(resolveLockstepVersionsOrThrow()).rejects.toBeInstanceOf(VersionResolutionError);
+
+    globalThis.fetch = vi.fn().mockImplementation((url: string) => {
+      if (url.includes('registry.npmjs.org')) return Promise.reject(new Error('ECONNREFUSED'));
+      return Promise.resolve({ ok: true, status: 200, json: async () => ({ tag_name: 'v5.0.0' }) });
+    }) as typeof fetch;
+    try {
+      await resolveLockstepVersionsOrThrow();
+      throw new Error('should have thrown');
+    } catch (e) {
+      expect(e).toBeInstanceOf(VersionResolutionError);
+      const err = e as VersionResolutionError;
+      expect(err.code).toBe('lockstep_versions_unresolvable');
+      expect(err.message).toContain(FALLBACK_VERSIONS.cli);
+      expect(err.message).toContain(FALLBACK_VERSIONS.plugin);
+      expect(err.message).toContain('ECONNREFUSED');
+      expect(err.message).toContain('registry.npmjs.org');
+    }
+  });
+
+  it('DECISIVE — actions lookup failure REJECTS naming the actions fallback and the cause, and does NOT also blame cli (which succeeded)', async () => {
+    globalThis.fetch = vi.fn().mockImplementation((url: string) => {
+      if (url.includes('registry.npmjs.org')) {
+        return Promise.resolve({ ok: true, status: 200, json: async () => ({ 'dist-tags': { latest: '0.9.9' } }) });
+      }
+      if (url.includes('macf-actions')) return Promise.reject(new Error('ENOTFOUND'));
+      return Promise.reject(new Error('unexpected'));
+    }) as typeof fetch;
+
+    try {
+      await resolveLockstepVersionsOrThrow();
+      throw new Error('should have thrown');
+    } catch (e) {
+      const err = e as VersionResolutionError;
+      expect(err.message).toContain(FALLBACK_VERSIONS.actions);
+      expect(err.message).toContain('ENOTFOUND');
+      expect(err.message).not.toContain(FALLBACK_VERSIONS.cli);
+    }
+  });
+
+  it('both lookups failing names BOTH fallbacks in one message', async () => {
+    globalThis.fetch = vi.fn().mockRejectedValue(new Error('down')) as typeof fetch;
+    try {
+      await resolveLockstepVersionsOrThrow();
+      throw new Error('should have thrown');
+    } catch (e) {
+      const err = e as VersionResolutionError;
+      expect(err.message).toContain(FALLBACK_VERSIONS.cli);
+      expect(err.message).toContain(FALLBACK_VERSIONS.actions);
+    }
+  });
+
+  // MUTATION CHECK (assert-the-wrong-path.md): if `resolveLockstepVersionsOrThrow`
+  // regressed to `resolveLatestVersions()`'s warn-and-degrade shape (`return
+  // { cli: FALLBACK_VERSIONS.cli, plugin: FALLBACK_VERSIONS.plugin, actions:
+  // FALLBACK_VERSIONS.actions }` instead of throwing), every `.rejects` /
+  // try-catch assertion in this block fails outright — the promise resolves
+  // instead of rejecting, which `await expect(...).rejects.toBeInstanceOf(...)`
+  // and the `throw new Error('should have thrown')` sentinels both surface
+  // immediately, not as a softer wrong-value mismatch.
 });
 
 describe('statusMessage', () => {

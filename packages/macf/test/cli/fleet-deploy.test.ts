@@ -41,10 +41,19 @@ function fakeInitAgentWritingCertWhenCaPresent(caPaths: { certPath: string; keyP
   };
 }
 
+// `versions:` declared (macf#1406) so every test in this file — fully
+// offline per this file's own header doc — never falls into
+// `deployAgent`'s network-resolving `resolveVersions` seam (which, left at
+// its real default, would attempt a genuine network fetch and fail in a
+// sandboxed test run). Matches `bootstrap/fleet-deploy.test.ts`'s own
+// `manifestWith()` fixture, the same values, for consistency.
 const FLEET_YAML = `apiVersion: macf/v0
 kind: Fleet
 metadata:
   name: demo-fleet
+versions:
+  macf: 0.2.56
+  actions: v3.4.1
 owner:
   account: groundnuty
   type: user

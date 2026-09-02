@@ -132,6 +132,22 @@ export interface ResolvedVersions {
   };
 }
 
+/**
+ * Thrown by {@link resolveLockstepVersionsOrThrow} — a real pin was expected
+ * (no explicit version was available to the caller) and the network lookup
+ * failed. `code` is always `'lockstep_versions_unresolvable'`; `message`
+ * names, per failed component, why the lookup failed and which hardcoded
+ * {@link FALLBACK_VERSIONS} value this function refused to silently return.
+ */
+export class VersionResolutionError extends Error {
+  readonly code: string;
+  constructor(code: string, message: string) {
+    super(message);
+    this.name = 'VersionResolutionError';
+    this.code = code;
+  }
+}
+
 export const FALLBACK_VERSIONS: VersionSet = {
   cli: PACKAGE_VERSION,
   // Bumped 2026-04-26 (testbed#229 + macf#259): v0.1.0 plugin manifest
@@ -354,6 +370,24 @@ export async function resolveLatestVersions(): Promise<ResolvedVersions> {
 }
 
 /**
+ * The human-readable reason a non-'ok' {@link FetchStatus} failed — no
+ * component name, no "(using default)" suffix, no detail. Shared by
+ * {@link statusMessage} (the warn-and-degrade wording every existing caller
+ * depends on byte-for-byte) and {@link resolveLockstepVersionsOrThrow}'s
+ * loud-failure message (macf#1406), so the two can never describe the same
+ * status differently.
+ */
+function fetchFailureReason(status: FetchStatus): string {
+  switch (status) {
+    case 'ok': return 'ok';
+    case 'not_published': return 'no published release found';
+    case 'network_error': return 'network fetch failed';
+    case 'rate_limited': return 'GitHub API rate-limited or unauthorized — set GH_TOKEN to raise the anon 60 req/h limit';
+    case 'invalid_response': return 'unexpected response format';
+  }
+}
+
+/**
  * Human-readable message for a non-ok fetch status. Used by callers to
  * print actionable warnings instead of the generic "network fetch failed".
  *
@@ -363,14 +397,71 @@ export async function resolveLatestVersions(): Promise<ResolvedVersions> {
  * WHICH endpoint rejected the call and WHY, not just a status label.
  */
 export function statusMessage(component: string, status: FetchStatus, detail?: string): string {
-  const base = ((): string => {
-    switch (status) {
-      case 'ok': return `${component}: ok`;
-      case 'not_published': return `${component}: no published release found (using default)`;
-      case 'network_error': return `${component}: network fetch failed (using default)`;
-      case 'rate_limited': return `${component}: GitHub API rate-limited or unauthorized — set GH_TOKEN to raise the anon 60 req/h limit (using default)`;
-      case 'invalid_response': return `${component}: unexpected response format (using default)`;
-    }
-  })();
+  const base = status === 'ok'
+    ? `${component}: ok`
+    : `${component}: ${fetchFailureReason(status)} (using default)`;
   return detail ? `${base} — ${detail}` : base;
+}
+
+/**
+ * Resolves `{cli, plugin, actions}` for a caller that needs every value to
+ * actually BE a live pin — never {@link FALLBACK_VERSIONS} (macf#1406,
+ * DR-044 Decision 6: fail loud, fail fast, "one reason, once"). Unlike
+ * {@link resolveLatestVersions}, `plugin` is NEVER independently looked up
+ * against the marketplace repo — it is DERIVED from `cli`, in lockstep,
+ * because `release.sh::cmd_marketplace` always bumps the marketplace
+ * `plugin.json` to the SAME `VERSION` the CLI release uses. Deriving it
+ * rather than fetching it separately closes two things at once: one fewer
+ * network call, and no possibility of the two independent lookups landing
+ * on different values (a marketplace tag pushed a few seconds before/after
+ * the matching npm publish, or one of the two endpoints failing while the
+ * other succeeds).
+ *
+ * `actions` stays an independent lookup — its versioning is genuinely
+ * decoupled from the CLI/plugin pair (`vX` major-only floating tags on a
+ * separate release cadence).
+ *
+ * On any lookup failure, throws {@link VersionResolutionError} naming, per
+ * failed component, why the fetch failed and which hardcoded
+ * {@link FALLBACK_VERSIONS} value this function refused to silently return
+ * — never the "print a warning to stderr and keep going" degrade
+ * {@link resolveLatestVersions} performs. That warn-and-degrade path stays
+ * exactly as-is and is UNCHANGED by this addition — it is the deliberate
+ * offline-default `macf init`/`macf update` rely on (see
+ * {@link FALLBACK_VERSIONS}'s own doc for why landing on a *working* plugin
+ * matters for an operator genuinely offline). This function is for the one
+ * caller (`macf fleet deploy`, via `bootstrap/fleet-deploy.ts`) where a
+ * silently-wrong pin becomes an unattended, unguarded agent workspace with
+ * nobody watching stderr — see `silent-fallback-hazards.md` Instance 17's
+ * "assert the result, or degrade to unknown — never silently substitute a
+ * default" floor, applied here to a version pin instead of a health check.
+ */
+export async function resolveLockstepVersionsOrThrow(): Promise<VersionSet> {
+  const [cli, actions] = await Promise.all([fetchLatestCliVersion(), fetchLatestActionsVersion()]);
+
+  const failures: string[] = [];
+  if (cli.status !== 'ok') {
+    const detail = cli.detail ? ` (${cli.detail})` : '';
+    failures.push(
+      `  - cli+plugin: ${fetchFailureReason(cli.status)}${detail} — refusing the hardcoded fallback ` +
+        `("${FALLBACK_VERSIONS.cli}" / "${FALLBACK_VERSIONS.plugin}"; plugin locksteps to cli, so a cli ` +
+        'lookup failure means plugin has no real pin either)',
+    );
+  }
+  if (actions.status !== 'ok') {
+    const detail = actions.detail ? ` (${actions.detail})` : '';
+    failures.push(
+      `  - actions: ${fetchFailureReason(actions.status)}${detail} — refusing the hardcoded fallback "${FALLBACK_VERSIONS.actions}"`,
+    );
+  }
+  if (failures.length > 0) {
+    throw new VersionResolutionError(
+      'lockstep_versions_unresolvable',
+      'fleet deploy: version resolution failed — refusing to silently pin the hardcoded default ' +
+        `versions, since an unattended deploy landing on a mismatched pin is worse than an explicit ` +
+        `failure naming exactly what to fix:\n${failures.join('\n')}`,
+    );
+  }
+
+  return { cli: cli.value!, plugin: cli.value!, actions: actions.value! };
 }
