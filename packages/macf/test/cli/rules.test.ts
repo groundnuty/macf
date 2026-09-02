@@ -123,15 +123,17 @@ describe('copyCanonicalRules', () => {
     expect(existsSync(join(workspace, '.claude', 'rules', 'coordination.md'))).toBe(true);
   });
 
-  it('returns empty array when canonical dir does not exist (no crash)', () => {
+  // groundnuty/macf#1403: a missing canonical source dir used to be
+  // tolerated silently (return []) — indistinguishable from "nothing needed
+  // refreshing." A real CLI install always ships this dir; its absence is a
+  // packaging defect and must be loud, not a state a caller can miss.
+  it('throws naming the missing dir when the canonical rules dir does not exist (groundnuty/macf#1403)', () => {
     const workspace = join(tmpRoot, 'workspace');
     mkdirSync(workspace);
+    const missingDir = join(tmpRoot, 'does-not-exist');
 
-    const copied = copyCanonicalRules(workspace, {
-      canonicalDir: join(tmpRoot, 'does-not-exist'),
-    });
-
-    expect(copied).toEqual([]);
+    expect(() => copyCanonicalRules(workspace, { canonicalDir: missingDir })).toThrow(missingDir);
+    // Nothing was written — the refusal happens before any target dir exists.
     expect(existsSync(join(workspace, '.claude'))).toBe(false);
   });
 });
@@ -281,16 +283,55 @@ describe('copyCanonicalScripts', () => {
     expect(out).toContain('echo hi');
   });
 
-  it('returns empty array when both canonical dirs do not exist (no crash)', () => {
+  // groundnuty/macf#1403: both-missing used to be tolerated silently
+  // (return []) — indistinguishable from "nothing needed refreshing." A
+  // real CLI install always ships both source dirs; either being absent is
+  // a packaging defect and must be loud, not a state a caller can miss.
+  it('throws naming BOTH missing dirs in one error when neither canonical dir exists (groundnuty/macf#1403)', () => {
     const workspace = join(tmpRoot, 'workspace');
     mkdirSync(workspace);
+    const missingLegacy = join(tmpRoot, 'does-not-exist');
+    const missingPlugin = join(tmpRoot, 'also-does-not-exist');
 
-    const copied = copyCanonicalScripts(workspace, {
-      canonicalDir: join(tmpRoot, 'does-not-exist'),
-      pluginScriptsDir: join(tmpRoot, 'also-does-not-exist'),
-    });
+    let thrown: unknown;
+    try {
+      copyCanonicalScripts(workspace, { canonicalDir: missingLegacy, pluginScriptsDir: missingPlugin });
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    const message = (thrown as Error).message;
+    expect(message).toContain(missingLegacy);
+    expect(message).toContain(missingPlugin);
+    // Nothing was written — the refusal happens before any target dir exists.
+    expect(existsSync(join(workspace, '.claude'))).toBe(false);
+  });
 
-    expect(copied).toEqual([]);
+  // The actual macf#1403 bug shape: ONE source dir present (the legacy
+  // `scripts/`), the OTHER absent (`plugin/scripts/` — omitted from
+  // `package.json` `files[]` on every published CLI through 0.2.59). This is
+  // NOT "nothing to copy" — it's a partial packaging failure that must not
+  // be conflated with the both-present, zero-files-changed silent case.
+  it('throws naming the missing dir when only the PLUGIN scripts dir is absent (the real macf#1403 shape)', () => {
+    const workspace = join(tmpRoot, 'workspace');
+    mkdirSync(workspace);
+    const missingPlugin = join(tmpRoot, 'plugin-does-not-exist');
+
+    expect(() =>
+      copyCanonicalScripts(workspace, { canonicalDir: fakeCanonical, pluginScriptsDir: missingPlugin }),
+    ).toThrow(missingPlugin);
+    expect(existsSync(join(workspace, '.claude'))).toBe(false);
+  });
+
+  // Symmetric: only the LEGACY dir absent, plugin dir present.
+  it('throws naming the missing dir when only the LEGACY scripts dir is absent', () => {
+    const workspace = join(tmpRoot, 'workspace');
+    mkdirSync(workspace);
+    const missingLegacy = join(tmpRoot, 'legacy-does-not-exist');
+
+    expect(() =>
+      copyCanonicalScripts(workspace, { canonicalDir: missingLegacy, pluginScriptsDir: fakePluginScripts }),
+    ).toThrow(missingLegacy);
     expect(existsSync(join(workspace, '.claude'))).toBe(false);
   });
 
