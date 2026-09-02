@@ -335,6 +335,26 @@ describe('copyCanonicalScripts', () => {
     expect(existsSync(join(workspace, '.claude'))).toBe(false);
   });
 
+  // The decisive OTHER half of the pair above: absent ≠ empty. Both source
+  // dirs EXIST here (fakePluginScripts is present but has nothing in it —
+  // same fixture shape `beforeEach` already sets up for the single-source
+  // tests above) — this must stay silent, exactly like before #1403.
+  // Pinned explicitly rather than left to be true only incidentally because
+  // the existing single-source tests happen to use an empty fakePluginScripts.
+  it('does NOT throw when both source dirs exist but the plugin dir is genuinely empty (present ≠ absent)', () => {
+    const workspace = join(tmpRoot, 'workspace');
+    mkdirSync(workspace);
+    // fakePluginScripts exists (created in beforeEach) and has zero .sh files.
+
+    let copied: readonly string[] = [];
+    expect(() => {
+      copied = copyCanonicalScripts(workspace, { canonicalDir: fakeCanonical, pluginScriptsDir: fakePluginScripts });
+    }).not.toThrow();
+
+    expect(copied.slice().sort()).toEqual(['helper.sh', 'other.sh']);
+    expect(existsSync(join(workspace, '.claude', 'scripts', 'helper.sh'))).toBe(true);
+  });
+
   describe('dual-source merge (DR-039 phase 2, groundnuty/macf#698)', () => {
     it('copies .sh files from BOTH the legacy dir and the plugin scripts dir', () => {
       writeFileSync(join(fakePluginScripts, 'check-fake-hook.sh'), '#!/usr/bin/env bash\necho hook\n');
