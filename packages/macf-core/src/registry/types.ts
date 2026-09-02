@@ -19,6 +19,26 @@ export const AgentInfoSchema = z.object({
    * graceful-deregister (#586) shutdown handler never runs for.
    */
   last_heartbeat: z.string().optional(),
+  /**
+   * The agent's OTEL wire identity — `MACF_AGENT_NAME`, written at
+   * registration (groundnuty/macf#1393, `groundnuty/macf-devops-toolkit#203`).
+   * ADDITIVE-OPTIONAL: the registry KEY is (and stays) `routing_label`
+   * (`MACF_ROUTING_LABEL`, defaulting to `agent_name` when unset — see
+   * `config.ts`), so this field records a SECOND name, not a replacement.
+   * The two are allowed to differ by design (`coordination.md` §tmux launch
+   * — e.g. science: `agent_name=macf-science-agent`,
+   * `routing_label=science-agent`) and OTEL's `gen_ai.agent.name` carries
+   * `agent_name`, not the routing label.
+   *
+   * A reader MUST treat an ABSENT `agent_name` as unknown — NEVER default it
+   * to `routing_label`. Doing so would silently reintroduce the exact "I
+   * can't tell a real name from a guess" ambiguity this field exists to
+   * remove: entries written before this field existed (and any future
+   * channel-server predating it) parse fine without it, and defaulting the
+   * absence would make every pre-existing entry look like a coincidentally
+   * name-matching agent instead of an honestly-unknown one.
+   */
+  agent_name: z.string().optional(),
 });
 
 export type AgentInfo = z.infer<typeof AgentInfoSchema>;
@@ -34,6 +54,15 @@ export type AgentInfo = z.infer<typeof AgentInfoSchema>;
  * CAS if a heartbeat from the prior instance landed in the collision-check →
  * register-write window (a re-stamp must not block a legitimate #424 version-
  * takeover). The five identity fields below fully determine slot ownership.
+ *
+ * `agent_name` is ALSO excluded (groundnuty/macf#1393) — it is descriptive
+ * metadata (the OTEL wire name), not identity; the registry KEY + these five
+ * fields already fully determine slot ownership, and `agent_name` is constant
+ * for a given instance's whole lifetime, so excluding it from the CAS is
+ * purely a "don't widen the identity surface" choice, not a functional need
+ * the way `last_heartbeat`'s exclusion is. It also keeps a pre-existing entry
+ * (written before this field existed, so `agent_name` is absent) comparing
+ * correctly against a freshly composed one that carries it.
  */
 export function agentInfoEquals(a: AgentInfo | null, b: AgentInfo | null): boolean {
   if (a === null || b === null) return a === b;
