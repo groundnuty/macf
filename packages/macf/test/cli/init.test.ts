@@ -378,6 +378,76 @@ describe('macf init', () => {
     expect(lines).toContain('.claude/rules/project/'); // original line untouched
   });
 
+  // macf#1434 — `.claude/scripts/*` (the substrate idiom, paired with a
+  // `!.claude/scripts/<file>` negation to preserve one operator-authored
+  // script) is a DIFFERENT SPELLING of the same coverage as the plain
+  // `.claude/scripts/` entry, not a narrower one. Appending the plain-dir
+  // line on top would silently defeat the negation for any future
+  // preserved file (git: "It is not possible to re-include a file if a
+  // parent directory of that file is excluded."). The whole file — the
+  // `*`-idiom pair AND the negation line — must come out byte-identical;
+  // in particular no `.claude/scripts/` line gets appended anywhere.
+  it('leaves a .gitignore using the dir/* + negation idiom byte-identical, not appending the plain dir/ line (macf#1434)', async () => {
+    const existing =
+      '.macf/\n.claude/rules/\n.claude/scripts/*\n!.claude/scripts/macf-statusline.sh\n';
+    writeFileSync(join(dir, '.gitignore'), existing);
+
+    await initAgent(dir, {
+      project: 'T',
+      role: 'a',
+      appId: '1',
+      installId: '2',
+      keyPath: 'k',
+      registryType: 'repo',
+      registryRepo: 'o/r',
+    });
+
+    expect(readFileSync(join(dir, '.gitignore'), 'utf-8')).toBe(existing);
+  });
+
+  // Sibling spelling: `dir/**` must be recognized as coverage too, not
+  // just `dir/*`.
+  it('leaves a .gitignore using the dir/** idiom byte-identical (macf#1434)', async () => {
+    const existing = '.macf/\n.claude/rules/\n.claude/scripts/**\n';
+    writeFileSync(join(dir, '.gitignore'), existing);
+
+    await initAgent(dir, {
+      project: 'T',
+      role: 'a',
+      appId: '1',
+      installId: '2',
+      keyPath: 'k',
+      registryType: 'repo',
+      registryRepo: 'o/r',
+    });
+
+    expect(readFileSync(join(dir, '.gitignore'), 'utf-8')).toBe(existing);
+  });
+
+  // The `dir/*` coverage check must stay scoped to its OWN directory entry
+  // — `.claude/rules/project/*` covers nothing for the unrelated
+  // `.claude/scripts/` entry, which must still get appended (neither
+  // spelling of it is present at all here).
+  it('still appends .claude/scripts/ when only an unrelated dir carries the */** idiom (macf#1434)', async () => {
+    writeFileSync(join(dir, '.gitignore'), '.macf/\n.claude/rules/\n.claude/rules/project/*\n');
+
+    await initAgent(dir, {
+      project: 'T',
+      role: 'a',
+      appId: '1',
+      installId: '2',
+      keyPath: 'k',
+      registryType: 'repo',
+      registryRepo: 'o/r',
+    });
+
+    const gitignore = readFileSync(join(dir, '.gitignore'), 'utf-8');
+    expect(gitignore).toContain('.claude/scripts/');
+    // The literal line, not merely a substring hit inside another entry.
+    const lines = gitignore.split('\n').map((l) => l.trim());
+    expect(lines).toContain('.claude/scripts/');
+  });
+
   // Regression pin for "preserve the file's trailing-newline state": a
   // .gitignore whose last line has no trailing newline must not get the
   // appended block glued onto that line.

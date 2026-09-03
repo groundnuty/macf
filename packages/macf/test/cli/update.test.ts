@@ -359,6 +359,23 @@ describe('update command', () => {
     expect(readFileSync(join(dir, '.gitignore'), 'utf-8')).toBe(existing);
   });
 
+  // macf#1434 — update-side companion to the init-side test of the same
+  // name: a workspace using the substrate `.claude/scripts/*` + negation
+  // idiom must come out byte-identical after `update` too — no plain
+  // `.claude/scripts/` line appended on top, which would silently defeat
+  // the negation for any future operator-preserved file under the dir.
+  it('leaves a .gitignore using the dir/* + negation idiom byte-identical after update (macf#1434)', async () => {
+    writeConfig(dir, { cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
+    mockFetchReturning({ cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
+    const existing =
+      '.macf/\n.claude/rules/\n.claude/scripts/*\n!.claude/scripts/macf-statusline.sh\n';
+    writeFileSync(join(dir, '.gitignore'), existing);
+
+    const code = await update(dir, { all: false, cli: false, plugin: false, actions: false, yes: false, dryRun: false });
+    expect(code).toBe(0);
+    expect(readFileSync(join(dir, '.gitignore'), 'utf-8')).toBe(existing);
+  });
+
   it('--all --yes bumps all out-of-date components', async () => {
     writeConfig(dir, { cli: '0.1.0', plugin: '0.1.0', actions: 'v1' });
     mockFetchReturning({ cli: '0.3.0', plugin: '0.2.0', actions: 'v2' });
