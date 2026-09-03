@@ -24,7 +24,7 @@
   "bugs": "https://github.com/groundnuty/macf/issues",
   "license": "MIT",
   "engines": {
-    "node": ">=22"
+    "node": ">=22.12.0"
   },
   "scripts": {
     "build": "tsc -b",
