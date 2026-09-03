@@ -304,6 +304,23 @@ export interface ObservedAgentState {
    */
   readonly routerWithKeys?: readonly string[];
   /**
+   * groundnuty/macf#1425 (silent-fallback-hazards.md Instance 18) — the
+   * agent-role KEYS present in this repo's committed
+   * `.github/agent-config.json` `"agents"` object, i.e. who this repo's
+   * routing table currently names. Sourced from a LIVE read
+   * (`observer.ts::readInstalledAgentConfigRoles`) of the sibling file
+   * `actionsPin` above reads — the SAME "read a committed file, extract one
+   * fact" shape, applied to `.github/agent-config.json` instead of
+   * `.github/workflows/agent-router.yml`. `undefined` on ANY read failure
+   * (file absent, malformed JSON, no `agents` object, auth/network) — same
+   * "collapse absent + unreadable into one signal" posture `actionsPin`
+   * uses above; a caller needing the absent-vs-unreadable distinction
+   * doesn't exist yet. An empty array (`[]`) is a REAL, distinct reading:
+   * the file WAS found and parsed, and its `"agents"` object genuinely has
+   * no keys.
+   */
+  readonly agentConfigRoles?: readonly string[];
+  /**
    * Vault-derived secret-field presence for this agent (DR-043 Amendment D
    * phase 3, `vault-read.ts::queryVaultAgentPresence`) — `undefined` when
    * `plan` ran without vault access (the phase-2 default; NOT evidence the
@@ -582,6 +599,13 @@ export type PlanItemKind =
   | 'version'
   | 'actions_pin'
   | 'labels'
+  /**
+   * groundnuty/macf#1425 (silent-fallback-hazards.md Instance 18) — this
+   * agent repo's `.github/agent-config.json` routing-table membership: does
+   * it name every DECLARED fleet role, or just its own? See
+   * {@link agentConfigItem}'s doc.
+   */
+  | 'agent_config'
   | 'routing_client'
   | 'runner_ops'
   | 'vault_recipients'
@@ -1096,6 +1120,16 @@ export function planItemApplyCoverage(item: PlanItem): ApplyCoverage {
       // (`presenceVerb` is never called for this kind — see its own doc), so
       // this arm's only live input is 'create'.
       return 'implemented';
+    case 'agent_config':
+      // groundnuty/macf#1425 — the SAME `applyRepoInitForAgent` call
+      // `'labels'` immediately above already established as 'implemented'
+      // is what widens the committed `.github/agent-config.json` to the
+      // full declared fleet (`agents: manifest.agents.map(a => a.role).join(',')`
+      // in `apply-repo-init.ts`), unconditionally, every reused/resumed-
+      // install run. `agentConfigItem` emits `'create'` (unobservable
+      // degrade), `'update'` (missing role[s]), or `'noop'` — all three
+      // are real apply behavior; 'noop' is already filtered above.
+      return 'implemented';
     case 'routing_client':
       // groundnuty/macf#920 gap 2 — apply-fleet.ts's routing-client ceremony
       // publishes create-only when a mint succeeded. Produced by
@@ -1253,6 +1287,7 @@ function unimplementedReasonFor(item: PlanItem): string {
     case 'control_repo':
     case 'agent_repo_archived':
     case 'labels':
+    case 'agent_config':
     case 'routing_client':
     case 'runner_ops':
     case 'runner_warm':
@@ -1269,7 +1304,9 @@ function unimplementedReasonFor(item: PlanItem): string {
       // 2, 'federated_ca' in groundnuty/macf#810 (same registry-publish
       // shape as 'ca'), 'control_repo' in macf#867 / DR-043 Amendment G, 'agent_repo_archived'
       // in macf#1034 (DR-043 Amendment G correction), 'labels'/
-      // 'routing_client' in groundnuty/macf#920, 'runner_ops' in
+      // 'routing_client' in groundnuty/macf#920, 'agent_config' joined at
+      // birth in groundnuty/macf#1425 (the SAME `applyRepoInitForAgent` call
+      // 'labels' already covers), 'runner_ops' in
       // groundnuty/macf#943, 'vault_recipients' in groundnuty/macf#957,
       // 'version' in macf#1045 / DR-043 Amendment L, 'actions_pin' in
       // macf#1072 / DR-043 Amendment L extended, 'router_app' in
@@ -1343,6 +1380,11 @@ export const UNKNOWN_REASONS = {
   actionsPin:
     'could not be read from "agent-router.yml" (missing file, no macf-actions `uses:` line, or the read ' +
     'failed — auth / network / insufficient scope)',
+  // groundnuty/macf#1425 — sibling phrasing to `actionsPin` immediately
+  // above, for the OTHER committed-file read `agentConfigItem` needs.
+  agentConfigRoles:
+    'could not be read from "agent-config.json" (missing file, malformed JSON, no `agents` object, or the ' +
+    'read failed — auth / network / insufficient scope)',
 } as const;
 
 /** Presence → {verb, reason-suffix} for a pure existence-only resource (App / repo / install / CA). */
@@ -1465,6 +1507,76 @@ function labelsItem(agent: FleetAgent): PlanItem {
       'apply attempts label creation unconditionally on every repo-init run, whether or not the labels already ' +
       'exist; this item cannot distinguish "missing" from "already present".',
     confirm_required: false,
+  };
+}
+
+/**
+ * groundnuty/macf#1425 (silent-fallback-hazards.md Instance 18) — does
+ * `agent.repo`'s committed `.github/agent-config.json` name every DECLARED
+ * fleet role, or only this agent's own? A one-agent table makes that repo a
+ * one-way channel: `route-by-mention` finds no entry for a sibling and
+ * silently drops (exits 0, emits no `Routed mention` line — no error at any
+ * layer). Unlike `labelsItem` immediately above, this item IS observable at
+ * plan time — `observedRoles` is a live read of the committed file
+ * (`ObservedAgentState.agentConfigRoles`) — so it uses a genuine
+ * create/update/noop verb instead of `'write-always'`.
+ *
+ * `desiredRoles` is the FULL declared fleet roster (`manifest.agents[].role`),
+ * not just `agent.role` — the same union `apply-repo-init.ts::applyRepoInitForAgent`
+ * now asks `repoInit()` to write (this issue's OTHER half). A role present in
+ * `observedRoles` but NOT in `desiredRoles` (an agent dropped from the
+ * manifest, or a hand-added entry) is NEVER treated as something to remove
+ * here — §D3 Design invariant 4 ("play it safe," no delete/prune verb from
+ * this item) and `patchAgentConfig`'s own "existing entries are preserved,
+ * never dropped" contract agree: this item only asks "is anything MISSING,"
+ * never "is anything EXTRA."
+ *
+ * - `observedRoles === undefined` (file absent, malformed, or unreadable) →
+ *   `'create'`, LOW CONFIDENCE — same `presenceVerb`-style degrade
+ *   `actionsVersionItem`'s own `observed === undefined` branch uses: not
+ *   drift, not a confirmed match, an honest "couldn't check."
+ * - every `desiredRoles` member is already in `observedRoles` → `'noop'`.
+ * - some `desiredRoles` member is missing → `'update'`, naming the missing
+ *   roles explicitly. `confirm_required: true` per `PlanItem.confirm_required`'s
+ *   own doc ("`update` is ALWAYS `true`" — §D3 confirm-then-update, never
+ *   silent) — even though the write itself is additive-only (never drops a
+ *   pre-existing entry), it IS a commit to a repo the operator hasn't
+ *   explicitly approved yet this run.
+ */
+function agentConfigItem(agent: FleetAgent, desiredRoles: readonly string[], observedRoles: readonly string[] | undefined): PlanItem {
+  const target = `agent:${agent.role}:agent_config:${agent.repo}`;
+  if (observedRoles === undefined) {
+    return {
+      kind: 'agent_config',
+      target,
+      verb: 'create',
+      reason:
+        `routing table on "${agent.repo}" (.github/agent-config.json) ${UNKNOWN_REASONS.agentConfigRoles} — ` +
+        'not drift, not a match — LOW CONFIDENCE',
+      confirm_required: false,
+    };
+  }
+  const observedSet = new Set(observedRoles);
+  const missing = desiredRoles.filter((role) => !observedSet.has(role));
+  if (missing.length === 0) {
+    return {
+      kind: 'agent_config',
+      target,
+      verb: 'noop',
+      reason: `routing table on "${agent.repo}" already names every declared fleet role`,
+      confirm_required: false,
+    };
+  }
+  return {
+    kind: 'agent_config',
+    target,
+    verb: 'update',
+    reason:
+      `routing table on "${agent.repo}" (.github/agent-config.json) is missing ${missing.length === 1 ? 'role' : 'roles'} ` +
+      `${missing.map((r) => `"${r}"`).join(', ')} — a repo whose table names only its own agent silently drops any ` +
+      '@mention routed to a sibling on that repo; apply reconciles this by adding the missing role(s) to the ' +
+      'committed file (existing entries are never dropped or rewritten)',
+    confirm_required: true,
   };
 }
 
@@ -2789,6 +2901,11 @@ export function computePlan(
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([role, originFleet]) => scopeCredentialNotice(role, originFleet));
 
+  // groundnuty/macf#1425 — the full declared fleet roster, computed ONCE
+  // (never per-agent) — `agentConfigItem`'s "is every fleet member named on
+  // THIS repo" question needs the SAME union `apply-repo-init.ts` now asks
+  // `repoInit()` to write, for every agent in the loop below.
+  const declaredRoles = manifest.agents.map((a) => a.role);
   for (const agent of manifest.agents) {
     const obs = observed.agents[agent.role];
     items.push(appItem(fleetName, agent, obs));
@@ -2801,6 +2918,7 @@ export function computePlan(
     items.push(installItem(fleetName, agent, obs));
     items.push(secretFingerprintItem(agent, obs));
     items.push(labelsItem(agent));
+    items.push(agentConfigItem(agent, declaredRoles, obs?.agentConfigRoles));
   }
 
   items.push(caRegistryItem(seg, observed.caRegistry, observed.vaultCa));

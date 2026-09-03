@@ -408,10 +408,23 @@ export async function applyRepoInitForAgent(
     const result = await runRepoInit(dir, {
       repo: agent.repo,
       actionsVersion,
-      // repo/role are unique-per-manifest (FleetManifestSchema's superRefine
-      // rejects duplicate agents[].repo) — one agent per repo in v0, so the
-      // routing config for THIS repo names exactly this agent's role.
-      agents: agent.role,
+      // groundnuty/macf#1425 (silent-fallback-hazards.md Instance 18) —
+      // every DECLARED fleet role, not just this agent's own. `repoInit`'s
+      // `patchAgentConfig`/`generateAgentConfig` already implement the
+      // correct contract given a full agent list ("agents not in the list
+      // are left alone" — i.e. never DROPPED; anything IN the list that's
+      // missing gets ADDED). The bug was never at that layer: it was this
+      // call site asking for a union of ONE. Every agent repo then only
+      // ever listed its own role, so `route-by-mention` found no entry for
+      // a sibling on that repo and silently dropped — exactly the shape
+      // `apply-control-repo-init.ts::applyControlRepoInit` already avoids
+      // (it has passed `manifest.agents.map(a => a.role).join(',')` since
+      // #1057; this is that same fix, applied to the per-agent-repo path).
+      // repo/role stay unique-per-manifest (FleetManifestSchema's
+      // superRefine rejects duplicate agents[].repo) — one agent owns THIS
+      // repo, but its agent-config.json routing table must still carry
+      // every fleet member, the same way the control repo's does.
+      agents: manifest.agents.map((a) => a.role).join(','),
       force: opts?.force ?? false,
       project: manifest.metadata.name,
       ...(opts?.tokenSource !== undefined ? { tokenSource: opts.tokenSource } : {}),

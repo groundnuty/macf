@@ -8,7 +8,7 @@
  * exercised end to end with zero real I/O beyond local temp-file writes.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   applyRepoInitForAgent,
@@ -19,6 +19,7 @@ import {
   type AgentRepoDeps,
   type RepoInitStepDeps,
 } from '../../../src/cli/bootstrap/apply-repo-init.js';
+import { generateAgentConfig } from '../../../src/cli/commands/repo-init.js';
 import type { FleetAgent, FleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import type { RegistryConfig } from '@groundnuty/macf-core';
 
@@ -537,6 +538,159 @@ describe('applyRepoInitForAgent', () => {
     const seenOpts = fakeRepoInit.mock.calls[0]?.[1] as { force?: boolean; actionsVersion?: string };
     expect(seenOpts.force).toBe(false);
     expect(seenOpts.actionsVersion).toBe('v3.4.1');
+  });
+});
+
+// --- groundnuty/macf#1425 (silent-fallback-hazards.md Instance 18) — an
+// agent repo's `.github/agent-config.json` must widen to the FULL declared
+// fleet, not just this agent's own role. Measured live on `macf-trial`:
+// every agent repo's table listed only its own agent, surviving a
+// fleet-wide apply, because THIS call site (`applyRepoInitForAgent`) asked
+// `repoInit()` for a union of ONE. `patchAgentConfig`/`generateAgentConfig`
+// (`commands/repo-init.ts`) already implement the correct "never DROP an
+// existing entry, ADD anything in the list that's missing" contract given a
+// full agent list — proven directly against those functions in
+// `repo-init.test.ts`. These tests exercise the ORCHESTRATION fix: does the
+// REAL apply-time call site (this module's own `applyRepoInitForAgent`, the
+// exact function `apply-fleet.ts` calls for every `reused`/`resumed-install`/
+// `created` agent) actually pass the union — not a mock of it. ---
+
+describe('applyRepoInitForAgent — agent-config.json widens to the full declared fleet (groundnuty/macf#1425)', () => {
+  const THREE_AGENT_MANIFEST: FleetManifest = {
+    ...MANIFEST,
+    agents: [
+      { role: 'code-agent', profile: 'code', repo: 'groundnuty/demo-code', deploy_path: '/x' },
+      { role: 'science-agent', profile: 'science', repo: 'groundnuty/demo-science', deploy_path: '/y' },
+      { role: 'writing-agent', profile: 'writing', repo: 'groundnuty/demo-writing', deploy_path: '/z' },
+    ],
+  };
+  const CODE_AGENT = THREE_AGENT_MANIFEST.agents[0]!;
+
+  /**
+   * Seeds the scratch dir with a `.github/agent-config.json` BEFORE `repoInit`
+   * ever runs — mirroring a repo that was already `repo-init`'d by a prior
+   * (pre-fix) apply run. `cloneRepo` is faked throughout this file (no real
+   * git); this is the fake that also materializes the pre-existing file the
+   * real `repoInit()` will then read via `existsSync`/`readFileSync` and
+   * merge-patch, exactly as it would against a real clone.
+   */
+  function cloneRepoSeedingAgentConfig(agentsObject: Record<string, unknown>): (url: string, destDir: string) => Promise<void> {
+    return async (_url, destDir) => {
+      mkdirSync(destDir, { recursive: true });
+      const githubDir = join(destDir, '.github');
+      mkdirSync(githubDir, { recursive: true });
+      writeFileSync(join(githubDir, 'agent-config.json'), JSON.stringify({ agents: agentsObject, label_to_status: {} }, null, 2) + '\n');
+    };
+  }
+
+  it('DECISIVE 1: a one-agent table + a three-agent fleet -> widens to three; the pre-existing entry survives byte-identical', async () => {
+    // A deliberately CUSTOM entry (real ones vary — a hand-edited host IP,
+    // a non-default workspace_dir) so "byte-identical" is a meaningful claim
+    // rather than something that would pass by construction.
+    const preExisting = {
+      app_name: 'demo-fleet-code-agent',
+      host: '203.0.113.5',
+      ssh_user: 'ubuntu',
+      tmux_bin: 'tmux',
+      ssh_key_secret: 'AGENT_SSH_KEY',
+      workspace_dir: '/home/ubuntu/repos/groundnuty/demo-code',
+    };
+    let written = '';
+    const deps: RepoInitStepDeps = {
+      cloneRepo: cloneRepoSeedingAgentConfig({ 'code-agent': preExisting }),
+      commitAndPush: async (dir) => {
+        written = readFileSync(join(dir, '.github', 'agent-config.json'), 'utf-8');
+        return 'pushed';
+      },
+    };
+    const outcome = await applyRepoInitForAgent(CODE_AGENT, THREE_AGENT_MANIFEST, deps);
+    expect(outcome.status).toBe('applied');
+    const cfg = JSON.parse(written) as { agents: Record<string, unknown> };
+    // Widened: every declared role now has an entry on THIS repo's table —
+    // the whole point (route-by-mention no longer drops a sibling mention).
+    expect(Object.keys(cfg.agents).sort()).toEqual(['code-agent', 'science-agent', 'writing-agent']);
+    // The pre-existing entry is untouched, byte-for-byte — the union only
+    // ADDS the two missing roles, it never rewrites the one already there.
+    expect(cfg.agents['code-agent']).toEqual(preExisting);
+  });
+
+  it('DECISIVE 2: a table that already names every declared role -> apply writes back the SAME content (noop, byte-identical)', async () => {
+    // The exact shape a fresh `generateAgentConfig` call for this fleet
+    // produces — `applyRepoInitForAgent` calls `repoInit()` with THIS repo's
+    // own owner/repo/project (`groundnuty`/`demo-code`/`demo-fleet`), a v3+
+    // pin (`omitTmuxSession: true`), same as the fixture below.
+    const fullTable = generateAgentConfig(
+      ['code-agent', 'science-agent', 'writing-agent'],
+      undefined,
+      { owner: 'groundnuty', repo: 'demo-code', project: 'demo-fleet' },
+      true,
+    );
+    let written = '';
+    const deps: RepoInitStepDeps = {
+      cloneRepo: async (_url, destDir) => {
+        mkdirSync(destDir, { recursive: true });
+        const githubDir = join(destDir, '.github');
+        mkdirSync(githubDir, { recursive: true });
+        writeFileSync(join(githubDir, 'agent-config.json'), fullTable);
+      },
+      commitAndPush: async (dir) => {
+        written = readFileSync(join(dir, '.github', 'agent-config.json'), 'utf-8');
+        return 'nothing-to-commit';
+      },
+    };
+    const outcome = await applyRepoInitForAgent(CODE_AGENT, THREE_AGENT_MANIFEST, deps);
+    expect(outcome.status).toBe('applied');
+    if (outcome.status === 'applied') expect(outcome.pushed).toBe(false);
+    // Byte-identical — reconciling an already-complete table produces no
+    // drift, not even re-serialization noise.
+    expect(written).toBe(fullTable);
+  });
+
+  it('an entry for an agent NOT declared in the fleet is preserved, never dropped', async () => {
+    const preExisting = {
+      'code-agent': { app_name: 'demo-fleet-code-agent', host: '<agent-host-ip>', ssh_user: 'ubuntu', tmux_bin: 'tmux', ssh_key_secret: 'AGENT_SSH_KEY' },
+      // A role this fleet's manifest does not (or no longer) declares — a
+      // hand-added entry, or a role dropped from `fleet.yaml` since the last
+      // apply. §D3 Design invariant 4 ("play it safe," no delete/prune from
+      // this write path) says this must survive untouched.
+      'retired-agent': { app_name: 'demo-fleet-retired-agent', host: '198.51.100.9', ssh_user: 'ubuntu', tmux_bin: 'tmux', ssh_key_secret: 'AGENT_SSH_KEY' },
+    };
+    let written = '';
+    const deps: RepoInitStepDeps = {
+      cloneRepo: cloneRepoSeedingAgentConfig(preExisting),
+      commitAndPush: async (dir) => {
+        written = readFileSync(join(dir, '.github', 'agent-config.json'), 'utf-8');
+        return 'pushed';
+      },
+    };
+    const outcome = await applyRepoInitForAgent(CODE_AGENT, THREE_AGENT_MANIFEST, deps);
+    expect(outcome.status).toBe('applied');
+    const cfg = JSON.parse(written) as { agents: Record<string, unknown> };
+    expect(Object.keys(cfg.agents).sort()).toEqual(['code-agent', 'retired-agent', 'science-agent', 'writing-agent']);
+    expect(cfg.agents['retired-agent']).toEqual(preExisting['retired-agent']);
+  });
+
+  it('reachability: the REAL runRepoInit default (not an injected fake) is what widens — proves the fix lives on the production call path, not just in a mock\'s expectations', async () => {
+    // No `deps.repoInit` override anywhere in this describe block — every
+    // test above already runs through `realRepoInit` (the module-level
+    // default `deps.repoInit ?? realRepoInit` in `apply-repo-init.ts`), the
+    // EXACT function object `apply-fleet.ts` imports and calls for every
+    // `reused`/`resumed-install`/`created` agent (see that module's
+    // `applyRepoInitForAgent`/`applyRepoInitForCreatedAgent` call sites).
+    // This test just states that reachability claim explicitly as its own
+    // assertion, rather than leaving it implicit in "no override was passed".
+    let written = '';
+    const deps: RepoInitStepDeps = {
+      cloneRepo: cloneRepoSeedingAgentConfig({ 'code-agent': { app_name: 'demo-fleet-code-agent', host: '<agent-host-ip>', ssh_user: 'ubuntu', tmux_bin: 'tmux', ssh_key_secret: 'AGENT_SSH_KEY' } }),
+      commitAndPush: async (dir) => {
+        written = readFileSync(join(dir, '.github', 'agent-config.json'), 'utf-8');
+        return 'pushed';
+      },
+      // repoInit deliberately OMITTED — proves the default (real) path widens.
+    };
+    await applyRepoInitForAgent(CODE_AGENT, THREE_AGENT_MANIFEST, deps);
+    const cfg = JSON.parse(written) as { agents: Record<string, unknown> };
+    expect(Object.keys(cfg.agents).sort()).toEqual(['code-agent', 'science-agent', 'writing-agent']);
   });
 });
 

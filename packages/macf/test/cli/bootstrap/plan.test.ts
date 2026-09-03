@@ -100,20 +100,23 @@ describe('computePlan — all-missing manifest (fresh fleet) → all creates', (
     const manifest = baseManifest();
     const plan = computePlan(manifest, EMPTY_OBSERVED);
 
-    // 5 items per agent (app, repo, install, secret_fingerprint, labels) × 2
-    // agents + caRegistry (1) + one caRepo per agent (2) + one routing_client
-    // per agent-repo (2) — CA/labels/routing_client items are unconditional
-    // (never gated on `trust:` being declared — macf#839 review nit 5 for
-    // CA; groundnuty/macf#920 for labels/routing_client). NO runner_ops item
-    // — `baseManifest()` declares no `routing:` at all, so this fleet needs
-    // no runner-ops App (groundnuty/macf#1083; see the dedicated describe
-    // block for the conditional-creation behavior itself). +1 `router_app`
-    // item — UNCONDITIONAL regardless of `routing:` (groundnuty/macf#1105;
-    // see the dedicated describe block below). +1 `ts_oauth` item — ALSO
-    // UNCONDITIONAL (groundnuty/macf#1109); no `observed.vaultTsOauth` this
-    // run degrades to the low-confidence 'create' branch, same as every
-    // other unknown-presence item here.
-    expect(plan.items).toHaveLength(17);
+    // 6 items per agent (app, repo, install, secret_fingerprint, labels,
+    // agent_config — groundnuty/macf#1425) × 2 agents + caRegistry (1) + one
+    // caRepo per agent (2) + one routing_client per agent-repo (2) —
+    // CA/labels/agent_config/routing_client items are unconditional (never
+    // gated on `trust:` being declared — macf#839 review nit 5 for CA;
+    // groundnuty/macf#920 for labels/routing_client; #1425 for agent_config).
+    // NO runner_ops item — `baseManifest()` declares no `routing:` at all, so
+    // this fleet needs no runner-ops App (groundnuty/macf#1083; see the
+    // dedicated describe block for the conditional-creation behavior
+    // itself). +1 `router_app` item — UNCONDITIONAL regardless of `routing:`
+    // (groundnuty/macf#1105; see the dedicated describe block below). +1
+    // `ts_oauth` item — ALSO UNCONDITIONAL (groundnuty/macf#1109); no
+    // `observed.vaultTsOauth` this run degrades to the low-confidence
+    // 'create' branch, same as every other unknown-presence item here
+    // (including the two new `agent_config` items — `observed.agents` is
+    // `{}`, so `obs?.agentConfigRoles` is `undefined` for both agents).
+    expect(plan.items).toHaveLength(19);
     for (const item of plan.items) {
       // `labels` is `'write-always'`, not `'create'` (groundnuty/macf#926) —
       // `labelsItem` has no observed-state input, so it can never carry the
@@ -321,6 +324,11 @@ describe('computePlan — all-match observed state → all noops', () => {
           installId: '22222222',
           repo: 'present',
           fingerprints: { app_private_key: 'sha256:aaa' },
+          // groundnuty/macf#1425 — both roles present on BOTH repos' routing
+          // tables: "fully observed-matching"/"fully-provisioned" fleet
+          // fixtures need this too, or the new `agent_config` item would
+          // degrade to a low-confidence 'create' and break the noop claim.
+          agentConfigRoles: ['science-agent', 'code-agent'],
         },
         'code-agent': {
           app: 'present',
@@ -329,6 +337,7 @@ describe('computePlan — all-match observed state → all noops', () => {
           installId: '44444444',
           repo: 'present',
           fingerprints: { app_private_key: 'sha256:bbb' },
+          agentConfigRoles: ['science-agent', 'code-agent'],
         },
       },
       caRegistry: 'present',
@@ -349,14 +358,14 @@ describe('computePlan — all-match observed state → all noops', () => {
     };
 
     const plan = computePlan(manifest, observed);
-    // 5 × 2 agents (app/repo/install/secret_fingerprint/labels) + caRegistry +
-    // 2 caRepo + routing + runner_warm (macf#942) + runner_platform
-    // (groundnuty/macf#1211 — runs_on is self-hosted here) + 2 routing_client
-    // + the fleet-level runner_ops item (groundnuty/macf#943; control_repo
-    // item absent — not archived) + the fleet-level router_app item
-    // (groundnuty/macf#1105, UNCONDITIONAL) + the fleet-level ts_oauth item
-    // (groundnuty/macf#1109, UNCONDITIONAL).
-    expect(plan.items).toHaveLength(21);
+    // 6 × 2 agents (app/repo/install/secret_fingerprint/labels/agent_config
+    // — groundnuty/macf#1425) + caRegistry + 2 caRepo + routing + runner_warm
+    // (macf#942) + runner_platform (groundnuty/macf#1211 — runs_on is
+    // self-hosted here) + 2 routing_client + the fleet-level runner_ops item
+    // (groundnuty/macf#943; control_repo item absent — not archived) + the
+    // fleet-level router_app item (groundnuty/macf#1105, UNCONDITIONAL) + the
+    // fleet-level ts_oauth item (groundnuty/macf#1109, UNCONDITIONAL).
+    expect(plan.items).toHaveLength(23);
     for (const item of plan.items) {
       // `labels`/`runner_warm` are `'write-always'` (groundnuty/macf#926,
       // was `'create'`): they have NO plan-time observed read at all (see
@@ -1354,7 +1363,7 @@ describe('orphan rows say "not deleted" + carry a link, on BOTH the plan and app
 });
 
 describe('computePlan — deterministic ordering', () => {
-  it('orders per-agent items in manifest agents[] order, each agent app→repo→install→secret_fingerprint→labels', () => {
+  it('orders per-agent items in manifest agents[] order, each agent app→repo→install→secret_fingerprint→labels→agent_config', () => {
     // groundnuty/macf#1083 — self-hosted DECLARED so the runner_ops item is
     // actually emitted; this test's purpose is the ORDERING once it's
     // present, not the presence/absence gate itself (covered in the
@@ -1367,13 +1376,15 @@ describe('computePlan — deterministic ordering', () => {
     // `EMPTY_OBSERVED.controlRepoPresence` is `'absent'`), then the
     // fleet-level `router_app` item (groundnuty/macf#1105, UNCONDITIONAL),
     // then the fleet-level `ts_oauth` item (groundnuty/macf#1109,
-    // UNCONDITIONAL), before any per-agent item.
-    expect(kinds.slice(0, 13)).toEqual([
+    // UNCONDITIONAL), before any per-agent item. `agent_config`
+    // (groundnuty/macf#1425) is pushed right after `labels` — the SAME
+    // per-agent loop iteration, same order `computePlan` pushes them in.
+    expect(kinds.slice(0, 15)).toEqual([
       'runner_ops',
       'router_app',
       'ts_oauth',
-      'app', 'repo', 'install', 'secret_fingerprint', 'labels', // science-agent
-      'app', 'repo', 'install', 'secret_fingerprint', 'labels', // code-agent
+      'app', 'repo', 'install', 'secret_fingerprint', 'labels', 'agent_config', // science-agent
+      'app', 'repo', 'install', 'secret_fingerprint', 'labels', 'agent_config', // code-agent
     ]);
   });
 
@@ -1383,7 +1394,8 @@ describe('computePlan — deterministic ordering', () => {
     });
     const plan = computePlan(manifest, EMPTY_OBSERVED);
     const kinds = plan.items.map((i) => i.kind);
-    // 10 per-agent items, then 3 CA items (registry + 2 agent repos), then
+    // 12 per-agent items (groundnuty/macf#1425 added `agent_config`, 6 × 2
+    // agents), then 3 CA items (registry + 2 agent repos), then
     // 2 routing_client items (one per agent repo), then routing, then
     // runner_warm (macf#942 — pushed right after routingItem), then
     // runner_platform (groundnuty/macf#1211 — pushed right after runner_warm,
@@ -1556,11 +1568,15 @@ describe('summarizePlan', () => {
     const observed: ObservedState = { ...EMPTY_OBSERVED, routingTrustedActors: 'github-hosted' };
     const plan = computePlan(manifest, observed);
     const summary = summarizePlan(plan.items);
-    // 8 per-agent creates (app/repo/install/secret_fingerprint × 2) + 1 CA
-    // registry create + 2 routing_client creates + 1 runner_ops create
-    // (groundnuty/macf#943) + 1 router_app create (groundnuty/macf#1105,
-    // UNCONDITIONAL) + 1 ts_oauth create (groundnuty/macf#1109,
-    // UNCONDITIONAL) = 14 creates. + 1 routing update. The 2 per-repo CA
+    // 8 per-agent creates (app/repo/install/secret_fingerprint × 2) + 2
+    // per-agent agent_config creates (groundnuty/macf#1425 — no
+    // `observed.agents` entries here, so both degrade to the low-confidence
+    // 'create' branch, same as every other unknown-presence item in this
+    // fixture) + 1 CA registry create + 2 routing_client creates + 1
+    // runner_ops create (groundnuty/macf#943) + 1 router_app create
+    // (groundnuty/macf#1105, UNCONDITIONAL) + 1 ts_oauth create
+    // (groundnuty/macf#1109, UNCONDITIONAL) = 16 creates. + 1 routing
+    // update. The 2 per-repo CA
     // items are `'noop'` now, NOT `'create'` (groundnuty/macf#800 — apply
     // has no per-repo CA write left to attempt, so an unconfirmed-presence
     // repo item can never claim `'create'`; this fixture's `caRepos: {}`
@@ -1578,7 +1594,7 @@ describe('summarizePlan', () => {
     // var, so the `'orphan'` branch is never reached either — 0, not for
     // row-4's not-in-the-lock reason, but because there is nothing observed
     // to call superseded.
-    expect(summary).toEqual({ creates: 14, updates: 1, noops: 2, extras: 0, writeAlways: 4, deletes: 0, orphans: 0 });
+    expect(summary).toEqual({ creates: 16, updates: 1, noops: 2, extras: 0, writeAlways: 4, deletes: 0, orphans: 0 });
   });
 });
 
@@ -1732,6 +1748,11 @@ describe('computePlan — unimplementedByApply (plan must not overstate what app
           installId: '22222222',
           repo: 'present',
           fingerprints: { app_private_key: 'sha256:aaa' },
+          // groundnuty/macf#1425 — both roles present on BOTH repos' routing
+          // tables: "fully observed-matching"/"fully-provisioned" fleet
+          // fixtures need this too, or the new `agent_config` item would
+          // degrade to a low-confidence 'create' and break the noop claim.
+          agentConfigRoles: ['science-agent', 'code-agent'],
         },
         'code-agent': {
           app: 'present',
@@ -1740,6 +1761,7 @@ describe('computePlan — unimplementedByApply (plan must not overstate what app
           installId: '44444444',
           repo: 'present',
           fingerprints: { app_private_key: 'sha256:bbb' },
+          agentConfigRoles: ['science-agent', 'code-agent'],
         },
       },
       caRegistry: 'present',

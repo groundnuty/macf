@@ -1336,6 +1336,50 @@ async function readInstalledRouterWorkflow(repo: string): Promise<string | undef
 }
 
 /**
+ * Best-effort read-only read of a repo's `.github/agent-config.json`
+ * `"agents"` object's KEYS — groundnuty/macf#1425 (silent-fallback-hazards.md
+ * Instance 18), `ObservedAgentState.agentConfigRoles`'s live source. Mirrors
+ * {@link readInstalledRouterWorkflow} exactly (same `gh api .../contents/<path>
+ * --jq .content` shape, same repo, sibling file) except this one also parses
+ * the decoded content as JSON and extracts the role-key set, since
+ * `plan.ts::agentConfigItem` needs the SET, not the raw text (unlike
+ * `actionsPin`, which is a regex pull off raw YAML). Returns `undefined` on
+ * ANY failure — file absent, not valid JSON, no `agents` object, auth/network
+ * — the SAME "collapse absent + unreadable into one signal" posture
+ * `readCallerActionsPin`'s own doc establishes for this file's other
+ * committed-content read; a caller needing the absent-vs-unreadable
+ * distinction doesn't exist yet (mirrors that field's own justification, and
+ * `routing-doctor-gh.ts::createRoutingConfigGhReaderDetailed`'s DIFFERENT
+ * four-state discrimination is a deliberately separate, per-subsystem
+ * implementation of the same read for a DIFFERENT caller with a DIFFERENT
+ * need — see this module's own doc for why `gh`-shelling functions aren't
+ * shared across the `commands/` / `bootstrap/` boundary). An empty array is a
+ * REAL, distinct reading: the file WAS found and parsed, and its `"agents"`
+ * object genuinely has no keys. NEVER throws.
+ */
+async function readInstalledAgentConfigRoles(repo: string): Promise<readonly string[] | undefined> {
+  try {
+    const { stdout } = await execFileAsync(
+      'gh',
+      ['api', `repos/${repo}/contents/.github/agent-config.json`, '--jq', '.content'],
+      { encoding: 'utf-8' },
+    );
+    const parsed: unknown = JSON.parse(decodeGhContent(stdout));
+    if (
+      !parsed ||
+      typeof parsed !== 'object' ||
+      typeof (parsed as { agents?: unknown }).agents !== 'object' ||
+      (parsed as { agents?: unknown }).agents === null
+    ) {
+      return undefined;
+    }
+    return Object.keys((parsed as { agents: Record<string, unknown> }).agents);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * The real `FleetObserverFn`. `manifestPath` is the on-disk path to the
  * `fleet.yaml` that was parsed into `manifest` — used only to locate the
  * co-located `fleet.lock` (never re-parses the manifest itself).
@@ -1479,6 +1523,11 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
     const routerContent = await readInstalledRouterWorkflow(agent.repo);
     const actionsPin = routerContent === undefined ? undefined : extractActionsPin(routerContent);
     const routerWithKeys = routerContent === undefined ? undefined : extractCallerWithKeys(routerContent)?.withKeys;
+    // groundnuty/macf#1425 (silent-fallback-hazards.md Instance 18) — a
+    // SEPARATE `gh api` read (`.github/agent-config.json` is a sibling file
+    // to `.github/workflows/agent-router.yml`, never the same content, so
+    // this is not a second read of what `routerContent` already fetched).
+    const agentConfigRoles = await readInstalledAgentConfigRoles(agent.repo);
     // DR-043 Amendment G correction (groundnuty/macf#1034) — a STANDALONE
     // `{archived}` read, deliberately NOT threaded through
     // `resolveAgentRepoState` (macf#1026-gated, serves the unrelated
@@ -1507,6 +1556,7 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
       deployedVersion: lockEntry?.deployed_version,
       actionsPin,
       routerWithKeys,
+      agentConfigRoles,
       archived: repoArchivedMeta.archived,
       installRepositorySelection: findInstallRepositorySelection(orgInstallScopes, deriveAppHandle(manifest.metadata.name, agent.role)),
     };
