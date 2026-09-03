@@ -4,6 +4,48 @@ All notable changes to the `macf` CLI. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.61] — 2026-09-03
+
+**Six hardening fixes from the first live fleet deploy, each measured before it was written.**
+
+### Fixed
+
+- **The PreToolUse hook family's token refresh failed from any cwd but the workspace root**
+  when the session's `KEY_PATH` was relative — the hook lib passed it to the minting
+  helper unresolved, so the merge gate refused valid merges depending on where the
+  previous command had left the shell. A relative key is now resolved against
+  `MACF_WORKSPACE_DIR`, then `CLAUDE_PROJECT_DIR`, then the cwd; a key that is truly
+  absent is reported with every path tried, distinct from a helper that ran and
+  failed. (#1415)
+- **`macf init` and `macf update` never wrote `.gitignore` entries for the two directories
+  they manage** — only `.macf/` — so any consumer that staged `.claude/` tracked every
+  managed hook and rule, and each reset reinstalled whatever was last committed over
+  what the tool wrote. Both now write `.claude/rules/` and `.claude/scripts/`,
+  idempotently, matching entries line-exact so the shipped `.claude/rules/project/`
+  line is not mistaken for coverage. (#1416)
+- **`doctor` gave a workspace a clean bill of health while its managed files were tracked
+  in git** — current today, one `reset --hard` from stale copies. A new "Managed file git
+  tracking" section names each tracked distributed file with the remedy, and reports
+  UNKNOWN, never PASS, when there is no repository to ask. (#1412)
+- **`plan`'s runner-declaration verdict said `UNCERTAIN` when the declaration was certain**
+  and only the runtime unknown — after a successful apply, three `UNCERTAIN` rows read as
+  though the apply might have failed. It now says `DECLARED (runtime unverified)` when the
+  runner input is present at a capable pin, with the reason that a routed run is what proves
+  the router acts on it; `NOT HONOURED` is unchanged and `HONOURED` is never emitted by a
+  static check. The tag word now lives in one function shared by `plan` and the standalone
+  check — a hand-duplicated copy is how the stale word had survived. (#1422)
+- **A failed plugin fetch during `init` or `fleet deploy` exited 0 and recorded the pin it had
+  not installed**; `update` then read that record as "up to date" and never re-fetched — so a
+  workspace could carry zero plugin-hosted guards while every record said otherwise. `init`
+  and `deploy` now report *materialized WITHOUT its plugin*, naming the tag and the error,
+  and exit non-zero (returning the failure rather than throwing, so the partial view survives);
+  `update` judges plugin currency from the installed manifest on disk and repairs a missing,
+  empty, unreadable or mismatched plugin; `doctor` names a record-versus-disk mismatch. The pin
+  stays the intended version — the comparison against disk is the truth. (#1423)
+- **The packaging seam test's real `npm pack` timed out under full-suite load** on a budget
+  nobody had measured. Measured, memoised, and budgeted with real margin on the spawn's
+  own timeout; the tarball assertion is intact. (#1418)
+
 ## [0.2.60] — 2026-09-02
 
 **The release that makes the guards real.** Every npm release since the hooks moved to
