@@ -116,6 +116,25 @@ function packedTarballFiles(): ReadonlySet<string> {
   return packedFilesCache;
 }
 
+/**
+ * Why `plugin/{agents,hooks,skills}` are deliberately NOT in `files[]` — read this
+ * before "fixing" the omission (an auditor re-derived it from a tarball listing
+ * once, 2026-09-03):
+ *
+ *   The npm package is not the plugin's distribution channel. The plugin ships
+ *   via `groundnuty/macf-marketplace` — `marketplace-sync.ts` pushes
+ *   `agents/ hooks/ scripts/ skills/` from this repo to the marketplace at
+ *   release, and `fetchPluginToWorkspace` clones the pinned tag into a
+ *   workspace's `.macf/plugin/`, which is what `--plugin-dir` mounts. That is
+ *   where every consumer's hook REGISTRATIONS (`hooks/hooks.json`) come from.
+ *
+ *   `plugin/rules/` and `plugin/scripts/` are in `files[]` for one reason only:
+ *   they are the SOURCES `rules refresh` / `copyCanonicalScripts` copy into a
+ *   workspace's `.claude/` as the compat layer. No code reads `plugin/hooks`
+ *   (or agents, or skills) from the package root — the seam test below derives
+ *   the read-set from the `canonical*Dir` resolvers precisely so that the
+ *   packaged set equals the set that is actually read, nothing more.
+ */
 describe('packaging: canonical source dirs are covered by package.json files[] (groundnuty/macf#1403)', () => {
   it('sanity: the derivation found at least the known resolvers (rules.ts exports haven\'t silently changed shape)', () => {
     expect(dirResolverNames).toEqual(
