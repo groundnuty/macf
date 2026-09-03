@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { lstatSync, realpathSync } from 'node:fs';
 import {
-  fetchPluginToWorkspace, workspacePluginDir, stripPluginMcpServers,
+  fetchPluginToWorkspace, copyLocalPluginToWorkspace, workspacePluginDir, stripPluginMcpServers,
   linkPluginCliDist, resolveCliDistDir,
 } from '../../src/cli/plugin-fetcher.js';
 
@@ -158,6 +158,62 @@ describe('fetchPluginToWorkspace', () => {
     expect(existsSync(join(altDir, 'manifest.txt'))).toBe(true);
     // The conventional default was never written.
     expect(existsSync(workspacePluginDir(workspace))).toBe(false);
+  });
+});
+
+describe('copyLocalPluginToWorkspace (groundnuty/macf#1424)', () => {
+  let workspace: string;
+  let localSource: string;
+
+  beforeEach(() => {
+    workspace = mkdtempSync(join(tmpdir(), 'macf-plugin-workspace-'));
+    mkdirSync(join(workspace, '.macf'), { recursive: true });
+    localSource = mkdtempSync(join(tmpdir(), 'macf-plugin-localsrc-'));
+    mkdirSync(join(localSource, 'agents'), { recursive: true });
+    writeFileSync(join(localSource, 'manifest.txt'), 'local-build-tree\n');
+    writeFileSync(join(localSource, 'agents', 'code-agent.md'), '# local code-agent\n');
+  });
+
+  afterEach(() => {
+    rmSync(workspace, { recursive: true, force: true });
+    rmSync(localSource, { recursive: true, force: true });
+  });
+
+  it('copies a local directory tree with no git/network involved', () => {
+    copyLocalPluginToWorkspace(workspace, localSource);
+
+    const pluginDir = workspacePluginDir(workspace);
+    expect(readFileSync(join(pluginDir, 'manifest.txt'), 'utf-8')).toBe('local-build-tree\n');
+    expect(existsSync(join(pluginDir, 'agents', 'code-agent.md'))).toBe(true);
+  });
+
+  it('replaces an existing plugin dir (no stale files merged in)', () => {
+    const pluginDir = workspacePluginDir(workspace);
+    mkdirSync(pluginDir, { recursive: true });
+    writeFileSync(join(pluginDir, 'stale-file.txt'), 'should be gone after copy\n');
+
+    copyLocalPluginToWorkspace(workspace, localSource);
+
+    expect(existsSync(join(pluginDir, 'stale-file.txt'))).toBe(false);
+    expect(existsSync(join(pluginDir, 'manifest.txt'))).toBe(true);
+  });
+
+  it('writes to targetDir when given, not the conventional default (macf#889)', () => {
+    const altDir = join(workspace, '.macf', 'plugin-cs');
+    copyLocalPluginToWorkspace(workspace, localSource, { targetDir: altDir });
+
+    expect(existsSync(join(altDir, 'manifest.txt'))).toBe(true);
+    expect(existsSync(workspacePluginDir(workspace))).toBe(false);
+  });
+
+  it('throws with an actionable message when the source dir does not exist', () => {
+    const missing = join(localSource, 'does-not-exist');
+    expect(() => copyLocalPluginToWorkspace(workspace, missing)).toThrow(/does not exist or is not a directory/);
+  });
+
+  it('throws when the source path is a FILE, not a directory', () => {
+    const filePath = join(localSource, 'manifest.txt');
+    expect(() => copyLocalPluginToWorkspace(workspace, filePath)).toThrow(/does not exist or is not a directory/);
   });
 });
 

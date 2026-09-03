@@ -313,6 +313,59 @@ export function fetchPluginToWorkspace(
   }
 }
 
+export interface CopyLocalPluginOptions {
+  /** Write to this absolute path instead of `workspacePluginDir(workspaceDir)` (macf#889). */
+  readonly targetDir?: string;
+}
+
+/**
+ * Copy an ALREADY-ON-DISK plugin tree (e.g. this checkout's own
+ * `packages/macf/plugin/`) into `<workspace>/.macf/plugin/` — no `git clone`,
+ * no network, no tag. Sibling to {@link fetchPluginToWorkspace}, which always
+ * goes over the network at a git tag; this is for the one caller (the
+ * release script's harness-compat gate, groundnuty/macf#1424) that must
+ * validate the ARTIFACT UNDER RELEASE, not a network-versioned copy.
+ *
+ * Why the network path is the wrong subject for that caller: at release
+ * time the new marketplace tag does not exist yet — `release.sh`'s
+ * `marketplace` stage tags the plugin with the CLI's version DURING the
+ * release — so a `fetchPluginToWorkspace` clone can only ever fetch the
+ * PREVIOUSLY published plugin, one version behind the build under test. And
+ * on a host that denies anonymous git HTTPS (groundnuty/macf#1423), that
+ * clone fails outright rather than silently serving stale content. The
+ * plugin these callers actually want to test is sitting on disk already, in
+ * this build — this function is a straight recursive copy of it, with no
+ * network dependency to fail loudly OR silently.
+ *
+ * `sourceDir` must exist and be a directory — thrown, not silently no-op'd,
+ * matching {@link fetchPluginToWorkspace}'s own fail-loud contract for a
+ * missing source. Idempotent: an existing target dir is removed before the
+ * copy, so re-running gives a clean replacement (no stale files from a
+ * previous call hanging around) — same replace-not-merge contract as
+ * {@link fetchPluginToWorkspace}.
+ */
+export function copyLocalPluginToWorkspace(
+  workspaceDir: string,
+  sourceDir: string,
+  options: CopyLocalPluginOptions = {},
+): void {
+  const src = resolve(sourceDir);
+  const target = options.targetDir ?? workspacePluginDir(workspaceDir);
+
+  if (!existsSync(src) || !lstatSync(src).isDirectory()) {
+    throw new Error(
+      `--plugin-source "${sourceDir}" does not exist or is not a directory — ` +
+      `pass the local plugin tree to copy (e.g. packages/macf/plugin/ in a macf checkout).`,
+    );
+  }
+
+  if (existsSync(target)) {
+    rmSync(target, { recursive: true, force: true });
+  }
+  mkdirSync(target, { recursive: true });
+  cpSync(src, target, { recursive: true });
+}
+
 /**
  * Resolve the running CLI's own `dist/` directory — the one containing the
  * built `plugin/bin/macf-plugin-cli.js`. The CLI source compiles to

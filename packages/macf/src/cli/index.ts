@@ -124,6 +124,7 @@ program
   .option('--cli-version <semver>', 'Pin @macf/cli version (e.g., 0.1.0)')
   .option('--plugin-version <semver>', 'Pin macf-agent plugin version (e.g., 0.1.0)')
   .option('--actions-version <tag>', 'Pin macf-actions version (e.g., v1, v1.0.0)')
+  .option('--plugin-source <dir>', 'Copy the plugin from this LOCAL directory instead of fetching groundnuty/macf-marketplace over the network. For validating a plugin tree already on disk (a checkout\'s own packages/macf/plugin/) — not for a normal operator init, which wants the published, network-versioned plugin.')
   .option('--dir <path>', 'Project directory (defaults to current working directory)')
   .option(
     '--force',
@@ -176,6 +177,7 @@ program
       cliVersion: opts.cliVersion,
       pluginVersion: opts.pluginVersion,
       actionsVersion: opts.actionsVersion,
+      pluginSource: opts.pluginSource,
       force: opts.force,
       agentsIndex: opts.agentsIndex,
     });

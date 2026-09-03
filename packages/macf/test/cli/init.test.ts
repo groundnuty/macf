@@ -1224,3 +1224,81 @@ describe('canonical-overwrite guard integration (groundnuty/macf#1401, extending
     }
   }, 20000);
 });
+
+// --plugin-source (groundnuty/macf#1424): the release script's harness-compat
+// gate must materialize its scratch workspace's plugin from the ARTIFACT
+// UNDER RELEASE (this checkout's own packages/macf/plugin/), not a network
+// clone of the previous release's marketplace tag — the network clone is
+// both the WRONG subject (one version behind) and, on a host that refuses
+// anonymous git HTTPS, an outright FATAL (#1423). Both tests here are
+// network-free by construction (no marketplace fetch happens on either
+// path), unlike the rest of this file's plugin-touching tests.
+describe('macf init --plugin-source (groundnuty/macf#1424)', () => {
+  let dir: string;
+  let localSource: string;
+
+  beforeEach(() => {
+    dir = tempDir();
+    localSource = tempDir();
+    mkdirSync(join(localSource, 'agents'), { recursive: true });
+    writeFileSync(join(localSource, 'agents', 'code-agent.md'), '# local code-agent\n');
+    mkdirSync(join(localSource, '.claude-plugin'), { recursive: true });
+    writeFileSync(
+      join(localSource, '.claude-plugin', 'plugin.json'),
+      JSON.stringify({ name: 'macf-agent', version: '0.0.0-local-build-tree' }),
+    );
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(localSource, { recursive: true, force: true });
+  });
+
+  it('copies the plugin from --plugin-source instead of fetching over the network', async () => {
+    await initAgent(dir, {
+      project: 'PLUGINSRC',
+      role: 'code-agent',
+      registryType: 'local',
+      registryPath: join(dir, 'registry.json'), // scratch — inside this test's own tmp dir, never $HOME
+      agentsIndex: false,
+      pluginSource: localSource,
+    });
+
+    const pluginJsonPath = join(dir, '.macf', 'plugin', '.claude-plugin', 'plugin.json');
+    expect(existsSync(pluginJsonPath)).toBe(true);
+    const parsed = JSON.parse(readFileSync(pluginJsonPath, 'utf-8')) as { version?: string };
+    expect(parsed.version).toBe('0.0.0-local-build-tree');
+    expect(existsSync(join(dir, '.macf', 'plugin', 'agents', 'code-agent.md'))).toBe(true);
+  });
+
+  it('reports (never throws) when --plugin-source points at a missing directory — loud, non-destructive per #1419', async () => {
+    // This is the exact regression #1424 reports: a scratch workspace that
+    // silently ends up WITHOUT a plugin (because the fetch failed and the
+    // failure was swallowed) still lets the harness-compat gate pass,
+    // against a population that excludes what it exists to check. A
+    // --plugin-source copy failure must surface LOUDLY (named in the
+    // result, non-zero process.exitCode from index.ts) — but per the
+    // #1419 InitAgentResult contract landed on this same surface,
+    // NEVER as a thrown Error: throwing would destroy the rest of the
+    // (successfully materialized) workspace outcome the same way a
+    // network plugin-fetch failure's throw once did. The one caller that
+    // cares (release.sh's harness-compat gate) asserts the RESULT
+    // (assert_scratch_has_plugin) rather than relying on an exception.
+    const result = await initAgent(dir, {
+      project: 'PLUGINSRC',
+      role: 'code-agent',
+      registryType: 'local',
+      registryPath: join(dir, 'registry.json'),
+      agentsIndex: false,
+      pluginSource: join(localSource, 'does-not-exist'),
+    });
+
+    expect(result.pluginFetchFailure).toBeDefined();
+    expect(result.pluginFetchFailure!.tag).toContain('does-not-exist');
+    expect(result.pluginFetchFailure!.detail).toMatch(/does not exist or is not a directory/);
+    // The rest of the workspace still materialized — the whole point of
+    // the report-don't-throw contract.
+    expect(existsSync(join(dir, 'claude.sh'))).toBe(true);
+    expect(existsSync(join(dir, '.macf', 'macf-agent.json'))).toBe(true);
+  });
+});

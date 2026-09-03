@@ -18,7 +18,7 @@ import { reportSeedPromptResponses, seedPromptResponsesConfig } from '../prompt-
 import { reportSeedStallSignatures, seedStallSignaturesConfig } from '../stall-signatures.js';
 import { installGhTokenHook, installStartupPickupHook, installPluginSkillPermissions, installSandboxFdAllowRead, installSandboxExcludedCommands } from '../settings-writer.js';
 import { deriveBotLogin, fetchAppSlug } from './doctor.js';
-import { fetchPluginToWorkspace, stripPluginMcpServers, linkPluginCliDist } from '../plugin-fetcher.js';
+import { fetchPluginToWorkspace, copyLocalPluginToWorkspace, stripPluginMcpServers, linkPluginCliDist } from '../plugin-fetcher.js';
 import { writeMcpJsonChannelServer } from '../mcp-json.js';
 import { writeClaudeSh, hasManagedHeader } from '../claude-sh.js';
 import { writeEnvFiles } from '../env-files.js';
@@ -104,6 +104,17 @@ export interface InitOptions {
   readonly cliVersion?: string;
   readonly pluginVersion?: string;
   readonly actionsVersion?: string;
+  /**
+   * Copy the plugin from this LOCAL directory instead of fetching
+   * groundnuty/macf-marketplace over the network (groundnuty/macf#1424).
+   * For a caller validating a plugin tree already on disk — a source-repo
+   * checkout's own `packages/macf/plugin/` — never for a normal operator
+   * `macf init`, which wants the network-versioned, published plugin. When
+   * set, `versions.plugin` is still resolved (and still recorded in
+   * `macf-agent.json` for a later `macf update` to pin against) but is NOT
+   * used to select what gets copied — see {@link copyLocalPluginToWorkspace}.
+   */
+  readonly pluginSource?: string;
   /**
    * Skip issuing a fresh agent mTLS leaf cert when a valid cert+key pair
    * ALREADY exists at the destination workspace (macf#1000). Defaults to
@@ -944,10 +955,16 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
   installSandboxExcludedCommands(absDir);
   console.log(`  Sandbox: excludedCommands canonical set installed`);
 
-  // Fetch the macf-agent plugin at the pinned version and place it at
-  // .macf/plugin/ so claude.sh can use --plugin-dir (per DR-013).
+  // Fetch the macf-agent plugin and place it at .macf/plugin/ so claude.sh
+  // can use --plugin-dir (per DR-013). Two sources, mutually exclusive:
+  //  - normal case: network-fetch the pinned VERSION from the marketplace.
+  //  - `--plugin-source <dir>` (groundnuty/macf#1424): copy an
+  //    already-on-disk plugin tree instead — no network, no version
+  //    lookup. Used by release.sh's harness-compat gate to validate the
+  //    checkout's own canonical content (packages/macf/plugin/) instead of
+  //    fetching a stale marketplace tag over the network.
   //
-  // A network failure here does NOT abort init (groundnuty/macf#1419) —
+  // A failure on EITHER path does NOT abort init (groundnuty/macf#1419) —
   // the rest of the workspace (cert, env files, launcher, .mcp.json) still
   // gets built, because aborting mid-function (or throwing at either exit
   // point) would DESTROY that informative outcome, not merely fail loud —
@@ -964,9 +981,17 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
   // pre-#1419 shape was `console.warn` + a plain `void` return with NO
   // signal anywhere a caller could act on; this shape is loud everywhere
   // (exit code, JSON outcome, printed message) without being destructive.
+  // `--plugin-source`'s one caller (release.sh's harness-compat gate)
+  // relies on exactly the non-zero exit code, asserting the RESULT
+  // independently (`assert_scratch_has_plugin` — see that function's own
+  // doc) rather than on this message's wording.
   let pluginFetchFailure: { readonly tag: string; readonly detail: string } | undefined;
   try {
-    fetchPluginToWorkspace(absDir, versions.plugin);
+    if (opts.pluginSource !== undefined && opts.pluginSource !== '') {
+      copyLocalPluginToWorkspace(absDir, opts.pluginSource);
+    } else {
+      fetchPluginToWorkspace(absDir, versions.plugin);
+    }
     // Strip mcpServers from the fetched local plugin.json copy (DR-022
     // Amendment P, groundnuty/macf#995) — the channel-server no longer
     // mounts via the plugin; it mounts as a project .mcp.json server below.
@@ -989,16 +1014,35 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
     // dist/, so without this the /macf-* skills fail MODULE_NOT_FOUND. MUST run
     // after the fetch (a re-clone wipes the dir).
     const linkedDist = linkPluginCliDist(absDir);
+    const source = opts.pluginSource !== undefined && opts.pluginSource !== ''
+      ? `copied from local source ${opts.pluginSource}`
+      : `fetched macf-agent@v${versions.plugin}`;
     console.log(
-      `  Plugin: fetched macf-agent@v${versions.plugin} to .macf/plugin/ ` +
+      `  Plugin: ${source} to .macf/plugin/ ` +
       `(mcpServers ${stripResult.status === 'stripped' ? 'stripped' : 'already absent'}` +
       `${linkedDist ? '; plugin-CLI dist linked' : ''})`,
     );
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    pluginFetchFailure = { tag: `v${versions.plugin}`, detail: msg };
-    console.warn(`  Warning: plugin fetch failed: ${msg}`);
-    console.warn(`  You can retry later with \`macf update\` once the issue is resolved.`);
+    const usingPluginSource = opts.pluginSource !== undefined && opts.pluginSource !== '';
+    pluginFetchFailure = {
+      tag: usingPluginSource ? `local:${opts.pluginSource}` : `v${versions.plugin}`,
+      detail: msg,
+    };
+    if (usingPluginSource) {
+      // --plugin-source is an explicit request to validate THAT tree — a
+      // network-fetch fallback here would silently validate a DIFFERENT
+      // plugin than the one the caller asked for, defeating the flag's
+      // entire purpose (groundnuty/macf#1424). Still non-throwing (per the
+      // #1419 contract above — see `pluginFetchFailure`'s doc); the
+      // immediate message is specific because the generic "retry with
+      // `macf update`" advice below does NOT apply here — a bare
+      // `macf update` retries the NETWORK path, not this copy.
+      console.warn(`  Warning: plugin copy from --plugin-source "${opts.pluginSource}" failed: ${msg}`);
+    } else {
+      console.warn(`  Warning: plugin fetch failed: ${msg}`);
+      console.warn(`  You can retry later with \`macf update\` once the issue is resolved.`);
+    }
   }
 
   // Write <workspace>/.mcp.json with the channel-server as a project MCP
