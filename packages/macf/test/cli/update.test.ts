@@ -85,7 +85,7 @@ vi.mock('../../src/cli/rules.js', async (importOriginal) => {
 });
 
 import { update, buildDiff, renderDiff } from '../../src/cli/commands/update.js';
-import { agentConfigPath } from '../../src/cli/config.js';
+import { agentConfigPath, readAgentConfig } from '../../src/cli/config.js';
 import { findCliPackageRoot } from '../../src/cli/rules.js';
 import { fetchPluginToWorkspace, stripPluginMcpServers, linkPluginCliDist } from '../../src/cli/plugin-fetcher.js';
 import { mcpJsonPath, readMcpJsonChannelServerVersion, MCP_SERVER_NAME } from '../../src/cli/mcp-json.js';
@@ -592,6 +592,61 @@ describe('update command', () => {
     await update(dir, { all: false, cli: false, plugin: false, actions: false, yes: false, dryRun: false });
 
     expect(fetchPluginToWorkspace).not.toHaveBeenCalled();
+  });
+
+  // -----------------------------------------------------------------
+  // groundnuty/macf#1419 DECISIVE PAIR: the repair-fetch trigger must
+  // compare the recorded pin against the OBSERVED disk state, not just
+  // "is the dir non-empty" — the exact gap that let a workspace whose
+  // `macf init`/`fleet deploy` plugin fetch failed (leaving a STALE
+  // manifest from an earlier fetch, or none at all) report "✓ up to
+  // date" forever, defeating the retry path `init`'s own failure
+  // message names.
+  // -----------------------------------------------------------------
+  it('DECISIVE (mismatch half): record 0.2.60, disk plugin.json 0.2.0 — re-fetches to converge', async () => {
+    writeConfig(dir, { cli: '0.2.0', plugin: '0.2.60', actions: 'v1' });
+    seedInstalledPlugin(join(dir, '.macf', 'plugin'), '0.2.0');
+    mockFetchReturning({ cli: '0.2.0', plugin: '0.2.60', actions: 'v1' });
+
+    vi.mocked(fetchPluginToWorkspace).mockClear();
+    const code = await update(dir, { all: false, cli: false, plugin: false, actions: false, yes: false, dryRun: false });
+    expect(code).toBe(0);
+
+    expect(fetchPluginToWorkspace).toHaveBeenCalledTimes(1);
+    expect(fetchPluginToWorkspace).toHaveBeenCalledWith(
+      dir, '0.2.60', { targetDir: join(dir, '.macf', 'plugin') },
+    );
+    // The record itself is untouched by this run (it was already the
+    // target pin — interpretation A, see this fix's report for why the
+    // record stays intent rather than observation).
+    expect(readAgentConfig(dir)?.versions?.plugin).toBe('0.2.60');
+  });
+
+  it('DECISIVE (match half): record AND disk both 0.2.60 — no fetch, output unchanged', async () => {
+    writeConfig(dir, { cli: '0.2.0', plugin: '0.2.60', actions: 'v1' });
+    seedInstalledPlugin(join(dir, '.macf', 'plugin'), '0.2.60');
+    mockFetchReturning({ cli: '0.2.0', plugin: '0.2.60', actions: 'v1' });
+
+    vi.mocked(fetchPluginToWorkspace).mockClear();
+    const code = await update(dir, { all: false, cli: false, plugin: false, actions: false, yes: false, dryRun: false });
+    expect(code).toBe(0);
+
+    expect(fetchPluginToWorkspace).not.toHaveBeenCalled();
+    expect(readAgentConfig(dir)?.versions?.plugin).toBe('0.2.60');
+  });
+
+  it('an UNREADABLE plugin.json (present but corrupt) is treated the same as a mismatch — repair fires', async () => {
+    writeConfig(dir, { cli: '0.2.0', plugin: '0.2.60', actions: 'v1' });
+    const pluginDir = join(dir, '.macf', 'plugin');
+    mkdirSync(join(pluginDir, '.claude-plugin'), { recursive: true });
+    writeFileSync(join(pluginDir, '.claude-plugin', 'plugin.json'), '{not valid json');
+    mockFetchReturning({ cli: '0.2.0', plugin: '0.2.60', actions: 'v1' });
+
+    vi.mocked(fetchPluginToWorkspace).mockClear();
+    const code = await update(dir, { all: false, cli: false, plugin: false, actions: false, yes: false, dryRun: false });
+    expect(code).toBe(0);
+
+    expect(fetchPluginToWorkspace).toHaveBeenCalledTimes(1);
   });
 
   // ---------------------------------------------------------------------
