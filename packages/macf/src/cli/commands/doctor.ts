@@ -15,7 +15,7 @@
  * for the attribution-trap class this prevents).
  */
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync, statfsSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statfsSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { createInterface } from 'node:readline';
 import { join, resolve } from 'node:path';
@@ -1668,6 +1668,277 @@ export function checkDistributedScriptCurrency(
 }
 
 /**
+ * Whether the running CLI's plugin-scripts canonical source dir is absent —
+ * the groundnuty/macf#1403-class packaging-defect signature. A single
+ * source of truth for this fact, shared by `checkStrayScripts`'s UNKNOWN
+ * branch (a missing plugin dir narrows `listDistributedScriptNames`, so ANY
+ * on-disk script that's canonical to the missing dir would misread as a
+ * stray) and `classifyGuardGapCause`'s systemic-packaging signature —
+ * computed once so the two verdicts can never disagree about the same
+ * underlying fact.
+ */
+function pluginScriptsDirAbsent(pluginScriptsDir: string): boolean {
+  return !existsSync(pluginScriptsDir);
+}
+
+/**
+ * Scripts an operator has deliberately kept in `.claude/scripts/` that are
+ * NOT part of any canonical distribution set and never will be — distinct
+ * from `CANONICAL_SCRIPTS_REPO_LOCAL` (`rules.ts`), which excludes scripts
+ * that DO live in the CLI's own source tree but are repo-local to
+ * `groundnuty/macf` itself (release tooling); those are deliberately NOT on
+ * this list — an operator workspace with a `release.sh` copy lying around
+ * is exactly the visibility gap `checkStrayScripts` exists to close
+ * (groundnuty/macf#1401 comment: "survived every refresh today, and
+ * nothing reports them").
+ *
+ * No managed-file header exists on distributed scripts to discriminate
+ * "operator-authored" from "canonical" structurally — `copyCanonicalScripts`
+ * (`rules.ts`)'s own doc comment: "no header is injected — shell scripts
+ * can't take HTML comments." So this allow-list is a FORCED hand-
+ * enumeration (checked, not assumed), not a hand-enumeration of
+ * convenience: the next operator-authored script an operator wants kept
+ * needs a new entry here, named with a reason.
+ */
+const STRAY_SCRIPT_ALLOWLIST: ReadonlySet<string> = new Set([
+  // groundnuty/macf#1395 — operator-authored statusline script, referenced
+  // from .claude/settings.json's statusLine config; deliberately preserved
+  // across every `macf update` / `rules refresh` run.
+  'macf-statusline.sh',
+]);
+
+/** One on-disk `.claude/scripts/` entry `checkStrayScripts` found that the tool did not put there. */
+export interface StrayScriptFinding {
+  readonly name: string;
+}
+
+/**
+ * Result of the stray-script visibility check (groundnuty/macf#1401 second
+ * increment). "Stray" = present in `<workspace>/.claude/scripts/` but
+ * neither in the set `macf rules refresh` would write there right now
+ * (`listDistributedScriptNames`) nor on `STRAY_SCRIPT_ALLOWLIST`. An
+ * operator-kept script is a stray BY DEFINITION — the point of this check
+ * is visibility, not a defect to fix.
+ *
+ *   - `PASS`    — `.claude/scripts/` doesn't exist, is empty, or every
+ *                 on-disk entry is either canonically distributed or
+ *                 allow-listed.
+ *   - `INFO`    — at least one on-disk entry is neither; `findings` names
+ *                 each. ALSO used for the "not a macf-managed workspace"
+ *                 case (no `.macf/`) with empty `findings` — nothing here
+ *                 has ever been distributed by the tool, so every file
+ *                 would trivially read as a stray, which is not
+ *                 informative; reported distinctly via `detail` instead.
+ *                 Deliberately INFO, never WARN — see
+ *                 `printStrayScriptsSection`'s doc comment for why a
+ *                 persistent, non-actionable finding belongs at INFO.
+ *   - `UNKNOWN` — the running CLI's own canonical script source
+ *                 directories aren't fully present (`pluginScriptsDirAbsent`,
+ *                 or the legacy dir missing), so the distributed-name
+ *                 population to diff against is indeterminate. NEVER
+ *                 enumerate findings in this branch — a script canonical
+ *                 to the missing dir would misread as a stray.
+ */
+export interface StrayScriptCheckResult {
+  readonly status: 'PASS' | 'INFO' | 'UNKNOWN';
+  readonly findings: readonly StrayScriptFinding[];
+  readonly detail: string;
+}
+
+/**
+ * DR-039-sibling for `.claude/scripts/*` VISIBILITY rather than currency —
+ * asks "what's here that the tool didn't put there," not "is what's here
+ * current." Gated on `.macf/` exactly like `checkDistributedScriptCurrency`,
+ * for the same reason: a workspace `macf update` has never touched has no
+ * distribution relationship to canonical, so "stray" is the wrong word for
+ * every file in it.
+ *
+ * Enumerates ALL files, not just `.sh` — the distributed set is `.sh`-only,
+ * so a stray `.mjs`/`.bak`/leftover README is exactly the kind of thing
+ * nobody notices and this check exists to surface; narrowing to `.sh` would
+ * quietly exempt the most likely stray shape. Directories are skipped (not
+ * reported as strays). A symlink is followed via `statSync` (not
+ * `entry.isFile()`, which reports the symlink's OWN type from
+ * `readdirSync`'s dirent, not its target) so an operator-symlinked script
+ * doesn't silently vanish from a check whose entire purpose is visibility;
+ * a broken symlink (stat throws) is skipped, not reported.
+ */
+export function checkStrayScripts(
+  workspaceDir: string,
+  options: {
+    readonly canonicalDir?: string;
+    readonly pluginScriptsDir?: string;
+  } = {},
+): StrayScriptCheckResult {
+  const absDir = resolve(workspaceDir);
+  if (!existsSync(join(absDir, '.macf'))) {
+    return {
+      status: 'INFO',
+      findings: [],
+      detail:
+        'no .macf/ directory — not a macf-managed workspace; .claude/scripts/ here has no distribution ' +
+        'relationship to canonical, so nothing here can be classified as a stray',
+    };
+  }
+
+  const legacyDir = options.canonicalDir ?? canonicalScriptsDir();
+  const pluginDir = options.pluginScriptsDir ?? canonicalPluginScriptsDir();
+
+  if (!existsSync(legacyDir) || pluginScriptsDirAbsent(pluginDir)) {
+    return {
+      status: 'UNKNOWN',
+      findings: [],
+      detail:
+        "this CLI install's canonical script source directories aren't fully present — the distributed " +
+        "name set to compare against is indeterminate, so which on-disk scripts are strays can't be told",
+    };
+  }
+
+  const scriptsDir = join(absDir, '.claude', 'scripts');
+  if (!existsSync(scriptsDir)) {
+    return { status: 'PASS', findings: [], detail: 'no .claude/scripts/ directory — nothing to check' };
+  }
+
+  const distributed = new Set(listDistributedScriptNames({ canonicalDir: legacyDir, pluginScriptsDir: pluginDir }));
+  const findings: StrayScriptFinding[] = [];
+  for (const entry of readdirSync(scriptsDir, { withFileTypes: true })) {
+    if (distributed.has(entry.name) || STRAY_SCRIPT_ALLOWLIST.has(entry.name)) continue;
+    let isFile: boolean;
+    try {
+      isFile = statSync(join(scriptsDir, entry.name)).isFile();
+    } catch {
+      continue; // broken symlink or a race with a concurrent writer — not reportable
+    }
+    if (!isFile) continue; // directories are out of scope
+    findings.push({ name: entry.name });
+  }
+  findings.sort((a, b) => a.name.localeCompare(b.name));
+
+  if (findings.length === 0) {
+    return {
+      status: 'PASS',
+      findings: [],
+      detail: 'no stray scripts — every .claude/scripts/ entry is either distributed or operator-preserved',
+    };
+  }
+
+  return {
+    status: 'INFO',
+    findings,
+    detail: `${findings.length} script(s) in .claude/scripts/ that the tool did not put there`,
+  };
+}
+
+/**
+ * Count of `hooks.PreToolUse` hook-entries registered in a hooks.json-
+ * shaped file at `jsonPath` — 0 for absent/unreadable/malformed/no-
+ * PreToolUse-key, the same "can't confirm" collapse
+ * `plugin-hook-resolver.ts`'s `readHooksMapEntries` uses for its own
+ * absence case. Deliberately reads ONLY the `PreToolUse` key (not the
+ * whole `hooks` map the way `readHooksMapEntries` does) — the
+ * groundnuty/macf#1401 systemic-pin signature is specifically about the
+ * PreToolUse guard family going dark, not about hooks.json being entirely
+ * empty of every event.
+ */
+function countPreToolUseEntries(jsonPath: string): number {
+  if (!existsSync(jsonPath)) return 0;
+  try {
+    const raw = readFileSync(jsonPath, 'utf-8');
+    const parsed = JSON.parse(raw) as { hooks?: { PreToolUse?: unknown } };
+    const preToolUse = parsed.hooks?.PreToolUse;
+    if (!Array.isArray(preToolUse)) return 0;
+    let count = 0;
+    for (const group of preToolUse) {
+      const hooks = (group as { hooks?: unknown } | null)?.hooks;
+      if (Array.isArray(hooks)) count += hooks.length;
+    }
+    return count;
+  } catch {
+    return 0;
+  }
+}
+
+/** One systemic cause `classifyGuardGapCause` can measure for a guard-presence gap. */
+export type GuardGapCause = 'systemic-packaging' | 'systemic-pin';
+
+/**
+ * Result of classifying WHY a workspace's guard scripts might be absent
+ * (groundnuty/macf#1401 second increment). `causes` holds every
+ * INDEPENDENTLY-measured systemic signature that currently fires — NOT a
+ * first-match verdict. The two known causes are independent defects with
+ * the same symptom (a fleet that fixes one and re-runs must not read the
+ * OTHER cause's still-firing warning as "the fix failed"), so both are
+ * reported when both signatures are present. `descriptions` carries one
+ * human-readable line per entry in `causes`, same order/length.
+ *
+ * Empty `causes` means neither measurable signature fired — the caller's
+ * cue that any actual gap is this workspace's own, not a known systemic
+ * one.
+ */
+export interface GuardGapClassification {
+  readonly causes: readonly GuardGapCause[];
+  readonly descriptions: readonly string[];
+}
+
+/**
+ * Classify why this workspace's guard scripts (PreToolUse hooks) might be
+ * absent, by MEASURABLE SIGNATURE rather than a hand-maintained list of
+ * known incidents — a FUTURE systemic cause with the same signature
+ * classifies correctly without anyone updating this function. Per the
+ * groundnuty/macf#1401 thread ruling, the two causes below are DESCRIBED,
+ * never numbered, in `descriptions` — this is user-facing CLI output, and
+ * an internal issue citation there would mean nothing to a reader who was
+ * never in the room (groundnuty/macf#1061).
+ *
+ * Two independent signatures, each checked separately:
+ *   - `systemic-packaging` — the running CLI's own `plugin/scripts/`
+ *     canonical source dir doesn't exist. Every workspace initialised from
+ *     that CLI release is in this state; nothing about THIS workspace is
+ *     individually broken.
+ *   - `systemic-pin` — the plugin dir this workspace's `claude.sh`
+ *     ACTUALLY mounts (resolved via `resolvePluginDirFromClaudeSh` — no
+ *     second resolver, DR-044's "one reader, never a second") has a
+ *     `hooks/hooks.json` that registers zero `PreToolUse` entries. Only
+ *     checked when the mount is cleanly determinable from a real
+ *     `claude.sh` — a bare workspace with no launcher at all isn't
+ *     evidence of a version-pin defect at deploy, just evidence nothing
+ *     was ever deployed; guessing a default path here would misclassify
+ *     that case as this one (Instance 17's "assert live or degrade to
+ *     unknown" floor, applied to a classification rather than a verdict).
+ *     Every workspace pinned to that same plugin deploy is in this state.
+ */
+export function classifyGuardGapCause(
+  workspaceDir: string,
+  options: { readonly pluginScriptsDir?: string } = {},
+): GuardGapClassification {
+  const causes: GuardGapCause[] = [];
+  const descriptions: string[] = [];
+
+  const pluginScriptsDir = options.pluginScriptsDir ?? canonicalPluginScriptsDir();
+  if (pluginScriptsDirAbsent(pluginScriptsDir)) {
+    causes.push('systemic-packaging');
+    descriptions.push(
+      'the released CLI this workspace was initialised from ships no guard scripts — a packaging ' +
+      'defect; every workspace from that release is in this state; your workspace is not individually broken',
+    );
+  }
+
+  const pluginDirResolution = resolvePluginDirFromClaudeSh(workspaceDir);
+  if (pluginDirResolution.determinable && pluginDirResolution.dir) {
+    const pluginHooksJsonPath = join(pluginDirResolution.dir, 'hooks', 'hooks.json');
+    if (countPreToolUseEntries(pluginHooksJsonPath) === 0) {
+      causes.push('systemic-pin');
+      descriptions.push(
+        'the plugin clone carries no hooks — a version-pin defect at deploy; every workspace from ' +
+        'that deploy is in this state; not individually broken',
+      );
+    }
+  }
+
+  return { causes, descriptions };
+}
+
+/**
  * One distributed rule (`.claude/rules/<name>.md`) found not to match what
  * the running CLI would write there right now. Sibling of
  * `ScriptCurrencyFinding` for `.claude/rules/*.md` rather than
@@ -2366,10 +2637,18 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
     // party) — same result then reused for this section's own print call
     // below rather than re-running the (read-only, local) git calls twice.
     const checkoutCurrency = checkCheckoutCurrency(projectDir, null);
+    // groundnuty/macf#1401 second increment: computed once here too, for
+    // the same reachable-without-config reasoning as checkoutCurrency above
+    // — classifyGuardGapCause never touches config either.
+    const guardGapClassification = classifyGuardGapCause(projectDir);
     console.log('');
     console.log('Distributed script currency');
     console.log('──────────────────────────────────────────────────────────────');
-    printScriptCurrencySection(checkDistributedScriptCurrency(projectDir), checkoutCurrency);
+    printScriptCurrencySection(checkDistributedScriptCurrency(projectDir), checkoutCurrency, guardGapClassification);
+    console.log('');
+    console.log('Stray scripts');
+    console.log('──────────────────────────────────────────────────────────────');
+    printStrayScriptsSection(checkStrayScripts(projectDir));
     // groundnuty/macf#1360: same reachable-without-config reasoning as the
     // script-currency section above, applied to .claude/rules/ —
     // `checkDistributedRuleCurrency` gates on `.macf/` presence exactly like
@@ -2524,12 +2803,20 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
   // same result then reused for this section's own print call below rather
   // than re-running the (read-only, local) git calls twice.
   const checkoutCurrency = checkCheckoutCurrency(projectDir, config);
+  // groundnuty/macf#1401 second increment: computed once, same reasoning as
+  // checkoutCurrency above.
+  const guardGapClassification = classifyGuardGapCause(projectDir);
 
   console.log('');
   console.log('Distributed script currency');
   console.log('──────────────────────────────────────────────────────────────');
   const scriptCurrencyCheck = checkDistributedScriptCurrency(projectDir);
-  printScriptCurrencySection(scriptCurrencyCheck, checkoutCurrency);
+  printScriptCurrencySection(scriptCurrencyCheck, checkoutCurrency, guardGapClassification);
+
+  console.log('');
+  console.log('Stray scripts');
+  console.log('──────────────────────────────────────────────────────────────');
+  printStrayScriptsSection(checkStrayScripts(projectDir));
 
   console.log('');
   console.log('Distributed rule currency');
@@ -2801,8 +3088,36 @@ function printDistributionFixLine(
   console.log(`    ${plainFix}`);
 }
 
-/** Print the groundnuty/macf#1362 distributed-script-currency report section for `check`. */
-function printScriptCurrencySection(check: ScriptCurrencyCheckResult, checkoutCurrency: CheckoutCurrencyCheckResult): void {
+/**
+ * Print the systemic-vs-individual classification for a guard-presence gap
+ * (groundnuty/macf#1401 second increment) — called only when the caller
+ * has already established there IS a real gap (FAIL, or WARN with at
+ * least one `missing` finding; never for stale-only findings, which have
+ * nothing to do with either systemic cause). `classification.causes` empty
+ * means neither measurable signature fired: the gap is this workspace's
+ * own, printed as the individual-investigate line per the issue thread's
+ * decisive triple.
+ */
+function printGuardGapClassification(classification: GuardGapClassification): void {
+  if (classification.causes.length === 0) {
+    console.log('    Note: your guards are missing — investigate this workspace.');
+    return;
+  }
+  for (const d of classification.descriptions) {
+    console.log(`    Note: ${d}`);
+  }
+}
+
+/**
+ * Print the groundnuty/macf#1362 distributed-script-currency report section
+ * for `check`, composed with the groundnuty/macf#1401 systemic-vs-
+ * individual classification.
+ */
+function printScriptCurrencySection(
+  check: ScriptCurrencyCheckResult,
+  checkoutCurrency: CheckoutCurrencyCheckResult,
+  classification: GuardGapClassification,
+): void {
   if (check.status === 'INFO') {
     console.log(`  ℹ ${check.detail}  [INFO]`);
     return;
@@ -2815,8 +3130,11 @@ function printScriptCurrencySection(check: ScriptCurrencyCheckResult, checkoutCu
   // script source dirs missing) — distinct from both PASS (everything
   // current) and WARN (both dirs present, some workspace copy is stale or
   // missing). No findings to list; the detail line names the missing dir.
+  // This precondition is exactly the systemic-packaging signature, so the
+  // classification is always worth printing here.
   if (check.status === 'FAIL') {
     console.log(`  ✗ ${check.detail}  [FAIL]`);
+    printGuardGapClassification(classification);
     return;
   }
   if (check.status === 'PASS') {
@@ -2830,6 +3148,44 @@ function printScriptCurrencySection(check: ScriptCurrencyCheckResult, checkoutCu
   }
   const staleCount = check.findings.filter((f) => f.reason === 'stale').length;
   printDistributionFixLine('.claude/scripts/', checkoutCurrency, staleCount);
+  // Both canonical source dirs present here (that's what distinguishes WARN
+  // from FAIL) — "both present, a script missing" is the decisive triple's
+  // own framing for when this classification applies. Stale-only findings
+  // (nothing actually MISSING) have no bearing on either systemic cause, so
+  // the classification stays silent for those — printing it would falsely
+  // imply a packaging/pin defect explains a byte-drift finding it can't.
+  const missingCount = check.findings.length - staleCount;
+  if (missingCount > 0) {
+    printGuardGapClassification(classification);
+  }
+}
+
+/**
+ * Print the groundnuty/macf#1401 stray-script visibility report section for
+ * `check`. Deliberately INFO, never WARN, even when findings are non-empty
+ * — a stray the operator wants to keep is not a defect, and it STAYS
+ * present forever, so a WARN-tier severity here would fire every session
+ * for the life of the workspace. That trains the reader to skim past
+ * doctor's WARN-tier output — where an actual, fixable defect lives — the
+ * same "persistent-but-correct signal degrades the urgent one" hazard the
+ * currency checks avoid by keeping the ordinarily-benign "unmanaged
+ * workspace" case at INFO too. Visibility is the point, never remediation:
+ * this check (like the SessionStart guard-presence detector it sits beside
+ * in this issue) never deletes, never auto-repairs.
+ */
+function printStrayScriptsSection(check: StrayScriptCheckResult): void {
+  if (check.status === 'UNKNOWN') {
+    console.log(`  ? ${check.detail}  [UNKNOWN]`);
+    return;
+  }
+  if (check.status === 'PASS') {
+    console.log(`  ✓ ${check.detail}  [PASS]`);
+    return;
+  }
+  console.log(`  ℹ ${check.detail}  [INFO]`);
+  for (const f of check.findings) {
+    console.log(`    · ${f.name}`);
+  }
 }
 
 /** Print the groundnuty/macf#1360 distributed-rule-currency report section for `check`. */
