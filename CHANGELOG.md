@@ -4,6 +4,28 @@ All notable changes to the `macf` CLI. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.62] — 2026-09-03
+
+**Two fixes from the first fleet's first morning.**
+
+### Fixed
+
+- **`bootstrap apply` preserved a one-agent routing table on each agent repo instead of widening
+  it to the fleet** — the caller asked `repo-init` for a union of one, so `.github/agent-config.json`
+  on every agent repo named only its own agent and any `@mention` of a sibling there dropped
+  silently (the one-way-channel hazard). Apply now writes the union of the existing table and every
+  declared role, never dropping an entry; `plan` reports a table missing a fleet member as an
+  `update` row naming the missing roles. Measured on `macf-trial` after its first apply. (#1427)
+- **The release gate's harness-compat check fetched the previous release's plugin from the
+  marketplace — and had passed two releases with no plugin at all** because that fetch failed
+  silently on hosts that refuse anonymous git, until a failed fetch became loud. The gate now
+  materializes its scratch workspace from this checkout's plugin content through a new
+  `macf init --plugin-source <dir>` (a synthetic manifest is written into the scratch only, since
+  the source tree carries none by design), asserts the scratch actually has a plugin and hooks,
+  states its network preconditions per stage up front, and `release-cli`'s cleanliness refusal
+  names every entry it refused on with counts — and says so when every entry is a zero-byte
+  sandbox stub. (#1426)
+
 ## [0.2.61] — 2026-09-03
 
 **Six hardening fixes from the first live fleet deploy, each measured before it was written.**

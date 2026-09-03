@@ -1,6 +1,6 @@
 {
   "name": "@groundnuty/macf",
-  "version": "0.2.61",
+  "version": "0.2.62",
   "description": "Multi-Agent Coordination Framework CLI — coordinate Claude Code agents via GitHub. Installs as `macf` binary; use `macf init` to set up an agent workspace, `macf update` to refresh rules + version pins.",
   "type": "module",
   "main": "dist/index.js",
@@ -37,7 +37,7 @@
     "test:live-smoke": "vitest run --config vitest.live-smoke.config.ts"
   },
   "dependencies": {
-    "@groundnuty/macf-core": "0.2.61",
+    "@groundnuty/macf-core": "0.2.62",
     "commander": "^14.0.3",
     "reflect-metadata": "^0.2.2",
     "yaml": "^2.8.1",
