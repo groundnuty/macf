@@ -18,8 +18,8 @@ const TODAYS_CALLER_YAML = `jobs:
 // only from a fixture today (no real router emits this), and per
 // `runner-declaration-reach.ts`'s own doc, `conveysRunnerIntent` cannot
 // tell "the new key is runner-intent" apart from "the new key is
-// something unrelated" — hence the CLI's UNCERTAIN tag + non-zero exit
-// rather than treating it as a confirmed pass.
+// something unrelated" — hence the CLI's "DECLARED (runtime unverified)"
+// tag + non-zero exit rather than treating it as a confirmed pass.
 const UNKNOWN_THIRD_KEY_CALLER_YAML = `jobs:
   route:
     uses: groundnuty/macf-actions/.github/workflows/agent-router.yml@v3.6.0
@@ -78,7 +78,7 @@ describe('runRunnerDeclarationCheck', () => {
     logSpy.mockRestore();
   });
 
-  it('DECISIVE: an "honoured" verdict is STILL non-zero exit, tagged UNCERTAIN — never treated as a confirmed pass', async () => {
+  it('DECISIVE: an "honoured" verdict is STILL non-zero exit, tagged "DECLARED (runtime unverified)" — never treated as a confirmed pass', async () => {
     let printed = '';
     const logSpy = vi.spyOn(console, 'log').mockImplementation((s: string) => {
       printed += `${s}\n`;
@@ -86,8 +86,9 @@ describe('runRunnerDeclarationCheck', () => {
     const deps: RunnerDeclarationDeps = { readInstalledWorkflow: async () => UNKNOWN_THIRD_KEY_CALLER_YAML };
     const code = await runRunnerDeclarationCheck({ repos: ['groundnuty/x'], runsOn: 'self-hosted' }, deps);
     expect(code).toBe(1);
-    expect(printed).toMatch(/\[UNCERTAIN\]/);
+    expect(printed).toMatch(/\[DECLARED \(runtime unverified\)\]/);
     expect(printed).not.toMatch(/\[N\/A\]/);
+    expect(printed).not.toMatch(/UNCERTAIN/);
     logSpy.mockRestore();
   });
 

@@ -71,6 +71,33 @@ export interface RunnerDeclarationFinding {
 }
 
 /**
+ * groundnuty/macf#1421 — the ONE place the human-readable tag word for each
+ * {@link RunnerDeclarationVerdict} lives, imported by both `plan.ts`
+ * ({@link formatRunnerDeclarationLines}) and the standalone `macf routing
+ * runner-declaration-check` CLI (`runner-declaration-check.ts::formatFinding`)
+ * so the two surfaces render byte-identical vocabulary rather than two
+ * hand-synced copies that can silently drift (exactly what this issue
+ * fixed: `'honoured'` was tagged `UNCERTAIN` — "we could not tell what the
+ * declaration is" — when the true state is "the declaration is present and
+ * certain; only the ROUTER'S RUNTIME behaviour is unverified"). `'honoured'`
+ * itself stays a real verdict name (see this module's own doc for why it is
+ * a weaker signal than its name suggests); only the OPERATOR-FACING WORD
+ * changes here.
+ */
+export function runnerDeclarationTag(verdict: RunnerDeclarationVerdict): string {
+  switch (verdict) {
+    case 'not-honoured':
+      return 'NOT HONOURED';
+    case 'unknown':
+      return 'UNKNOWN';
+    case 'honoured':
+      return 'DECLARED (runtime unverified)';
+    case 'not-applicable':
+      return 'N/A';
+  }
+}
+
+/**
  * The macf-actions router `with:` input keys verified LIVE (this module's
  * own doc comment above) against `groundnuty/macf-actions`'s reusable
  * `agent-router.yml`: its ENTIRE `workflow_call.inputs` set, nothing
@@ -250,8 +277,9 @@ function decideFromWithKeys(repo: string, pin: string, withKeys: readonly string
       message:
         `${repo}: installed agent-router.yml@${pin} passes a "with:" input beyond ` +
         `{${KNOWN_NON_RUNNER_INTENT_WITH_KEYS.join(', ')}} (with: keys: ${withKeys.join(', ')}) — this fleet's self-hosted ` +
-        `declaration MAY be reaching the router. Verify by hand against the current macf-actions@${pin} workflow_call schema; ` +
-        'this check cannot yet name what a new key does.',
+        `declaration is DECLARED in the installed workflow. Whether the router ACTS on it is proven only by a routed ` +
+        `run landing on the self-hosted runner, not by this static read; this check cannot yet name what a new key ` +
+        `does, so verify by hand against the current macf-actions@${pin} workflow_call schema.`,
     };
   }
 

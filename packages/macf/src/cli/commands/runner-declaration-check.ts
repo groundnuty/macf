@@ -25,9 +25,11 @@
  * own doc explains why `conveysRunnerIntent` fires on ANY unrecognized
  * `with:` key, not specifically a runner-intent one, so a repo classified
  * `'honoured'` still needs an operator's eyes, tagged distinctly
- * (`UNCERTAIN`) from a genuine `N/A` pass rather than silently trusted.
+ * (`DECLARED (runtime unverified)`, via the shared {@link runnerDeclarationTag}
+ * — groundnuty/macf#1421) from a genuine `N/A` pass rather than silently
+ * trusted.
  */
-import { checkRunnerDeclarationReach, REAL_RUNNER_DECLARATION_DEPS } from '../bootstrap/runner-declaration-reach.js';
+import { checkRunnerDeclarationReach, REAL_RUNNER_DECLARATION_DEPS, runnerDeclarationTag } from '../bootstrap/runner-declaration-reach.js';
 import type { RunnerDeclarationDeps, RunnerDeclarationFinding } from '../bootstrap/runner-declaration-reach.js';
 
 export interface RunnerDeclarationCheckCliOptions {
@@ -38,15 +40,7 @@ export interface RunnerDeclarationCheckCliOptions {
 }
 
 function formatFinding(finding: RunnerDeclarationFinding): string {
-  const tag =
-    finding.verdict === 'not-applicable'
-      ? 'N/A'
-      : finding.verdict === 'honoured'
-        ? 'UNCERTAIN'
-        : finding.verdict === 'unknown'
-          ? 'UNKNOWN'
-          : 'NOT HONOURED';
-  return `[${tag}] ${finding.message}`;
+  return `[${runnerDeclarationTag(finding.verdict)}] ${finding.message}`;
 }
 
 /**
