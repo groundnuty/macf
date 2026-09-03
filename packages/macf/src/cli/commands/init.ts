@@ -560,32 +560,6 @@ function localCaKeyPath(registryPath: string, project: string): string {
  * "rejects before writing any workspace state" test) so a refusal never
  * leaves a half-reinitialized workspace behind.
  */
-/**
- * Turn a recorded plugin-fetch failure into a thrown Error at one of
- * `initAgent`'s two exit points (groundnuty/macf#1419). Deferred rather than
- * thrown at the fetch's own catch site so the REST of the workspace
- * (cert, env files, launcher, `.mcp.json`) still gets built first — a
- * plugin failure must not degrade into a WORSE half-initialized workspace.
- *
- * The thrown message carries the tag + underlying error and no internal
- * issue/DR citations (`no-internal-citations-in-user-facing-output.test.ts`)
- * — it reaches `index.ts`'s top-level `.catch()` verbatim for a direct
- * `macf init` run, and via `deployAgent`'s own try/catch becomes a `fleet
- * deploy` role's `status: 'failed'` `reason` for the in-process caller —
- * so a human reading stderr and a script reading the JSON outcome both get
- * the same honest, actionable summary instead of a bare "materialized".
- */
-function throwIfPluginFetchFailed(
-  pluginFetchFailure: { readonly tag: string; readonly detail: string } | undefined,
-  absDir: string,
-): void {
-  if (pluginFetchFailure === undefined) return;
-  throw new Error(
-    `Workspace at ${absDir} initialized WITHOUT its plugin — macf-agent@${pluginFetchFailure.tag} ` +
-      `fetch failed: ${pluginFetchFailure.detail}. Retry with \`macf update\` once the issue is resolved.`,
-  );
-}
-
 function refuseUnmanagedClaudeShWithoutForce(absDir: string, force: boolean): void {
   if (force) return;
   const claudeShPath = join(absDir, 'claude.sh');
@@ -599,9 +573,46 @@ function refuseUnmanagedClaudeShWithoutForce(absDir: string, force: boolean): vo
 }
 
 /**
+ * Print the "materialized WITHOUT its plugin" caveat naming the tag + the
+ * underlying error, when a plugin fetch failed this run (groundnuty/
+ * macf#1419). A no-op on success. Called at BOTH of `initAgent`'s exit
+ * points so the honest summary appears regardless of registry mode — never
+ * only the short "WITHOUT its plugin" qualifier already appended to the
+ * "Agent … initialized" line above it, which names the failure but not the
+ * detail.
+ */
+function logPluginFetchFailureIfAny(
+  pluginFetchFailure: { readonly tag: string; readonly detail: string } | undefined,
+): void {
+  if (pluginFetchFailure === undefined) return;
+  console.warn(
+    `  Warning: this workspace was initialized WITHOUT its plugin — macf-agent@${pluginFetchFailure.tag} ` +
+      `fetch failed: ${pluginFetchFailure.detail}. Retry with \`macf update\` once the issue is resolved.`,
+  );
+}
+
+/**
+ * `initAgent`'s report of what happened (groundnuty/macf#1419). Empty
+ * (`{}`) is the ordinary success shape — deliberately NOT a plain
+ * `Promise<void>` any more, because a plugin-fetch failure is a real,
+ * supported outcome (the rest of the workspace — cert, env files,
+ * launcher, `.mcp.json` — still gets built; see the fetch try/catch's own
+ * comment for why aborting mid-function would be WORSE) and callers need
+ * to know about it without the informative parts of a successful run being
+ * destroyed by a thrown Error. Both `index.ts` (sets `process.exitCode = 1`
+ * without discarding the printed success output) and `deployAgent`
+ * (threads it into `FleetDeployOutcome`'s `pluginFetch` field, alongside
+ * `certIssue` — an existing precedent for "a named sub-failure inside an
+ * otherwise-informative outcome") read this field.
+ */
+export interface InitAgentResult {
+  readonly pluginFetchFailure?: { readonly tag: string; readonly detail: string };
+}
+
+/**
  * Set up a project directory for an agent.
  */
-export async function initAgent(projectDir: string, opts: InitOptions): Promise<void> {
+export async function initAgent(projectDir: string, opts: InitOptions): Promise<InitAgentResult> {
   validateInitOpts(opts);
 
   const absDir = resolve(projectDir);
@@ -936,19 +947,23 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
   // Fetch the macf-agent plugin at the pinned version and place it at
   // .macf/plugin/ so claude.sh can use --plugin-dir (per DR-013).
   //
-  // A network failure here does NOT abort init immediately (groundnuty/
-  // macf#1419) — the rest of the workspace (cert, env files, launcher,
-  // .mcp.json) still gets built, because aborting mid-function would leave
-  // a WORSE half-initialized workspace than a plugin-less one. But this is
-  // NOT the pre-#1419 "warn and quietly succeed" shape either: the failure
-  // is recorded here and the deferred throw at both of this function's
-  // exit points (the local-registry `return` below and the natural
-  // GitHub-mode end) turns the overall run into a non-zero-exit failure —
-  // "materialized WITHOUT its plugin" is the true summary, not
-  // "initialized." A silent `exit 0` here is exactly the DR-044 Decision 6
-  // violation this fix exists to close: a script driving `macf init`/`macf
-  // fleet deploy` (in-process — see `deployAgent`) must see failure at the
-  // process-exit-code level, not only in scrollback a human might not read.
+  // A network failure here does NOT abort init (groundnuty/macf#1419) —
+  // the rest of the workspace (cert, env files, launcher, .mcp.json) still
+  // gets built, because aborting mid-function (or throwing at either exit
+  // point) would DESTROY that informative outcome, not merely fail loud —
+  // a `deployAgent` catch around a thrown Error collapses a mostly-
+  // successful deploy into a bare `status: 'failed'` string, discarding
+  // exactly the fields (workspace, keyPath, certIssue, ...) the operator
+  // needs to know what DID land. Instead the failure is carried in
+  // `InitAgentResult.pluginFetchFailure`, returned (never thrown) at both
+  // of this function's exit points. `index.ts` sets `process.exitCode = 1`
+  // from it without discarding the printed success output; `deployAgent`
+  // threads it into `FleetDeployOutcome`'s `pluginFetch` field alongside
+  // `certIssue` — same "named sub-failure inside an informative outcome"
+  // shape. This is still the DR-044 Decision 6 fix, not a softer one: the
+  // pre-#1419 shape was `console.warn` + a plain `void` return with NO
+  // signal anywhere a caller could act on; this shape is loud everywhere
+  // (exit code, JSON outcome, printed message) without being destructive.
   let pluginFetchFailure: { readonly tag: string; readonly detail: string } | undefined;
   try {
     fetchPluginToWorkspace(absDir, versions.plugin);
@@ -1005,13 +1020,17 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
   // `macf certs init`.
   if (regType === 'local' && registry.type === 'local') {
     await initLocalModeCertsAndRegistry(absDir, registry.path, opts, agentName);
-    console.log(`Agent "${agentName}" initialized in ${absDir} (local-registry mode)`);
+    console.log(
+      pluginFetchFailure
+        ? `Agent "${agentName}" initialized in ${absDir} (local-registry mode) — WITHOUT its plugin`
+        : `Agent "${agentName}" initialized in ${absDir} (local-registry mode)`,
+    );
     console.log(`  Config: ${join(macfDir, 'macf-agent.json')}`);
     console.log(`  Cert:   ${agentCertPath(absDir)}`);
     console.log(`  Launcher: ${claudeShPath}`);
     console.log(`  Registry: ${registry.path}`);
-    throwIfPluginFetchFailed(pluginFetchFailure, absDir);
-    return;
+    logPluginFetchFailureIfAny(pluginFetchFailure);
+    return { pluginFetchFailure };
   }
 
   // GitHub-mode cert flow — the ONLY place in this codebase that issues an
@@ -1041,7 +1060,8 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
     }
   }
 
-  throwIfPluginFetchFailed(pluginFetchFailure, absDir);
+  logPluginFetchFailureIfAny(pluginFetchFailure);
+  return { pluginFetchFailure };
 }
 
 /**

@@ -154,7 +154,7 @@ program
     // LocalRegistryConfig at init time. The flag wins if both forms are
     // supplied with conflicting values; they almost always agree.
     const registryType = opts.local ? 'local' : opts.registryType;
-    await initAgent(projectDir, {
+    const result = await initAgent(projectDir, {
       project: opts.project,
       role: opts.role,
       name: opts.name,
@@ -179,6 +179,15 @@ program
       force: opts.force,
       agentsIndex: opts.agentsIndex,
     });
+    // groundnuty/macf#1419 — a failed plugin fetch is a completed-but-
+    // degraded run (the rest of the workspace materialized fully; see
+    // `InitAgentResult`'s own doc for why `initAgent` reports this rather
+    // than throwing). Set the exit code without discarding the printed
+    // success output above — the same `process.exitCode = code` shape
+    // every other command in this file uses, never `process.exit()`.
+    if (result.pluginFetchFailure) {
+      process.exitCode = 1;
+    }
   });
 
 program

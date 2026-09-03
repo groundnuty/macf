@@ -122,6 +122,15 @@ function caOutcomeToJson(ca: CaMaterializeOutcome): unknown {
   return ca.status === 'vault-absent' ? { status: ca.status } : { status: ca.status, cert_fingerprint: ca.certFingerprint };
 }
 
+/** snake_case mirror of {@link FleetDeployOutcome}'s `pluginFetch` field (groundnuty/macf#1419) — same convention as {@link caOutcomeToJson}. */
+function pluginFetchToJson(
+  pluginFetch: Extract<FleetDeployOutcome, { status: 'deployed' }>['pluginFetch'],
+): unknown {
+  return pluginFetch.status === 'fetched'
+    ? { status: pluginFetch.status }
+    : { status: pluginFetch.status, tag: pluginFetch.tag, detail: pluginFetch.detail };
+}
+
 /**
  * Exported (macf#1013) so `commands/bootstrap-apply.ts`'s default deploy
  * phase can render the SAME redacted per-agent `--json` shape this file's
@@ -144,6 +153,7 @@ export function outcomeToJson(outcome: FleetDeployOutcome): unknown {
         key_fingerprint: outcome.keyFingerprint,
         ca: caOutcomeToJson(outcome.ca),
         cert_issue: outcome.certIssue,
+        plugin_fetch: pluginFetchToJson(outcome.pluginFetch),
       };
     case 'failed':
       return { role: outcome.role, status: outcome.status, reason: outcome.reason };
@@ -171,7 +181,21 @@ function nextStepLines(
   const checkAgentCertPresent =
     deps.checkAgentCertPresent ?? ((d: string) => existsSync(agentCertPath(d)) && existsSync(agentKeyPath(d)));
   const certPresent = checkAgentCertPresent(destDir);
-  const lines: string[] = ['', `Workspace materialized at ${destDir} — the agent is NOT running yet.`];
+  // groundnuty/macf#1419 — the header line must never read as unqualified
+  // success when the plugin didn't land: a workspace with no plugin-hosted
+  // hooks (#749) is missing its PreToolUse guard floor, not merely a cert.
+  const lines: string[] = [
+    '',
+    outcome.pluginFetch.status === 'failed'
+      ? `Workspace materialized at ${destDir} — WITHOUT its plugin — the agent is NOT running yet.`
+      : `Workspace materialized at ${destDir} — the agent is NOT running yet.`,
+  ];
+  if (outcome.pluginFetch.status === 'failed') {
+    lines.push(
+      `⚠ Plugin NOT installed: macf-agent@${outcome.pluginFetch.tag} fetch failed — ${outcome.pluginFetch.detail} ` +
+        'Retry with `macf update` once the issue is resolved.',
+    );
+  }
   if (!certPresent) {
     lines.push(
       outcome.ca.status === 'vault-absent'
@@ -273,5 +297,13 @@ export async function runFleetDeploy(opts: RunFleetDeployOptions, deps?: FleetDe
     console.error(`Role "${outcome.role}" FAILED — ${outcome.reason}`);
   }
 
-  return outcome.status === 'deployed' ? 0 : 1;
+  // groundnuty/macf#1419 — DR-044 Decision 6's "fail loud" applies to the
+  // EXIT CODE even though `outcome.status` stays 'deployed' (never
+  // collapsed to 'failed' — see `FleetDeployOutcome.pluginFetch`'s own doc
+  // for why the informative fields must survive). A script driving this
+  // command must see non-zero when the plugin didn't land, the same as any
+  // other failure — `runDoctor`'s numeric-code-with-full-report shape,
+  // applied here.
+  const pluginFetchOk = outcome.status !== 'deployed' || outcome.pluginFetch.status !== 'failed';
+  return outcome.status === 'deployed' && pluginFetchOk ? 0 : 1;
 }
