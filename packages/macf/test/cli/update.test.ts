@@ -9,24 +9,34 @@ import { tmpdir } from 'node:os';
 
 // Stub the plugin fetcher for the whole file — otherwise any test that
 // bumps a pin would trigger a real `git clone` of groundnuty/macf-marketplace,
-// making tests network-dependent and slow. workspacePluginDir still returns
-// a real path so the repair-case predicate can inspect it.
-vi.mock('../../src/cli/plugin-fetcher.js', () => ({
-  fetchPluginToWorkspace: vi.fn(),
-  workspacePluginDir: (dir: string) => join(dir, '.macf', 'plugin'),
-  // DR-022 Amendment P / groundnuty/macf#995 successor to the retired
-  // pinChannelServerVersion — strips mcpServers from the (mocked, never
-  // really fetched) local plugin.json copy. Default mock return matches
-  // the post-#1005 result-object shape (StripPluginMcpServersResult) —
-  // 'noop' is the common case (nothing to strip in a mocked, never-really-
-  // written manifest). Individual tests override with mockReturnValueOnce
-  // where the 'stripped' / 'refused' branches matter.
-  stripPluginMcpServers: vi.fn(() => ({ status: 'noop' as const, path: '/mock/plugin.json' })),
-  // Stub the #676 dist-link delivery — it resolves the running CLI's own dist
-  // via import.meta.url, which isn't built in the test runner; a no-op keeps
-  // the update flow under test without touching the filesystem.
-  linkPluginCliDist: vi.fn(() => false),
-}));
+// making tests network-dependent and slow. `workspacePluginDir` and
+// `readInstalledPluginVersion` (groundnuty/macf#1419) are left as their
+// REAL implementations via `importOriginal` — both are pure, read-only
+// filesystem functions with no network/git dependency, and
+// `readInstalledPluginVersion` specifically must read whatever a test
+// actually wrote to `.claude-plugin/plugin.json` for
+// `checkPluginRepairNeeded`'s mismatch check to be a genuine test rather
+// than a mock asserting against itself (assert-the-wrong-path.md's
+// circularity trigger).
+vi.mock('../../src/cli/plugin-fetcher.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/cli/plugin-fetcher.js')>();
+  return {
+    ...actual,
+    fetchPluginToWorkspace: vi.fn(),
+    // DR-022 Amendment P / groundnuty/macf#995 successor to the retired
+    // pinChannelServerVersion — strips mcpServers from the (mocked, never
+    // really fetched) local plugin.json copy. Default mock return matches
+    // the post-#1005 result-object shape (StripPluginMcpServersResult) —
+    // 'noop' is the common case (nothing to strip in a mocked, never-really-
+    // written manifest). Individual tests override with mockReturnValueOnce
+    // where the 'stripped' / 'refused' branches matter.
+    stripPluginMcpServers: vi.fn(() => ({ status: 'noop' as const, path: '/mock/plugin.json' })),
+    // Stub the #676 dist-link delivery — it resolves the running CLI's own dist
+    // via import.meta.url, which isn't built in the test runner; a no-op keeps
+    // the update flow under test without touching the filesystem.
+    linkPluginCliDist: vi.fn(() => false),
+  };
+});
 
 // `.mcp.json` writing (groundnuty/macf#995) is REAL pure-fs code (no
 // network, no git clone) — left UNMOCKED by default so the decisive
@@ -100,6 +110,24 @@ function writeConfig(dir: string, versions?: { cli: string; plugin: string; acti
   if (versions) cfg.versions = versions;
   mkdirSync(join(dir, '.macf'), { recursive: true });
   writeFileSync(agentConfigPath(dir), JSON.stringify(cfg, null, 2) + '\n');
+}
+
+/**
+ * Seed a plugin dir that looks genuinely installed at `version` — a
+ * `.claude-plugin/plugin.json` with a matching `version` field, alongside
+ * arbitrary other content (`manifest.txt`, this file's long-standing
+ * "there's SOMETHING here" convention predating groundnuty/macf#1419).
+ * `readInstalledPluginVersion` (real implementation — see the module mock's
+ * `importOriginal` above) reads this for real, so `checkPluginRepairNeeded`
+ * sees a genuine match and a "healthy, no repair" fixture stays healthy
+ * under the post-#1419 mismatch check, not just under the pre-#1419
+ * empty-dir-only check.
+ */
+function seedInstalledPlugin(pluginDir: string, version: string): void {
+  mkdirSync(pluginDir, { recursive: true });
+  writeFileSync(join(pluginDir, 'manifest.txt'), 'seed\n');
+  mkdirSync(join(pluginDir, '.claude-plugin'), { recursive: true });
+  writeFileSync(join(pluginDir, '.claude-plugin', 'plugin.json'), JSON.stringify({ version }) + '\n');
 }
 
 describe('buildDiff', () => {
@@ -552,11 +580,12 @@ describe('update command', () => {
   });
 
   it('does not re-fetch plugin when .macf/plugin/ is populated and no bump happens', async () => {
-    // Healthy workspace: .macf/plugin/ has content, pins match latest.
+    // Healthy workspace: .macf/plugin/ has content AND a plugin.json
+    // matching the recorded pin (groundnuty/macf#1419 — a non-empty dir
+    // alone is no longer sufficient; the manifest must actually agree).
     // Should short-circuit without any plugin refresh.
     writeConfig(dir, { cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
-    mkdirSync(join(dir, '.macf', 'plugin'), { recursive: true });
-    writeFileSync(join(dir, '.macf', 'plugin', 'manifest.txt'), 'v0.1.0\n');
+    seedInstalledPlugin(join(dir, '.macf', 'plugin'), '0.1.0');
     mockFetchReturning({ cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
 
     vi.mocked(fetchPluginToWorkspace).mockClear();
@@ -582,8 +611,8 @@ describe('update command', () => {
     // exact steady-state case #1002's fetch-coupled strip missed.
     it('strips mcpServers even when the plugin is already at the pinned version (no fetch this run)', async () => {
       writeConfig(dir, { cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
-      mkdirSync(join(dir, '.macf', 'plugin'), { recursive: true });
-      writeFileSync(join(dir, '.macf', 'plugin', 'manifest.txt'), 'v0.1.0\n');
+      // groundnuty/macf#1419 — genuinely at the pin, not just non-empty.
+      seedInstalledPlugin(join(dir, '.macf', 'plugin'), '0.1.0');
       mockFetchReturning({ cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
 
       const stripPath = join(dir, '.macf', 'plugin', '.claude-plugin', 'plugin.json');
