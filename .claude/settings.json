@@ -5,13 +5,22 @@
   "enableAllProjectMcpServers": false,
   "permissions": {
     "allow": [
+      "Bash(*)",
       "Read",
+      "Write",
+      "Edit",
       "Glob",
       "Grep",
       "WebFetch",
       "WebSearch",
-      "Bash(*)",
       "Agent",
+      "Skill(macf-agent:macf-status)",
+      "Skill(macf-agent:macf-issues)",
+      "Skill(macf-agent:macf-peers)",
+      "Skill(macf-agent:macf-ping)",
+      "Skill(macf-agent:macf-notify-peer)",
+      "mcp__macf-agent__notify_peer",
+      "mcp__macf-agent__checkpoint_to_memory",
       "mcp__*"
     ],
     "deny": [
@@ -19,20 +28,89 @@
       "Read(~/.ssh/*.pem)",
       "Read(~/.aws/**)",
       "Read(~/.gnupg/**)",
+      "Read(~/.kube/**)",
+      "Read(~/.config/gcloud/**)",
+      "Read(~/.netrc)",
+      "Read(~/.config/gh/**)",
+      "Read(~/.bash_history)",
+      "Read(~/.zsh_history)",
+      "Edit(~/.claude/settings.json)",
+      "Edit(~/.claude.json)",
+      "Edit(~/.ssh/**)",
+      "Edit(~/.aws/**)",
+      "Edit(~/.gnupg/**)",
+      "Edit(~/.kube/**)",
+      "Edit(~/.config/gcloud/**)",
+      "Edit(~/.gitconfig)",
+      "Edit(~/.npmrc)",
+      "Edit(~/.pypirc)",
+      "Edit(~/.docker/config.json)",
+      "Edit(~/.netrc)",
+      "Edit(~/.config/gh/**)",
+      "Edit(~/.bashrc)",
+      "Edit(~/.zshrc)",
+      "Edit(~/.profile)",
+      "Edit(~/.bash_profile)",
+      "Edit(~/.zprofile)",
+      "Edit(~/.zshenv)",
       "Bash(sudo *)",
       "Bash(rm -rf /)",
-      "Bash(docker push *)",
+      "Bash(git push --force*)",
+      "Bash(git push * --force*)",
+      "Bash(git push -f)",
+      "Bash(git push -f *)",
+      "Bash(git push * -f)",
+      "Bash(git push * -f *)",
       "Bash(git commit --no-verify *)",
-      "Bash(git commit -n *)"
+      "Bash(git commit -n *)",
+      "Bash(docker push *)"
     ]
   },
   "sandbox": {
     "enabled": true,
     "autoAllowBashIfSandboxed": true,
     "allowUnsandboxedCommands": true,
-    "excludedCommands": ["ssh:*", "scp:*", "rsync:*", "devbox:*", "nix:*", "git:*", "gpg:*", "gpg-agent:*", "gh:*", "npx:*", "npm:*", "node:*", "make:*", "tmux:*", "jq:*", "openssl:*"],
+    "excludedCommands": [
+      "ssh:*",
+      "scp:*",
+      "rsync:*",
+      "devbox:*",
+      "nix:*",
+      "git:*",
+      "gpg:*",
+      "gpg-agent:*",
+      "gh:*",
+      "npx:*",
+      "npm:*",
+      "node:*",
+      "make:*",
+      "tmux:*",
+      "jq:*",
+      "openssl:*",
+      "grep:*",
+      "rg:*",
+      "find:*",
+      "head:*",
+      "tail:*",
+      "cat:*",
+      "ls:*",
+      "wc:*",
+      "sort:*",
+      "awk:*",
+      "sed:*",
+      "diff:*",
+      "which:*",
+      "bash:*",
+      "sh:*",
+      "xargs:*",
+      "mkdir:*",
+      "cp:*",
+      "touch:*"
+    ],
     "network": {
-      "allowedDomains": ["*"]
+      "allowedDomains": [
+        "*"
+      ]
     },
     "filesystem": {
       "allowWrite": [
@@ -58,6 +136,9 @@
         "~/.aws",
         "~/.kube",
         "~/.config/gcloud"
+      ],
+      "allowRead": [
+        "/proc/self/fd"
       ]
     }
   },
@@ -82,19 +163,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "$CLAUDE_PROJECT_DIR/.claude/scripts/check-gh-token.sh"
-          },
-          {
-            "type": "command",
-            "command": "$CLAUDE_PROJECT_DIR/.claude/scripts/check-mention-routing.sh"
-          },
-          {
-            "type": "command",
-            "command": "$CLAUDE_PROJECT_DIR/.claude/scripts/check-lgtm-gate.sh"
-          },
-          {
-            "type": "command",
-            "command": "$CLAUDE_PROJECT_DIR/.claude/scripts/check-close-keyword.sh"
+            "command": "$CLAUDE_PROJECT_DIR/.claude/scripts/check-auditor-never-acts.sh"
           }
         ]
       }
@@ -118,6 +187,24 @@
             "timeout": 5000
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/scripts/check-channels-enabled.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/scripts/macf-startup-pickup.sh",
+            "timeout": 120
+          }
+        ]
       }
     ],
     "PostToolUse": [
@@ -133,15 +220,6 @@
             "type": "command",
             "command": "sh -c 'command -v jq >/dev/null 2>&1 || exit 0; FILE=$(cat | jq -r \".tool_input.file_path // empty\"); case \"$FILE\" in *.ts|*.tsx) npx tsc --noEmit 2>&1 | head -20 ;; esac; exit 0'",
             "timeout": 30000
-          }
-        ]
-      },
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "$CLAUDE_PROJECT_DIR/.claude/scripts/check-gh-attribution.sh"
           }
         ]
       }
@@ -179,5 +257,8 @@
         ]
       }
     ]
-  }
+  },
+  "enabledMcpjsonServers": [
+    "macf-agent"
+  ]
 }
