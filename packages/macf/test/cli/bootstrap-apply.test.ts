@@ -5788,6 +5788,9 @@ describe('formatApplyResult — macf#994 first-launch guidance (deploy phase)', 
         keyFingerprint: 'sha256:deadbeef',
         ca: { status: 'vault-absent' },
         certIssue: 'not-attempted',
+        // groundnuty/macf#1419 — required field on the 'deployed' variant;
+        // this fixture models a normal (non-plugin-failed) deploy.
+        pluginFetch: { status: 'fetched' },
       },
     };
   }

@@ -838,3 +838,96 @@ describe('runFleetDeploy — per-project CA fingerprint mismatch (macf#982)', ()
     }
   });
 });
+
+// -------------------------------------------------------------------
+// groundnuty/macf#1419 — a plugin-fetch failure in the REAL initAgent
+// (via `InitAgentResult`) must thread through the REAL `deployAgent`
+// (never mocked in this file — only `deps.initAgent`/`deps.readVault`/
+// `deps.cloneRepo` are) into `FleetDeployOutcome.pluginFetch`, and the
+// command's exit code must go non-zero WITHOUT `outcome.status`
+// collapsing to 'failed' — see `FleetDeployOutcome.pluginFetch`'s own
+// doc for why: the first version of this fix threw from `initAgent`,
+// which `deployAgent`'s existing catch turned into a bare 'failed'
+// string, discarding `workspace`/`keyPath`/`ca`/`certIssue`.
+// -------------------------------------------------------------------
+describe('runFleetDeploy — plugin-fetch outcome (groundnuty/macf#1419)', () => {
+  it('a failed plugin fetch reaches the REAL deployAgent: status stays "deployed", pluginFetch names it, exit code is non-zero', async () => {
+    const { manifestPath, dir } = writeManifest();
+    const destDir = join(dir, 'workspace');
+    const cap = captureConsole();
+    try {
+      const code = await runFleetDeploy(
+        { file: manifestPath, agent: 'code-agent', identityKey: join(dir, 'identity.txt'), dir: destDir, json: true },
+        depsFor({
+          readVault: async () => {
+            const seg = 'DEMO_FLEET_CODE_AGENT';
+            return {
+              [`MACF_AGENT_${seg}_APP_ID`]: '111',
+              [`MACF_AGENT_${seg}_INSTALL_ID`]: '222',
+              [`MACF_AGENT_${seg}_PRIVATE_KEY_B64`]: Buffer.from('SYNTH-PEM', 'utf-8').toString('base64'),
+            };
+          },
+          cloneRepo: async (_url, d) => mkdirSync(d, { recursive: true }),
+          // Simulates the REAL initAgent's report shape on a fetch
+          // failure — this fake plays initAgent's role; deployAgent
+          // itself is the real, un-injected function under test here.
+          initAgent: async () => ({
+            pluginFetchFailure: { tag: 'v0.2.60', detail: 'HTTP 401' },
+          }),
+        }),
+      );
+
+      // Exit code is non-zero — a script driving this command sees
+      // failure, per DR-044 Decision 6 — even though...
+      expect(code).toBe(1);
+
+      const out = cap.logs.join('\n');
+      const parsed = JSON.parse(out) as {
+        outcome: {
+          status: string;
+          plugin_fetch: { status: string; tag?: string; detail?: string };
+        };
+      };
+      // ...outcome.status is untouched — the informative fields
+      // (workspace/key/ca/cert_issue, not asserted here individually,
+      // covered by the sibling tests above) survive intact.
+      expect(parsed.outcome.status).toBe('deployed');
+      expect(parsed.outcome.plugin_fetch).toEqual({
+        status: 'failed', tag: 'v0.2.60', detail: 'HTTP 401',
+      });
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it('a successful plugin fetch (void-returning fake, this file\'s existing convention) reports plugin_fetch: fetched, exit code 0', async () => {
+    const { manifestPath, dir } = writeManifest();
+    const destDir = join(dir, 'workspace');
+    const cap = captureConsole();
+    try {
+      const code = await runFleetDeploy(
+        { file: manifestPath, agent: 'code-agent', identityKey: join(dir, 'identity.txt'), dir: destDir, json: true },
+        depsFor({
+          readVault: async () => {
+            const seg = 'DEMO_FLEET_CODE_AGENT';
+            return {
+              [`MACF_AGENT_${seg}_APP_ID`]: '111',
+              [`MACF_AGENT_${seg}_INSTALL_ID`]: '222',
+              [`MACF_AGENT_${seg}_PRIVATE_KEY_B64`]: Buffer.from('SYNTH-PEM', 'utf-8').toString('base64'),
+            };
+          },
+          cloneRepo: async (_url, d) => mkdirSync(d, { recursive: true }),
+          initAgent: async () => {},
+        }),
+      );
+
+      expect(code).toBe(0);
+      const out = cap.logs.join('\n');
+      const parsed = JSON.parse(out) as { outcome: { status: string; plugin_fetch: { status: string } } };
+      expect(parsed.outcome.status).toBe('deployed');
+      expect(parsed.outcome.plugin_fetch).toEqual({ status: 'fetched' });
+    } finally {
+      cap.restore();
+    }
+  });
+});

@@ -18,6 +18,7 @@ import {
   checkCanonicalBranch,
   checkLoadBearingHooks,
   checkPermissionsAllow,
+  checkPluginPinCurrency,
   checkRoutingLabelProjectPrefix,
   checkSandboxFdAllowRead,
   deriveBotLogin,
@@ -996,6 +997,95 @@ describe('checkLoadBearingHooks (DR-039 Decision 1)', () => {
     mkdirSync(join(tmpRoot, '.macf'), { recursive: true });
     const result = checkLoadBearingHooks(tmpRoot);
     expect(result.status).toBe('WARN');
+  });
+});
+
+describe('checkPluginPinCurrency (groundnuty/macf#1419)', () => {
+  let tmpRoot: string;
+
+  beforeEach(() => {
+    tmpRoot = mkdtempSync(join(tmpdir(), 'doctor-plugin-pin-'));
+  });
+
+  afterEach(() => {
+    rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  function baseConfig(overrides: Partial<MacfAgentConfig> = {}): MacfAgentConfig {
+    return {
+      project: 'TEST',
+      agent_name: 'test-agent',
+      agent_role: 'code-agent',
+      agent_type: 'permanent',
+      registry: { type: 'repo', owner: 'o', repo: 'r' },
+      versions: { cli: '0.2.60', plugin: '0.2.60', actions: 'v1' },
+      ...overrides,
+    };
+  }
+
+  function writeClaudeShMountingDefault(): void {
+    writeFileSync(
+      join(tmpRoot, 'claude.sh'),
+      [
+        '#!/bin/bash',
+        'SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"',
+        'exec claude --plugin-dir "$SCRIPT_DIR/.macf/plugin" "$@"',
+        '',
+      ].join('\n'),
+    );
+  }
+
+  function seedInstalledPlugin(version: string): void {
+    const manifestDir = join(tmpRoot, '.macf', 'plugin', '.claude-plugin');
+    mkdirSync(manifestDir, { recursive: true });
+    writeFileSync(join(manifestDir, 'plugin.json'), JSON.stringify({ version }));
+  }
+
+  it('DECISIVE (mismatch half): record 0.2.60, disk 0.2.0 — WARN naming both values', () => {
+    writeClaudeShMountingDefault();
+    seedInstalledPlugin('0.2.0');
+
+    const result = checkPluginPinCurrency(tmpRoot, baseConfig());
+
+    expect(result.status).toBe('WARN');
+    expect(result.recorded).toBe('0.2.60');
+    expect(result.installed).toBe('0.2.0');
+    expect(result.detail).toContain('0.2.60');
+    expect(result.detail).toContain('0.2.0');
+  });
+
+  it('DECISIVE (match half): record AND disk both 0.2.60 — PASS', () => {
+    writeClaudeShMountingDefault();
+    seedInstalledPlugin('0.2.60');
+
+    const result = checkPluginPinCurrency(tmpRoot, baseConfig());
+
+    expect(result.status).toBe('PASS');
+    expect(result.recorded).toBe('0.2.60');
+    expect(result.installed).toBe('0.2.60');
+  });
+
+  it('an unreadable (absent) plugin.json degrades to UNKNOWN — never PASS on absence', () => {
+    writeClaudeShMountingDefault();
+    // No .macf/plugin/.claude-plugin/plugin.json written at all.
+    mkdirSync(join(tmpRoot, '.macf', 'plugin'), { recursive: true });
+
+    const result = checkPluginPinCurrency(tmpRoot, baseConfig());
+
+    expect(result.status).toBe('UNKNOWN');
+    expect(result.recorded).toBe('0.2.60');
+    expect(result.installed).toBeNull();
+  });
+
+  it('a legacy config with no versions.plugin pin degrades to UNKNOWN, not PASS', () => {
+    writeClaudeShMountingDefault();
+    seedInstalledPlugin('0.2.60');
+    const { versions: _versions, ...legacyConfig } = baseConfig();
+
+    const result = checkPluginPinCurrency(tmpRoot, legacyConfig as MacfAgentConfig);
+
+    expect(result.status).toBe('UNKNOWN');
+    expect(result.recorded).toBeNull();
   });
 });
 

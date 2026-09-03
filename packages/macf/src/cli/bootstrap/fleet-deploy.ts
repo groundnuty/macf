@@ -81,7 +81,7 @@ import { deriveAppHandle } from './fleet-manifest.js';
 import type { VaultReadOptions } from './vault-read.js';
 import { queryVaultAgentPresence, queryVaultCaPresence } from './vault-read.js';
 import { secretFingerprint } from './fleet-lock.js';
-import type { InitOptions } from '../commands/init.js';
+import type { InitOptions, InitAgentResult } from '../commands/init.js';
 import { defaultAgentKeyPath, legacyAgentKeyPath, legacyProjectAgentKeyPath } from '../commands/init.js';
 import { caCertPath, caKeyPath, legacyProjectCaCertPath, legacyProjectCaKeyPath, agentCertPath, agentKeyPath } from '../config.js';
 import type { VersionSet } from '../version-resolver.js';
@@ -844,8 +844,22 @@ export interface FleetDeployDeps {
   readonly readVault: (opts: VaultReadOptions) => Promise<Readonly<Record<string, string>>>;
   /** Real, authenticated `git clone` — a thin network I/O leaf, injectable so tests never touch the network. Production default: {@link realAuthenticatedCloneRepo}. */
   readonly cloneRepo: (url: string, destDir: string) => Promise<void>;
-  /** The REAL `initAgent` (`commands/init.ts`) in production; tests inject a recording fake so workspace-generation side effects (network version-resolution, plugin fetch, cert gen) never run in a unit test. */
-  readonly initAgent: (projectDir: string, opts: InitOptions) => Promise<void>;
+  /**
+   * The REAL `initAgent` (`commands/init.ts`) in production; tests inject a
+   * recording fake so workspace-generation side effects (network
+   * version-resolution, plugin fetch, cert gen) never run in a unit test.
+   *
+   * Return type is `InitAgentResult | void` (groundnuty/macf#1419) — the
+   * REAL `initAgent` returns `InitAgentResult` (carries
+   * `pluginFetchFailure` when the plugin fetch failed this run); a test
+   * fake with no `return` statement (the existing convention across this
+   * file's test suite) infers `Promise<void>` and stays valid without
+   * every fake needing an explicit `return {}`. `deployAgent` reads the
+   * result via `?.pluginFetchFailure`, so a `void`-returning fake is
+   * indistinguishable from "no plugin fetch failure" — exactly what those
+   * fakes mean; none of them models a plugin-fetch failure scenario.
+   */
+  readonly initAgent: (projectDir: string, opts: InitOptions) => Promise<InitAgentResult | void>;
   /**
    * Mints a short-lived installation token from the SAME vault credentials
    * this run already decrypted for this role, used ONLY to authenticate the
@@ -1006,13 +1020,30 @@ export type FleetDeployOutcome =
        * `commands/init.ts::issueGithubModeAgentCert`'s catch block). Computed
        * by `deployAgent` checking `agentCertPath(destDir)`/
        * `agentKeyPath(destDir)` existence immediately before and after its
-       * single `deps.initAgent(...)` call — never by asking what that call
-       * did (it returns `void`) and never by issuing a cert itself. See
+       * single `deps.initAgent(...)` call — never by asking what that call's
+       * RETURN VALUE said, and never by issuing a cert itself. See
        * {@link AgentCertIssueOutcome}'s own doc for the existence-only
        * caveat (a stale-but-present cert reports `'skipped-existing'`, not
        * re-validated against the current CA).
        */
       readonly certIssue: AgentCertIssueOutcome | 'not-attempted';
+      /**
+       * Whether `initAgent`'s plugin fetch actually installed the pinned
+       * version this run (groundnuty/macf#1419). Sibling to `certIssue` —
+       * a NAMED sub-failure inside an otherwise-informative `'deployed'`
+       * outcome, not a reason to collapse the whole role to `'failed'` and
+       * discard `workspace`/`keyPath`/`ca`/`certIssue` (that WAS the first
+       * shape of this fix; it was wrong — see the fix's own commit history
+       * for the 56-tests-passing-to-30-failing measurement that reversed
+       * it). Read straight from `deps.initAgent`'s return value, unlike
+       * `certIssue` above — the plugin-fetch outcome has no reliable
+       * before/after filesystem check the way a cert file's existence does
+       * (a stale manifest from an EARLIER fetch can be sitting there either
+       * way), so the return value IS the only ground truth.
+       */
+      readonly pluginFetch:
+        | { readonly status: 'fetched' }
+        | { readonly status: 'failed'; readonly tag: string; readonly detail: string };
     }
   | { readonly role: string; readonly status: 'failed'; readonly reason: string };
 
@@ -1477,7 +1508,7 @@ export async function deployAgent(
       ? { cli: manifest.versions.macf, plugin: manifest.versions.macf, actions: manifest.versions.actions }
       : await (deps.resolveVersions ?? resolveLockstepVersionsOrThrow)();
 
-    await deps.initAgent(destDir, {
+    const initResult = await deps.initAgent(destDir, {
       project: manifest.metadata.name,
       role,
       appId: creds.appId,
@@ -1503,6 +1534,21 @@ export async function deployAgent(
       ...registryOpts,
     });
     log(`Role "${role}": macf init completed at ${destDir}.`);
+
+    // groundnuty/macf#1419 — `initResult?.` (not `initResult.`) because a
+    // test fake's `void` return (the existing convention across this
+    // file's test suite — see `FleetDeployDeps.initAgent`'s own doc) means
+    // "no plugin-fetch failure modeled," identical to a real success.
+    const pluginFetchFailure = initResult?.pluginFetchFailure;
+    const pluginFetch: { readonly status: 'fetched' } | { readonly status: 'failed'; readonly tag: string; readonly detail: string } =
+      pluginFetchFailure === undefined
+        ? { status: 'fetched' }
+        : { status: 'failed', tag: pluginFetchFailure.tag, detail: pluginFetchFailure.detail };
+    log(
+      `Role "${role}": plugin ${
+        pluginFetch.status === 'fetched' ? 'fetched.' : `fetch FAILED (${pluginFetch.tag}): ${pluginFetch.detail}`
+      }`,
+    );
 
     const certIssue: AgentCertIssueOutcome | 'not-attempted' =
       ca.status === 'vault-absent'
@@ -1535,6 +1581,7 @@ export async function deployAgent(
       keyFingerprint,
       ca,
       certIssue,
+      pluginFetch,
     };
   } catch (err) {
     return { role, status: 'failed', reason: errMessage(err) };

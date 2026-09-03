@@ -56,6 +56,81 @@ export function workspacePluginDir(workspaceDir: string): string {
   return join(resolve(workspaceDir), '.macf', 'plugin');
 }
 
+export interface ReadInstalledPluginVersionOptions {
+  /** Read this absolute plugin dir instead of `workspacePluginDir(workspaceDir)`. */
+  readonly targetDir?: string;
+}
+
+/**
+ * What's actually on disk at `.claude-plugin/plugin.json`'s `version` field
+ * — the ground truth a recorded `macf-agent.json` `versions.plugin` pin can
+ * be compared against (groundnuty/macf#1419).
+ *
+ * Three outcomes, deliberately distinct (never collapsed into a plain
+ * `string | undefined`): `absent` is the normal first-launch/never-fetched
+ * shape; `unreadable` is a corrupt/malformed manifest (unparseable JSON, no
+ * `version` string) — a DIFFERENT condition a caller should react to
+ * differently (same `absent` vs `unreadable` split Instance 20 forced on
+ * the channel-log guards in `silent-fallback-hazards.md`). `present` is the
+ * only outcome carrying a `version` a caller may compare against a pin.
+ *
+ * A single reader shared by every caller that needs this comparison
+ * (`macf update`'s repair-fetch trigger; `macf doctor`'s pin-vs-disk check)
+ * rather than each re-implementing its own manifest parse — DR-044's own
+ * "read the permission map through one path, never a second reader" lesson
+ * (`#1000`) applied here to the plugin manifest.
+ */
+export type InstalledPluginVersionResult =
+  | { readonly status: 'absent'; readonly path: string }
+  | { readonly status: 'unreadable'; readonly path: string; readonly reason: string }
+  | { readonly status: 'present'; readonly path: string; readonly version: string };
+
+/**
+ * Read the INSTALLED plugin version from the fetched local
+ * `.claude-plugin/plugin.json` copy — never the recorded pin. Verified
+ * against real `groundnuty/macf-marketplace` tags (v0.2.55, v0.2.60): the
+ * manifest's `version` field tracks the git tag it was fetched at exactly,
+ * so this is a reliable observable for "what did the last successful fetch
+ * actually install," independent of what `macf-agent.json` claims.
+ */
+export function readInstalledPluginVersion(
+  workspaceDir: string,
+  options: ReadInstalledPluginVersionOptions = {},
+): InstalledPluginVersionResult {
+  const pluginDir = options.targetDir ?? workspacePluginDir(workspaceDir);
+  const manifestPath = join(pluginDir, '.claude-plugin', 'plugin.json');
+  if (!existsSync(manifestPath)) return { status: 'absent', path: manifestPath };
+
+  let raw: string;
+  try {
+    raw = readFileSync(manifestPath, 'utf-8');
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { status: 'unreadable', path: manifestPath, reason: `cannot read ${manifestPath}: ${msg}` };
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { status: 'unreadable', path: manifestPath, reason: `${manifestPath} is not valid JSON: ${msg}` };
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return {
+      status: 'unreadable',
+      path: manifestPath,
+      reason: `${manifestPath} top-level content is not a JSON object`,
+    };
+  }
+
+  const version = (parsed as { version?: unknown }).version;
+  if (typeof version !== 'string' || version.length === 0) {
+    return { status: 'unreadable', path: manifestPath, reason: `${manifestPath} has no "version" string field` };
+  }
+  return { status: 'present', path: manifestPath, version };
+}
+
 /** The shape of `plugin.json`'s `mcpServers` block this module reads/strips. */
 type McpServersManifest = {
   mcpServers?: Record<string, unknown>;

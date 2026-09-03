@@ -59,6 +59,7 @@ import {
   resolvePluginDirFromClaudeSh,
 } from '../plugin-hook-resolver.js';
 import type { HookMatchEntry, PluginDirResolution } from '../plugin-hook-resolver.js';
+import { readInstalledPluginVersion, workspacePluginDir } from '../plugin-fetcher.js';
 
 // Re-exported for backward compatibility — `resolvePluginDirFromClaudeSh` +
 // `PluginDirResolution` moved to `plugin-hook-resolver.ts` (DR-039 Amendment B,
@@ -1400,6 +1401,92 @@ export function checkLoadBearingHooks(workspaceDir: string): LoadBearingHooksChe
 }
 
 /**
+ * Result of comparing the RECORDED `versions.plugin` pin in
+ * `macf-agent.json` against what `.macf/plugin/.claude-plugin/plugin.json`
+ * actually shows installed (groundnuty/macf#1419).
+ *
+ * A failed `macf init`/`macf fleet deploy` plugin fetch can leave these two
+ * disagreeing indefinitely — the pin advances (it's the intended target;
+ * see `checkPluginRepairNeeded` in `commands/update.ts` for why the pin
+ * itself stays intent, not observation) while the disk stays on whatever
+ * was fetched last, or nothing at all. This check is the LOCAL, no-network
+ * detector for that gap on a workspace that predates the fetch-failure fix
+ * — a `macf update` run repairs it going forward, but does nothing for a
+ * workspace already stuck with a stale record before that fix landed.
+ *
+ *   - `PASS` — recorded pin matches the installed manifest's version.
+ *   - `WARN` — they disagree. Never silent: the plugin actually running
+ *     (hooks, skills, agent templates) is whatever `installed` says, not
+ *     `recorded` — a reader trusting the record alone is trusting a claim,
+ *     not the evidence (`verify-before-claim.md`).
+ *   - `UNKNOWN` — no pin recorded (legacy config) OR the installed manifest
+ *     can't be read (absent/corrupt) — never collapsed into `PASS`; an
+ *     unreadable manifest is not proof the pin is satisfied
+ *     (silent-fallback-hazards.md Instance 17's "degrade to unknown, never
+ *     a proxy for ok" floor).
+ */
+export interface PluginPinCurrencyCheckResult {
+  readonly status: 'PASS' | 'WARN' | 'UNKNOWN';
+  readonly recorded: string | null;
+  readonly installed: string | null;
+  readonly detail: string;
+}
+
+/**
+ * Pure detection, no network. Resolves the MOUNTED plugin dir the same way
+ * `checkLoadBearingHooks`/`getEffectiveHookConfig` do — `resolvePluginDirFromClaudeSh`
+ * with the "err toward not-false-alarming" default-dir fallback when the
+ * mount can't be cleanly determined — rather than adding a second resolver
+ * for the same question (DR-044's "one reader, never a second" lesson,
+ * `#1000`).
+ */
+export function checkPluginPinCurrency(
+  workspaceDir: string,
+  config: MacfAgentConfig,
+): PluginPinCurrencyCheckResult {
+  const recorded = config.versions?.plugin ?? null;
+  if (recorded === null) {
+    return {
+      status: 'UNKNOWN',
+      recorded: null,
+      installed: null,
+      detail: 'no versions.plugin pin recorded (legacy config) — nothing to compare',
+    };
+  }
+
+  const pluginDirResolution = resolvePluginDirFromClaudeSh(workspaceDir);
+  const usedDefaultFallback = !pluginDirResolution.determinable || !pluginDirResolution.dir;
+  const targetDir = usedDefaultFallback
+    ? workspacePluginDir(workspaceDir)
+    : (pluginDirResolution.dir as string);
+
+  const installedResult = readInstalledPluginVersion(workspaceDir, { targetDir });
+  if (installedResult.status !== 'present') {
+    const reason =
+      installedResult.status === 'absent'
+        ? `no plugin.json found at ${installedResult.path}`
+        : installedResult.reason;
+    return { status: 'UNKNOWN', recorded, installed: null, detail: `cannot verify — ${reason}` };
+  }
+
+  if (installedResult.version !== recorded) {
+    return {
+      status: 'WARN',
+      recorded,
+      installed: installedResult.version,
+      detail: `macf-agent.json records versions.plugin=${recorded}, but ${installedResult.path} shows ${installedResult.version} installed`,
+    };
+  }
+
+  return {
+    status: 'PASS',
+    recorded,
+    installed: installedResult.version,
+    detail: `versions.plugin (${recorded}) matches the installed plugin manifest`,
+  };
+}
+
+/**
  * One distributed script (`.claude/scripts/<name>`) found not to match what
  * the running CLI would write there right now.
  */
@@ -2426,6 +2513,11 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
   console.log('──────────────────────────────────────────────────────────────');
   printLoadBearingHooksSection(checkLoadBearingHooks(projectDir));
 
+  console.log('');
+  console.log('Plugin pin currency');
+  console.log('──────────────────────────────────────────────────────────────');
+  printPluginPinCurrencySection(checkPluginPinCurrency(projectDir, config));
+
   // groundnuty/macf#1383: computed once, ahead of the two distribution-
   // currency sections below, so their WARN fix line can be composed with it
   // (never plain `macf update` when the CLI is itself the stale party) —
@@ -2605,6 +2697,19 @@ function printLoadBearingHooksSection(check: LoadBearingHooksCheckResult): void 
     'floor. A stripped --plugin-dir (a hooks-less plugin variant), a bad stash, or a hand-edit can ' +
     'drop these silently.',
   );
+}
+
+function printPluginPinCurrencySection(check: PluginPinCurrencyCheckResult): void {
+  if (check.status === 'UNKNOWN') {
+    console.log(`  ? ${check.detail}  [UNKNOWN]`);
+    return;
+  }
+  if (check.status === 'PASS') {
+    console.log(`  ✓ ${check.detail}  [PASS]`);
+    return;
+  }
+  console.log(`  ⚠ ${check.detail}  [WARN]`);
+  console.log('    Fix: run `macf update` to re-fetch the plugin at the recorded pin.');
 }
 
 /**
