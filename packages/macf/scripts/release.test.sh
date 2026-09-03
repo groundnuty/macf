@@ -22,6 +22,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=packages/macf/scripts/release.sh
 source "$SCRIPT_DIR/release.sh"
 
+# Several sections below reassign the sourced $REPO_ROOT to a throwaway
+# fixture dir (cmd_cli / cmd_verify tests). Capture THIS checkout's real
+# root now, before any of that happens, so the cmd_harness_check
+# end-to-end section near the bottom of this file can restore it —
+# see that section for why it needs the real tree, not a fixture.
+REAL_REPO_ROOT="$REPO_ROOT"
+
 pass=0
 fail=0
 
@@ -115,6 +122,153 @@ REPO_ROOT="$TMP_ROOT"
 assert_true "heading present at top for current release" changelog_has_heading "0.9.9"
 assert_false "no heading at all for an unreleased version" changelog_has_heading "0.9.10"
 assert_false "heading exists but NOT at the top" changelog_has_heading "0.9.8"
+
+# --- describe_dirty_tree (groundnuty/macf#1424) -----------------------------
+# Decisive triple straight off the issue thread's ruled shape: a modified
+# tracked file names its own size; an all-zero-byte untracked set gets the
+# sandbox-stub sentence; a MIXED tree (the expensive case for a reader — one
+# real change hiding among stub entries) reports the counts but suppresses
+# the sentence, since "every entry is zero-byte" is no longer true. No real
+# git repo needed — this function only reads porcelain TEXT + on-disk file
+# sizes, so the porcelain lines are hand-built (`?? path` / ` M path`,
+# standard `git status --porcelain` v1 shape) against files this test writes
+# directly under $REPO_ROOT.
+DDT_ROOT="$(mktemp -d)"
+CLEANUP_DIRS+=("$DDT_ROOT")
+REPO_ROOT="$DDT_ROOT"
+
+# Row 1 — one modified tracked file only.
+printf 'hello world' >"$DDT_ROOT/tracked.txt" # 11 bytes, nonzero
+DDT_OUT="$(describe_dirty_tree ' M tracked.txt' 2>&1)"
+assert_contains "describe_dirty_tree: header reports 0 untracked / 1 modified" "$DDT_OUT" "BLOCKED: working tree not clean — 0 untracked entries (0 zero-byte), 1 modified tracked file(s):"
+assert_contains "describe_dirty_tree: names the modified tracked file with its size" "$DDT_OUT" "tracked.txt (modified, 11 bytes)"
+assert_not_contains "describe_dirty_tree: no sandbox sentence for a real (nonzero) modification" "$DDT_OUT" "a sandbox that stubs denied paths"
+
+# Row 2 — seventeen zero-byte untracked entries only (the sandbox-stub shape
+# from the issue thread's live incident).
+DDT_UNTRACKED=""
+for i in $(seq 1 17); do
+  : >"$DDT_ROOT/stub-$i"
+  DDT_UNTRACKED="${DDT_UNTRACKED}?? stub-$i
+"
+done
+DDT_OUT="$(describe_dirty_tree "$DDT_UNTRACKED" 2>&1)"
+assert_contains "describe_dirty_tree: header reports all 17 as zero-byte, 0 modified" "$DDT_OUT" "BLOCKED: working tree not clean — 17 untracked entries (17 zero-byte), 0 modified tracked file(s):"
+assert_contains "describe_dirty_tree: names an individual zero-byte stub" "$DDT_OUT" "stub-1 (0 bytes)"
+assert_contains "describe_dirty_tree: names the last zero-byte stub too (all 17 listed, not truncated)" "$DDT_OUT" "stub-17 (0 bytes)"
+assert_contains "describe_dirty_tree: sandbox sentence fires when EVERY entry is zero-byte" "$DDT_OUT" "a sandbox that stubs denied paths"
+
+# Row 3 — mixed: the 17 zero-byte stubs AND the one real modified file.
+# Counts are reported unconditionally; the sentence must NOT fire, since not
+# every entry is zero-byte anymore (science-agent's refinement on the issue
+# thread — this is the row that would have gone silent under the earlier
+# all-untracked-zero-byte-only gate).
+DDT_MIXED="${DDT_UNTRACKED} M tracked.txt"
+DDT_OUT="$(describe_dirty_tree "$DDT_MIXED" 2>&1)"
+assert_contains "describe_dirty_tree: mixed header reports both counts" "$DDT_OUT" "BLOCKED: working tree not clean — 17 untracked entries (17 zero-byte), 1 modified tracked file(s):"
+assert_contains "describe_dirty_tree: mixed still names the real modification" "$DDT_OUT" "tracked.txt (modified, 11 bytes)"
+assert_contains "describe_dirty_tree: mixed still names a stub" "$DDT_OUT" "stub-1 (0 bytes)"
+assert_not_contains "describe_dirty_tree: mixed does NOT show the sandbox sentence (one entry is real)" "$DDT_OUT" "a sandbox that stubs denied paths"
+
+# --- preflight_network (groundnuty/macf#1424 — Pattern D precheck) ---------
+# network_probe_github / network_probe_npm overridden (same shell-function-
+# redefinition technique as the `gh` / `npm_view_version` stubs elsewhere in
+# this file) so no real network call happens in this test run.
+network_probe_github() { return 0; }
+network_probe_npm() { return 0; }
+if PN_OUT="$(preflight_network "all" 2>&1)"; then PN_RC=0; else PN_RC=$?; fi
+assert_eq "preflight_network: passes when both probes succeed" "0" "$PN_RC"
+assert_eq "preflight_network: prints nothing when both probes succeed" "" "$PN_OUT"
+
+network_probe_github() { return 1; }
+network_probe_npm() { return 0; }
+if PN_OUT="$(preflight_network "all" 2>&1)"; then PN_RC=0; else PN_RC=$?; fi
+assert_true "preflight_network: fails when github is unreachable" test "$PN_RC" -ne 0
+assert_contains "preflight_network: names github as the unreachable resource" "$PN_OUT" "github.com is unreachable"
+assert_not_contains "preflight_network: does not name npm when only github is missing" "$PN_OUT" "registry.npmjs.org is unreachable"
+
+network_probe_github() { return 0; }
+network_probe_npm() { return 1; }
+if PN_OUT="$(preflight_network "verify" 2>&1)"; then PN_RC=0; else PN_RC=$?; fi
+assert_true "preflight_network: fails when npm is unreachable (verify needs both)" test "$PN_RC" -ne 0
+assert_contains "preflight_network: names npm as the unreachable resource" "$PN_OUT" "registry.npmjs.org is unreachable"
+assert_not_contains "preflight_network: does not name github when only npm is missing" "$PN_OUT" "github.com is unreachable"
+
+network_probe_github() { return 1; }
+network_probe_npm() { return 1; }
+if PN_OUT="$(preflight_network "all" 2>&1)"; then PN_RC=0; else PN_RC=$?; fi
+assert_true "preflight_network: fails when BOTH are unreachable" test "$PN_RC" -ne 0
+assert_contains "preflight_network: aggregate failure names github" "$PN_OUT" "github.com is unreachable"
+assert_contains "preflight_network: aggregate failure ALSO names npm (fail-loud, not fail-on-first-miss)" "$PN_OUT" "registry.npmjs.org is unreachable"
+
+# marketplace/cli only need github — never gated on npm reachability.
+network_probe_github() { return 0; }
+network_probe_npm() { return 1; }
+if PN_OUT="$(preflight_network "marketplace" 2>&1)"; then PN_RC=0; else PN_RC=$?; fi
+assert_eq "preflight_network: 'marketplace' does not check npm reachability at all" "0" "$PN_RC"
+if PN_OUT="$(preflight_network "cli" 2>&1)"; then PN_RC=0; else PN_RC=$?; fi
+assert_eq "preflight_network: 'cli' does not check npm reachability at all" "0" "$PN_RC"
+
+# Reset (not unset) to always-succeed stubs — every cmd_marketplace / cmd_cli
+# / cmd_verify test below this point now runs through preflight_network too
+# (it's called at the top of each), and none of those sections is testing
+# network reachability; they need it to unconditionally pass so their own,
+# unrelated assertions are what's under test.
+network_probe_github() { return 0; }
+network_probe_npm() { return 0; }
+
+# --- assert_scratch_has_plugin / write_scratch_plugin_manifest (groundnuty/macf#1424) ---
+# Mutation-decisive per the issue thread: "make the scratch init skip the
+# plugin; the gate must fail." This is the exact assertion cmd_harness_check
+# now runs right after its scratch 'macf init --local --plugin-source ...'
+# call — no real init/build/network needed to exercise it directly. THREE
+# scenarios, not two: the manifest is written UNCONDITIONALLY by
+# write_scratch_plugin_manifest, so a manifest-only check would trivially
+# always pass — assert_scratch_has_plugin ALSO requires a stable file from
+# the real canonical content (hooks/hooks.json), which is what actually
+# proves the --plugin-source copy happened.
+ASP_ROOT="$(mktemp -d)"
+CLEANUP_DIRS+=("$ASP_ROOT")
+
+# Full plugin: canonical content copied (hooks/hooks.json present) THEN the
+# manifest written on top — mirrors cmd_harness_check's real call order.
+mkdir -p "$ASP_ROOT/with-plugin/.macf/plugin/agents" "$ASP_ROOT/with-plugin/.macf/plugin/hooks"
+printf '{"hooks":{}}' >"$ASP_ROOT/with-plugin/.macf/plugin/hooks/hooks.json"
+printf '# fake agent\n' >"$ASP_ROOT/with-plugin/.macf/plugin/agents/code-agent.md"
+write_scratch_plugin_manifest "$ASP_ROOT/with-plugin/.macf/plugin"
+if ASP_WITH_OUT="$(assert_scratch_has_plugin "$ASP_ROOT/with-plugin" 2>&1)"; then
+  ASP_WITH_RC=0
+else
+  ASP_WITH_RC=$?
+fi
+assert_eq "assert_scratch_has_plugin: passes when manifest + canonical content are both present" "0" "$ASP_WITH_RC"
+assert_eq "assert_scratch_has_plugin: prints nothing when it passes" "" "$ASP_WITH_OUT"
+assert_contains "write_scratch_plugin_manifest: derives the agents list from what actually landed in agents/" "$(cat "$ASP_ROOT/with-plugin/.macf/plugin/.claude-plugin/plugin.json")" "./agents/code-agent.md"
+
+# Nothing at all — the pre-#1423 regression shape (init 'succeeded', scratch
+# ended up plugin-less) — must fail on the MANIFEST check first.
+mkdir -p "$ASP_ROOT/no-plugin"
+if ASP_NO_OUT="$(assert_scratch_has_plugin "$ASP_ROOT/no-plugin" 2>&1)"; then
+  ASP_NO_RC=0
+else
+  ASP_NO_RC=$?
+fi
+assert_true "assert_scratch_has_plugin: FAILS on a plugin-less scratch — never passes again (mutation-decisive)" test "$ASP_NO_RC" -ne 0
+assert_contains "assert_scratch_has_plugin: names the missing manifest path" "$ASP_NO_OUT" ".macf/plugin/.claude-plugin/plugin.json"
+
+# Manifest present (write_scratch_plugin_manifest ran) but NO canonical
+# content underneath — the case a manifest-only check would have MISSED,
+# since the manifest write is unconditional. This is the scenario that makes
+# the two-part check mutation-decisive rather than trivially-always-pass.
+mkdir -p "$ASP_ROOT/manifest-only-no-content/.macf/plugin"
+write_scratch_plugin_manifest "$ASP_ROOT/manifest-only-no-content/.macf/plugin"
+if ASP_MO_OUT="$(assert_scratch_has_plugin "$ASP_ROOT/manifest-only-no-content" 2>&1)"; then
+  ASP_MO_RC=0
+else
+  ASP_MO_RC=$?
+fi
+assert_true "assert_scratch_has_plugin: FAILS when the manifest exists but the canonical content (hooks.json) never copied" test "$ASP_MO_RC" -ne 0
+assert_contains "assert_scratch_has_plugin: names the missing canonical-content path" "$ASP_MO_OUT" ".macf/plugin/hooks/hooks.json"
 
 # --- wait_for_npm_version (groundnuty/macf#776 — npm registry lag) ---------
 # npm's registry CDN is eventually consistent: `npm view` can report the OLD
@@ -659,6 +813,49 @@ STUB
   echo "$HC_DOCTOR_INSCOPE_OUT"
 else
   echo "SKIP: 'claude' not found on PATH — skipping check_harness_compat tests (nothing installed to verify against)" >&2
+fi
+
+# --- cmd_harness_check end-to-end (groundnuty/macf#1424) -------------------
+# Runs the REAL subcommand — real 'make -f dev.mk build', real scratch
+# 'macf init --local --plugin-source ...', real 'claude doctor'/'claude -p'
+# — against THIS checkout, restoring $REPO_ROOT to the value captured before
+# any earlier section reassigned it to a fixture (see $REAL_REPO_ROOT at the
+# top of this file). Two things asserted, both from the issue thread:
+#
+#   1. the scratch workspace actually gets a plugin from the LOCAL build
+#      tree with zero network calls for it (the #1424 fix itself) — proven
+#      by the run succeeding at all, since a network-only path on a host
+#      that denies anonymous git HTTPS would FATAL exactly as #1423 did;
+#   2. the scratch workspace + its --local registry CA + 'macf init's HOME
+#      redirect are ALL confined under a mktemp -d OUTSIDE this checkout —
+#      proven by this checkout's OWN `git status --porcelain` being
+#      byte-identical before and after the run. A transient write was
+#      suspected adjacent to this gate mid-incident on the issue thread and
+#      was ultimately retracted (traced to the Claude Code SANDBOX's own
+#      denied-path stubbing, not this gate) — this is the decisive check
+#      that settles it going forward rather than by inference.
+#
+# Heavier than everything else in this file (a real incremental build + two
+# real Claude Code subprocess calls) — skipped, like check_harness_compat
+# above, when there's no 'claude' binary to exercise it against.
+if command -v claude >/dev/null 2>&1; then
+  REPO_ROOT="$REAL_REPO_ROOT"
+  MHC_BEFORE="$(cd "$REPO_ROOT" && git status --porcelain)"
+  if MHC_OUT="$(cmd_harness_check 2>&1)"; then
+    MHC_RC=0
+  else
+    MHC_RC=$?
+  fi
+  MHC_AFTER="$(cd "$REPO_ROOT" && git status --porcelain)"
+
+  assert_eq "cmd_harness_check: leaves this checkout's git status byte-identical before/after" "$MHC_BEFORE" "$MHC_AFTER"
+  assert_contains "cmd_harness_check: confirms the plugin came from a LOCAL copy, not a network fetch" "$MHC_OUT" "copied from local source"
+
+  echo ""
+  echo "--- cmd_harness_check: real end-to-end run against this checkout (rc=$MHC_RC) ---"
+  echo "$MHC_OUT"
+else
+  echo "SKIP: 'claude' not found on PATH — skipping cmd_harness_check end-to-end test" >&2
 fi
 
 echo ""

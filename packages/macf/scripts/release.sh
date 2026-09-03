@@ -16,17 +16,26 @@
 #                         not generated); commit locally.
 #   check VERSION        make -f dev.mk check (reuse).
 #   harness-check VERSION  Build dist; materialize a scratch canonical
-#                         workspace via the just-built CLI's own
-#                         `init --local`; exercise its .claude/settings.json
-#                         + .mcp.json + launcher channels-flag against the
-#                         currently-installed Claude Code (`claude doctor`
-#                         + a settings-load-only `claude -p`); FATAL if
-#                         Claude Code rejects/skips any of it (the
-#                         groundnuty/macf#1067 class — a rule ships that the
-#                         harness silently ignores). VERSION is ignored.
-#                         Runs identically under --dry-run (no dependency on
-#                         any earlier step's real mutation, unlike `cli`
-#                         below).
+#                         workspace via the just-built CLI's own `init
+#                         --local --plugin-source packages/macf/plugin`
+#                         (the plugin content under release, copied locally
+#                         — zero network calls for it; see
+#                         `write_scratch_plugin_manifest` for the one thing
+#                         that dir doesn't carry, groundnuty/macf#426, and
+#                         how it's supplied offline, groundnuty/macf#1424);
+#                         exercise its .claude/settings.json + .mcp.json +
+#                         launcher channels-flag against the currently-
+#                         installed Claude Code (`claude doctor` + a
+#                         settings-load-only `claude -p`); FATAL if Claude
+#                         Code rejects/skips any of it (the groundnuty/macf#1067
+#                         class — a rule ships that the harness silently
+#                         ignores) OR if the scratch workspace ends up
+#                         without a plugin at all (`assert_scratch_has_plugin`
+#                         — the groundnuty/macf#1424 class: a check that
+#                         passed on a population that excluded what it
+#                         exists to check). VERSION is ignored. Runs
+#                         identically under --dry-run (no dependency on any
+#                         earlier step's real mutation, unlike `cli` below).
 #   marketplace VERSION  make -f dev.mk build; clone macf-marketplace
 #                         (HTTPS+token); conditional-sync the plugin tree
 #                         (`sync-marketplace-plugin.mjs --check`, sync only
@@ -215,6 +224,70 @@ changelog_has_heading() {
   [[ "$first" == "## [$version]"* ]]
 }
 
+# describe_dirty_tree PORCELAIN — prints `release-cli`'s cleanliness-refusal
+# diagnostic for a non-empty `git status --porcelain` output (relative to
+# $REPO_ROOT, matching cmd_cli's own `cd "$REPO_ROOT"` before it calls this).
+# Called ONLY when the tree is already known dirty; the caller still does its
+# own `die` afterward (this function only describes, never aborts) —
+# groundnuty/macf#1424, ruled on the issue thread:
+#
+#   "the refusal names what it found; nobody encodes the harness's list ...
+#    a description of the evidence, never a classification of it"
+#
+# Two things this function does NOT do, both deliberate: it never checks
+# whether an entry's NAME is on Claude Code's sandbox deny-list (that list
+# belongs to the harness, changes without notice, and copying it into a
+# release tool is its own hazard-class — see the issue thread's "do NOT
+# teach release-cli the sandbox's deny list" ruling); and the sandbox
+# EXPLANATORY sentence is the one piece of interpretation this function
+# offers, gated on every single entry being zero bytes (a sandbox that stubs
+# denied paths produces exactly that shape) — everything else printed is a
+# plain fact about the evidence (path, tracked/untracked, byte size),
+# reported UNCONDITIONALLY regardless of whether the sentence fires. This
+# matters most on a MIXED tree — one real change hiding among stub
+# entries — which is the expensive case for a reader to miss and exactly the
+# case a gate-on-all-zero-byte hint (an earlier draft of this function)
+# would have gone silent on.
+describe_dirty_tree() {
+  local porcelain="$1"
+  local total=0 untracked=0 zero_untracked=0 modified=0 all_zero=1
+  local -a lines=()
+  local raw status path size
+
+  while IFS= read -r raw; do
+    [ -n "$raw" ] || continue
+    status="${raw:0:2}"
+    path="${raw:3}"
+    total=$((total + 1))
+
+    size=""
+    if [ -f "$REPO_ROOT/$path" ]; then
+      size="$(wc -c <"$REPO_ROOT/$path" 2>/dev/null | tr -d '[:space:]')"
+    fi
+    size="${size:-?}"
+
+    if [ "$status" = "??" ]; then
+      untracked=$((untracked + 1))
+      [ "$size" = "0" ] && zero_untracked=$((zero_untracked + 1))
+      lines+=("  ${path} (${size} bytes)")
+    else
+      modified=$((modified + 1))
+      lines+=("  ${path} (modified, ${size} bytes)")
+    fi
+    [ "$size" = "0" ] || all_zero=0
+  done <<<"$porcelain"
+
+  log "BLOCKED: working tree not clean — ${untracked} untracked entries (${zero_untracked} zero-byte), ${modified} modified tracked file(s):"
+  local l
+  for l in "${lines[@]}"; do
+    log "$l"
+  done
+
+  if [ "$total" -gt 0 ] && [ "$all_zero" = "1" ]; then
+    log "  (a sandbox that stubs denied paths produces exactly this; run release-cli outside it, or exclude the entries locally)"
+  fi
+}
+
 # ---------------------------------------------------------------------------
 # npm-registry-lag retry (groundnuty/macf#776)
 # ---------------------------------------------------------------------------
@@ -344,6 +417,76 @@ ensure_gh_token() {
 # instead of `origin`).
 gh_https_url() {
   printf 'https://x-access-token:%s@github.com/%s.git' "$GH_TOKEN" "$1"
+}
+
+# ---------------------------------------------------------------------------
+# Network preflight (Pattern D — silent-fallback-hazards.md; groundnuty/macf#1424)
+# ---------------------------------------------------------------------------
+#
+# Without this, a network gap surfaces mid-run as a cryptic error several
+# steps into a subcommand — the exact shape #1424 reports for the
+# harness-compat gate's (now-removed) marketplace clone: `fatal: could not
+# read Username for 'https://github.com'` three steps in, on a host that
+# refuses anonymous git HTTPS. The fix there was removing the plugin-content
+# network dependency entirely (see cmd_harness_check below); THIS
+# network-precondition pattern is for the dependencies release.sh still
+# genuinely has —
+# github.com (marketplace clone/push, cli push+tag, gh api polling) and
+# registry.npmjs.org (verify's `npm view`) — asserted once, up front, before
+# any of a subcommand's mutating work runs, with every unreachable resource
+# named in one message (aggregate-fail-loud, never fail-on-first-miss, so a
+# re-run after a partial connectivity fix doesn't just trade one cryptic
+# failure for the next).
+#
+# network_probe_github / network_probe_npm are their own functions (not
+# inlined into preflight_network) so release.test.sh can override them via
+# shell-function redefinition — same technique the `gh` / `npm_view_version`
+# stubs elsewhere in this file use — without any real network call in the
+# test run.
+network_probe_github() {
+  curl -sf --max-time 5 -o /dev/null 'https://api.github.com/'
+}
+
+network_probe_npm() {
+  curl -sf --max-time 5 -o /dev/null 'https://registry.npmjs.org/-/ping'
+}
+
+# preflight_network SUBCOMMAND — read-only reachability assert. Safe to run
+# under --dry-run (this file's own --dry-run contract permits read-only
+# diagnostic network calls — see the file header); does not mutate anything
+# and is never gated on $DRY_RUN.
+preflight_network() {
+  local sub="$1"
+  local -a missing=()
+
+  case "$sub" in
+    marketplace)
+      network_probe_github || missing+=("github.com is unreachable (needed to clone/push ${MARKETPLACE_REPO})")
+      ;;
+    cli)
+      network_probe_github || missing+=("github.com is unreachable (needed to push the bump commit + tag to ${CLI_REPO})")
+      ;;
+    verify)
+      network_probe_github || missing+=("github.com is unreachable (needed to poll the ${CLI_REPO} publish.yml run)")
+      network_probe_npm || missing+=("registry.npmjs.org is unreachable (needed to verify the published package versions)")
+      ;;
+    all)
+      network_probe_github || missing+=("github.com is unreachable (needed by the marketplace/cli/verify stages)")
+      network_probe_npm || missing+=("registry.npmjs.org is unreachable (needed by the verify stage)")
+      ;;
+    *)
+      die "preflight_network: unknown subcommand '$sub'"
+      ;;
+  esac
+
+  if [ "${#missing[@]}" -gt 0 ]; then
+    log "PRECONDITION FAILED: '$sub' needs network access that isn't reachable right now:"
+    local m
+    for m in "${missing[@]}"; do
+      log "  - $m"
+    done
+    die "network precondition failed for '$sub' (see above) — fix connectivity, then re-run"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -601,6 +744,98 @@ check_harness_compat() {
   return "$rc"
 }
 
+# assert_scratch_has_plugin WORKSPACE_DIR — the RESULT-invariant this gate
+# exists to protect (groundnuty/macf#1424): the scratch workspace this gate
+# validates must actually HAVE a plugin, not merely have run 'macf init'
+# without a non-zero exit. Before this assertion, a plugin-fetch failure
+# that `initAgent` warns-and-continues on (the historical contract for the
+# network-fetch path — see `packages/macf/src/cli/commands/init.ts`) left
+# the scratch workspace silently plugin-less, and `check_harness_compat`
+# validated whatever settings/launcher config WAS present regardless — a
+# population that excludes the very thing the gate exists to check
+# (assert-the-wrong-path.md trigger 3). Both v0.2.59 and v0.2.60 passed this
+# gate that way.
+#
+# Checks TWO independent things, not one, because `write_scratch_plugin_manifest`
+# below unconditionally writes a manifest regardless of whether the REAL
+# canonical content actually copied — a manifest-only check would therefore
+# always pass and stop being mutation-decisive:
+#   1. the manifest exists (.claude-plugin/plugin.json) — makes --plugin-dir
+#      a syntactically valid mount at all;
+#   2. a stable file from the REAL canonical content (hooks/hooks.json) —
+#      proves the --plugin-source copy from packages/macf/plugin/ actually
+#      happened, which is the thing this gate exists to guarantee.
+# Factored out as its own function (not inlined in cmd_harness_check) so
+# release.test.sh can drive it directly against a fixture, without a real
+# 'macf init' + 'make build' round-trip.
+assert_scratch_has_plugin() {
+  local workspace_dir="$1"
+  local plugin_dir="$workspace_dir/.macf/plugin"
+  [ -f "$plugin_dir/.claude-plugin/plugin.json" ] \
+    || die "scratch workspace has NO plugin manifest at .macf/plugin/.claude-plugin/plugin.json (groundnuty/macf#1424) — the harness-compat gate cannot validate a --plugin-dir mount without one."
+  [ -f "$plugin_dir/hooks/hooks.json" ] \
+    || die "scratch workspace's plugin has NO canonical content at .macf/plugin/hooks/hooks.json (groundnuty/macf#1424) — the --plugin-source copy from packages/macf/plugin/ appears to have silently failed or been skipped. This should not happen when --plugin-source points at a real local plugin dir; if it does, the local-copy path (packages/macf/src/cli/plugin-fetcher.ts::copyLocalPluginToWorkspace) is broken."
+}
+
+# write_scratch_plugin_manifest PLUGIN_DIR — writes a minimal, ENTIRELY
+# OFFLINE .claude-plugin/plugin.json into a scratch plugin dir that was just
+# populated (via --plugin-source) from packages/macf/plugin/ — the checkout's
+# own canonical agents/hooks/scripts/skills. That tree deliberately carries
+# NO manifest of its own: groundnuty/macf#426 retired the checked-in copy as
+# vestigial specifically because it silently drifted from the real, MOUNTED
+# marketplace copy (frozen at a stale version + launch form for months,
+# undetected) — the manifest is canonical ONLY in
+# groundnuty/macf-marketplace:macf-agent/.claude-plugin/plugin.json.
+# `packages/macf/test/plugin/plugin-json.test.ts` is the structural guard
+# that keeps it that way; this function must NEVER write into
+# packages/macf/plugin/ itself, only into the scratch copy.
+#
+# Why a fixed, synthetic manifest is correct here (and not a compromise): the
+# manifest's own CONTENT is not the thing check_harness_compat validates —
+# that function reads .claude/settings.json, .mcp.json, and claude.sh's
+# launcher-flag, never the plugin manifest itself. The manifest's only job
+# in this gate is making the scratch --plugin-dir mount SYNTACTICALLY valid
+# so Claude Code doesn't reject the whole plugin outright. A REAL consumer's
+# manifest genuinely needs the published one (skills/hooks/mcpServers
+# wiring that only the marketplace repo owns) — this gate does not, which is
+# exactly why it can stay fully offline where a real `macf init` cannot.
+#
+# `agents` is derived from whatever actually landed in PLUGIN_DIR/agents/
+# (the SCRATCH copy, not the source tree) rather than hardcoded, so this
+# never drifts from the real agents/ directory and never claims a file that
+# isn't actually there.
+write_scratch_plugin_manifest() {
+  local plugin_dir="$1"
+  mkdir -p "$plugin_dir/.claude-plugin"
+
+  local -a agent_entries=()
+  local f
+  if [ -d "$plugin_dir/agents" ]; then
+    for f in "$plugin_dir"/agents/*.md; do
+      [ -e "$f" ] || continue
+      agent_entries+=("\"./agents/$(basename "$f")\"")
+    done
+  fi
+  local agents_json="[]"
+  if [ "${#agent_entries[@]}" -gt 0 ]; then
+    agents_json="[$(
+      IFS=,
+      echo "${agent_entries[*]}"
+    )]"
+  fi
+
+  cat >"$plugin_dir/.claude-plugin/plugin.json" <<EOF
+{
+  "name": "macf-agent",
+  "version": "0.0.0-release-harness-check",
+  "description": "Synthetic scratch manifest for release.sh's harness-compat gate only. NOT the published manifest — that one is canonical in groundnuty/macf-marketplace (groundnuty/macf#426) and is deliberately never fetched here (groundnuty/macf#1424).",
+  "skills": "./skills/",
+  "agents": ${agents_json},
+  "hooks": "./hooks/hooks.json"
+}
+EOF
+}
+
 # cmd_harness_check VERSION — the release-time orchestrator. Builds dist
 # (idempotent — `tsc -b` is incremental), materializes a REAL canonical
 # workspace via the just-built CLI's own `init --local` (the actual
@@ -619,18 +854,39 @@ check_harness_compat() {
 # specifically to catch what nothing else in the release pipeline looks
 # for. The scratch workspace, its local-registry CA (via `--path`), AND
 # `macf init`'s own cross-project state (via `HOME=`, see the comment
-# below) are all confined under a single `mktemp -d` (registered in
-# CLEANUP_DIRS, same as every other scratch dir this script creates) —
-# nothing here is ever written to the operator's real `~/.macf/`. A
-# `git clone`-free, read-only `GET` for the pinned plugin version is the
-# only network call `macf init` makes here; it degrades gracefully to
-# defaults when rate-limited (no GH_TOKEN is passed — this check doesn't
-# need one).
+# below) are all confined under a single `mktemp -d` OUTSIDE the checkout
+# (registered in CLEANUP_DIRS, same as every other scratch dir this script
+# creates) — nothing here is ever written to the operator's real `~/.macf/`,
+# and nothing here ever touches this checkout's own working tree (asserted
+# by release.test.sh: `git status --porcelain` in a fixture checkout is
+# byte-identical before and after a harness-check-shaped scratch init).
+#
+# --plugin-source (groundnuty/macf#1424, replacing a network `git clone` of
+# groundnuty/macf-marketplace): the scratch 'macf init --local' copies
+# agents/hooks/scripts/skills from THIS checkout's own packages/macf/plugin/
+# — the artifact actually under release — instead of cloning a marketplace
+# tag. Two separate reasons the old network path was the WRONG subject, not
+# merely unreliable: (1) at release time the marketplace isn't tagged for
+# THIS version yet (`cmd_marketplace` below tags it DURING the release), so
+# a clone could only ever fetch the PREVIOUS release's content; (2) on a
+# host that refuses anonymous git HTTPS (groundnuty/macf#1423), the clone
+# fails outright. `write_scratch_plugin_manifest` (above) then supplies the
+# one thing packages/macf/plugin/ deliberately does NOT carry — a
+# `.claude-plugin/plugin.json` — with a fixed, offline stub (see that
+# function's doc for why a stub is correct here, not a compromise). Zero
+# network calls happen for the plugin; the only remaining network call
+# `macf init` makes here is a read-only GET for version-pin resolution
+# (unrelated to the plugin), which already degrades gracefully to hardcoded
+# fallbacks on any failure — see
+# `packages/macf/src/cli/commands/init.ts::resolveVersions`.
 cmd_harness_check() {
   (cd "$REPO_ROOT" && make -f dev.mk build)
 
   local cli_dist="$REPO_ROOT/packages/macf/dist/cli/index.js"
   [ -f "$cli_dist" ] || die "dist not built — $cli_dist missing after 'make build'"
+
+  local plugin_source="$REPO_ROOT/packages/macf/plugin"
+  [ -d "$plugin_source" ] || die "plugin source dir missing — $plugin_source not found (expected the checkout's own canonical plugin tree)"
 
   local scratch
   scratch="$(mktemp -d)"
@@ -656,10 +912,15 @@ cmd_harness_check() {
     --role code-agent \
     --local \
     --path "$scratch/registry/macf-release-harness-check.json" \
-    --dir "$scratch/workspace" 2>&1)"; then
+    --dir "$scratch/workspace" \
+    --plugin-source "$plugin_source" 2>&1)"; then
     log "$init_out"
     die "could not materialize a scratch canonical workspace via 'macf init --local' — cannot run the harness-compat check"
   fi
+  log "$init_out"
+
+  write_scratch_plugin_manifest "$scratch/workspace/.macf/plugin"
+  assert_scratch_has_plugin "$scratch/workspace"
 
   if check_harness_compat "$scratch/workspace"; then
     log "harness-compat check passed — the currently-installed Claude Code accepts the release-generated settings/launcher config"
@@ -672,6 +933,7 @@ cmd_marketplace() {
   local version="${1:-}"
   [ -n "$version" ] || die "marketplace requires <version>"
 
+  preflight_network marketplace
   ensure_gh_token
 
   if gh api "repos/${MARKETPLACE_REPO}/git/ref/tags/v${version}" >/dev/null 2>&1; then
@@ -795,6 +1057,7 @@ cmd_cli() {
   local version="${1:-}"
   [ -n "$version" ] || die "cli requires <version>"
 
+  preflight_network cli
   ensure_gh_token
 
   cd "$REPO_ROOT"
@@ -804,7 +1067,12 @@ cmd_cli() {
     return 0
   fi
 
-  [ -z "$(git status --porcelain)" ] || die "working tree not clean — commit or stash before release-cli"
+  local dirty_status
+  dirty_status="$(git status --porcelain)"
+  if [ -n "$dirty_status" ]; then
+    describe_dirty_tree "$dirty_status"
+    die "working tree not clean — commit or stash before release-cli"
+  fi
 
   local branch
   branch="$(git rev-parse --abbrev-ref HEAD)"
@@ -834,6 +1102,7 @@ cmd_verify() {
   local version="${1:-}"
   [ -n "$version" ] || die "verify requires <version>"
 
+  preflight_network verify
   ensure_gh_token
 
   if [ "$DRY_RUN" = "1" ]; then
@@ -898,6 +1167,11 @@ cmd_verify() {
 cmd_all() {
   local version="${1:-}"
   [ -n "$version" ] || die "all requires <version>"
+  # Preflight the FULL chain's network needs before the first mutating
+  # stage runs (bump's local commit) — never mid-pipeline, after bump/check/
+  # harness-check already spent time, only to die three stages in on a gap
+  # that was there the whole time.
+  preflight_network all
   cmd_bump "$version"
   cmd_check
   cmd_harness_check
