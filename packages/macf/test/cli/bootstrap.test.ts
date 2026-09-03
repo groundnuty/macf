@@ -263,6 +263,10 @@ describe('runBootstrapPlan', () => {
             install: 'present',
             repo: 'present',
             fingerprints: { app_private_key: 'sha256:aaa' },
+            // groundnuty/macf#1425 — matches this single-agent fleet's
+            // declared roster, so the new `agent_config` item reads noop
+            // too ("nothing to do" — this test's own title claim).
+            agentConfigRoles: ['code-agent'],
           },
         },
         caRegistry: 'present',
@@ -280,9 +284,11 @@ describe('runBootstrapPlan', () => {
     const code = await runBootstrapPlan({ file, json: true }, deps);
     expect(code).toBe(0);
     const json = JSON.parse(logSpy.mock.calls.flat().join('')) as { summary: { noops: number; creates: number; writeAlways: number } };
-    // 4 per-agent (app, repo, install, secret_fingerprint) + 2 CA (registry
-    // present + the one agent repo confirmed absent — both noop, since
-    // apply has no per-repo CA write to attempt regardless) + 1
+    // 4 per-agent (app, repo, install, secret_fingerprint) + 1 per-agent
+    // agent_config (groundnuty/macf#1425 — `agentConfigRoles: ['code-agent']`
+    // matches this single-agent fleet's declared roster exactly) + 2 CA
+    // (registry present + the one agent repo confirmed absent — both noop,
+    // since apply has no per-repo CA write to attempt regardless) + 1
     // routing_client (observed-present) — all noop.
     // `labels` is a write-always structural exception (groundnuty/macf#920,
     // verb per groundnuty/macf#926): it has no plan-time observed read at
@@ -297,7 +303,7 @@ describe('runBootstrapPlan', () => {
     // (groundnuty/macf#1109) is ALSO UNCONDITIONAL, and `deps.observe`'s
     // fixture above sets no `vaultTsOauth` — so `router_app` + `ts_oauth`
     // are the two create-candidates; `labels` is the one write-always item.
-    expect(json.summary.noops).toBe(7);
+    expect(json.summary.noops).toBe(8);
     expect(json.summary.creates).toBe(2);
     expect(json.summary.writeAlways).toBe(1);
   });

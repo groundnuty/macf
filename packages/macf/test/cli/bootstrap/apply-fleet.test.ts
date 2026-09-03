@@ -1867,7 +1867,7 @@ agents:
       ],
     };
 
-    it('DECISIVE — control repo repo-init receives ALL three declared agents; each agent repo still receives only its OWN role (private-queue separation preserved)', async () => {
+    it('DECISIVE — control repo AND every agent repo\'s own repo-init call all receive ALL three declared agents (groundnuty/macf#1425)', async () => {
       const manifestPath = manifestPathIn();
       const manifest = manifestWith([CODE_AGENT, SCI_AGENT, WRITING_AGENT]);
       const repoInitCalls: { repo: string | undefined; agents: string | undefined }[] = [];
@@ -1897,19 +1897,28 @@ agents:
         expect(result.controlRepoInit.repo).toBe('groundnuty/demo-fleet-control');
       }
 
-      // Each AGENT repo's own repo-init call still carries ONLY its own
-      // role — the private-queue separation #1057's design explicitly
-      // preserves is unaffected by the new control-repo call.
-      expect(repoInitCalls.find((c) => c.repo === 'groundnuty/demo-code')?.agents).toBe('code-agent');
-      expect(repoInitCalls.find((c) => c.repo === 'groundnuty/demo-science')?.agents).toBe('science-agent');
-      expect(repoInitCalls.find((c) => c.repo === 'groundnuty/demo-writing')?.agents).toBe('writing-agent');
+      // groundnuty/macf#1425 (silent-fallback-hazards.md Instance 18) — EACH
+      // agent repo's OWN repo-init call ALSO carries every declared role now,
+      // not just its own. Before this fix, an agent repo's `.github/
+      // agent-config.json` routing table named only its own agent, so
+      // `route-by-mention` silently dropped any mention of a sibling posted
+      // on that repo — measured live on `macf-trial`. There is no
+      // "private-queue separation" to preserve here: the routing table is
+      // orthogonal to GitHub App install scope (#1057's actual concern,
+      // documented in `apply-control-repo-init.ts`'s module doc) — it is
+      // read directly by the router workflow's mTLS POST, which needs to
+      // know how to reach EVERY sibling regardless of which repo hosts the
+      // triggering event.
+      expect(repoInitCalls.find((c) => c.repo === 'groundnuty/demo-code')?.agents).toBe('code-agent,science-agent,writing-agent');
+      expect(repoInitCalls.find((c) => c.repo === 'groundnuty/demo-science')?.agents).toBe('code-agent,science-agent,writing-agent');
+      expect(repoInitCalls.find((c) => c.repo === 'groundnuty/demo-writing')?.agents).toBe('code-agent,science-agent,writing-agent');
 
       // Exactly 4 repoInit calls total: 1 control repo + 3 agent repos — no
       // extra, no missing.
       expect(repoInitCalls).toHaveLength(4);
     });
 
-    it('does not touch any App-installation seam — every identity/install dep is the SAME "reused, prior-confirmed" fixture already used for the private-queue test above', async () => {
+    it('does not touch any App-installation seam — every identity/install dep is the SAME "reused, prior-confirmed" fixture already used for the widening test above', async () => {
       // No new call to `waitForAppInstallation` (gate 2 / App install) is
       // introduced by the control-repo-init step — it throws if called, and
       // this run completes successfully, proving it never fires. This is
