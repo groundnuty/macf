@@ -120,6 +120,11 @@ function classifyPlanItemKind(kind: PlanItemKind): Classification {
     // `federatedCaItem` is produced by `presenceVerb`, a live existence
     // check, never write-always.
     case 'federated_ca':
+    // groundnuty/macf#1425 — `agentConfigItem` compares a LIVE read
+    // (`ObservedAgentState.agentConfigRoles`) against the declared fleet
+    // roster, same "genuinely checkable" shape as `routing`/`actions_pin`
+    // immediately below/above, never write-always.
+    case 'agent_config':
     case 'routing':
     case 'agent':
     case 'control_repo':
@@ -143,6 +148,7 @@ const ALL_KINDS: readonly PlanItemKind[] = [
   'secret_fingerprint',
   'ca',
   'federated_ca',
+  'agent_config',
   'routing',
   'runner_warm',
   'runner_platform',
@@ -168,7 +174,7 @@ describe('PlanItemKind coverage — every kind is classified exactly once (groun
     for (const kind of ALL_KINDS) {
       expect(['write-always', 'checkable']).toContain(classifyPlanItemKind(kind));
     }
-    // 21 kinds as of groundnuty/macf#810 (3 write-always + 18 checkable) —
+    // 22 kinds as of groundnuty/macf#1425 (3 write-always + 19 checkable) —
     // pins the count so a kind added to ALL_KINDS-but-not-the-switch (or
     // vice versa) is caught here even though both are hand-maintained lists
     // (the switch is compile-checked against the TYPE; this asserts the
@@ -176,8 +182,9 @@ describe('PlanItemKind coverage — every kind is classified exactly once (groun
     // exercising every member). 'install_scope' joined at groundnuty/macf#1220
     // / #1129 / #1229 / DR-043 Amendment P2 (row 3 of the reconciler verb
     // matrix); was 19 (3 + 16) before it. 'federated_ca' joined at
-    // groundnuty/macf#810 (was 20 (3 + 17) before it).
-    expect(ALL_KINDS).toHaveLength(21);
+    // groundnuty/macf#810 (was 20 (3 + 17) before it). 'agent_config' joined
+    // at groundnuty/macf#1425 (was 21 (3 + 18) before it).
+    expect(ALL_KINDS).toHaveLength(22);
   });
 });
 
@@ -196,7 +203,12 @@ describe('write-always kinds NEVER reach noop, under ANY fixture (groundnuty/mac
     const observed: ObservedState = {
       lock: { schema_version: 1, fleet: FLEET, agents: [{ role: 'runner-ops', app_id: 'a', install_id: 'i' }] },
       agents: {
-        'code-agent': { app: 'present', install: 'present', repo: 'present', fingerprints: { app_private_key: 'sha256:x' } },
+        // groundnuty/macf#1425 — `agentConfigRoles: ['code-agent']` matches
+        // this single-agent manifest's declared roster exactly, so the NEW
+        // `agent_config` item reads `'noop'` here too — otherwise this
+        // "every OTHER checkable kind reads quiet" fixture would stop being
+        // true the moment `agent_config` joined the checkable set.
+        'code-agent': { app: 'present', install: 'present', repo: 'present', fingerprints: { app_private_key: 'sha256:x' }, agentConfigRoles: ['code-agent'] },
       },
       caRegistry: 'present',
       // groundnuty/macf#800 — 'absent', not 'present': a PRESENT per-repo
@@ -234,7 +246,12 @@ describe('write-always kinds NEVER reach noop, under ANY fixture (groundnuty/mac
     const observed: ObservedState = {
       lock: { schema_version: 1, fleet: FLEET, agents: [{ role: 'runner-ops', app_id: 'a', install_id: 'i' }] },
       agents: {
-        'code-agent': { app: 'present', install: 'present', repo: 'present', fingerprints: { app_private_key: 'sha256:x' } },
+        // groundnuty/macf#1425 — `agentConfigRoles: ['code-agent']` matches
+        // this single-agent manifest's declared roster exactly, so the NEW
+        // `agent_config` item reads `'noop'` here too — otherwise this
+        // "every OTHER checkable kind reads quiet" fixture would stop being
+        // true the moment `agent_config` joined the checkable set.
+        'code-agent': { app: 'present', install: 'present', repo: 'present', fingerprints: { app_private_key: 'sha256:x' }, agentConfigRoles: ['code-agent'] },
       },
       caRegistry: 'present',
       // groundnuty/macf#800 — 'absent', not 'present': a PRESENT per-repo
@@ -269,7 +286,12 @@ describe('write-always kinds NEVER reach noop, under ANY fixture (groundnuty/mac
     const observed: ObservedState = {
       lock: { schema_version: 1, fleet: FLEET, agents: [{ role: 'runner-ops', app_id: 'a', install_id: 'i' }] },
       agents: {
-        'code-agent': { app: 'present', install: 'present', repo: 'present', fingerprints: { app_private_key: 'sha256:x' } },
+        // groundnuty/macf#1425 — `agentConfigRoles: ['code-agent']` matches
+        // this single-agent manifest's declared roster exactly, so the NEW
+        // `agent_config` item reads `'noop'` here too — otherwise this
+        // "every OTHER checkable kind reads quiet" fixture would stop being
+        // true the moment `agent_config` joined the checkable set.
+        'code-agent': { app: 'present', install: 'present', repo: 'present', fingerprints: { app_private_key: 'sha256:x' }, agentConfigRoles: ['code-agent'] },
       },
       caRegistry: 'present',
       // groundnuty/macf#800 — 'absent', not 'present': a PRESENT per-repo
@@ -391,6 +413,24 @@ const COVERAGE_CASES: readonly CoverageCase[] = [
       computePlan(manifest({ trust: { federated_cas: [{ project: 'ppam-2026', ca_bundle: 'GUEST-CERT-PEM' }] } }), {
         ...EMPTY,
         federatedCaRegistry: { 'ppam-2026': 'absent' },
+      }),
+  },
+  {
+    // groundnuty/macf#1425 — quiet: the live-read roster (`agentConfigRoles`)
+    // already names this single-agent manifest's one declared role; active:
+    // the roster is EMPTY, so `agent.role` reads as missing — the exact
+    // one-agent-table shape `silent-fallback-hazards.md` Instance 18
+    // describes.
+    kind: 'agent_config',
+    quiet: () =>
+      computePlan(manifest(), {
+        ...EMPTY,
+        agents: { 'code-agent': { app: 'unknown', install: 'unknown', repo: 'unknown', fingerprints: {}, agentConfigRoles: ['code-agent'] } },
+      }),
+    active: () =>
+      computePlan(manifest(), {
+        ...EMPTY,
+        agents: { 'code-agent': { app: 'unknown', install: 'unknown', repo: 'unknown', fingerprints: {}, agentConfigRoles: [] } },
       }),
   },
   {
