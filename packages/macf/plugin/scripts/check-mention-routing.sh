@@ -143,33 +143,38 @@ fi
 # See the file-header "`create` coverage" section for the full 4-case
 # rationale. Computed here (before the --body-file dispatch below) because
 # the branch-3 warning also needs to know whether Check A applies.
-IS_CREATE_SUBCOMMAND=false
-if [[ "$COMMAND" =~ gh[[:space:]]+(issue|pr)[[:space:]]+create ]]; then
-  IS_CREATE_SUBCOMMAND=true
-fi
+# A command counts as a create or comment only where a segment starts
+# (command start, or after ; | & ( or a newline, optionally behind sudo /
+# env VAR=x / VAR=x / bash -c "), so prose in a body that names the command
+# never triggers it.
+SEG_WRAP='(sudo[[:space:]]+|env[[:space:]]+([A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+)*|[A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+|(bash|sh|zsh)[[:space:]]+-c[[:space:]]+["'"'"'])*'
+SEG_SEP='[;|&(]|'$'\n'
+macf_has_segment_cmd() {
+  local re='(^|'"$SEG_SEP"')[[:space:]]*'"$SEG_WRAP"'gh[[:space:]]+'"$1"'([[:space:]]|$)'
+  [[ "$COMMAND" =~ $re ]]
+}
 
 # `gh pr create` is tracked separately from `gh issue create` because case 4
 # ("no confirmed routing signal → BLOCK") does NOT extend to it — see the
 # CHECK_A_APPLIES computation below for why.
 IS_PR_CREATE=false
-if [[ "$COMMAND" =~ gh[[:space:]]+pr[[:space:]]+create ]]; then
-  IS_PR_CREATE=true
+if macf_has_segment_cmd 'pr[[:space:]]+create'; then IS_PR_CREATE=true; fi
+HAS_ISSUE_CREATE=false
+if macf_has_segment_cmd 'issue[[:space:]]+create'; then HAS_ISSUE_CREATE=true; fi
+IS_CREATE_SUBCOMMAND=false
+if [[ "$IS_PR_CREATE" == "true" || "$HAS_ISSUE_CREATE" == "true" ]]; then
+  IS_CREATE_SUBCOMMAND=true
 fi
 
-# A chained PR create followed by an issue or PR comment must still check
-# the comment segment: the PR-create exemption below covers only the PR
-# create. CHAIN_COMMENT_TAIL holds the command text from the first chained
-# comment onward (empty when there is none). A comment counts only when it
-# starts a segment (command start, or after ; | & or a newline), so prose in
-# a PR body that names the command does not trigger it.
-HAS_ISSUE_CREATE=false
-if [[ "$COMMAND" =~ gh[[:space:]]+issue[[:space:]]+create ]]; then
-  HAS_ISSUE_CREATE=true
-fi
+# A create followed by chained comments must still check each comment
+# segment: the create exemption covers only the create. CHAIN_COMMENT_TAIL
+# holds the command text from the first chained comment onward (empty when
+# there is none).
+CHAIN_COMMENT_RE='(^|'"$SEG_SEP"')[[:space:]]*'"$SEG_WRAP"'gh[[:space:]]+(issue|pr)[[:space:]]+comment([[:space:]]|$)'
+CHAIN_NEXT_RE='('"$SEG_SEP"')[[:space:]]*'"$SEG_WRAP"'gh[[:space:]]+(issue|pr)[[:space:]]+comment([[:space:]]|$)'
 CHAIN_COMMENT_TAIL=""
-if [[ "$IS_PR_CREATE" == "true" ]] && [[ "$HAS_ISSUE_CREATE" == "false" ]]; then
-  CHAIN_COMMENT_PATTERN='(^|[;|&]|'$'\n'')[[:space:]]*(sudo[[:space:]]+|env[[:space:]]+([A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+)*|[A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+)*gh[[:space:]]+(issue|pr)[[:space:]]+comment([[:space:]]|$)'
-  if [[ "$COMMAND" =~ $CHAIN_COMMENT_PATTERN ]]; then
+if [[ "$IS_CREATE_SUBCOMMAND" == "true" ]]; then
+  if [[ "$COMMAND" =~ $CHAIN_COMMENT_RE ]]; then
     CHAIN_COMMENT_TAIL="${COMMAND#"${COMMAND%%"${BASH_REMATCH[0]}"*}"}"
   fi
 fi
@@ -236,7 +241,31 @@ if [[ "$IS_CREATE_SUBCOMMAND" == "true" ]]; then
   fi
   AGENT_CONFIG_PATH="${PROJECT_DIR:+$PROJECT_DIR/.github/agent-config.json}"
   ROUTING_LABELS=()
+  REGISTRY_READABLE=false
+  # The target repo is this workspace's own unless --repo/-R names another
+  # one; the registry read below belongs to this workspace's repo only.
+  TARGET_IS_OWN=true
+  repo_re='(^|[[:space:]])(--repo|-R)(=|[[:space:]]+)([^[:space:]]+)'
+  if [[ "$COMMAND" =~ $repo_re ]]; then
+    target_repo="${BASH_REMATCH[4]}"
+    target_repo="${target_repo%\"}"; target_repo="${target_repo#\"}"
+    target_repo="${target_repo%\'}"; target_repo="${target_repo#\'}"
+    origin_url=""
+    if [[ -n "$PROJECT_DIR" ]]; then
+      origin_url="$(git -C "$PROJECT_DIR" remote get-url origin 2>/dev/null || true)"
+    fi
+    origin_url="${origin_url%.git}"
+    origin_name="${origin_url##*[:/]}"
+    origin_rest="${origin_url%/*}"
+    origin_repo="${origin_rest##*[:/]}/$origin_name"
+    lower_target="$(printf '%s' "$target_repo" | tr '[:upper:]' '[:lower:]')"
+    lower_origin="$(printf '%s' "$origin_repo" | tr '[:upper:]' '[:lower:]')"
+    if [[ -z "$origin_url" ]] || [[ "$lower_target" != "$lower_origin" ]]; then
+      TARGET_IS_OWN=false
+    fi
+  fi
   if [[ -n "$AGENT_CONFIG_PATH" ]] && [[ -f "$AGENT_CONFIG_PATH" ]] && [[ -r "$AGENT_CONFIG_PATH" ]]; then
+    REGISTRY_READABLE=true
     # Registry keys = this fleet's actual routing labels (repo-specific;
     # never hardcoded — see repo-init.ts, the file's writer, and the
     # router that reads it the same way).
@@ -271,7 +300,7 @@ if [[ "$IS_CREATE_SUBCOMMAND" == "true" ]]; then
             CREATE_MATCHED_LABELS+="${CREATE_MATCHED_LABELS:+, }$tok"
             if [[ -n "${MACF_ROUTING_LABEL:-}" ]] && [[ "$tok" == "${MACF_ROUTING_LABEL}" ]]; then
               CREATE_CONFIRMED_SELF_LABEL=true
-            elif [[ -n "${MACF_ROUTING_LABEL:-}" ]]; then
+            elif [[ -n "${MACF_ROUTING_LABEL:-}" ]] && [[ "$TARGET_IS_OWN" == "true" ]]; then
               CREATE_CONFIRMED_PEER_LABEL=true
             fi
             # $MACF_ROUTING_LABEL unset: a real assignee label matched, but
@@ -292,6 +321,17 @@ fi
 # (comment) is unchanged — always applies.
 CHECK_A_APPLIES=true
 ISSUE_CREATE_UNROUTED=false
+ISSUE_CREATE_WARNING=""
+# The model never sees stderr on exit 0, so an allow-with-warning goes out
+# as additionalContext JSON on stdout when the hook exits 0.
+macf_emit_warning() {
+  local rc=$?
+  if [[ "$rc" -eq 0 ]] && [[ -n "$ISSUE_CREATE_WARNING" ]]; then
+    jq -n --arg ctx "$ISSUE_CREATE_WARNING" \
+      '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "allow", additionalContext: $ctx}}'
+  fi
+}
+trap macf_emit_warning EXIT
 if [[ "$IS_CLOSE_SUBCOMMAND" == "true" ]]; then
   CHECK_A_APPLIES=false
 elif [[ "$HAS_ISSUE_CREATE" == "true" ]]; then
@@ -300,7 +340,33 @@ elif [[ "$HAS_ISSUE_CREATE" == "true" ]]; then
   # another agent, the issue reaches no one, with or without a mention.
   CHECK_A_APPLIES=false
   if [[ "$CREATE_HAS_BACKLOG_LABEL" != "true" ]] && [[ "$CREATE_CONFIRMED_PEER_LABEL" != "true" ]]; then
-    ISSUE_CREATE_UNROUTED=true
+    # Block only what the hook can prove undeliverable: no label, a
+    # confirmed self-label, or a readable registry for this repo with no
+    # other agent's label. A label it cannot confirm is allowed with a
+    # warning, because the router reads the target repo's registry.
+    ALL_LABELS_JOINED=""
+    for tok in ${EXTRACTED_LABELS[@]+"${EXTRACTED_LABELS[@]}"}; do
+      ALL_LABELS_JOINED+="${ALL_LABELS_JOINED:+, }$tok"
+    done
+    UNCONFIRMED_REASON=""
+    if [[ -z "$ALL_LABELS_JOINED" ]] || [[ "$CREATE_CONFIRMED_SELF_LABEL" == "true" ]]; then
+      ISSUE_CREATE_UNROUTED=true
+    elif [[ "$REGISTRY_READABLE" != "true" ]]; then
+      UNCONFIRMED_REASON="no .github/agent-config.json in this workspace"
+    elif [[ -z "${MACF_ROUTING_LABEL:-}" ]] && [[ -n "$CREATE_MATCHED_LABELS" ]]; then
+      UNCONFIRMED_REASON="MACF_ROUTING_LABEL is unset"
+    elif [[ "$TARGET_IS_OWN" != "true" ]]; then
+      UNCONFIRMED_REASON="--repo is not this workspace's repo"
+    else
+      ISSUE_CREATE_UNROUTED=true
+    fi
+    if [[ -n "$UNCONFIRMED_REASON" ]]; then
+      ISSUE_CREATE_WARNING="The hook could not confirm that label \"$ALL_LABELS_JOINED\" belongs to another agent ($UNCONFIRMED_REASON). If \"$ALL_LABELS_JOINED\" is an agent label in the target repo, the router delivers it; if not, add one."
+    fi
+  fi
+  # A comment chained after the create is a separate segment and needs a mention.
+  if [[ -n "$CHAIN_COMMENT_TAIL" ]]; then
+    CHECK_A_APPLIES=true
   fi
 elif [[ "$IS_CREATE_SUBCOMMAND" == "true" ]]; then
   # PR create only. A PR body mention does route (pull_request event).
@@ -685,14 +751,38 @@ ACTIVE_COUNT="$(grep '^ACTIVE_COUNT:' <<<"$AWK_OUTPUT" | sed 's/^ACTIVE_COUNT://
 # Skipped in --body-file mode, where LINT_TARGET is file content, not the
 # command text.
 if [[ -n "$CHAIN_COMMENT_TAIL" ]] && [[ "$BODY_FILE_MODE" == "false" ]]; then
-  ACTIVE_COUNT="$(awk -v pat="$HANDLE_PATTERN" '
-    { l = $0; a = 0
-      while (match(l, pat)) {
-        s = a + RSTART; b = (s > 1) ? substr($0, s - 1, 1) : ""; c = substr($0, s + RLENGTH, 1)
-        if (!(b == "`" && c == "`")) n++
-        l = substr(l, RSTART + RLENGTH); a = s + RLENGTH - 1
-      } }
-    END { print n + 0 }' <<<"$CHAIN_COMMENT_TAIL")"
+  # Each chained comment is its own segment and needs its own mention, so
+  # ACTIVE_COUNT becomes the smallest per-segment count.
+  CHAIN_SEGMENTS=()
+  seg_rest="$CHAIN_COMMENT_TAIL"
+  seg_guard=0
+  while [[ -n "$seg_rest" ]] && [[ "$seg_guard" -lt 50 ]]; do
+    seg_guard=$((seg_guard + 1))
+    seg_body="${seg_rest:1}"
+    if [[ "$seg_body" =~ $CHAIN_NEXT_RE ]]; then
+      seg_next="${BASH_REMATCH[0]}"
+      seg_head="${seg_body%%"$seg_next"*}"
+      CHAIN_SEGMENTS+=("${seg_rest:0:1}$seg_head")
+      seg_rest="${seg_body#"$seg_head"}"
+    else
+      CHAIN_SEGMENTS+=("$seg_rest")
+      seg_rest=""
+    fi
+  done
+  ACTIVE_COUNT=""
+  for seg in "${CHAIN_SEGMENTS[@]}"; do
+    seg_count="$(awk -v pat="$HANDLE_PATTERN" '
+      { l = $0; a = 0
+        while (match(l, pat)) {
+          s = a + RSTART; b = (s > 1) ? substr($0, s - 1, 1) : ""; c = substr($0, s + RLENGTH, 1)
+          if (!(b == "`" && c == "`")) n++
+          l = substr(l, RSTART + RLENGTH); a = s + RLENGTH - 1
+        } }
+      END { print n + 0 }' <<<"$seg")"
+    if [[ -z "$ACTIVE_COUNT" ]] || [[ "$seg_count" -lt "$ACTIVE_COUNT" ]]; then
+      ACTIVE_COUNT="$seg_count"
+    fi
+  done
 fi
 
 if [[ -n "$OFFENDING" ]]; then
@@ -755,12 +845,10 @@ if [[ "$CHECK_A_APPLIES" == "true" ]] && [[ "$ACTIVE_COUNT" == "0" ]]; then
   if [[ -n "$CHAIN_COMMENT_TAIL" ]]; then
     CREATE_NOTE="
 The comment later in this command has no mention. Add one for whoever
-should read it, because the PR create does not cover it."
+should read it, because the create does not cover it."
   elif [[ "$IS_CREATE_SUBCOMMAND" == "true" ]] && [[ "$CREATE_CONFIRMED_SELF_LABEL" == "true" ]]; then
     CREATE_NOTE="
-The router skips a label applied by the agent it names, so the label on
-this pull request routes it to no one. Add a mention for whoever should
-read it."
+A label on a pull request does not route; only a mention in its body or in a comment does. Add a mention for whoever should read it."
   fi
   cat >&2 <<ERR
 BLOCKED by MACF mention-routing-hygiene hook: this comment/issue/PR body has

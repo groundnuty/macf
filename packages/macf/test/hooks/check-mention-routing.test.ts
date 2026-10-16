@@ -60,6 +60,16 @@ function runHook(opts: {
   });
 }
 
+/** The additionalContext of an allow-with-warning hook result ('' when none). */
+function warningOf(r: ReturnType<typeof runHook>): string {
+  try {
+    const j = JSON.parse(String(r.stdout)) as { hookSpecificOutput?: { additionalContext?: string } };
+    return j.hookSpecificOutput?.additionalContext ?? '';
+  } catch {
+    return '';
+  }
+}
+
 describe('check-mention-routing.sh (hook)', () => {
   describe('positive path — non-comment commands pass through', () => {
     it('allows `gh issue view` (no body to validate)', () => {
@@ -803,13 +813,12 @@ describe('check-mention-routing.sh (hook)', () => {
         expect(r.stderr).toContain('routed only by its label');
       });
 
-      it('case 4 — assignee label present but self-identity unknown (MACF_ROUTING_LABEL unset) → BLOCKED', () => {
-        // Can't confirm self vs. peer → ambiguous → blocks, per the
-        // operator's ruling that uncertainty defaults to BLOCK not ALLOW.
+      it('assignee label present but self-identity unknown (MACF_ROUTING_LABEL unset) → ALLOWED with a warning', () => {
         const r = runCreate('gh issue create --title "x" --label science-agent --body "no mention here"', {
           MACF_ROUTING_LABEL: undefined,
         });
-        expect(r.status).toBe(2);
+        expect(r.status).toBe(0);
+        expect(warningOf(r)).toContain('MACF_ROUTING_LABEL is unset');
       });
 
       it('a body mention does NOT rescue a self-labeled issue create (the router never reads a new issue body)', () => {
@@ -881,7 +890,9 @@ describe('check-mention-routing.sh (hook)', () => {
       it('case 3 sister-case: self-labeled `gh pr create`, no mention → BLOCKED', () => {
         const r = runCreate('gh pr create --title "x" --label code-agent --body "Refs #1"');
         expect(r.status).toBe(2);
-        expect(r.stderr).toContain('skips a label applied by the agent it names');
+        expect(r.stderr).toContain(
+          'A label on a pull request does not route; only a mention in its body or in a comment does. Add a mention for whoever should read it.',
+        );
         expect(r.stderr).not.toContain('routing delivers it to');
       });
 
@@ -942,6 +953,84 @@ describe('check-mention-routing.sh (hook)', () => {
         const r = runCreate(PR);
         expect(r.status).toBe(0);
       });
+
+      it('each chained comment needs its own mention: comment(no mention) && comment(mention) is BLOCKED', () => {
+        const r = runCreate(
+          `${PR} && gh issue comment 5 --body "PR is up." && gh issue comment 6 --body "$(cat <<EOF\n@macf-science-agent[bot] ready\nEOF\n)"`,
+        );
+        expect(r.status).toBe(2);
+        expect(r.stderr).toContain('comment later in this command has no mention');
+      });
+
+      it('two chained comments that each carry a mention pass', () => {
+        const r = runCreate(
+          `${PR} && gh issue comment 5 --body "$(cat <<EOF\n@macf-science-agent[bot] one\nEOF\n)" && gh issue comment 6 --body "$(cat <<EOF\n@macf-science-agent[bot] two\nEOF\n)"`,
+        );
+        expect(r.status).toBe(0);
+      });
+    });
+
+    describe('a labeled issue create followed by a comment keeps the comment checked', () => {
+      it('issue create (peer label) && issue comment without a mention is BLOCKED', () => {
+        const r = runCreate(
+          'gh issue create --title "x" --label science-agent --body "b" && gh issue comment 5 --body "done"',
+        );
+        expect(r.status).toBe(2);
+        expect(r.stderr).toContain('comment later in this command has no mention');
+      });
+
+      it('issue create (peer label) && issue comment WITH a mention passes', () => {
+        const r = runCreate(
+          'gh issue create --title "x" --label science-agent --body "b" && gh issue comment 5 --body "$(cat <<EOF\n@macf-science-agent[bot] done\nEOF\n)"',
+        );
+        expect(r.status).toBe(0);
+      });
+    });
+
+    describe('create is detected only where a command starts', () => {
+      it('`gh pr create` whose body names `gh issue create` is not an issue create', () => {
+        const r = runCreate('gh pr create --title x --body "Fix gh issue create validation"');
+        expect(r.status).toBe(0);
+      });
+
+      it('a real `gh issue create` after && is still detected', () => {
+        const r = runCreate('cd /tmp && gh issue create --title x --body "b"');
+        expect(r.status).toBe(2);
+      });
+
+      it('a `bash -c` wrapped issue create is still detected', () => {
+        const r = runCreate(`bash -c "gh issue create --title x --body b"`);
+        expect(r.status).toBe(2);
+      });
+    });
+
+    describe('an unconfirmable peer label warns instead of blocking', () => {
+      it('auditor-like workspace (registry lists only auditor) filing a peer label → allowed with warning', () => {
+        writeFileSync(join(dir, '.github', 'agent-config.json'), JSON.stringify({ agents: { auditor: {} } }));
+        const r = runCreate('gh issue create --repo other/repo --title x --label science-agent --body b', {
+          MACF_ROUTING_LABEL: 'auditor',
+        });
+        expect(r.status).toBe(0);
+        const w = warningOf(r);
+        expect(w).toContain('could not confirm that label "science-agent" belongs to another agent');
+        expect(w).toContain("--repo is not this workspace's repo");
+      });
+
+      it('a --repo other than the workspace origin warns even when the registry matches', () => {
+        const r = runCreate('gh issue create --repo other/repo --title x --label science-agent --body b');
+        expect(r.status).toBe(0);
+        expect(warningOf(r)).toContain("--repo is not this workspace's repo");
+      });
+
+      it('unconfirmable with NO label still blocks', () => {
+        const r = runHook({ command: 'gh issue create --title x --body b' });
+        expect(r.status).toBe(2);
+      });
+
+      it('a readable registry for this repo with no matching label still blocks', () => {
+        const r = runCreate('gh issue create --title x --label docs --body b');
+        expect(r.status).toBe(2);
+      });
     });
 
     describe('registry / infrastructure edge cases', () => {
@@ -960,11 +1049,12 @@ describe('check-mention-routing.sh (hook)', () => {
         expect(r.status).toBe(2);
       });
 
-      it('no registry + a non-backlog label present → BLOCKED (can\'t confirm, falls to case 4)', () => {
+      it('no registry + a non-backlog label present → ALLOWED with a warning (the router may know it)', () => {
         const r = runHook({
           command: 'gh issue create --title "x" --label code-agent --body "no mention here"',
         });
-        expect(r.status).toBe(2);
+        expect(r.status).toBe(0);
+        expect(warningOf(r)).toContain('no .github/agent-config.json in this workspace');
       });
     });
 

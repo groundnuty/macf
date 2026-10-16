@@ -16,7 +16,7 @@ A comment with no routing-active `@mention` reaches nobody, so put the raw handl
 
 In a `--body` string, start the body with a newline before the handle, or use `--body-file`; the hook does not treat `--body "` as a line start.
 
-`gh issue create` needs an assignee label for another agent, or `backlog`. A mention in a new issue's body does not route, so the hook blocks a create without that label even when the body has a mention; to reach someone, mention them in a follow-up comment. A label naming yourself routes nowhere: the router skips a label applied by the agent it names.
+`gh issue create` needs an assignee label for another agent, or `backlog`. A mention in a new issue's body does not route, so the hook blocks a create without that label even when the body has a mention; to reach someone, mention them in a follow-up comment. A label naming yourself routes nowhere: the router skips a label applied by the agent it names. If it cannot confirm the label (no `.github/agent-config.json` here, or another `--repo`), it warns instead.
 
 ## Hook
 
