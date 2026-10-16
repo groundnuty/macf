@@ -363,6 +363,33 @@ describe('check-close-and-ping.sh (hook)', () => {
       });
       expect(parseAdditionalContext(r.stdout) ?? '').toContain('#7');
     });
+
+    describe('shell-wrapper boundary: the wrapper quote ends the invocation (Codex)', () => {
+      const stub = (n: number): StubMap => ({
+        [`repos/o/r/issues/${n}/timeline`]: { xrefs: [{ number: 9, repo: 'o/r', state: 'open' }] },
+      });
+      it("`bash -c '<close> 42 --repo o/r' && echo done` → 42 in o/r", () => {
+        const r = runHook({
+          command: "bash -c 'gh issue close 42 --repo o/r' && echo done",
+          stubGh: stub(42),
+        });
+        expect(parseAdditionalContext(r.stdout) ?? '').toContain('#42');
+      });
+      it('same with double quotes', () => {
+        const r = runHook({
+          command: 'bash -c "gh issue close 42 --repo o/r" && echo done',
+          stubGh: stub(42),
+        });
+        expect(parseAdditionalContext(r.stdout) ?? '').toContain('#42');
+      });
+      it('`sh -lc "…--comment \\"x && y\\"" ; echo z` → 7', () => {
+        const r = runHook({
+          command: 'sh -lc "gh issue close 7 --repo o/r --comment \\"x && y\\"" ; echo z',
+          stubGh: stub(7),
+        });
+        expect(parseAdditionalContext(r.stdout) ?? '').toContain('#7');
+      });
+    });
   });
 
   describe('wrapper / subshell bypass coverage (mirrors check-close-condition.sh)', () => {

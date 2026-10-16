@@ -176,6 +176,31 @@ if [[ ! "$JOINED_COMMAND" =~ $CLOSE_RE ]]; then
 fi
 MATCH_STR="${BASH_REMATCH[0]}"
 INVOCATION="${JOINED_COMMAND#"${JOINED_COMMAND%%"$MATCH_STR"*}"}"
+# Shell-wrapper form (`bash -c '…close…' && echo done`): the match consumed
+# the wrapper's OPENING quote, so the tail still carries its CLOSING quote,
+# which the tokenizer below would read as a new opening quote and swallow
+# ` && echo done` into a value. Cut the invocation at the wrapper quote's
+# matching close and tokenize only what is inside. `'…'` has no escapes;
+# `"…"` skips `\"` and `\\` (unescaped here so inner quotes tokenize).
+# Non-wrapper matches are untouched. (Duplicated in check-close-condition.sh.)
+WRAP_RE='(bash|sh|zsh)[[:space:]]+(-[a-zA-Z]+[[:space:]]+)*-[a-zA-Z]*c[[:space:]]+'
+if [[ "$MATCH_STR" =~ $WRAP_RE ]] && [[ "$INVOCATION" =~ $WRAP_RE ]]; then
+  WRAP_REST="${INVOCATION#*"${BASH_REMATCH[0]}"}"
+  WRAP_Q="${WRAP_REST:0:1}"
+  if [[ "$WRAP_Q" == "'" || "$WRAP_Q" == '"' ]]; then
+    WRAP_INNER=""
+    for ((wi = 1; wi < ${#WRAP_REST}; wi++)); do
+      wc="${WRAP_REST:wi:1}"
+      if [[ "$wc" == "$WRAP_Q" ]]; then break; fi
+      if [[ "$WRAP_Q" == '"' && "$wc" == $'\\' && "${WRAP_REST:wi+1:1}" =~ ^[\"\\]$ ]]; then
+        wi=$((wi + 1))
+        wc="${WRAP_REST:wi:1}"
+      fi
+      WRAP_INNER+="$wc"
+    done
+    INVOCATION="$WRAP_INNER"
+  fi
+fi
 GH_CLOSE_WORD='gh[[:space:]]+issue[[:space:]]+close([[:space:]]|$)'
 if [[ ! "$INVOCATION" =~ $GH_CLOSE_WORD ]]; then
   exit 0
