@@ -131,7 +131,8 @@
  */
 import { toVariableSegment } from '@groundnuty/macf-core';
 import type { FleetAgent, FleetLock, FleetManifest } from './fleet-manifest.js';
-import { buildTrustedActorsValue, deriveAppHandle, deriveControlRepoName, routerCarryingRepos } from './fleet-manifest.js';
+import { controlRepoRunnerItem } from './control-repo-runner.js';
+import { buildTrustedActorsValue, controlRepoSelfHosted, deriveAppHandle, deriveControlRepoName, routerCarryingRepos } from './fleet-manifest.js';
 import { formatTable } from '../commands/ps.js';
 import type { VaultAgentObservation, VaultCaObservation, VaultRecipientsObservation, VaultRouterAppObservation, VaultTsOauthObservation } from './vault-read.js';
 import { countVaultAgentPresence, countVaultCaPresence } from './vault-read.js';
@@ -470,6 +471,13 @@ export interface ObservedState {
   readonly orgSecretRepos?: Readonly<Record<string, RepoSecretNamesObservation>>;
   /** What the CONTROL repo's installed router caller passes under `secrets:` (sibling of `agents[role].callerSecrets`). */
   readonly controlRepoCallerSecrets?: CallerSecrets;
+  /** groundnuty/macf#1446 — control-repo runner observations; present ONLY when the manifest declares `routing.control_repo_runs_on`. */
+  readonly controlRepoRunnerRunsOn?: string;
+  readonly controlRepoCallerReadable?: boolean;
+  readonly controlRepoTrustedActors?: string;
+  readonly controlRepoRunnerRegistered?: Presence;
+  readonly controlRepoRunnerHandover?: string;
+  readonly controlRepoRunnerDetail?: string;
   /**
    * Vault-derived per-project CA key/cert presence (DR-043 Amendment D phase
    * 3) — same undefined-vs-observed convention as {@link ObservedAgentState.vault}.
@@ -3024,8 +3032,9 @@ export function computePlan(
   }
 
   // The control repo carries a router too (every agent App is installed
-  // there; its routing table lists the whole fleet), and its caller never
-  // declares a runner — so it runs hosted and needs the Tailscale pair.
+  // there; its routing table lists the whole fleet). Its caller declares a
+  // runner only when the manifest opts in (routing.control_repo_runs_on,
+  // #1446) — otherwise it runs hosted and needs the Tailscale pair.
   if (observed.controlRepoPresence === 'present') {
     const controlRepo = routerCarryingRepos(manifest).at(-1)!;
     items.push(
@@ -3035,9 +3044,23 @@ export function computePlan(
         observed.controlRepoCallerSecrets,
         observed.routingSecretRepos?.[controlRepo],
         observed.orgSecretRepos?.[controlRepo],
-        false,
+        controlRepoSelfHosted(manifest),
       ),
     );
+    // groundnuty/macf#1446 — the control repo's runner class, explicit, only
+    // when the manifest opts it in (no row at all otherwise).
+    if (controlRepoSelfHosted(manifest)) {
+      items.push(
+        controlRepoRunnerItem(fleetName, controlRepo, buildTrustedActorsValue(fleetName, manifest.agents), {
+          callerRunsOn: observed.controlRepoRunnerRunsOn,
+          callerReadable: observed.controlRepoCallerReadable ?? false,
+          trustedActors: observed.controlRepoTrustedActors,
+          runnerPresence: observed.controlRepoRunnerRegistered,
+          runnerHandover: observed.controlRepoRunnerHandover,
+          runnerDetail: observed.controlRepoRunnerDetail,
+        }),
+      );
+    }
   }
 
   items.push(caRegistryItem(seg, observed.caRegistry, observed.vaultCa));

@@ -61,6 +61,8 @@ import { caCertVariableName } from './apply-ca.js';
 // "a parallel read is a hazard" requirement).
 import { extractCallerWithKeys } from './runner-declaration-reach.js';
 import { extractCallerSecrets } from './router-caller-secrets.js';
+import { extractRunnerRunsOnInput } from './control-repo-runner.js';
+import { controlRepoSelfHosted } from './fleet-manifest.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -1842,6 +1844,12 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
       ? await readOrgSecrets(controlRepoFullNameHere)
       : { status: 'unknown', reason: `control repo "${controlRepoFullNameHere}" presence unconfirmed this run` };
 
+  // groundnuty/macf#1446 — control-repo runner reads, gated on the opt-in so an
+  // undeclared fleet makes zero new calls.
+  const controlSelfHosted = controlRepoSelfHosted(manifest) && controlRepoMeta.presence === 'present';
+  const controlRunnerUsability = controlSelfHosted ? await checkRunnerUsableByRepo(controlRepoFullNameHere) : undefined;
+  const controlRepoTrustedActors = controlSelfHosted ? await readRepoVariable(controlRepoFullNameHere, 'MACF_TRUSTED_ACTORS') : undefined;
+
   return {
     lock,
     lockSource,
@@ -1862,6 +1870,16 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
     controlRepoArchived: controlRepoMeta.archived,
     controlRepoActionsPin,
     controlRepoCallerSecrets,
+    ...(controlSelfHosted
+      ? {
+          controlRepoRunnerRunsOn: controlRouterContent === undefined ? undefined : extractRunnerRunsOnInput(controlRouterContent),
+          controlRepoCallerReadable: controlRouterContent !== undefined,
+          controlRepoTrustedActors,
+          controlRepoRunnerRegistered: controlRunnerUsability?.presence,
+          controlRepoRunnerHandover: controlRunnerUsability?.handover,
+          controlRepoRunnerDetail: controlRunnerUsability?.detail,
+        }
+      : {}),
   };
 }
 

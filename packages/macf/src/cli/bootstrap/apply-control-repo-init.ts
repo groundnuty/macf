@@ -122,6 +122,7 @@
 import { existsSync } from 'node:fs';
 import type { TokenSource } from '@groundnuty/macf-core';
 import type { FleetLock, FleetManifest } from './fleet-manifest.js';
+import { controlRepoSelfHosted } from './fleet-manifest.js';
 import type { LabelsOutcome } from '../commands/repo-init.js';
 import { repoInit as realRepoInit } from '../commands/repo-init.js';
 import { DEFAULT_ACTIONS_VERSION, repoInitRegistryOptions } from './apply-repo-init.js';
@@ -375,6 +376,10 @@ export async function applyControlRepoInit(
       // the caller resolved none, so `generateToken()`'s pre-#1221 fallback
       // chain is unchanged for that case.
       ...(opts?.tokenSource !== undefined ? { tokenSource: opts.tokenSource } : {}),
+      // groundnuty/macf#1446 — the control repo routes self-hosted ONLY when
+      // the manifest opts it in (`routing.control_repo_runs_on`); otherwise
+      // the call is byte-identical to before (no `runner-runs-on` line).
+      ...(controlRepoSelfHosted(manifest) ? { routingRunnerRunsOn: 'self-hosted' } : {}),
       ...registryOpts,
     });
     return {
