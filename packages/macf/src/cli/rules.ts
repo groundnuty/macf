@@ -202,6 +202,7 @@ const FRONTMATTER_RE = /^---[ \t]*\r?\n[\s\S]*?\r?\n---[ \t]*(?:\r?\n|$)/;
  */
 export const RETIRED_CANONICAL_RULES: readonly string[] = [
   'check-before-propose.md',
+  'codify-at-correction-time.md',
   'execute-on-directive.md',
   'model-era-compatibility.md',
 ];

@@ -645,13 +645,13 @@ describe('check-mention-routing.sh (hook)', () => {
       expect(r.status).toBe(0);
     });
 
-    it('block message cites coordination.md §Communication 2', () => {
+    it('block message cites coordination.md §Communication 1', () => {
       const r = runHook({
         command: 'gh issue comment 123 --body "no mention here"',
       });
       expect(r.status).toBe(2);
       expect(r.stderr).toContain('coordination.md');
-      expect(r.stderr).toContain('Communication 2');
+      expect(r.stderr).toContain('Communication 1');
     });
 
     it('block message includes example fix + override hint', () => {

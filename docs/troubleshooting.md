@@ -183,9 +183,9 @@ EOF
 
 ## Check A blocking legitimate use
 
-**Symptom:** `gh issue comment <N> --body "..."` blocks with `BLOCKED by MACF mention-routing-hygiene hook: this comment has zero routing-active @<bot>[bot] mentions. Per coordination.md §Communication 2: "@mention in EVERY comment. Routing depends on it. A comment without @mention is invisible to the recipient agent."`.
+**Symptom:** `gh issue comment <N> --body "..."` blocks with `BLOCKED by MACF mention-routing-hygiene hook: this comment has zero routing-active @<bot>[bot] mentions. Per coordination.md §Communication 1: "Put an @mention in every comment, because routing depends on it. A comment that only closes your own issue needs none."`.
 
-**Diagnosis:** the comment body has no addressing-active `@<bot>[bot]` mention (or only backticked describing-form mentions, which are routing-suppressed). Per [`coordination.md` §Communication 2](../packages/macf/plugin/rules/coordination.md), comments without addressing don't reach peers — they're silently invisible.
+**Diagnosis:** the comment body has no addressing-active `@<bot>[bot]` mention (or only backticked describing-form mentions, which are routing-suppressed). Per [`coordination.md` §Communication 1](../packages/macf/plugin/rules/coordination.md), comments without addressing don't reach peers — they're silently invisible.
 
 **Fix:** add an addressing mention to the recipient peer:
 

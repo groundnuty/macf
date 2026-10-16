@@ -916,7 +916,7 @@ describe('applyAgentIdentity — resumed-gate instruction reuses the pre-flight 
   });
 
   // groundnuty/macf#1178 — THE decisive test. Per assert-the-wrong-path.md
-  // (two triggers) and the authoring check codify-at-correction-time.md
+  // (two triggers) and the authoring check (design/rule-authoring.md)
   // added: a test that fakes `startInstallInterstitial` and asserts "the
   // fake was called" cannot reproduce the live failure #1175 found — the
   // page opened, but was gone before it could be fetched, three times,

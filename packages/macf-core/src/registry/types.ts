@@ -25,7 +25,7 @@ export const AgentInfoSchema = z.object({
    * ADDITIVE-OPTIONAL: the registry KEY is (and stays) `routing_label`
    * (`MACF_ROUTING_LABEL`, defaulting to `agent_name` when unset — see
    * `config.ts`), so this field records a SECOND name, not a replacement.
-   * The two are allowed to differ by design (`coordination.md` §tmux launch
+   * The two are allowed to differ by design (`design/agent-launch-and-sandbox.md` §tmux sessions
    * — e.g. science: `agent_name=macf-science-agent`,
    * `routing_label=science-agent`) and OTEL's `gen_ai.agent.name` carries
    * `agent_name`, not the routing label.

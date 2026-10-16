@@ -17,7 +17,7 @@ not here.
 
 ## The exception: `rules/` IS canonical here
 
-`packages/macf/plugin/rules/` (coordination.md, delegation-template.md,
+`packages/macf/plugin/rules/` (coordination.md, reflection-staging.md,
 silent-fallback-hazards.md, …) is the single source of truth — the CLI's
 `rules.ts` distributes it into each workspace's `.claude/rules/` at
 `macf init` / `macf update` / `macf rules refresh`. Edit rules HERE.

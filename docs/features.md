@@ -201,7 +201,6 @@ The routing-Action's HTTP 200 from the channel server is the result-invariant as
 | `verify-before-claim.md` | Quote literal output, re-query state before asserting it, cite from a fetched `origin/main`, re-run a peer's evidence |
 | `gh-token-attribution-traps.md` | Class catalog of attribution-trap recurrences; cross-references the structural defense (`check-gh-token.sh`) |
 | `observability-wiring.md` | Path-scoped (launcher and env files): the exported OTel variable set, opt-out, and checking that traces arrive |
-| `codify-at-correction-time.md` | When discipline gets corrected mid-flow, codify the rule before continuing — prevents recurrence drift |
 
 The `coordination.md` file is the most-cited; it's the single source of truth for cross-cutting rules. Agents read it session-loaded and on `macf rules refresh`.
 
@@ -209,7 +208,6 @@ The `coordination.md` file is the most-cited; it's the single source of truth fo
 
 - `pr-discipline.md` formal-review-submission requirement ([#297](https://github.com/groundnuty/macf/pull/297)) — agents must use `gh pr review --approve` for LGTM (not `gh pr comment`); engages the `route-by-pr-review-state` Path-2 defense
 - `silent-fallback-hazards.md` canonicalization ([#294](https://github.com/groundnuty/macf/pull/294)) — 8-instance hazard class + Pattern A-E defenses
-- `coordination.md §Issue Lifecycle 1` Inversion warning ([#304](https://github.com/groundnuty/macf/pull/304)) — closure-direction independence from fix-authorship; 4-case enumeration for `{filed, implemented} × {self, peer}`
 - `mention-routing-hygiene.md` §7 broadened scope ([#301](https://github.com/groundnuty/macf/pull/301)) — fleet-agnostic HANDLE_PATTERN
 - `mention-routing-hygiene.md` §7 4-space-indent mechanism clarification ([#299](https://github.com/groundnuty/macf/pull/299)) — addressing-allowance vs code-block-recognition
 
