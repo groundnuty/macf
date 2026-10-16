@@ -61,7 +61,8 @@ if [[ "$1" == "issue" && "$2" == "view" ]]; then
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --repo) repo="$2"; shift 2 ;;
-      *) shift ;;
+      --json) shift 2 ;;
+      *) echo "stub gh: unexpected extra arg: $1" >&2; exit 1 ;;
     esac
   done
   key="\${repo}#\${num}"
@@ -292,6 +293,117 @@ describe('check-close-condition.sh (hook)', () => {
       const r = runHook({ command: 'gh issue close --repo groundnuty/macf' });
       expect(r.status).toBe(0);
       expect(r.stdout.trim()).toBe('');
+    });
+  });
+
+  describe('multi-line commands — target comes from the close line only (#1453)', () => {
+    const MULTI = [
+      'gh pr view 1449 --repo groundnuty/macf --json state',
+      'echo "  #1449: merged"',
+      'gh issue close 1448 --repo groundnuty/macf --comment "done"',
+    ].join('\n');
+
+    it('takes the number after `close`, not an earlier `gh pr view` / `echo "#N"` line', () => {
+      const r = runHook({
+        command: MULTI,
+        // Only 1448 is stubbed with a condition; any lookup of 1449 (or 1) fails the stub.
+        stubGh: { 'groundnuty/macf#1448': { body: SECTION_BODY } },
+      });
+      const ctx = parseAdditionalContext(r.stdout) ?? '';
+      expect(ctx).toContain('#1448');
+      expect(ctx).toContain(CONDITION_MARKER);
+      expect(ctx).not.toContain('#1449');
+    });
+
+    it('single-line close behaves as before', () => {
+      const r = runHook({
+        command: 'gh issue close 1448 --repo groundnuty/macf',
+        stubGh: { 'groundnuty/macf#1448': { body: SECTION_BODY } },
+      });
+      expect(parseAdditionalContext(r.stdout) ?? '').toContain('#1448');
+    });
+
+    it('`bash -c "gh issue close 42 ..."` targets 42', () => {
+      const r = runHook({
+        command: 'echo "#7"\nbash -c "gh issue close 42 --repo groundnuty/macf"',
+        stubGh: { 'groundnuty/macf#42': { body: SECTION_BODY } },
+      });
+      expect(parseAdditionalContext(r.stdout) ?? '').toContain('#42');
+    });
+
+    it('takes --repo from the close line, not an earlier line', () => {
+      const r = runHook({
+        command: 'gh pr view 5 --repo other/repo\ngh issue close 1448 --repo groundnuty/macf',
+        stubGh: { 'groundnuty/macf#1448': { body: SECTION_BODY } },
+      });
+      expect(parseAdditionalContext(r.stdout) ?? '').toContain(CONDITION_MARKER);
+    });
+
+    it('a quoted --comment holding a literal newline BEFORE the number still resolves (Codex)', () => {
+      const r = runHook({
+        command: 'gh issue close --comment "done\nverified" 42 --repo o/r',
+        stubGh: { 'o/r#42': { body: SECTION_BODY } },
+      });
+      const ctx = parseAdditionalContext(r.stdout) ?? '';
+      expect(ctx).toContain('#42');
+      expect(ctx).toContain(CONDITION_MARKER);
+    });
+
+    it('numbers inside a --comment value are never the target', () => {
+      const r = runHook({
+        command: 'gh issue close 7 --comment "see #1449 and 88" --repo groundnuty/macf',
+        stubGh: { 'groundnuty/macf#7': { body: SECTION_BODY } },
+      });
+      const ctx = parseAdditionalContext(r.stdout) ?? '';
+      expect(ctx).toContain('#7');
+      expect(ctx).toContain(CONDITION_MARKER);
+    });
+
+    it('stops at `&&`: a later command\'s number and --repo are never read', () => {
+      const r = runHook({
+        command: 'gh issue close 7 --repo groundnuty/macf && gh pr view 99 --repo other/repo',
+        stubGh: { 'groundnuty/macf#7': { body: SECTION_BODY } },
+      });
+      const ctx = parseAdditionalContext(r.stdout) ?? '';
+      expect(ctx).toContain('#7');
+      expect(ctx).toContain(CONDITION_MARKER);
+    });
+
+    describe('shell-wrapper boundary: the wrapper quote ends the invocation (Codex)', () => {
+      it("`bash -c '<close> 42 --repo o/r' && echo done` → 42 in o/r", () => {
+        const r = runHook({
+          command: "bash -c 'gh issue close 42 --repo o/r' && echo done",
+          stubGh: { 'o/r#42': { body: SECTION_BODY } },
+        });
+        const ctx = parseAdditionalContext(r.stdout) ?? '';
+        expect(ctx).toContain('#42');
+        expect(ctx).toContain(CONDITION_MARKER);
+      });
+      it('same with double quotes', () => {
+        const r = runHook({
+          command: 'bash -c "gh issue close 42 --repo o/r" && echo done',
+          stubGh: { 'o/r#42': { body: SECTION_BODY } },
+        });
+        expect(parseAdditionalContext(r.stdout) ?? '').toContain(CONDITION_MARKER);
+      });
+      it('`sh -lc "…--comment \\"x && y\\"" ; echo z` → 7', () => {
+        const r = runHook({
+          command: 'sh -lc "gh issue close 7 --repo o/r --comment \\"x && y\\"" ; echo z',
+          stubGh: { 'o/r#7': { body: SECTION_BODY } },
+        });
+        const ctx = parseAdditionalContext(r.stdout) ?? '';
+        expect(ctx).toContain('#7');
+        expect(ctx).toContain(CONDITION_MARKER);
+      });
+      it("a close AFTER an unrelated wrapper (`bash -c 'echo hello' && <close> 42`) is still found (Codex)", () => {
+        const r = runHook({
+          command: "bash -c 'echo hello' && gh issue close 42 --repo o/r",
+          stubGh: { 'o/r#42': { body: SECTION_BODY } },
+        });
+        const ctx = parseAdditionalContext(r.stdout) ?? '';
+        expect(ctx).toContain('#42');
+        expect(ctx).toContain(CONDITION_MARKER);
+      });
     });
   });
 
