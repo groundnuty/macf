@@ -434,7 +434,7 @@ describe('runRoutingE2eCore — which router run is the probe\'s (never a guess)
   const run = (id: number): RoutingE2eRouterRun => ({ found: true, id, conclusion: 'success', status: 'completed', url: `https://example.test/run/${String(id)}` });
   const mentionDeps = (logs: Record<number, string>, runs: readonly RoutingE2eRouterRun[]): RoutingE2eDeps =>
     evidenceDeps({
-      listRouterRuns: vi.fn(async () => runs),
+      listRouterRuns: vi.fn(async () => ({ ok: true as const, runs })),
       readRunLog: vi.fn(async (_r: string, id: number): Promise<TextRead> => ({ kind: 'ok', text: logs[id] ?? '' })),
       postMention: vi.fn(async () => ({ ok: true as const, url: 'https://example.test/c' })),
       readTargetRoutingConfig: vi.fn(async (): Promise<RoutingConfig | null> => ({ agents: { 'science-agent': { app_name: 'macf-science-agent' } } })),

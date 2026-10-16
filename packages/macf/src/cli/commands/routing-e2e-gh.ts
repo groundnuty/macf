@@ -14,7 +14,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import type { TextRead } from './routing-e2e-evidence.js';
-import type { RoutingE2eCreateIssueResult, RoutingE2eLabelResult, RoutingE2eRouterRun } from './routing-e2e.js';
+import type { RoutingE2eCreateIssueResult, RoutingE2eLabelResult, RoutingE2eRouterRun, RoutingE2eRunListing } from './routing-e2e.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -119,7 +119,7 @@ export function createIssueCloser(token: string): (repo: string, issueNumber: nu
  * event's own `cleanup-labels` run (a DIFFERENT job, gated on `action ==
  * 'closed'`, never re-notifies — verified against the live workflow source)
  * can never be mistaken for the one the label triggered. NEVER throws;
- * degrades to `found: false` on any read failure (repo has no
+ * a read failure returns `found: false` WITH `error` set (repo has no
  * `agent-router.yml`, auth failure, network error).
  */
 export function createRouterRunFinder(
@@ -132,6 +132,8 @@ export function createRouterRunFinder(
         'gh',
         [
           'api',
+          '--method',
+          'GET',
           `repos/${repo}/actions/workflows/agent-router.yml/runs`,
           '-f',
           `event=${event}`,
@@ -156,8 +158,9 @@ export function createRouterRunFinder(
       const run = candidates[0];
       if (!run) return { found: false, conclusion: null, status: null, url: null };
       return { found: true, id: run.id, conclusion: run.conclusion, status: run.status, url: run.html_url };
-    } catch {
-      return { found: false, conclusion: null, status: null, url: null };
+    } catch (err) {
+      // Could not read ≠ no run: carry the error so the caller says "unknown".
+      return { found: false, conclusion: null, status: null, url: null, error: errMessage(err) };
     }
   };
 }
@@ -225,29 +228,30 @@ export async function readLocalLog(path: string): Promise<TextRead> {
 /**
  * EVERY router run for `event` created no earlier than 5 s before `sinceIso`,
  * oldest first (the finder above returns only the first). Used to disambiguate
- * concurrent runs by their logs. NEVER throws; degrades to `[]`.
+ * concurrent runs by their logs. NEVER throws; a read failure is `{ ok: false }`, never `[]`.
  */
 export function createRouterRunLister(
   token: string,
-): (repo: string, sinceIso: string, event: 'issues' | 'issue_comment') => Promise<readonly RoutingE2eRouterRun[]> {
+): (repo: string, sinceIso: string, event: 'issues' | 'issue_comment') => Promise<RoutingE2eRunListing> {
   const env = { ...process.env, GH_TOKEN: token };
   return async (repo, sinceIso, event) => {
     try {
       const { stdout } = await execFileAsync(
         'gh',
-        ['api', `repos/${repo}/actions/workflows/agent-router.yml/runs`, '-f', `event=${event}`, '-f', 'per_page=20', '--jq', '.workflow_runs'],
+        ['api', '--method', 'GET', `repos/${repo}/actions/workflows/agent-router.yml/runs`, '-f', `event=${event}`, '-f', 'per_page=20', '--jq', '.workflow_runs'],
         { encoding: 'utf-8', env, maxBuffer: 4 * 1024 * 1024 },
       );
       const runs = JSON.parse(stdout) as readonly {
         id: number; conclusion: string | null; status: string; created_at: string; html_url: string;
       }[];
       const sinceMs = Date.parse(sinceIso) - RUN_LOOKBACK_BUFFER_MS;
-      return runs
+      const listed = runs
         .filter((r) => Date.parse(r.created_at) >= sinceMs)
         .sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at))
         .map((r) => ({ found: true, id: r.id, conclusion: r.conclusion, status: r.status, url: r.html_url }));
-    } catch {
-      return [];
+      return { ok: true, runs: listed };
+    } catch (err) {
+      return { ok: false, error: errMessage(err) };
     }
   };
 }

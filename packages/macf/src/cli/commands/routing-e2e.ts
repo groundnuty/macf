@@ -184,7 +184,14 @@ export interface RoutingE2eRouterRun {
   readonly conclusion: string | null;
   readonly status: string | null;
   readonly url: string | null;
+  /** Set when the runs could NOT be listed (found:false then means "unknown", not "none"). */
+  readonly error?: string;
 }
+
+/** Listed (possibly none) vs could not list — never conflated. */
+export type RoutingE2eRunListing =
+  | { readonly ok: true; readonly runs: readonly RoutingE2eRouterRun[] }
+  | { readonly ok: false; readonly error: string };
 
 export interface RoutingE2eResult {
   readonly verdict: RoutingE2eVerdict;
@@ -241,7 +248,7 @@ export interface RoutingE2eDeps {
     repo: string,
     sinceIso: string,
     event: 'issues' | 'issue_comment',
-  ) => Promise<readonly RoutingE2eRouterRun[]>;
+  ) => Promise<RoutingE2eRunListing>;
   /**
    * When present, delivery is judged from EVIDENCE (the router run's log +
    * a receiver receipt) and never from the run's conclusion. Production
@@ -561,12 +568,20 @@ export async function runRoutingE2eCore(
 
   const labeledAtIso = new Date(now()).toISOString();
   const maxPolls = deps.maxPolls ?? deriveMaxPolls(opts.timeoutSec);
-  const healthPolls = mode === 'label' ? maxPolls : 0;
   const intervalMs = deps.pollIntervalMs ?? DEFAULT_E2E_POLL_INTERVAL_MS;
+  // ONE deadline for the whole evidence wait (health stage + run stage):
+  // neither stage may start a fresh budget. `polls` is the same budget in
+  // poll units, shared too, so a frozen clock cannot loop forever.
+  const waitStart = now();
+  const budgetMs = opts.timeoutSec !== undefined && deps.maxPolls === undefined ? opts.timeoutSec * 1000 : (maxPolls - 1) * intervalMs;
+  const deadline = waitStart + budgetMs;
+  let polls = 0;
+  const budgetLeft = (): boolean => polls < maxPolls && now() < deadline;
 
   let everReachable = false;
   let delivered = false;
-  for (let i = 0; i < healthPolls; i++) {
+  while (mode === 'label' && (polls === 0 || budgetLeft())) {
+    polls++;
     const health = await deps.probe(targetInfo.host, targetInfo.port);
     if (health !== null) {
       everReachable = true;
@@ -575,22 +590,48 @@ export async function runRoutingE2eCore(
         break;
       }
     }
-    if (i < healthPolls - 1) await sleep(intervalMs);
+    if (!budgetLeft()) break;
+    await sleep(intervalMs);
   }
 
   if (deps.readRunLog) {
     const event = mode === 'label' ? 'issues' : 'issue_comment';
-    const listRuns = async (): Promise<readonly RoutingE2eRouterRun[]> => {
+    const listRuns = async (): Promise<RoutingE2eRunListing> => {
       if (deps.listRouterRuns) return deps.listRouterRuns(repo, labeledAtIso, event);
       const one = await deps.findRouterRun(repo, labeledAtIso, event);
-      return one.found ? [one] : [];
+      if (one.error !== undefined) return { ok: false, error: one.error };
+      return { ok: true, runs: one.found ? [one] : [] };
     };
-    let runs: readonly RoutingE2eRouterRun[] = [];
-    for (let i = 0; i < maxPolls; i++) {
-      runs = await listRuns();
-      if (runs.length > 0 && runs.every((r) => r.status === 'completed')) break;
-      if (i < maxPolls - 1) await sleep(intervalMs);
+    let listing: RoutingE2eRunListing = { ok: true, runs: [] };
+    for (let first = true; first || budgetLeft(); first = false) {
+      polls++;
+      listing = await listRuns();
+      if (listing.ok && listing.runs.length > 0 && listing.runs.every((r) => r.status === 'completed')) break;
+      if (!budgetLeft()) break;
+      await sleep(intervalMs);
     }
+    if (!listing.ok) {
+      const s = `router runs could not be listed: ${listing.error}`;
+      const ev: EvidenceVerdictResult = {
+        verdict: 'unknown',
+        summary: s,
+        stages: [
+          { name: 'router-run', status: 'unknown', detail: s },
+          { name: 'routed-line', status: 'skipped', detail: 'no run list to read' },
+          { name: 'receiver', status: 'skipped', detail: 'not evaluated' },
+        ],
+        gaps: [s],
+      };
+      const done = await finish({
+        verdict: 'RED',
+        stage: 'delivery_unverifiable',
+        message: s,
+        everReachable,
+        routerRun: null,
+      });
+      return { ...done, evidence: ev };
+    }
+    const runs = listing.runs;
     const candidates = [];
     for (const r of runs) {
       candidates.push({ run: r, log: r.id !== undefined && r.status === 'completed' ? await deps.readRunLog(repo, r.id) : null });
@@ -654,6 +695,15 @@ export async function runRoutingE2eCore(
   }
 
   const routerRun = await deps.findRouterRun(repo, labeledAtIso);
+  if (routerRun.error !== undefined) {
+    return finish({
+      verdict: 'RED',
+      stage: 'delivery_unverifiable',
+      message: `router runs could not be listed: ${routerRun.error}`,
+      everReachable,
+      routerRun: null,
+    });
+  }
   if (!routerRun.found) {
     return finish({
       verdict: 'RED',
