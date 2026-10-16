@@ -108,7 +108,9 @@ COMMAND="$(jq -r '.tool_input.command // ""' <<<"$INPUT_JSON" 2>/dev/null || ech
 #   gh issue close      gh pr close      (only when --comment is present;
 #                                          plain close has no body)
 #   gh issue create      gh pr create    (groundnuty/macf#1091)
-GH_COMMENT_PATTERN='(^|[[:space:];|&])(sudo[[:space:]]+|env[[:space:]]+([A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+)*|watch[[:space:]]+|ionice[[:space:]]+|setsid[[:space:]]+|nice[[:space:]]+|time[[:space:]]+|[A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+)*gh[[:space:]]+(issue|pr)[[:space:]]+(comment|close|create)([[:space:]]|$)'
+# One wrapper list feeds both this detector and the segment detector below.
+WRAP_LIST='sudo[[:space:]]+|env[[:space:]]+([A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+)*|watch[[:space:]]+|ionice[[:space:]]+|setsid[[:space:]]+|nice[[:space:]]+|time[[:space:]]+|[A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+'
+GH_COMMENT_PATTERN='(^|[[:space:];|&])('"$WRAP_LIST"')*gh[[:space:]]+(issue|pr)[[:space:]]+(comment|close|create)([[:space:]]|$)'
 
 # Shell-wrapper bypass: catches `bash -c "gh issue comment ..."` and
 # variants. Same flag-handling logic as check-gh-token.sh.
@@ -147,7 +149,7 @@ fi
 # (command start, or after ; | & ( or a newline, optionally behind sudo /
 # env VAR=x / VAR=x / bash -c "), so prose in a body that names the command
 # never triggers it.
-SEG_WRAP='(sudo[[:space:]]+|env[[:space:]]+([A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+)*|[A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+|(bash|sh|zsh)[[:space:]]+-c[[:space:]]+["'"'"'])*'
+SEG_WRAP='('"$WRAP_LIST"'|(bash|sh|zsh)[[:space:]]+-c[[:space:]]+["'"'"'])*'
 SEG_SEP='[;|&(]|'$'\n'
 macf_has_segment_cmd() {
   local re='(^|'"$SEG_SEP"')[[:space:]]*'"$SEG_WRAP"'gh[[:space:]]+'"$1"'([[:space:]]|$)'
@@ -293,14 +295,33 @@ if [[ "$IS_CREATE_SUBCOMMAND" == "true" ]]; then
       [[ "$tok" == "backlog" ]] && CREATE_HAS_BACKLOG_LABEL=true
     done
 
+    # The self check needs no registry: own label present and no other
+    # agent-ish label (in the registry, or named *-agent) means the router
+    # skips it and nobody else is named.
+    if [[ -n "${MACF_ROUTING_LABEL:-}" ]]; then
+      self_present=false
+      other_agentish=false
+      for tok in "${EXTRACTED_LABELS[@]}"; do
+        if [[ "$tok" == "${MACF_ROUTING_LABEL}" ]]; then
+          self_present=true
+        elif [[ "$tok" != "backlog" ]]; then
+          if [[ "$tok" == *-agent ]]; then other_agentish=true; fi
+          for rl in ${ROUTING_LABELS[@]+"${ROUTING_LABELS[@]}"}; do
+            [[ "$tok" == "$rl" ]] && other_agentish=true
+          done
+        fi
+      done
+      if [[ "$self_present" == "true" ]] && [[ "$other_agentish" == "false" ]]; then
+        CREATE_CONFIRMED_SELF_LABEL=true
+      fi
+    fi
+
     if [[ "${#ROUTING_LABELS[@]}" -gt 0 ]]; then
       for tok in "${EXTRACTED_LABELS[@]}"; do
         for rl in "${ROUTING_LABELS[@]}"; do
           if [[ "$tok" == "$rl" ]]; then
             CREATE_MATCHED_LABELS+="${CREATE_MATCHED_LABELS:+, }$tok"
-            if [[ -n "${MACF_ROUTING_LABEL:-}" ]] && [[ "$tok" == "${MACF_ROUTING_LABEL}" ]]; then
-              CREATE_CONFIRMED_SELF_LABEL=true
-            elif [[ -n "${MACF_ROUTING_LABEL:-}" ]] && [[ "$TARGET_IS_OWN" == "true" ]]; then
+            if [[ -n "${MACF_ROUTING_LABEL:-}" ]] && [[ "$tok" != "${MACF_ROUTING_LABEL}" ]] && [[ "$TARGET_IS_OWN" == "true" ]]; then
               CREATE_CONFIRMED_PEER_LABEL=true
             fi
             # $MACF_ROUTING_LABEL unset: a real assignee label matched, but
@@ -346,10 +367,11 @@ elif [[ "$HAS_ISSUE_CREATE" == "true" ]]; then
     # warning, because the router reads the target repo's registry.
     ALL_LABELS_JOINED=""
     for tok in ${EXTRACTED_LABELS[@]+"${EXTRACTED_LABELS[@]}"}; do
+      [[ -n "${MACF_ROUTING_LABEL:-}" ]] && [[ "$tok" == "${MACF_ROUTING_LABEL}" ]] && continue
       ALL_LABELS_JOINED+="${ALL_LABELS_JOINED:+, }$tok"
     done
     UNCONFIRMED_REASON=""
-    if [[ -z "$ALL_LABELS_JOINED" ]] || [[ "$CREATE_CONFIRMED_SELF_LABEL" == "true" ]]; then
+    if [[ "${#EXTRACTED_LABELS[@]}" -eq 0 ]] || [[ "$CREATE_CONFIRMED_SELF_LABEL" == "true" ]]; then
       ISSUE_CREATE_UNROUTED=true
     elif [[ "$REGISTRY_READABLE" != "true" ]]; then
       UNCONFIRMED_REASON="no .github/agent-config.json in this workspace"
@@ -361,12 +383,8 @@ elif [[ "$HAS_ISSUE_CREATE" == "true" ]]; then
       ISSUE_CREATE_UNROUTED=true
     fi
     if [[ -n "$UNCONFIRMED_REASON" ]]; then
-      ISSUE_CREATE_WARNING="The hook could not confirm that label \"$ALL_LABELS_JOINED\" belongs to another agent ($UNCONFIRMED_REASON). If \"$ALL_LABELS_JOINED\" is an agent label in the target repo, the router delivers it; if not, add one."
+      ISSUE_CREATE_WARNING="The hook could not confirm that any of these labels belongs to another agent: $ALL_LABELS_JOINED ($UNCONFIRMED_REASON). If one of them is another agent's label in the target repo, the router delivers the issue. If none is, add one with gh issue edit <N> --add-label <label>; adding a label after the issue exists still routes it."
     fi
-  fi
-  # A comment chained after the create is a separate segment and needs a mention.
-  if [[ -n "$CHAIN_COMMENT_TAIL" ]]; then
-    CHECK_A_APPLIES=true
   fi
 elif [[ "$IS_CREATE_SUBCOMMAND" == "true" ]]; then
   # PR create only. A PR body mention does route (pull_request event).
@@ -381,10 +399,6 @@ elif [[ "$IS_CREATE_SUBCOMMAND" == "true" ]]; then
     # the canonical PR call, its routing signal is the review state, and
     # blocking it cannot be recovered mid-session.
     CHECK_A_APPLIES=false
-  fi
-  # A chained comment is a separate segment and always needs a mention.
-  if [[ -n "$CHAIN_COMMENT_TAIL" ]]; then
-    CHECK_A_APPLIES=true
   fi
 fi
 
@@ -564,6 +578,70 @@ macf_extract_heredoc_body() {
   return 0
 }
 
+HANDLE_PATTERN='@[a-zA-Z][a-zA-Z0-9_-]*[[]bot[]]'
+
+# --- Chained comments: each is judged against its own body -----------------
+# Counts routing-active mentions (not backticked) in the text on stdin.
+macf_count_active() {
+  awk -v pat="$HANDLE_PATTERN" '
+    { l = $0; a = 0
+      while (match(l, pat)) {
+        s = a + RSTART; b = (s > 1) ? substr($0, s - 1, 1) : ""; c = substr($0, s + RLENGTH, 1)
+        if (!(b == "`" && c == "`")) n++
+        l = substr(l, RSTART + RLENGTH); a = s + RLENGTH - 1
+      } }
+    END { print n + 0 }'
+}
+
+# Prints the mention count of one chained comment's own body: its --body-file
+# (readable now, or a quoted heredoc in this command) or else its own text.
+# Prints nothing when its file cannot be resolved.
+macf_chain_segment_count() {
+  local seg="$1" re='--body-file(=|[[:space:]]+)([^[:space:]]+)' raw path body
+  if [[ "$seg" =~ $re ]]; then
+    raw="${BASH_REMATCH[2]}"
+    raw="${raw%\"}"; raw="${raw#\"}"; raw="${raw%\'}"; raw="${raw#\'}"
+    path="$(macf_resolve_path_vars "$raw")"
+    if [[ -n "$path" ]] && [[ -f "$path" ]] && [[ -r "$path" ]]; then
+      macf_count_active <"$path"
+    elif body="$(macf_extract_heredoc_body "$raw" "$COMMAND")"; then
+      macf_count_active <<<"$body"
+    fi
+    return 0
+  fi
+  macf_count_active <<<"$seg"
+}
+
+if [[ -n "$CHAIN_COMMENT_TAIL" ]]; then
+  seg_rest="$CHAIN_COMMENT_TAIL"
+  seg_guard=0
+  while [[ -n "$seg_rest" ]] && [[ "$seg_guard" -lt 50 ]]; do
+    seg_guard=$((seg_guard + 1))
+    seg_body="${seg_rest:1}"
+    if [[ "$seg_body" =~ $CHAIN_NEXT_RE ]]; then
+      seg_next="${BASH_REMATCH[0]}"
+      seg_head="${seg_body%%"$seg_next"*}"
+      seg="${seg_rest:0:1}$seg_head"
+      seg_rest="${seg_body#"$seg_head"}"
+    else
+      seg="$seg_rest"
+      seg_rest=""
+    fi
+    seg_count="$(macf_chain_segment_count "$seg")"
+    if [[ "$seg_count" == "0" ]]; then
+      cat >&2 <<ERR
+BLOCKED by MACF mention-routing-hygiene hook: A comment chained after the create has no mention. Each chained comment needs its own mention of whoever should read it; neither the create nor the other comments cover it.
+
+Add a line starting with the recipient's handle to that comment's body:
+  @<recipient-handle>[bot] <your message>
+
+The override (MACF_SKIP_MENTION_CHECK=1) is operator-only and set at launch.
+ERR
+      exit 2
+    fi
+  done
+fi
+
 # --- Three-branch dispatch ----------------------------------------------
 
 BODY_FILE_MODE=false
@@ -670,7 +748,6 @@ fi
 # operators can use `MACF_SKIP_MENTION_CHECK=1` for the rare legitimate
 # describing reference. The cost of generalization is small; the
 # benefit (fleet-agnostic protection) is durable.
-HANDLE_PATTERN='@[a-zA-Z][a-zA-Z0-9_-]*[[]bot[]]'
 
 # Single AWK pass produces TWO outputs (line-prefix-discriminated):
 #   - `LEAK:<line_no>: <line>` — describing-context leaks (Check B,
@@ -746,45 +823,6 @@ AWK_OUTPUT="$(awk -v pat="$HANDLE_PATTERN" '
 OFFENDING="$(grep '^LEAK:' <<<"$AWK_OUTPUT" | sed 's/^LEAK://' || true)"
 ACTIVE_COUNT="$(grep '^ACTIVE_COUNT:' <<<"$AWK_OUTPUT" | sed 's/^ACTIVE_COUNT://' || true)"
 
-# Chained PR create plus comment: only the comment segment's mentions count
-# for Check A (a mention in the PR body does not reach the comment's reader).
-# Skipped in --body-file mode, where LINT_TARGET is file content, not the
-# command text.
-if [[ -n "$CHAIN_COMMENT_TAIL" ]] && [[ "$BODY_FILE_MODE" == "false" ]]; then
-  # Each chained comment is its own segment and needs its own mention, so
-  # ACTIVE_COUNT becomes the smallest per-segment count.
-  CHAIN_SEGMENTS=()
-  seg_rest="$CHAIN_COMMENT_TAIL"
-  seg_guard=0
-  while [[ -n "$seg_rest" ]] && [[ "$seg_guard" -lt 50 ]]; do
-    seg_guard=$((seg_guard + 1))
-    seg_body="${seg_rest:1}"
-    if [[ "$seg_body" =~ $CHAIN_NEXT_RE ]]; then
-      seg_next="${BASH_REMATCH[0]}"
-      seg_head="${seg_body%%"$seg_next"*}"
-      CHAIN_SEGMENTS+=("${seg_rest:0:1}$seg_head")
-      seg_rest="${seg_body#"$seg_head"}"
-    else
-      CHAIN_SEGMENTS+=("$seg_rest")
-      seg_rest=""
-    fi
-  done
-  ACTIVE_COUNT=""
-  for seg in "${CHAIN_SEGMENTS[@]}"; do
-    seg_count="$(awk -v pat="$HANDLE_PATTERN" '
-      { l = $0; a = 0
-        while (match(l, pat)) {
-          s = a + RSTART; b = (s > 1) ? substr($0, s - 1, 1) : ""; c = substr($0, s + RLENGTH, 1)
-          if (!(b == "`" && c == "`")) n++
-          l = substr(l, RSTART + RLENGTH); a = s + RLENGTH - 1
-        } }
-      END { print n + 0 }' <<<"$seg")"
-    if [[ -z "$ACTIVE_COUNT" ]] || [[ "$seg_count" -lt "$ACTIVE_COUNT" ]]; then
-      ACTIVE_COUNT="$seg_count"
-    fi
-  done
-fi
-
 if [[ -n "$OFFENDING" ]]; then
   cat >&2 <<ERR
 BLOCKED by MACF mention-routing-hygiene hook: this comment/issue/PR body
@@ -842,11 +880,7 @@ fi
 # though the automated guard for it doesn't currently scan shell scripts).
 if [[ "$CHECK_A_APPLIES" == "true" ]] && [[ "$ACTIVE_COUNT" == "0" ]]; then
   CREATE_NOTE=""
-  if [[ -n "$CHAIN_COMMENT_TAIL" ]]; then
-    CREATE_NOTE="
-The comment later in this command has no mention. Add one for whoever
-should read it, because the create does not cover it."
-  elif [[ "$IS_CREATE_SUBCOMMAND" == "true" ]] && [[ "$CREATE_CONFIRMED_SELF_LABEL" == "true" ]]; then
+  if [[ "$IS_CREATE_SUBCOMMAND" == "true" ]] && [[ "$CREATE_CONFIRMED_SELF_LABEL" == "true" ]]; then
     CREATE_NOTE="
 A label on a pull request does not route; only a mention in its body or in a comment does. Add a mention for whoever should read it."
   fi

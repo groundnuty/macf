@@ -932,7 +932,7 @@ describe('check-mention-routing.sh (hook)', () => {
       it('a chained comment with no mention is BLOCKED', () => {
         const r = runCreate(`${PR} && gh issue comment 5 --body "PR is up."`);
         expect(r.status).toBe(2);
-        expect(r.stderr).toContain('comment later in this command has no mention');
+        expect(r.stderr).toContain('A comment chained after the create has no mention. Each chained comment needs its own mention of whoever should read it; neither the create nor the other comments cover it.');
       });
 
       it('a mention inside the PR body does not satisfy the chained comment', () => {
@@ -959,7 +959,7 @@ describe('check-mention-routing.sh (hook)', () => {
           `${PR} && gh issue comment 5 --body "PR is up." && gh issue comment 6 --body "$(cat <<EOF\n@macf-science-agent[bot] ready\nEOF\n)"`,
         );
         expect(r.status).toBe(2);
-        expect(r.stderr).toContain('comment later in this command has no mention');
+        expect(r.stderr).toContain('A comment chained after the create has no mention. Each chained comment needs its own mention of whoever should read it; neither the create nor the other comments cover it.');
       });
 
       it('two chained comments that each carry a mention pass', () => {
@@ -976,7 +976,7 @@ describe('check-mention-routing.sh (hook)', () => {
           'gh issue create --title "x" --label science-agent --body "b" && gh issue comment 5 --body "done"',
         );
         expect(r.status).toBe(2);
-        expect(r.stderr).toContain('comment later in this command has no mention');
+        expect(r.stderr).toContain('A comment chained after the create has no mention. Each chained comment needs its own mention of whoever should read it; neither the create nor the other comments cover it.');
       });
 
       it('issue create (peer label) && issue comment WITH a mention passes', () => {
@@ -984,6 +984,78 @@ describe('check-mention-routing.sh (hook)', () => {
           'gh issue create --title "x" --label science-agent --body "b" && gh issue comment 5 --body "$(cat <<EOF\n@macf-science-agent[bot] done\nEOF\n)"',
         );
         expect(r.status).toBe(0);
+      });
+    });
+
+    describe('round 3: self label, wrappers, per-comment body files (groundnuty/macf#1482)', () => {
+      it('no registry + own label + own repo is BLOCKED as self', () => {
+        const r = runHook({
+          command: 'gh issue create --title x --label code-agent --body b',
+          env: { MACF_ROUTING_LABEL: 'code-agent' },
+        });
+        expect(r.status).toBe(2);
+        expect(r.stderr).toContain('skips a label applied by the agent it names');
+      });
+
+      it('a registry + own label + a foreign --repo is still BLOCKED as self', () => {
+        const r = runCreate('gh issue create --repo other/repo --title x --label code-agent --body b');
+        expect(r.status).toBe(2);
+        expect(r.stderr).toContain('skips a label applied by the agent it names');
+      });
+
+      it('own label plus a peer label is not blocked as self, and the warning lists only the peer', () => {
+        const r = runHook({
+          command: 'gh issue create --title x --label code-agent,science-agent --body b',
+          env: { MACF_ROUTING_LABEL: 'code-agent' },
+        });
+        expect(r.status).toBe(0);
+        const w = warningOf(r);
+        expect(w).toContain('any of these labels belongs to another agent: science-agent (');
+        expect(w).not.toContain('code-agent');
+      });
+
+      for (const wrapper of ['time', 'nice', 'setsid']) {
+        it(`\`${wrapper} \` before the PR create is treated like the bare form`, () => {
+          const bare = runCreate('gh pr create --title x --body "Refs #1"');
+          const wrapped = runCreate(`${wrapper} gh pr create --title x --body "Refs #1"`);
+          expect(bare.status).toBe(0);
+          expect(wrapped.status).toBe(0);
+        });
+      }
+
+      it('a create with a readable mention-less body file and a chained comment WITH a mention passes', () => {
+        const file = join(dir, 'pr-body.md');
+        writeFileSync(file, 'Refs #1\n');
+        const r = runCreate(
+          `gh pr create --title x --body-file ${file} && gh issue comment 5 --body "$(cat <<EOF\n@macf-science-agent[bot] ready\nEOF\n)"`,
+        );
+        expect(r.status).toBe(0);
+      });
+
+      it('the same chain with a mention-less comment is BLOCKED', () => {
+        const file = join(dir, 'pr-body.md');
+        writeFileSync(file, 'Refs #1\n');
+        const r = runCreate(`gh pr create --title x --body-file ${file} && gh issue comment 5 --body "PR is up."`);
+        expect(r.status).toBe(2);
+        expect(r.stderr).toContain('A comment chained after the create has no mention.');
+      });
+
+      it('a chained comment is judged by its own --body-file, readable now', () => {
+        const ok = join(dir, 'c-ok.md');
+        const bad = join(dir, 'c-bad.md');
+        writeFileSync(ok, '@macf-science-agent[bot] ready\n');
+        writeFileSync(bad, 'no recipient\n');
+        const base = 'gh pr create --title x --body "Refs #1"';
+        expect(runCreate(`${base} && gh issue comment 5 --body-file ${ok}`).status).toBe(0);
+        expect(runCreate(`${base} && gh issue comment 5 --body-file ${bad}`).status).toBe(2);
+      });
+
+      it('a chained comment is judged by its own quoted heredoc body file', () => {
+        const f = join(dir, 'h.md');
+        const mk = (text: string): string =>
+          `cat > ${f} <<'EOF'\n${text}\nEOF\ngh pr create --title x --body "Refs #1" && gh issue comment 5 --body-file ${f}`;
+        expect(runCreate(mk('@macf-science-agent[bot] ready')).status).toBe(0);
+        expect(runCreate(mk('no recipient')).status).toBe(2);
       });
     });
 
@@ -1012,7 +1084,9 @@ describe('check-mention-routing.sh (hook)', () => {
         });
         expect(r.status).toBe(0);
         const w = warningOf(r);
-        expect(w).toContain('could not confirm that label "science-agent" belongs to another agent');
+        expect(w).toBe(
+          'The hook could not confirm that any of these labels belongs to another agent: science-agent (--repo is not this workspace\'s repo). If one of them is another agent\'s label in the target repo, the router delivers the issue. If none is, add one with gh issue edit <N> --add-label <label>; adding a label after the issue exists still routes it.',
+        );
         expect(w).toContain("--repo is not this workspace's repo");
       });
 
