@@ -1087,6 +1087,11 @@ export function applyIdleCompactionOffTransform(settings: Settings): Settings {
   return { ...settings, idleCompaction: false };
 }
 
+/** Read-only: does this workspace's `.claude/settings.json` already turn idle compaction off? */
+export function idleCompactionIsOff(workspaceDir: string): boolean {
+  return readSettings(join(resolve(workspaceDir), '.claude', 'settings.json'))['idleCompaction'] === false;
+}
+
 export function installIdleCompactionOff(workspaceDir: string): void {
   const absDir = resolve(workspaceDir);
   const claudeDir = join(absDir, '.claude');
