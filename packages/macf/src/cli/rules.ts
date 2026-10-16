@@ -165,7 +165,8 @@ export function copyCanonicalRulesDetailed(workspaceDir: string, options: {
       kept.push(entry.name);
       warn(
         `  Warning: .claude/rules/${entry.name} is a symbolic link, so macf leaves it alone rather than ` +
-        'write through it. Replace it with a regular file or delete it, then run `macf update`.',
+        'write through it. Delete it and run `macf update` (or `macf rules refresh --dir .`) to take the ' +
+        'canonical rule, or replace it with a regular file to keep your own.',
       );
       continue;
     }
@@ -174,7 +175,7 @@ export function copyCanonicalRulesDetailed(workspaceDir: string, options: {
       warn(
         `  Warning: .claude/rules/${entry.name} has no macf managed header, so it is operator-authored — ` +
         'left in place, not replaced by the canonical rule of the same name. Rename it to keep both, ' +
-        'or delete it and run `macf update` to take the canonical one.',
+        'or delete it and run `macf update` (or `macf rules refresh --dir .`) to take the canonical one.',
       );
       continue;
     }

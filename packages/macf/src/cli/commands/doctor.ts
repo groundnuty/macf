@@ -3271,13 +3271,13 @@ export function printRuleCurrencySection(check: RuleCurrencyCheckResult, checkou
     const reasonText =
       f.reason === 'stale' ? 'stale — differs from canonical'
       : f.reason === 'retired' ? 'retired — canonical no longer ships it, but this managed copy is still loaded (`macf update` or `macf doctor --fix` removes it)'
-      : f.reason === 'symlink' ? 'symbolic link — macf never writes through it; replace it with a regular file or delete it, then run `macf update`'
-      : f.reason === 'operator-authored' ? 'collision — no macf managed header, so it is operator-authored and kept; rename it to keep both, or delete it and run `macf update` to take the canonical rule'
+      : f.reason === 'symlink' ? 'symbolic link — macf never writes through it; delete it and run `macf update` (or `macf rules refresh --dir .`) to take the canonical rule, or replace it with a regular file to keep your own'
+      : f.reason === 'operator-authored' ? 'collision — no macf managed header, so it is operator-authored and kept; rename it to keep both, or delete it and run `macf update` (or `macf rules refresh --dir .`) to take the canonical rule'
       : 'missing — never distributed';
     console.log(`    ✗ ${f.name} — ${reasonText}`);
   }
   const staleCount = check.findings.filter((f) => f.reason === 'stale' || f.reason === 'retired').length;
-  // A collision carries its own remedy, and `macf update` keeps the file, so the update Fix line would mislead.
+  // Collisions and symlinks carry their own remedy; `macf update` keeps them, so the update Fix line would mislead.
   if (check.findings.some((f) => f.reason !== 'operator-authored' && f.reason !== 'symlink')) {
     printDistributionFixLine('.claude/rules/', checkoutCurrency, staleCount);
   }
