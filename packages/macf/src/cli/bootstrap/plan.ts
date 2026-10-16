@@ -200,6 +200,8 @@ import type { InstallScopeCoverageEntry } from './install-scope-coverage.js';
 // (both directions erased entirely by `verbatimModuleSyntax` — no runtime
 // edge either way).
 import type { RepoSecretNamesObservation } from './observer.js';
+import type { CallerSecrets } from './router-caller-secrets.js';
+import { evaluateCallerRoutingForm } from './router-caller-secrets.js';
 // groundnuty/macf#1336 — `routing-secret-parity.ts` only ever `import type`s
 // `Presence` from THIS module (same one-directional-runtime-dependency
 // shape `apply-routing-secrets.js`/`install-scope-coverage.js` above already
@@ -303,6 +305,13 @@ export interface ObservedAgentState {
    * carries NO `with:` block at all (a stale pre-v3 caller).
    */
   readonly routerWithKeys?: readonly string[];
+  /**
+   * What this repo's installed router caller passes under `secrets:` — read
+   * from the SAME single caller read as `actionsPin`/`routerWithKeys`.
+   * `undefined` = file unreadable / no router call found (unknown, never a
+   * match). See `router-caller-secrets.ts`.
+   */
+  readonly callerSecrets?: CallerSecrets;
   /**
    * groundnuty/macf#1425 (silent-fallback-hazards.md Instance 18) — the
    * agent-role KEYS present in this repo's committed
@@ -457,6 +466,10 @@ export interface ObservedState {
    * `routing-secret-parity.ts::secretPresenceFor`).
    */
   readonly routingSecretRepos?: Readonly<Record<string, RepoSecretNamesObservation>>;
+  /** Org-level Actions secrets visible to each router-carrying repo (`${{ secrets.X }}` resolves these). Same keys as `routingSecretRepos`; absent/unknown = org secrets unconfirmed. */
+  readonly orgSecretRepos?: Readonly<Record<string, RepoSecretNamesObservation>>;
+  /** What the CONTROL repo's installed router caller passes under `secrets:` (sibling of `agents[role].callerSecrets`). */
+  readonly controlRepoCallerSecrets?: CallerSecrets;
   /**
    * Vault-derived per-project CA key/cert presence (DR-043 Amendment D phase
    * 3) — same undefined-vs-observed convention as {@link ObservedAgentState.vault}.
@@ -606,6 +619,8 @@ export type PlanItemKind =
    * {@link agentConfigItem}'s doc.
    */
   | 'agent_config'
+  /** This agent repo's installed router caller passes a routing-secret form the router can consume. See {@link routerCallerSecretsItem}'s doc. */
+  | 'router_caller_secrets'
   | 'routing_client'
   | 'runner_ops'
   | 'vault_recipients'
@@ -1121,6 +1136,7 @@ export function planItemApplyCoverage(item: PlanItem): ApplyCoverage {
       // this arm's only live input is 'create'.
       return 'implemented';
     case 'agent_config':
+    case 'router_caller_secrets':
       // groundnuty/macf#1425 — the SAME `applyRepoInitForAgent` call
       // `'labels'` immediately above already established as 'implemented'
       // is what widens the committed `.github/agent-config.json` to the
@@ -1288,6 +1304,7 @@ function unimplementedReasonFor(item: PlanItem): string {
     case 'agent_repo_archived':
     case 'labels':
     case 'agent_config':
+    case 'router_caller_secrets':
     case 'routing_client':
     case 'runner_ops':
     case 'runner_warm':
@@ -1576,6 +1593,71 @@ function agentConfigItem(agent: FleetAgent, desiredRoles: readonly string[], obs
       `${missing.map((r) => `"${r}"`).join(', ')} — a repo whose table names only its own agent silently drops any ` +
       '@mention routed to a sibling on that repo; apply reconciles this by adding the missing role(s) to the ' +
       'committed file (existing entries are never dropped or rewritten)',
+    confirm_required: true,
+  };
+}
+
+/**
+ * Does `agent.repo`'s installed router caller pass a secret form the router
+ * can consume? A reusable workflow sees only the secrets its caller passes,
+ * so a repo can hold every required secret and still route nothing — and
+ * every other row reads healthy. Consumable form: the bundle, or the four
+ * always-required secrets plus the Tailscale pair unless the fleet declares a
+ * self-hosted runner.
+ *
+ * - caller or repo secrets unreadable → `'create'`, LOW CONFIDENCE (never `noop`).
+ * - consumable → `'noop'`.
+ * - not consumable → `'update'`, naming the missing secrets and the caller
+ *   file. A caller that omits a secret the repo holds is rewritten by apply
+ *   (the same rewrite that reconciles the router pin); a secret absent from
+ *   the repo is reported, not published by this row.
+ */
+function routerCallerSecretsItem(
+  repo: string,
+  target: string,
+  caller: CallerSecrets | undefined,
+  repoSecrets: RepoSecretNamesObservation | undefined,
+  orgSecrets: RepoSecretNamesObservation | undefined,
+  selfHostedRunner: boolean,
+): PlanItem {
+  const verdict = evaluateCallerRoutingForm(caller, repoSecrets, selfHostedRunner, orgSecrets, repo.split('/')[0]);
+  if (verdict.status === 'unknown') {
+    return {
+      kind: 'router_caller_secrets',
+      target,
+      verb: 'create',
+      reason:
+        `routing secrets passed by the router caller on "${repo}" (.github/workflows/agent-router.yml) could not be checked — ${verdict.reason} — ` +
+        'not drift, not a match — LOW CONFIDENCE',
+      confirm_required: false,
+    };
+  }
+  if (verdict.status === 'complete') {
+    return {
+      kind: 'router_caller_secrets',
+      target,
+      verb: 'noop',
+      reason: `router caller on "${repo}" passes a routing-secret form the router can consume`,
+      confirm_required: false,
+    };
+  }
+  const parts: string[] = [];
+  if (verdict.inheritCrossesOwner === true) {
+    parts.push(`the caller uses secrets: inherit, which does not cross from ${repo.split('/')[0]} to the router's owner, so it passes no secret`);
+  } else if (verdict.notPassedByCaller.length > 0) {
+    parts.push(`the caller (.github/workflows/agent-router.yml) does not pass ${verdict.notPassedByCaller.join(', ')}`);
+  }
+  if (verdict.missingFromRepo.length > 0) {
+    parts.push(`the repo has no secret named ${verdict.missingFromRepo.join(', ')}`);
+  }
+  return {
+    kind: 'router_caller_secrets',
+    target,
+    verb: 'update',
+    reason:
+      `router caller on "${repo}" cannot give the router a usable routing-secret form: ${parts.join('; ')} — ` +
+      'a reusable workflow sees only the secrets its caller passes, so nothing routes on this repo' +
+      (verdict.callerRewriteFixes ? '; apply reconciles the caller by rewriting the committed agent-router.yml during this run' : '; supply the missing secret(s) — apply cannot fix this by rewriting the caller'),
     confirm_required: true,
   };
 }
@@ -2919,6 +3001,33 @@ export function computePlan(
     items.push(secretFingerprintItem(agent, obs));
     items.push(labelsItem(agent));
     items.push(agentConfigItem(agent, declaredRoles, obs?.agentConfigRoles));
+    items.push(
+      routerCallerSecretsItem(
+        agent.repo,
+        `agent:${agent.role}:router_caller_secrets:${agent.repo}`,
+        obs?.callerSecrets,
+        observed.routingSecretRepos?.[agent.repo],
+        observed.orgSecretRepos?.[agent.repo],
+        manifest.routing?.runner?.runs_on === 'self-hosted',
+      ),
+    );
+  }
+
+  // The control repo carries a router too (every agent App is installed
+  // there; its routing table lists the whole fleet), and its caller never
+  // declares a runner — so it runs hosted and needs the Tailscale pair.
+  if (observed.controlRepoPresence === 'present') {
+    const controlRepo = routerCarryingRepos(manifest).at(-1)!;
+    items.push(
+      routerCallerSecretsItem(
+        controlRepo,
+        `repo:${controlRepo}:router_caller_secrets`,
+        observed.controlRepoCallerSecrets,
+        observed.routingSecretRepos?.[controlRepo],
+        observed.orgSecretRepos?.[controlRepo],
+        false,
+      ),
+    );
   }
 
   items.push(caRegistryItem(seg, observed.caRegistry, observed.vaultCa));

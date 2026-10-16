@@ -267,6 +267,7 @@ describe('runBootstrapPlan', () => {
             // declared roster, so the new `agent_config` item reads noop
             // too ("nothing to do" — this test's own title claim).
             agentConfigRoles: ['code-agent'],
+            callerSecrets: { inherit: false, names: ['MACF_ROUTING_APP_ID', 'MACF_ROUTING_APP_KEY', 'ROUTING_CLIENT_CERT', 'ROUTING_CLIENT_KEY', 'TS_OAUTH_CLIENT_ID', 'TS_OAUTH_SECRET'] },
           },
         },
         caRegistry: 'present',
@@ -279,6 +280,7 @@ describe('runBootstrapPlan', () => {
         // block for the full presence/verb table.
         caRepos: { 'groundnuty/icsoc-2026-experiment': 'absent' },
         routingClientRepos: { 'groundnuty/icsoc-2026-experiment': 'present' },
+        routingSecretRepos: { 'groundnuty/icsoc-2026-experiment': { status: 'confirmed', names: new Set(['MACF_ROUTING_APP_ID', 'MACF_ROUTING_APP_KEY', 'ROUTING_CLIENT_CERT', 'ROUTING_CLIENT_KEY', 'TS_OAUTH_CLIENT_ID', 'TS_OAUTH_SECRET']) } },
       }),
     };
     const code = await runBootstrapPlan({ file, json: true }, deps);
@@ -303,7 +305,7 @@ describe('runBootstrapPlan', () => {
     // (groundnuty/macf#1109) is ALSO UNCONDITIONAL, and `deps.observe`'s
     // fixture above sets no `vaultTsOauth` — so `router_app` + `ts_oauth`
     // are the two create-candidates; `labels` is the one write-always item.
-    expect(json.summary.noops).toBe(8);
+    expect(json.summary.noops).toBe(9);
     expect(json.summary.creates).toBe(2);
     expect(json.summary.writeAlways).toBe(1);
   });

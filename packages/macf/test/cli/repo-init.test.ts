@@ -633,19 +633,22 @@ describe('generateWorkflow — runner-runs-on emission (groundnuty/macf#1368)', 
 describe('generateWorkflow — MACF_ROUTING_BUNDLE emission (groundnuty/macf#1112)', () => {
   const v3Inputs = { project: 'macf-experiment', registryApiPath: '/orgs/macf-experiment' };
 
-  it('DECISIVE: a generated caller for a bundle-capable pin passes EXACTLY ONE secret name', () => {
+  it('DECISIVE: a generated caller for a bundle-capable pin passes the bundle AND the six individual names', () => {
     const yaml = generateWorkflow('v3.5.0', v3Inputs);
     const parsed = parseYaml(yaml) as { jobs: { route: { secrets: unknown } } };
     const secretsBlock = parsed.jobs.route.secrets;
     // Per `assert-the-wrong-path.md`: NOT "a secrets block exists" (which
-    // the six-name explicit-passing form would also satisfy) — the KEY
-    // COUNT of that block must be exactly 1.
+    // the bundle-only form would also satisfy) — the router falls back to
+    // the six individual secrets when no bundle exists, and a reusable
+    // workflow sees only what its caller passes.
     expect(typeof secretsBlock).toBe('object');
-    expect(Object.keys(secretsBlock as object)).toEqual(['MACF_ROUTING_BUNDLE']);
-    expect(Object.keys(secretsBlock as object)).toHaveLength(1);
+    expect(Object.keys(secretsBlock as object).sort()).toEqual(['MACF_ROUTING_BUNDLE', ...ALL_ROUTING_SECRET_NAMES].sort());
+    for (const n of ALL_ROUTING_SECRET_NAMES) {
+      expect((secretsBlock as Record<string, string>)[n]).toBe(`\${{ secrets.${n} }}`);
+    }
   });
 
-  it('DECISIVE: a hypothetical 7th router secret does not change the generated caller at all', () => {
+  it('a hypothetical 7th router secret does not change the generated caller at all', () => {
     // The generator never enumerates the callee's secret names in bundle
     // mode — it emits exactly one literal string regardless of how many
     // secrets the pinned macf-actions version actually requires. Simulate
@@ -663,7 +666,7 @@ describe('generateWorkflow — MACF_ROUTING_BUNDLE emission (groundnuty/macf#111
     const after = generateWorkflow('v3.5.0', v3Inputs);
     expect(after).toBe(before);
     const parsedBefore = parseYaml(before) as { jobs: { route: { secrets: unknown } } };
-    expect(Object.keys(parsedBefore.jobs.route.secrets as object)).toHaveLength(1);
+    expect(Object.keys(parsedBefore.jobs.route.secrets as object)).toHaveLength(7);
   });
 
   it('pre-bundle v3.x pins emit the explicit six-secret form, NOT secrets: inherit (groundnuty/macf#1338)', () => {
@@ -690,7 +693,7 @@ describe('generateWorkflow — MACF_ROUTING_BUNDLE emission (groundnuty/macf#111
   it("'main' pin is treated as bundle-capable (dev branch always-current)", () => {
     const yaml = generateWorkflow('main', v3Inputs);
     const parsed = parseYaml(yaml) as { jobs: { route: { secrets: unknown } } };
-    expect(Object.keys(parsed.jobs.route.secrets as object)).toEqual(['MACF_ROUTING_BUNDLE']);
+    expect(Object.keys(parsed.jobs.route.secrets as object)).toContain('MACF_ROUTING_BUNDLE');
   });
 });
 
@@ -782,10 +785,10 @@ describe('generateWorkflow — explicit six-secret emission for a v3+ non-bundle
     expect(Object.keys(parsed.jobs.route.secrets as object).sort()).toEqual([...ALL_ROUTING_SECRET_NAMES].sort());
   });
 
-  it('a bundle-capable pin still wins over the explicit-six fallback (v3.5.0 unaffected by this fix)', () => {
+  it('a bundle-capable pin passes the bundle PLUS the explicit six', () => {
     const yaml = generateWorkflow('v3.5.0', v3Inputs);
     const parsed = parseYaml(yaml) as { jobs: { route: { secrets: unknown } } };
-    expect(Object.keys(parsed.jobs.route.secrets as object)).toEqual(['MACF_ROUTING_BUNDLE']);
+    expect(Object.keys(parsed.jobs.route.secrets as object).sort()).toEqual(['MACF_ROUTING_BUNDLE', ...ALL_ROUTING_SECRET_NAMES].sort());
   });
 });
 

@@ -60,6 +60,7 @@ import { caCertVariableName } from './apply-ca.js';
 // read, never a second network read of the identical file (this issue's own
 // "a parallel read is a hazard" requirement).
 import { extractCallerWithKeys } from './runner-declaration-reach.js';
+import { extractCallerSecrets } from './router-caller-secrets.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -430,6 +431,29 @@ export async function listRepoSecretNames(repo: string): Promise<RepoSecretNames
   } catch (err) {
     const stderr = getStderr(err);
     return { status: 'unknown', reason: `gh api repos/${repo}/actions/secrets failed: ${stderr || 'unknown error'}` };
+  }
+}
+
+/**
+ * Names of the ORGANISATION-level Actions secrets visible to `repo`
+ * (`GET /repos/<repo>/actions/organization-secrets`). `${{ secrets.X }}` in a
+ * caller resolves these, so they count as present. Any failure (403/404,
+ * auth, shape) is `'unknown'` — never an empty set, which would read as
+ * "missing".
+ */
+export async function listOrgSecretNamesVisibleToRepo(repo: string): Promise<RepoSecretNamesObservation> {
+  try {
+    const { stdout } = await execFileAsync('gh', ['api', '--paginate', `repos/${repo}/actions/organization-secrets`, '--jq', '.secrets[].name'], {
+      encoding: 'utf-8',
+    });
+    const names = stdout.split('\n').map((x) => x.trim()).filter((x) => x.length > 0);
+    if (names.some((n) => !SECRET_NAME_SHAPE.test(n))) {
+      return { status: 'unknown', reason: `gh api repos/${repo}/actions/organization-secrets returned output that doesn't look like a secret-name list` };
+    }
+    return { status: 'confirmed', names: new Set(names) };
+  } catch (err) {
+    const stderr = getStderr(err);
+    return { status: 'unknown', reason: `gh api repos/${repo}/actions/organization-secrets failed: ${stderr || 'unknown error'}` };
   }
 }
 
@@ -1490,6 +1514,10 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
   // because the asymmetry sweep needs ALL SIX tracked secret names per repo,
   // not a single proxy — see that module's own doc.
   const routingSecretRepos: Record<string, RepoSecretNamesObservation> = {};
+  const orgSecretRepos: Record<string, RepoSecretNamesObservation> = {};
+  // A user-owned fleet has no org secrets: confirmed-empty, not unknown.
+  const readOrgSecrets = async (repo: string): Promise<RepoSecretNamesObservation> =>
+    manifest.owner.type === 'org' ? listOrgSecretNamesVisibleToRepo(repo) : { status: 'confirmed', names: new Set<string>() };
   // groundnuty/macf#1128 — already-provisioned-fleet install-scope drift
   // detection: ONE `GET /orgs/{org}/installations` call (never per-agent —
   // the listing already enumerates every App on the org in one shot),
@@ -1523,6 +1551,8 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
     const routerContent = await readInstalledRouterWorkflow(agent.repo);
     const actionsPin = routerContent === undefined ? undefined : extractActionsPin(routerContent);
     const routerWithKeys = routerContent === undefined ? undefined : extractCallerWithKeys(routerContent)?.withKeys;
+    // Same in-memory read — which secrets the caller passes to the router.
+    const callerSecrets = routerContent === undefined ? undefined : extractCallerSecrets(routerContent);
     // groundnuty/macf#1425 (silent-fallback-hazards.md Instance 18) — a
     // SEPARATE `gh api` read (`.github/agent-config.json` is a sibling file
     // to `.github/workflows/agent-router.yml`, never the same content, so
@@ -1556,6 +1586,7 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
       deployedVersion: lockEntry?.deployed_version,
       actionsPin,
       routerWithKeys,
+      callerSecrets,
       agentConfigRoles,
       archived: repoArchivedMeta.archived,
       installRepositorySelection: findInstallRepositorySelection(orgInstallScopes, deriveAppHandle(manifest.metadata.name, agent.role)),
@@ -1563,6 +1594,7 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
     caRepos[agent.repo] = repoState.caRepo;
     routingClientRepos[agent.repo] = repoState.routingClientRepo;
     routingSecretRepos[agent.repo] = routingSecretNames;
+    orgSecretRepos[agent.repo] = repoState.repo === 'present' ? await readOrgSecrets(agent.repo) : routingSecretNames.status === 'unknown' ? routingSecretNames : { status: 'unknown', reason: 'repo presence unconfirmed this run' };
   }
 
   // groundnuty/macf#1271 (disclosed by #1270's own body) — row 4 of the
@@ -1726,7 +1758,9 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
   // gets the SAME live pin read every agent repo already gets
   // ({@link readCallerActionsPin}), targeted at the SAME derived full name
   // `controlRepoMeta` above already computed.
-  const controlRepoActionsPin = await readCallerActionsPin(controlRepoFullNameHere);
+  const controlRouterContent = await readInstalledRouterWorkflow(controlRepoFullNameHere);
+  const controlRepoActionsPin = controlRouterContent === undefined ? undefined : extractActionsPin(controlRouterContent);
+  const controlRepoCallerSecrets = controlRouterContent === undefined ? undefined : extractCallerSecrets(controlRouterContent);
   // groundnuty/macf#1336 — the control repo is a router-carrying repo too
   // (same #1072 fact `controlRepoActionsPin` immediately above already acts
   // on: `apply-fleet.ts`'s `publishRoutingSecrets` call targets
@@ -1741,6 +1775,10 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
     controlRepoMeta.presence === 'present'
       ? await listRepoSecretNames(controlRepoFullNameHere)
       : { status: 'unknown', reason: `control repo "${controlRepoFullNameHere}" presence unconfirmed this run` };
+  orgSecretRepos[controlRepoFullNameHere] =
+    controlRepoMeta.presence === 'present'
+      ? await readOrgSecrets(controlRepoFullNameHere)
+      : { status: 'unknown', reason: `control repo "${controlRepoFullNameHere}" presence unconfirmed this run` };
 
   return {
     lock,
@@ -1751,6 +1789,7 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
     federatedCaRegistry,
     routingClientRepos,
     routingSecretRepos,
+    orgSecretRepos,
     routingTrustedActors,
     routingRunnerRegistered,
     routingRunnerHandover,
@@ -1760,6 +1799,7 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
     controlRepoPresence: controlRepoMeta.presence,
     controlRepoArchived: controlRepoMeta.archived,
     controlRepoActionsPin,
+    controlRepoCallerSecrets,
   };
 }
 

@@ -534,6 +534,15 @@ export interface FleetApplyDeps {
    * at); it simply never claims `already-current` without positive evidence
    * the pin actually matched.
    */
+  /**
+   * Roles whose installed router caller omits a routing secret that the repo
+   * holds (`router-caller-secrets.ts`), computed once from the observed state
+   * before `applyFleet` runs. `true` forces the same `agent-router.yml`
+   * rewrite `resolveActionsPinReconcile` drives. Absent = no gap known.
+   */
+  readonly callerSecretRewrites?: Readonly<Record<string, boolean>>;
+  /** Same, for the control repo's router caller. */
+  readonly callerSecretRewriteControl?: boolean;
   readonly observedActionsPins?: {
     readonly agents: Readonly<Record<string, string | undefined>>;
     readonly controlRepo: string | undefined;
@@ -1431,7 +1440,7 @@ export async function applyFleet(
     { repoInit: deps.repoInitDeps.repoInit },
     {
       actionsVersion: controlPinReconcile.actionsVersion,
-      force: controlPinReconcile.force,
+      force: controlPinReconcile.force || deps.callerSecretRewriteControl === true,
       ...(controlRepoLabelTokenSource !== undefined ? { tokenSource: controlRepoLabelTokenSource } : {}),
     },
   );
@@ -1762,7 +1771,10 @@ export async function applyFleet(
       const repoInitTokenSource = resolveAgentRepoInitTokenSource(agent.role, identity.appId, identity.installId, agentDeps.resolveKeyPath);
       repoInitOutcome = await applyRepoInitForAgent(agent, manifest, deps.repoInitDeps, {
         actionsVersion: pinReconcile.actionsVersion,
-        force: pinReconcile.force,
+        // Also rewrite when the installed caller omits a routing secret the
+        // repo holds (the router sees only what its caller passes) — the
+        // same rewrite that reconciles the pin, never a second writer.
+        force: pinReconcile.force || deps.callerSecretRewrites?.[agent.role] === true,
         ...(repoInitTokenSource !== undefined ? { tokenSource: repoInitTokenSource } : {}),
       });
       if (manifest.versions) actionsPinResults.push(actionsPinResultFor(agent.repo, pinReconcile.force, repoInitOutcome));
@@ -1835,7 +1847,7 @@ export async function applyFleet(
           controlDir,
           manifest,
           { repoInit: deps.repoInitDeps.repoInit },
-          { actionsVersion: controlPinReconcile.actionsVersion, force: controlPinReconcile.force, tokenSource: retryTokenSource },
+          { actionsVersion: controlPinReconcile.actionsVersion, force: controlPinReconcile.force || deps.callerSecretRewriteControl === true, tokenSource: retryTokenSource },
         );
         if (retried.status === 'written') {
           deps.log(

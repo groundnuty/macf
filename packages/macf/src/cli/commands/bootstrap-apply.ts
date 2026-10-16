@@ -20,6 +20,7 @@
  * only `role`/`status`/`appId`/`installId`/`reason`/paths off the outcomes,
  * never `credentials`.
  */
+import { evaluateCallerRoutingForm } from '../bootstrap/router-caller-secrets.js';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { execFile } from 'node:child_process';
@@ -1278,6 +1279,29 @@ function actionsPinsFromObserved(
     agents[agent.role] = observed.agents[agent.role]?.actionsPin;
   }
   return { agents, controlRepo: observed.controlRepoActionsPin };
+}
+
+/**
+ * Roles whose installed router caller must be rewritten because it omits a
+ * routing secret the repo holds. Pure projection of the already-observed
+ * state — never re-reads.
+ */
+export function callerSecretRewritesFromObserved(manifest: FleetManifest, observed: ObservedState): Readonly<Record<string, boolean>> {
+  const selfHosted = manifest.routing?.runner?.runs_on === 'self-hosted';
+  const out: Record<string, boolean> = {};
+  for (const agent of manifest.agents) {
+    const verdict = evaluateCallerRoutingForm(observed.agents[agent.role]?.callerSecrets, observed.routingSecretRepos?.[agent.repo], selfHosted, observed.orgSecretRepos?.[agent.repo], agent.repo.split('/')[0]);
+    out[agent.role] = verdict.status === 'incomplete' && verdict.callerRewriteFixes;
+  }
+  return out;
+}
+
+/** Whether the control repo's router caller must be rewritten (it runs hosted — no runner declared). */
+export function controlCallerSecretRewriteFromObserved(manifest: FleetManifest, observed: ObservedState): boolean {
+  if (observed.controlRepoPresence !== 'present') return false;
+  const repo = `${manifest.owner.account}/${deriveControlRepoName(manifest.metadata.name)}`;
+  const v = evaluateCallerRoutingForm(observed.controlRepoCallerSecrets, observed.routingSecretRepos?.[repo], false, observed.orgSecretRepos?.[repo], manifest.owner.account);
+  return v.status === 'incomplete' && v.callerRewriteFixes;
 }
 
 /**
@@ -3572,6 +3596,8 @@ export async function runBootstrapApply(
     const mutate: MutateApplyDeps = {
       ...(mutateDeps ?? resolveMutateDeps(manifestPath, vaultAgentPems, resolvedRunnerToken, opts.identityKeyPath, opts.vaultPath, opts.yes, resolvedTsOauth)),
       observedActionsPins: mutateDeps?.observedActionsPins ?? actionsPinsFromObserved(manifest, observed),
+      callerSecretRewrites: mutateDeps?.callerSecretRewrites ?? callerSecretRewritesFromObserved(manifest, observed),
+      callerSecretRewriteControl: mutateDeps?.callerSecretRewriteControl ?? controlCallerSecretRewriteFromObserved(manifest, observed),
       // groundnuty/macf#1211 — same "merged on TOP, never through
       // resolveMutateDeps's own param list" precedent as observedActionsPins
       // immediately above: the RAW scope-variable value, already read once
