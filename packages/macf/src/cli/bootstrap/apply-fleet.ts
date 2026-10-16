@@ -224,7 +224,7 @@ import { provisionControlRepo, readManifestSourceOrFallback } from './control-re
 import type { ControlRepoInitOutcome } from './apply-control-repo-init.js';
 import { applyControlRepoInit, deriveRouterCarryingRepos, resolveControlRepoLabelTokenSource } from './apply-control-repo-init.js';
 import type { FleetLockAgentUpdate, FleetLockIdentityChange } from './fleet-lock.js';
-import { composeFleetLock, readFleetLockFile, writeFleetLock } from './fleet-lock.js';
+import { composeFleetLock, readFleetLockFile, secretFingerprint, writeFleetLock } from './fleet-lock.js';
 // groundnuty/macf#1230 — the SAME directed set-difference + override-validity
 // predicates `commands/bootstrap-apply.ts`'s preflight refuses on, reused
 // here (never re-derived) to decide what — if anything — this run records
@@ -306,6 +306,7 @@ import type { ResolvedTsOauth, RoutingRefreshOptions, RoutingSecretResolution, R
 import {
   ROUTING_APP_ID_SECRET_NAME,
   ROUTING_APP_KEY_SECRET_NAME,
+  ROUTING_BUNDLE_SECRET_NAME,
   TS_OAUTH_CLIENT_ID_SECRET_NAME,
   TS_OAUTH_SECRET_SECRET_NAME,
   determineFleetRoutingFact,
@@ -315,6 +316,8 @@ import {
   skippedRoutingBundlePublish,
   skippedRoutingSecretsPublish,
   toBase64ForSecret,
+  tsDeployedLockKey,
+  tsPairEncoding,
 } from './apply-routing-secrets.js';
 import type { ComposeAndWriteVaultDeps, VaultRecipientCountResult } from './vault-read.js';
 import { composeAndWriteVault, readRecoveryArtifact, readVaultRecipientCount, reencryptVault } from './vault-read.js';
@@ -2735,11 +2738,21 @@ export async function applyFleet(
     [TS_OAUTH_CLIENT_ID_SECRET_NAME]: tsOauthClientId,
     [TS_OAUTH_SECRET_SECRET_NAME]: tsOauthSecret,
   };
-  // A pair supplied THIS run (not vault-restored) replaces what earlier runs built from the old one.
+  // A pair supplied THIS run always replaces what earlier runs built. A pair held from the vault replaces a
+  // repo's secrets only where `fleet.lock` records a different (or no) deployed pair — secrets are write-only,
+  // so the record, not a read-back, is what is compared.
   const refreshed: string[] = [];
+  const written = new Set<string>();
+  const heldPairValid = suppliedTsOauth !== undefined && tsOauthMalformed === undefined;
+  const heldPairEncoding = heldPairValid ? tsPairEncoding(suppliedTsOauth.clientId, suppliedTsOauth.secret) : undefined;
+  const lockForRecords = effectiveFleetFingerprints(currentLock);
   const refreshOpts: RoutingRefreshOptions = {
     refreshExisting: deps.resolvedTsOauth !== undefined && tsOauthMalformed === undefined,
+    ...(heldPairEncoding !== undefined
+      ? { heldPair: { fingerprint: secretFingerprint(heldPairEncoding), recordedFor: (repo: string) => lockForRecords?.[tsDeployedLockKey(repo)] } }
+      : {}),
     onRefreshed: (name, repo) => refreshed.push(`${name} on ${repo}`),
+    onWritten: (name, repo) => written.add(`${repo}\u0000${name}`),
   };
   const routingSecretsPublish: RoutingSecretsPublishResult = await publishRoutingSecrets(routingSecretsForPublish, routerCarryingRepos, deps.routingSecretsDeps, refreshOpts);
 
@@ -2780,6 +2793,20 @@ export async function applyFleet(
   // `apply-routing-secrets.ts::publishRoutingBundle`'s doc for why this
   // must compose from every-six-available or refuse).
   const routingBundlePublish = await publishRoutingBundle(routingSecretsForPublish, routerCarryingRepos, deps.routingSecretsDeps, refreshOpts);
+  // Record, per repo, which pair its routing secrets were just written from — only where EVERY pair-bearing
+  // secret was written this run. A repo with a failed or skipped write keeps its prior record.
+  if (heldPairEncoding !== undefined) {
+    const deployedNow: Record<string, string> = {};
+    for (const repo of routerCarryingRepos) {
+      const names = [ROUTING_BUNDLE_SECRET_NAME, TS_OAUTH_CLIENT_ID_SECRET_NAME, TS_OAUTH_SECRET_SECRET_NAME];
+      if (names.every((n) => written.has(`${repo}\u0000${n}`))) deployedNow[tsDeployedLockKey(repo)] = heldPairEncoding;
+    }
+    if (Object.keys(deployedNow).length > 0) {
+      const composedDeployed = composeFleetLock({ fleet: manifest.metadata.name, previous: currentLock, agentUpdates: {}, fleetSecrets: deployedNow });
+      writeFleetLock(lockPath, composedDeployed.lock);
+      currentLock = composedDeployed.lock;
+    }
+  }
   if (refreshed.length > 0) {
     deps.log(
       `Refreshed ${String(refreshed.length)} routing secret(s) from the Tailscale OAuth pair supplied this run ` +

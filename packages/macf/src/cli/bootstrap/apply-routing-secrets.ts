@@ -191,7 +191,35 @@ export function toBase64ForSecret(value: string): string {
  */
 export interface RoutingRefreshOptions {
   readonly refreshExisting?: boolean;
+  /**
+   * The pair apply holds (fresh OR vault-restored), as the fingerprint of its stable encoding, plus what
+   * `fleet.lock` recorded as deployed per repo. Secrets are write-only, so a repo is compared by this record
+   * rather than by reading it back: a different or missing record means the repo may still hold an older pair.
+   */
+  readonly heldPair?: { readonly fingerprint: string; readonly recordedFor: (repo: string) => string | undefined };
   readonly onRefreshed?: (name: string, repo: string) => void;
+  /** Called after EVERY successful write (create or refresh) of a pair-bearing secret — the only signal that may update the deployed record. */
+  readonly onWritten?: (name: string, repo: string) => void;
+}
+
+/** Stable encoding of a Tailscale pair, hashed (never stored) to record which pair a repo was built from. */
+export function tsPairEncoding(clientId: string, secret: string): string {
+  return JSON.stringify([clientId, secret]);
+}
+
+/** `fleet.lock` `fleet_fingerprints` key recording which Tailscale pair `repo`'s routing secrets were last written from. */
+export const TS_DEPLOYED_KEY_PREFIX = 'ts_oauth_deployed:';
+export function tsDeployedLockKey(repo: string): string {
+  return `${TS_DEPLOYED_KEY_PREFIX}${repo}`;
+}
+
+/** Why an existing pair-bearing secret on `repo` must be rewritten, or `undefined` when it need not be. */
+export function routingRefreshReason(repo: string, opts: RoutingRefreshOptions): 'fresh' | 'drift' | 'unrecorded' | undefined {
+  if (opts.refreshExisting === true) return 'fresh';
+  if (opts.heldPair === undefined) return undefined;
+  const recorded = opts.heldPair.recordedFor(repo);
+  if (recorded === undefined) return 'unrecorded';
+  return recorded !== opts.heldPair.fingerprint ? 'drift' : undefined;
 }
 
 const TS_OAUTH_NAMES: readonly RoutingSecretName[] = [TS_OAUTH_CLIENT_ID_SECRET_NAME, TS_OAUTH_SECRET_SECRET_NAME];
@@ -216,15 +244,17 @@ export async function publishRoutingSecrets(
       const legDeps: EnsureVariableDeps = {
         checkPresence: async () => {
           const presence = await deps.checkRepoSecretPresence(repo, name);
-          if (presence === 'present' && opts.refreshExisting === true && TS_OAUTH_NAMES.includes(name) && resolution.status === 'available') {
+          if (presence === 'present' && routingRefreshReason(repo, opts) !== undefined && TS_OAUTH_NAMES.includes(name) && resolution.status === 'available') {
             await deps.setRepoSecret(repo, name, resolution.value);
             opts.onRefreshed?.(name, repo);
+            opts.onWritten?.(name, repo);
           }
           return presence;
         },
         create: async () => {
           if (resolution.status !== 'available') throw new Error(resolution.reason);
           await deps.setRepoSecret(repo, name, resolution.value);
+          if (TS_OAUTH_NAMES.includes(name)) opts.onWritten?.(name, repo);
           return 'created';
         },
       };
@@ -390,14 +420,16 @@ export async function publishRoutingBundle(
       const legDeps: EnsureVariableDeps = {
         checkPresence: async () => {
           const presence = await deps.checkRepoSecretPresence(repo, ROUTING_BUNDLE_SECRET_NAME);
-          if (presence === 'present' && opts.refreshExisting === true) {
+          if (presence === 'present' && routingRefreshReason(repo, opts) !== undefined) {
             await deps.setRepoSecret(repo, ROUTING_BUNDLE_SECRET_NAME, bundleValue);
             opts.onRefreshed?.(ROUTING_BUNDLE_SECRET_NAME, repo);
+            opts.onWritten?.(ROUTING_BUNDLE_SECRET_NAME, repo);
           }
           return presence;
         },
         create: async () => {
           await deps.setRepoSecret(repo, ROUTING_BUNDLE_SECRET_NAME, bundleValue);
+          opts.onWritten?.(ROUTING_BUNDLE_SECRET_NAME, repo);
           return 'created';
         },
       };
@@ -408,11 +440,11 @@ export async function publishRoutingBundle(
     // that already carries a bundle from an earlier run is untouched
     // regardless of whether THIS run could recompute one.
     const presence = await deps.checkRepoSecretPresence(repo, ROUTING_BUNDLE_SECRET_NAME);
-    if (presence === 'present' && opts.refreshExisting === true) {
+    if (presence === 'present' && routingRefreshReason(repo, opts) !== undefined) {
       result[repo] = {
         status: 'failed',
         reason:
-          `${ROUTING_BUNDLE_SECRET_NAME} exists on this repo and a new Tailscale pair was supplied, but the bundle ` +
+          `${ROUTING_BUNDLE_SECRET_NAME} exists on this repo and may hold a different Tailscale pair than the one held, but the bundle ` +
           'cannot be recomposed this run (another routing secret is unavailable) — the existing bundle still holds the old pair',
       };
       continue;

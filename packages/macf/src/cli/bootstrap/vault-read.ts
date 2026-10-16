@@ -906,7 +906,7 @@ export type VaultRouterAppObservation =
  * run," never a false "absent."
  */
 export type VaultTsOauthObservation =
-  | { readonly status: 'confirmed'; readonly present: boolean }
+  | { readonly status: 'confirmed'; readonly present: boolean; /** Fingerprint of the held pair's stable encoding (never a value); set only when `present`. */ readonly fingerprint?: string }
   | { readonly status: 'unknown'; readonly reason: string };
 
 // --- Recipient-set reconciliation — DR-043 §D5 (groundnuty/macf#957) ---

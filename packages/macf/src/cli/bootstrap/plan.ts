@@ -131,6 +131,7 @@
  */
 import { toVariableSegment } from '@groundnuty/macf-core';
 import type { FleetAgent, FleetLock, FleetManifest } from './fleet-manifest.js';
+import { effectiveFleetFingerprints } from './fleet-manifest.js';
 import { buildTrustedActorsValue, deriveAppHandle, deriveControlRepoName, routerCarryingRepos } from './fleet-manifest.js';
 import { formatTable } from '../commands/ps.js';
 import type { VaultAgentObservation, VaultCaObservation, VaultRecipientsObservation, VaultRouterAppObservation, VaultTsOauthObservation } from './vault-read.js';
@@ -156,7 +157,7 @@ import { caCertVariableName } from './apply-ca.js';
 // `apply-routing-secrets.ts` only ever `import type`s `Presence` from THIS
 // module, so a value import going the other way here creates no runtime
 // cycle (only a type-level one, which TS resolves fine).
-import { TS_OAUTH_CLIENT_ID_ENV_VAR, TS_OAUTH_CLIENT_ID_FLAG, TS_OAUTH_SECRET_ENV_VAR, TS_OAUTH_SECRET_FLAG } from './apply-routing-secrets.js';
+import { TS_DEPLOYED_KEY_PREFIX, TS_OAUTH_CLIENT_ID_ENV_VAR, TS_OAUTH_CLIENT_ID_FLAG, TS_OAUTH_SECRET_ENV_VAR, TS_OAUTH_SECRET_FLAG } from './apply-routing-secrets.js';
 import { RUNNER_OPS_ROLE, deriveRunnerOpsHandle, runnerOpsNeeded } from './apply-runner-ops.js';
 // groundnuty/macf#1105 — same one-directional-runtime-dependency shape as
 // the `apply-runner-ops.js` import immediately above (that module ITSELF
@@ -1946,10 +1947,24 @@ const TS_OAUTH_FLAG_PLAN_NOTE =
   `${TS_OAUTH_CLIENT_ID_ENV_VAR}/${TS_OAUTH_SECRET_ENV_VAR} env fallbacks) directly — no pre-existing vault needed ` +
   'for that path.';
 
+/**
+ * Which repos' routing secrets may carry a different Tailscale pair than the vault holds, judged from what `fleet.lock`
+ * recorded as deployed (secrets are write-only, so there is no read-back). No pair records at all means a lock written
+ * before they existed. Neither value nor full fingerprint is ever returned.
+ */
+function staleTsDeployments(lock: FleetLock | null, heldFingerprint: string | undefined): { readonly reason: string; readonly repos: readonly string[] } | undefined {
+  if (lock === null || heldFingerprint === undefined) return undefined;
+  const recorded = Object.entries(effectiveFleetFingerprints(lock) ?? {}).filter(([k]) => k.startsWith(TS_DEPLOYED_KEY_PREFIX));
+  if (recorded.length === 0) return { reason: 'no record of which Tailscale pair was deployed', repos: [] };
+  const drifted = recorded.filter(([, fp]) => fp !== heldFingerprint).map(([k]) => k.slice(TS_DEPLOYED_KEY_PREFIX.length)).sort();
+  return drifted.length > 0 ? { reason: 'deployed with a different Tailscale pair than the vault holds', repos: drifted } : undefined;
+}
+
 function tsOauthItem(
   fleetName: string,
   tailscaleOauthRequired: boolean,
   vaultTsOauth: VaultTsOauthObservation | undefined,
+  lock: FleetLock | null,
 ): PlanItem {
   const target = `ts_oauth:fleet:${fleetName}:TS_OAUTH`;
   const requirementNote = tailscaleOauthRequired
@@ -1973,6 +1988,18 @@ function tsOauthItem(
   }
 
   if (vaultTsOauth.present) {
+    const stale = staleTsDeployments(lock, vaultTsOauth.fingerprint);
+    if (stale !== undefined) {
+      return {
+        kind: 'ts_oauth',
+        target,
+        verb: 'update',
+        reason:
+          `${stale.reason} — apply WILL rewrite the routing secrets that carry the Tailscale pair` +
+          (stale.repos.length > 0 ? ` on: ${stale.repos.join(', ')}.` : ' on every router-carrying repo that already holds them.'),
+        confirm_required: false,
+      };
+    }
     return {
       kind: 'ts_oauth',
       target,
@@ -2956,7 +2983,7 @@ export function computePlan(
   // reads this fleet's vault for TS_OAUTH_CLIENT_ID/TS_OAUTH_SECRET on every
   // run regardless of `transport.tailscale_oauth_required` (see
   // `tsOauthItem`'s doc).
-  items.push(tsOauthItem(fleetName, manifest.transport.tailscale_oauth_required, observed.vaultTsOauth));
+  items.push(tsOauthItem(fleetName, manifest.transport.tailscale_oauth_required, observed.vaultTsOauth, observed.lock));
 
   // groundnuty/macf#1162 — the scope-credential provenance notice, sourced
   // from the MANIFEST declaration UNION the LOCK marker (never lock alone

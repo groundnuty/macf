@@ -18,7 +18,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { applyFleet, shouldWriteBatchedFleetLock, type FleetApplyDeps, type VaultApplyOutcome } from '../../../src/cli/bootstrap/apply-fleet.js';
 import type { FleetAgent, FleetLock, FleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import { parseFleetLock, parseFleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
@@ -5365,8 +5365,15 @@ agents:
         ],
         fingerprints: { routing_client_key: 'sha256:cafef00d' },
       };
-      async function run(opts: { fresh?: { clientId: string; secret: string }; restored?: { clientId: string; secret: string } }) {
-        const manifestPath = manifestPathIn();
+      async function run(opts: {
+        fresh?: { clientId: string; secret: string };
+        restored?: { clientId: string; secret: string };
+        prior?: FleetLock;
+        manifestPath?: string;
+        failBundleOn?: string;
+        presence?: 'present' | 'absent';
+      }) {
+        const manifestPath = opts.manifestPath ?? manifestPathIn();
         const writes: { repo: string; name: string; value: string }[] = [];
         const logs: string[] = [];
         const deps: FleetApplyDeps = {
@@ -5381,13 +5388,16 @@ agents:
           },
           routerAppVaultDeps: { readVaultRouterApp: async () => ({ appId: '997', appKeyPem: 'ROUTER-APP-VAULT-PEM' }) },
           routingSecretsDeps: {
-            checkRepoSecretPresence: async () => 'present', // an earlier run already built the bundle + secrets
-            setRepoSecret: async (repo, name, value) => void writes.push({ repo, name, value }),
+            checkRepoSecretPresence: async () => opts.presence ?? 'present', // an earlier run already built the bundle + secrets
+            setRepoSecret: async (repo, name, value) => {
+              if (name === 'MACF_ROUTING_BUNDLE' && repo === opts.failBundleOn) throw new Error('transient github error');
+              writes.push({ repo, name, value });
+            },
             readVaultTsOauth: async () => opts.restored,
           },
           ...(opts.fresh !== undefined ? { resolvedTsOauth: opts.fresh } : {}),
         };
-        const result = await applyFleet(manifestWith([CODE_AGENT]), manifestPath, PRIOR, deps);
+        const result = await applyFleet(manifestWith([CODE_AGENT]), manifestPath, opts.prior ?? PRIOR, deps);
         return { result, writes, logs };
       }
 
@@ -5404,9 +5414,47 @@ agents:
         expect(log).not.toContain('tskey-client-new-secret');
       });
 
-      it('with no pair supplied, an existing bundle and secrets are left untouched (a vault-restored pair is not "fresh")', async () => {
-        const { writes } = await run({ restored: { clientId: 'k-old', secret: 'tskey-client-old-secret' } });
+      const NEW_PAIR = { clientId: 'k-new', secret: 'tskey-client-new-secret' };
+      const CODE = 'groundnuty/demo-code';
+      const CTRL = 'groundnuty/demo-fleet-control';
+      const bundleWrites = (w: { repo: string; name: string }[]) => w.filter((x) => x.name === 'MACF_ROUTING_BUNDLE').map((x) => x.repo).sort();
+      const deployedKeys = (lock: FleetLock | null) => Object.keys(lock?.fleet_fingerprints ?? {}).filter((k) => k.startsWith('ts_oauth_deployed:')).sort();
+
+      it('a failed bundle write leaves that repo\'s record unchanged; a later run with NO flags and the vault-restored pair rewrites only that repo', async () => {
+        const manifestPath = manifestPathIn();
+        const run1 = await run({ manifestPath, fresh: NEW_PAIR, restored: NEW_PAIR, failBundleOn: CODE });
+        expect(deployedKeys(run1.result.finalLock)).toEqual([`ts_oauth_deployed:${CTRL}`]);
+        const lock1 = run1.result.finalLock!;
+        const run2 = await run({ manifestPath, prior: lock1, restored: NEW_PAIR });
+        expect(bundleWrites(run2.writes)).toEqual([CODE]);
+        expect(deployedKeys(run2.result.finalLock)).toEqual([`ts_oauth_deployed:${CODE}`, `ts_oauth_deployed:${CTRL}`]);
+        // the repo that succeeded in run 1 is not rewritten, and a third run is a no-op
+        const run3 = await run({ manifestPath, prior: run2.result.finalLock!, restored: NEW_PAIR });
+        expect(run3.writes).toEqual([]);
+      });
+
+      it('a vault-restored pair matching every recorded fingerprint writes nothing, and the lock never holds the pair', async () => {
+        const manifestPath = manifestPathIn();
+        const run1 = await run({ manifestPath, fresh: NEW_PAIR, restored: NEW_PAIR });
+        const run2 = await run({ manifestPath, prior: run1.result.finalLock!, restored: NEW_PAIR });
+        expect(run2.writes).toEqual([]);
+        const serialized = JSON.stringify(run2.result.finalLock) + (readFileSync(join(dirname(manifestPath), 'fleet.lock'), 'utf-8'));
+        expect(serialized).not.toContain('k-new');
+        expect(serialized).not.toContain('tskey-client-new-secret');
+      });
+
+      it('a legacy lock with no record and an existing bundle gets one convergent rewrite, then records; the next run writes nothing', async () => {
+        const manifestPath = manifestPathIn();
+        const run1 = await run({ manifestPath, restored: NEW_PAIR });
+        expect(bundleWrites(run1.writes)).toEqual([CODE, CTRL]);
+        const run2 = await run({ manifestPath, prior: run1.result.finalLock!, restored: NEW_PAIR });
+        expect(run2.writes).toEqual([]);
+      });
+
+      it('with no pair held, nothing is written and nothing is recorded', async () => {
+        const { writes, result } = await run({});
         expect(writes).toEqual([]);
+        expect(deployedKeys(result.finalLock)).toEqual([]);
       });
 
       it('a malformed vault-restored pair is never written anywhere', async () => {
