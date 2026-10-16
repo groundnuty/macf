@@ -1647,8 +1647,16 @@ function routerCallerSecretsItem(
   } else if (verdict.notPassedByCaller.length > 0) {
     parts.push(`the caller (.github/workflows/agent-router.yml) does not pass ${verdict.notPassedByCaller.join(', ')}`);
   }
-  if (verdict.missingFromRepo.length > 0) {
-    parts.push(`the repo has no secret named ${verdict.missingFromRepo.join(', ')}`);
+  const withheld = verdict.orgWithheld ?? [];
+  const trulyMissing = verdict.missingFromRepo.filter((n) => !withheld.includes(n));
+  if (withheld.length > 0) {
+    parts.push(
+      `the org secret ${withheld.join(', ')} does not reach ${repo}: organisation secrets are not available to private repositories on the free plan — ` +
+        'set it as a repository secret, or route this repo self-hosted',
+    );
+  }
+  if (trulyMissing.length > 0) {
+    parts.push(`the repo has no secret named ${trulyMissing.join(', ')}`);
   }
   return {
     kind: 'router_caller_secrets',

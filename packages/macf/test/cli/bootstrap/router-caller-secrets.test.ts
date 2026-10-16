@@ -4,6 +4,7 @@ import { generateWorkflow } from '../../../src/cli/commands/repo-init.js';
 import { extractCallerSecrets, evaluateCallerRoutingForm } from '../../../src/cli/bootstrap/router-caller-secrets.js';
 import { computePlan, type ObservedState, type PlanItem } from '../../../src/cli/bootstrap/plan.js';
 import type { FleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
+import { classifyOrgSecretReach } from '../../../src/cli/bootstrap/observer.js';
 import { callerSecretRewritesFromObserved, controlCallerSecretRewriteFromObserved } from '../../../src/cli/commands/bootstrap-apply.js';
 
 const FOUR = ['MACF_ROUTING_APP_ID', 'MACF_ROUTING_APP_KEY', 'ROUTING_CLIENT_CERT', 'ROUTING_CLIENT_KEY'];
@@ -225,5 +226,43 @@ describe('evaluateCallerRoutingForm', () => {
       orgSecretRepos: { ...o.orgSecretRepos, 'macf-experiment/demo-control': { status: 'confirmed', names: new Set(TS) } },
     };
     expect(controlCallerSecretRewriteFromObserved(m, c)).toBe(true);
+  });
+});
+
+describe('org secrets reach a repo only if the repo can receive them (#1451)', () => {
+  const REPO = 'groundnuty/demo-code';
+  const caller = generateWorkflow('v3.5.0', V3);
+  function planRow(repoNames: readonly string[], visibility: string, plan: string | undefined): { r: PlanItem; o: ObservedState } {
+    const base = observed(caller, repoNames);
+    const o: ObservedState = {
+      ...base,
+      orgSecretRepos: { [REPO]: classifyOrgSecretReach(new Set(TS), visibility, plan, REPO) },
+    };
+    return { r: row(computePlan(manifest(false), o).items), o };
+  }
+
+  it('private + free + pair only at org level → update, says the org secret does not reach the repo; no rewrite flagged', () => {
+    const { r, o } = planRow(FOUR, 'private', 'free');
+    expect(r.verb).toBe('update');
+    expect(r.reason).toContain('the org secret TS_OAUTH_CLIENT_ID, TS_OAUTH_SECRET does not reach groundnuty/demo-code');
+    expect(r.reason).toContain('organisation secrets are not available to private repositories on the free plan');
+    expect(r.reason).toContain('set it as a repository secret, or route this repo self-hosted');
+    expect(r.reason).not.toContain('the repo has no secret named');
+    expect(callerSecretRewritesFromObserved(manifest(false), o)).toEqual({ 'code-agent': false });
+  });
+  it('private + free + pair at repo level → noop', () => {
+    expect(planRow([...FOUR, ...TS], 'private', 'free').r.verb).toBe('noop');
+  });
+  it('public + free + org-only → noop', () => {
+    expect(planRow(FOUR, 'public', 'free').r.verb).toBe('noop');
+  });
+  it('private + plan absent (App token) → create, LOW CONFIDENCE, never noop', () => {
+    const { r } = planRow(FOUR, 'private', undefined);
+    expect(r.verb).toBe('create');
+    expect(r.reason).toContain('LOW CONFIDENCE');
+    expect(r.reason).toContain('org plan could not be read');
+  });
+  it('private + paid plan (team) + org-only → noop', () => {
+    expect(planRow(FOUR, 'private', 'team').r.verb).toBe('noop');
   });
 });

@@ -98,10 +98,12 @@ export type CallerRoutingFormVerdict =
       readonly callerRewriteFixes: boolean;
       /** The caller uses `secrets: inherit` from an owner other than the router's, so it passes nothing. */
       readonly inheritCrossesOwner?: boolean;
+      /** Needed names listed at org level that this private repo cannot receive (free plan) — only a repo secret or a self-hosted route fixes them. */
+      readonly orgWithheld?: readonly string[];
     };
 
 export type RepoSecretsInput =
-  | { readonly status: 'confirmed'; readonly names: ReadonlySet<string> }
+  | { readonly status: 'confirmed'; readonly names: ReadonlySet<string>; readonly withheld?: ReadonlySet<string> }
   | { readonly status: 'unknown'; readonly reason: string }
   | undefined;
 
@@ -142,5 +144,11 @@ export function evaluateCallerRoutingForm(
   if (!orgKnown && !callerRewriteFixes && missingFromRepo.length > 0) {
     return { status: 'unknown', reason: `the org-level secrets visible to the repo could not be read (${orgSecrets?.status === 'unknown' ? orgSecrets.reason : 'no read attempted'}), so ${missingFromRepo.join(', ')} may exist there` };
   }
-  return { status: 'incomplete', missingFromRepo, notPassedByCaller, callerRewriteFixes, ...(inheritCrossesOwner ? { inheritCrossesOwner: true } : {}) };
+  const withheld = orgSecrets?.status === 'confirmed' ? orgSecrets.withheld : undefined;
+  const orgWithheld = withheld === undefined ? [] : needed.filter((n) => withheld.has(n) && !repoSecrets.names.has(n));
+  return {
+    status: 'incomplete', missingFromRepo, notPassedByCaller, callerRewriteFixes,
+    ...(inheritCrossesOwner ? { inheritCrossesOwner: true } : {}),
+    ...(orgWithheld.length > 0 ? { orgWithheld } : {}),
+  };
 }
