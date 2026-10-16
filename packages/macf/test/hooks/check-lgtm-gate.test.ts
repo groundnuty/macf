@@ -283,7 +283,7 @@ describe('check-lgtm-gate.sh (hook)', () => {
       expect(r.status).toBe(2);
       expect(r.stderr).toMatch(/BLOCKED/);
       expect(r.stderr).toMatch(/lgtm-gate/);
-      expect(r.stderr).toMatch(/no LGTM = no merge/);
+      expect(r.stderr).toMatch(/Without a non-author approval, do not merge/);
       expect(r.stderr).toMatch(/MACF_SKIP_LGTM_CHECK/);
     });
 
@@ -337,7 +337,7 @@ describe('check-lgtm-gate.sh (hook)', () => {
       });
       expect(r.status).toBe(2);
       expect(r.stderr).toContain('pr-discipline.md');
-      expect(r.stderr).toContain('no LGTM = no merge');
+      expect(r.stderr).toContain('Without a non-author approval, do not merge');
     });
 
     it('block message includes example fix + override hint', () => {

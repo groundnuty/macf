@@ -34,12 +34,20 @@ You implement features, fix bugs, write tests, and maintain CI/CD. You work in a
 
 Refresh token and run all commands in a single chained block. **Your turn ends after this.**
 
-    GH_TOKEN=$("$MACF_WORKSPACE_DIR/.claude/scripts/macf-gh-token.sh" --app-id "$APP_ID" --install-id "$INSTALL_ID" --key "$KEY_PATH") && \
-    export GH_TOKEN && \
-    git -c url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf="https://github.com/" push -u origin HEAD && \
-    GH_TOKEN=$GH_TOKEN gh pr create --repo <owner>/<repo> --title "<type>: <description>" --body "Refs #<N>" && \
-    GH_TOKEN=$GH_TOKEN gh issue edit <N> --repo <owner>/<repo> --add-label "in-review" --remove-label "in-progress" && \
-    GH_TOKEN=$GH_TOKEN gh issue comment <N> --repo <owner>/<repo> --body "@<science-agent> PR is ready for review."
+Write the comment to a temporary file first, with `@<recipient> …` on its own first line:
+
+```bash
+f=$(mktemp)
+cat > "$f" <<'EOF'
+@<science-agent> PR is ready for review.
+EOF
+GH_TOKEN=$("$MACF_WORKSPACE_DIR/.claude/scripts/macf-gh-token.sh" --app-id "$APP_ID" --install-id "$INSTALL_ID" --key "$KEY_PATH") && \
+export GH_TOKEN && \
+git -c url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf="https://github.com/" push -u origin HEAD && \
+GH_TOKEN=$GH_TOKEN gh pr create --repo <owner>/<repo> --title "<type>: <description>" --body "Refs #<N>" && \
+GH_TOKEN=$GH_TOKEN gh issue edit <N> --repo <owner>/<repo> --add-label "in-review" --remove-label "in-progress" && \
+GH_TOKEN=$GH_TOKEN gh issue comment <N> --repo <owner>/<repo> --body-file "$f"
+```
 
 **STOP. Do not check for more work. Your task is complete.**
 
@@ -48,9 +56,17 @@ Refresh token and run all commands in a single chained block. **Your turn ends a
 1. Push fixes to the same branch.
 2. Post in the **issue** thread:
 
-       GH_TOKEN=$("$MACF_WORKSPACE_DIR/.claude/scripts/macf-gh-token.sh" --app-id "$APP_ID" --install-id "$INSTALL_ID" --key "$KEY_PATH") && \
-    export GH_TOKEN && \
-       GH_TOKEN=$GH_TOKEN gh issue comment <N> --repo <owner>/<repo> --body "@<science-agent> Pushed fixes. Please re-review."
+Write the comment to a temporary file first, with `@<recipient> …` on its own first line:
+
+```bash
+f=$(mktemp)
+cat > "$f" <<'EOF'
+@<science-agent> Pushed fixes. Please re-review.
+EOF
+GH_TOKEN=$("$MACF_WORKSPACE_DIR/.claude/scripts/macf-gh-token.sh" --app-id "$APP_ID" --install-id "$INSTALL_ID" --key "$KEY_PATH") && \
+export GH_TOKEN && \
+GH_TOKEN=$GH_TOKEN gh issue comment <N> --repo <owner>/<repo> --body-file "$f"
+```
 
 ## Merging (Only After LGTM)
 

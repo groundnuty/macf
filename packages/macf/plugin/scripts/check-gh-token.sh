@@ -108,7 +108,7 @@ GH_TOKEN prefix: ghs_ (a bot installation token — NOT the attribution trap)
 This copy's pattern: ^ghs_[A-Za-z0-9._-]+\$
 
 Your token carries the bot prefix but did not match the pattern above. A
-`ghs_` token is a bot installation token by definition, so the likely cause
+\`ghs_\` token is a bot installation token by definition, so the likely cause
 is that this workspace's copy of check-gh-token.sh predates a widening of
 that pattern (gh-token v2.x mints a ~383-char \`ghs_<app>_<JWT>\` containing
 dots and hyphens; see groundnuty/macf#827 and #1360).
@@ -120,11 +120,13 @@ the token; that is not the problem:
   macf rules refresh --dir .
 
 If the pattern above already accepts your token's shape and it still blocks,
-THEN the token is genuinely malformed — refresh it via the fail-loud helper
-as described in .claude/rules/gh-token-refresh.md.
+THEN the token is genuinely malformed; a mint inside a command cannot replace
+it. Ask the operator to relaunch with ./claude.sh (see
+.claude/rules/gh-token-attribution-traps.md).
 
-Override (ONLY for intentional user-attributed ops):
-  export MACF_SKIP_TOKEN_CHECK=1
+Override (ONLY for intentional user-attributed ops) is launch-time / operator
+only: MACF_SKIP_TOKEN_CHECK is read from this session's process env, so an
+in-session export does not reach it. See .claude/rules/gh-token-attribution-traps.md.
 ERR
     exit 2
   fi
@@ -136,29 +138,21 @@ GH_TOKEN prefix: ${TOKEN_PREFIX:-(empty)}
 
 This hook exists because behavioral controls for the GH_TOKEN attribution
 trap recurred 5 times in a single day. See groundnuty/macf#140 and
-.claude/rules/coordination.md (Token & Git Hygiene).
+.claude/rules/gh-token-attribution-traps.md.
 
-Fix — refresh the bot token via the fail-loud helper:
-
-  GH_TOKEN=\$(./.claude/scripts/macf-gh-token.sh \\
-    --app-id "\$APP_ID" --install-id "\$INSTALL_ID" --key "\$KEY_PATH") || exit 1
-  export GH_TOKEN
-
-If the helper is missing, restore it:
-  macf rules refresh --dir .
-
-If GH_TOKEN is persistently bad in THIS session's ambient env (not just this
-one command) — e.g. a corrupt/inherited value from a relaunch or resume path
-— the in-session fixes above cannot reach the process env this hook reads.
-The sanctioned recovery is a relaunch: exit this session and run ./claude.sh
-again. Since macf#821, claude.sh full-shape-validates GH_TOKEN at the launch
+Fix — relaunch. The GH_TOKEN this session launched with is not a bot token, and
+a mint inside a command cannot change the env this hook reads. Ask the operator
+to relaunch this session with ./claude.sh. claude.sh full-shape-validates GH_TOKEN at the launch
 boundary (before exec) and re-mints or aborts loudly rather than starting a
 session this hook would then deadlock.
+
+If the token helper (macf-gh-token.sh) is missing from the workspace, restore it first:
+  macf rules refresh --dir .
 
 Override (ONLY for intentional user-attributed ops like onboarding) is
 launch-time / operator only: MACF_SKIP_TOKEN_CHECK is read from THIS
 session's process env, fixed when ./claude.sh launched it. An in-session
-\`export MACF_SKIP_TOKEN_CHECK=1\` from a Bash tool call does NOT reach
+export of MACF_SKIP_TOKEN_CHECK from a Bash tool call does NOT reach
 it — Bash-tool commands run in a separate subshell that never persists
 into the session's env. To use it: set MACF_SKIP_TOKEN_CHECK=1 in the
 launch env (or the workspace's .claude/.macf/env.* files) BEFORE running
