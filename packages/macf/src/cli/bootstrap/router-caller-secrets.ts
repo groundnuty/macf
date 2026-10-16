@@ -88,6 +88,7 @@ export function evaluateCallerRoutingForm(
   caller: CallerSecrets | undefined,
   repoSecrets: RepoSecretsInput,
   selfHostedRunner: boolean,
+  orgSecrets?: RepoSecretsInput,
 ): CallerRoutingFormVerdict {
   if (caller === undefined) return { status: 'unknown', reason: 'the installed router caller could not be read' };
   if (repoSecrets === undefined || repoSecrets.status === 'unknown') {
@@ -96,7 +97,9 @@ export function evaluateCallerRoutingForm(
   // `secrets: inherit` passes everything the repo holds — nothing the caller
   // can be faulted for; only repo-side absence remains.
   const passes = (n: string): boolean => caller.inherit || caller.names.includes(n);
-  const have = repoSecrets.names;
+  // Org-level secrets visible to the repo resolve in `${{ secrets.X }}` too.
+  const orgKnown = orgSecrets?.status === 'confirmed';
+  const have: ReadonlySet<string> = orgKnown ? new Set([...repoSecrets.names, ...orgSecrets.names]) : repoSecrets.names;
   const bundleUsable = have.has(ROUTING_BUNDLE_SECRET_NAME) && passes(ROUTING_BUNDLE_SECRET_NAME);
   const needed = routerNeededSecretNames(selfHostedRunner);
   const individualUsable = needed.every((n) => have.has(n) && passes(n));
@@ -104,5 +107,10 @@ export function evaluateCallerRoutingForm(
   const missingFromRepo = needed.filter((n) => !have.has(n));
   const notPassedByCaller = needed.filter((n) => !passes(n));
   const callerRewriteFixes = [ROUTING_BUNDLE_SECRET_NAME, ...needed].some((n) => have.has(n) && !passes(n));
+  // A name absent from the repo may still exist at org level; when that read
+  // failed, a gap only that could explain is unknown — never "missing".
+  if (!orgKnown && !callerRewriteFixes && missingFromRepo.length > 0) {
+    return { status: 'unknown', reason: `the org-level secrets visible to the repo could not be read (${orgSecrets?.status === 'unknown' ? orgSecrets.reason : 'no read attempted'}), so ${missingFromRepo.join(', ')} may exist there` };
+  }
   return { status: 'incomplete', missingFromRepo, notPassedByCaller, callerRewriteFixes };
 }

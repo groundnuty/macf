@@ -466,6 +466,10 @@ export interface ObservedState {
    * `routing-secret-parity.ts::secretPresenceFor`).
    */
   readonly routingSecretRepos?: Readonly<Record<string, RepoSecretNamesObservation>>;
+  /** Org-level Actions secrets visible to each router-carrying repo (`${{ secrets.X }}` resolves these). Same keys as `routingSecretRepos`; absent/unknown = org secrets unconfirmed. */
+  readonly orgSecretRepos?: Readonly<Record<string, RepoSecretNamesObservation>>;
+  /** What the CONTROL repo's installed router caller passes under `secrets:` (sibling of `agents[role].callerSecrets`). */
+  readonly controlRepoCallerSecrets?: CallerSecrets;
   /**
    * Vault-derived per-project CA key/cert presence (DR-043 Amendment D phase
    * 3) — same undefined-vs-observed convention as {@link ObservedAgentState.vault}.
@@ -1609,20 +1613,21 @@ function agentConfigItem(agent: FleetAgent, desiredRoles: readonly string[], obs
  *   the repo is reported, not published by this row.
  */
 function routerCallerSecretsItem(
-  agent: FleetAgent,
+  repo: string,
+  target: string,
   caller: CallerSecrets | undefined,
   repoSecrets: RepoSecretNamesObservation | undefined,
+  orgSecrets: RepoSecretNamesObservation | undefined,
   selfHostedRunner: boolean,
 ): PlanItem {
-  const target = `agent:${agent.role}:router_caller_secrets:${agent.repo}`;
-  const verdict = evaluateCallerRoutingForm(caller, repoSecrets, selfHostedRunner);
+  const verdict = evaluateCallerRoutingForm(caller, repoSecrets, selfHostedRunner, orgSecrets);
   if (verdict.status === 'unknown') {
     return {
       kind: 'router_caller_secrets',
       target,
       verb: 'create',
       reason:
-        `routing secrets passed by the router caller on "${agent.repo}" (.github/workflows/agent-router.yml) could not be checked — ${verdict.reason} — ` +
+        `routing secrets passed by the router caller on "${repo}" (.github/workflows/agent-router.yml) could not be checked — ${verdict.reason} — ` +
         'not drift, not a match — LOW CONFIDENCE',
       confirm_required: false,
     };
@@ -1632,7 +1637,7 @@ function routerCallerSecretsItem(
       kind: 'router_caller_secrets',
       target,
       verb: 'noop',
-      reason: `router caller on "${agent.repo}" passes a routing-secret form the router can consume`,
+      reason: `router caller on "${repo}" passes a routing-secret form the router can consume`,
       confirm_required: false,
     };
   }
@@ -1648,7 +1653,7 @@ function routerCallerSecretsItem(
     target,
     verb: 'update',
     reason:
-      `router caller on "${agent.repo}" cannot give the router a usable routing-secret form: ${parts.join('; ')} — ` +
+      `router caller on "${repo}" cannot give the router a usable routing-secret form: ${parts.join('; ')} — ` +
       'a reusable workflow sees only the secrets its caller passes, so nothing routes on this repo' +
       (verdict.callerRewriteFixes ? '; apply reconciles the caller by rewriting the committed agent-router.yml during this run' : '; supply the missing secret(s) — apply cannot fix this by rewriting the caller'),
     confirm_required: true,
@@ -2996,10 +3001,29 @@ export function computePlan(
     items.push(agentConfigItem(agent, declaredRoles, obs?.agentConfigRoles));
     items.push(
       routerCallerSecretsItem(
-        agent,
+        agent.repo,
+        `agent:${agent.role}:router_caller_secrets:${agent.repo}`,
         obs?.callerSecrets,
         observed.routingSecretRepos?.[agent.repo],
+        observed.orgSecretRepos?.[agent.repo],
         manifest.routing?.runner?.runs_on === 'self-hosted',
+      ),
+    );
+  }
+
+  // The control repo carries a router too (every agent App is installed
+  // there; its routing table lists the whole fleet), and its caller never
+  // declares a runner — so it runs hosted and needs the Tailscale pair.
+  if (observed.controlRepoPresence !== 'absent') {
+    const controlRepo = routerCarryingRepos(manifest).at(-1)!;
+    items.push(
+      routerCallerSecretsItem(
+        controlRepo,
+        `repo:${controlRepo}:router_caller_secrets`,
+        observed.controlRepoCallerSecrets,
+        observed.routingSecretRepos?.[controlRepo],
+        observed.orgSecretRepos?.[controlRepo],
+        false,
       ),
     );
   }

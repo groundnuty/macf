@@ -1290,10 +1290,18 @@ export function callerSecretRewritesFromObserved(manifest: FleetManifest, observ
   const selfHosted = manifest.routing?.runner?.runs_on === 'self-hosted';
   const out: Record<string, boolean> = {};
   for (const agent of manifest.agents) {
-    const verdict = evaluateCallerRoutingForm(observed.agents[agent.role]?.callerSecrets, observed.routingSecretRepos?.[agent.repo], selfHosted);
+    const verdict = evaluateCallerRoutingForm(observed.agents[agent.role]?.callerSecrets, observed.routingSecretRepos?.[agent.repo], selfHosted, observed.orgSecretRepos?.[agent.repo]);
     out[agent.role] = verdict.status === 'incomplete' && verdict.callerRewriteFixes;
   }
   return out;
+}
+
+/** Whether the control repo's router caller must be rewritten (it runs hosted — no runner declared). */
+export function controlCallerSecretRewriteFromObserved(manifest: FleetManifest, observed: ObservedState): boolean {
+  if (observed.controlRepoPresence === 'absent') return false;
+  const repo = `${manifest.owner.account}/${deriveControlRepoName(manifest.metadata.name)}`;
+  const v = evaluateCallerRoutingForm(observed.controlRepoCallerSecrets, observed.routingSecretRepos?.[repo], false, observed.orgSecretRepos?.[repo]);
+  return v.status === 'incomplete' && v.callerRewriteFixes;
 }
 
 /**
@@ -3589,6 +3597,7 @@ export async function runBootstrapApply(
       ...(mutateDeps ?? resolveMutateDeps(manifestPath, vaultAgentPems, resolvedRunnerToken, opts.identityKeyPath, opts.vaultPath, opts.yes, resolvedTsOauth)),
       observedActionsPins: mutateDeps?.observedActionsPins ?? actionsPinsFromObserved(manifest, observed),
       callerSecretRewrites: mutateDeps?.callerSecretRewrites ?? callerSecretRewritesFromObserved(manifest, observed),
+      callerSecretRewriteControl: mutateDeps?.callerSecretRewriteControl ?? controlCallerSecretRewriteFromObserved(manifest, observed),
       // groundnuty/macf#1211 — same "merged on TOP, never through
       // resolveMutateDeps's own param list" precedent as observedActionsPins
       // immediately above: the RAW scope-variable value, already read once

@@ -541,6 +541,8 @@ export interface FleetApplyDeps {
    * rewrite `resolveActionsPinReconcile` drives. Absent = no gap known.
    */
   readonly callerSecretRewrites?: Readonly<Record<string, boolean>>;
+  /** Same, for the control repo's router caller. */
+  readonly callerSecretRewriteControl?: boolean;
   readonly observedActionsPins?: {
     readonly agents: Readonly<Record<string, string | undefined>>;
     readonly controlRepo: string | undefined;
@@ -1438,7 +1440,7 @@ export async function applyFleet(
     { repoInit: deps.repoInitDeps.repoInit },
     {
       actionsVersion: controlPinReconcile.actionsVersion,
-      force: controlPinReconcile.force,
+      force: controlPinReconcile.force || deps.callerSecretRewriteControl === true,
       ...(controlRepoLabelTokenSource !== undefined ? { tokenSource: controlRepoLabelTokenSource } : {}),
     },
   );
@@ -1845,7 +1847,7 @@ export async function applyFleet(
           controlDir,
           manifest,
           { repoInit: deps.repoInitDeps.repoInit },
-          { actionsVersion: controlPinReconcile.actionsVersion, force: controlPinReconcile.force, tokenSource: retryTokenSource },
+          { actionsVersion: controlPinReconcile.actionsVersion, force: controlPinReconcile.force || deps.callerSecretRewriteControl === true, tokenSource: retryTokenSource },
         );
         if (retried.status === 'written') {
           deps.log(
