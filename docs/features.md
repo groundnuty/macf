@@ -201,7 +201,7 @@ The routing-Action's HTTP 200 from the channel server is the result-invariant as
 | `verify-before-claim.md` | Three-cut verification: at every hop; before citing peer evidence; on degenerate inputs. Sister to `mention-routing-hygiene.md` for inline-quoting |
 | `gh-token-attribution-traps.md` | Class catalog of attribution-trap recurrences; cross-references the structural defense (`check-gh-token.sh`) |
 | `model-era-compatibility.md` | Conventions for cross-version Claude Code agent interop |
-| `observability-wiring.md` | Where OTel + tracing + metrics are wired; conventions for new observability instruments |
+| `observability-wiring.md` | Path-scoped (launcher and env files): the exported OTel variable set, opt-out, and checking that traces arrive |
 | `check-before-propose.md` | When researching: cite primary sources; verify via tool calls before drafting |
 | `codify-at-correction-time.md` | When discipline gets corrected mid-flow, codify the rule before continuing — prevents recurrence drift |
 | `execute-on-directive.md` | When operator gives a directive (e.g., "merge whenever convenient"), execute promptly without re-confirming |
