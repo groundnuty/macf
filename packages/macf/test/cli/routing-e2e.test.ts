@@ -23,6 +23,8 @@ import {
   type RoutingE2eDeps,
   type RoutingE2eRouterRun,
 } from '../../src/cli/commands/routing-e2e.js';
+import type { TextRead } from '../../src/cli/commands/routing-e2e-evidence.js';
+import { receiverLogPathFor, resolveReceiverLogPath } from '../../src/cli/commands/routing-e2e-gh.js';
 
 const AGENT_INFO: AgentInfo = {
   host: '10.0.0.5',
@@ -337,5 +339,242 @@ describe('routingE2eToJson / formatRoutingE2eText', () => {
     expect(jsonStr).not.toContain(AGENT_INFO.host);
     expect(jsonStr).not.toContain(String(AGENT_INFO.port));
     expect(formatRoutingE2eText(r)).not.toContain(AGENT_INFO.host);
+  });
+});
+
+// --- Evidence-based verdicts: the run's conclusion is never the evidence ---
+
+const ROUTED_LINE = 'router\tRouted issue #42 to science-agent via mTLS POST (HTTP 200)';
+const RECEIPT_LINE = JSON.stringify({ ts: '2099-01-01T00:00:00.000Z', level: 'info', event: 'notify_received', type: 'issue_routed', issue: 42 });
+const DONE_RUN: RoutingE2eRouterRun = { found: true, id: 7, conclusion: 'success', status: 'completed', url: 'https://example.test/run/7' };
+
+const neverMatchedProbe = vi.fn(async () => REACHABLE_NOT_MATCHED_HEALTH);
+
+function evidenceDeps(over: Partial<RoutingE2eDeps> & { log?: string; recv?: TextRead } = {}): RoutingE2eDeps {
+  const { log = ROUTED_LINE, recv = { kind: 'ok', text: RECEIPT_LINE }, ...rest } = over;
+  return baseDeps({
+    probe: neverMatchedProbe,
+    findRouterRun: vi.fn(async () => DONE_RUN),
+    readRunLog: vi.fn(async (): Promise<TextRead> => ({ kind: 'ok', text: log })),
+    readReceiverLog: vi.fn(async () => ({ read: recv, path: '/state/macf/p@science-agent/channel.log' })),
+    ...rest,
+  });
+}
+
+describe('runRoutingE2eCore — evidence verdicts', () => {
+  it('delivered: routed line AND a receiver channel-log receipt', async () => {
+    const r = await runRoutingE2eCore(evidenceDeps(), { targetRepo: 'o/r' });
+    expect(r.verdict).toBe('GREEN');
+    expect(r.evidence?.verdict).toBe('delivered');
+  });
+
+  it('DECISIVE: a green run (conclusion success) with no routed line is not-routed', async () => {
+    const r = await runRoutingE2eCore(evidenceDeps({ log: 'router\tnothing was routed' }), { targetRepo: 'o/r' });
+    expect(DONE_RUN.conclusion).toBe('success');
+    expect(r.evidence?.verdict).toBe('not-routed');
+    expect(r.verdict).toBe('RED');
+  });
+
+  it('a red run with an error line is router-failed and quotes it', async () => {
+    const failed = { ...DONE_RUN, conclusion: 'failure' };
+    const r = await runRoutingE2eCore(
+      evidenceDeps({ findRouterRun: vi.fn(async () => failed), log: 'x\t##[error]Missing secret ROUTING_CLIENT_CERT' }),
+      { targetRepo: 'o/r' },
+    );
+    expect(r.evidence?.verdict).toBe('router-failed');
+    expect(r.evidence?.gaps).toContain('router error: Missing secret ROUTING_CLIENT_CERT');
+  });
+
+  it('routed but no receipt in the channel log is routed-but-not-received', async () => {
+    const r = await runRoutingE2eCore(evidenceDeps({ recv: { kind: 'ok', text: '' } }), { targetRepo: 'o/r' });
+    expect(r.evidence?.verdict).toBe('routed-but-not-received');
+  });
+
+  it('receiver log not local (and endpoint never answered) is unknown, never delivered', async () => {
+    const r = await runRoutingE2eCore(evidenceDeps({ recv: { kind: 'absent' }, probe: vi.fn(async () => null) }), { targetRepo: 'o/r' });
+    expect(r.evidence?.verdict).toBe('unknown');
+    expect(r.message).toContain('not verifiable from this host');
+    expect(r.verdict).toBe('RED');
+  });
+
+  it('a self-route skip line is reported as a self-route, not delivered', async () => {
+    const r = await runRoutingE2eCore(evidenceDeps({ log: 'x\tActor is the same agent, skipping self-routing' }), { targetRepo: 'o/r' });
+    expect(r.evidence?.verdict).toBe('self-route');
+  });
+
+  it('no run within the wait is no-run', async () => {
+    const r = await runRoutingE2eCore(evidenceDeps({ findRouterRun: vi.fn(async () => NOT_FOUND_RUN) }), { targetRepo: 'o/r' });
+    expect(r.evidence?.verdict).toBe('no-run');
+  });
+
+  it('mention mode comments once on the given issue and never closes anything', async () => {
+    const postMention = vi.fn(async () => ({ ok: true as const, url: 'https://example.test/c' }));
+    const deps = evidenceDeps({
+      postMention,
+      readTargetRoutingConfig: vi.fn(async (): Promise<RoutingConfig | null> => ({ agents: { 'science-agent': { app_name: 'macf-science-agent' } } })),
+      recv: { kind: 'ok', text: JSON.stringify({ ts: '2099-01-01T00:00:00.000Z', event: 'notify_received', type: 'mention', issue: 5 }) },
+    });
+    const r = await runRoutingE2eCore(deps, { targetRepo: 'o/r', mode: 'mention', issue: 5 });
+    expect(postMention).toHaveBeenCalledTimes(1);
+    expect(deps.createProbeIssue).not.toHaveBeenCalled();
+    expect(deps.closeIssue).not.toHaveBeenCalled();
+    expect(r.evidence?.verdict).toBe('delivered');
+  });
+});
+
+describe('receiver log path', () => {
+  const rec = (agent: string, project = 'macf', workspace = `/ws/${agent}`) => ({ agent, project, workspace, registry: 'r', versionPin: null }) as never;
+  const seams = (recs: readonly unknown[], agentName: string, env: string | null = null) => ({
+    discover: () => recs as never,
+    readConfig: () => ({ agent_name: agentName }),
+    readEnvLogPath: () => env,
+  });
+
+  it('receiverLogPathFor keys on agent_name (never the bot app name)', () => {
+    process.env['XDG_STATE_HOME'] = '/state';
+    expect(receiverLogPathFor('macf-trial', 'code-agent')).toBe('/state/macf/macf-trial@code-agent/channel.log');
+    expect(receiverLogPathFor('macf-trial', 'code-agent')).not.toContain('macf-trial-code-agent');
+  });
+
+  it('label == agent_name (the trial shape) resolves', () => {
+    process.env['XDG_STATE_HOME'] = '/state';
+    expect(resolveReceiverLogPath('macf-trial', 'code-agent', '/p', seams([rec('code-agent', 'macf-trial')], 'code-agent'))).toBe(
+      '/state/macf/macf-trial@code-agent/channel.log',
+    );
+  });
+
+  it('label != agent_name resolves via the workspace agent_name, never the label', () => {
+    process.env['XDG_STATE_HOME'] = '/state';
+    const p = resolveReceiverLogPath('macf', 'science-agent', '/p', seams([rec('science-agent')], 'macf-science-agent'));
+    expect(p).toBe('/state/macf/macf@macf-science-agent/channel.log');
+    expect(p).not.toContain('macf@science-agent/');
+  });
+
+  it('no local workspace for project+label → null (not verifiable), no label-keyed fallback', () => {
+    expect(resolveReceiverLogPath('macf', 'science-agent', '/p', seams([rec('code-agent'), rec('science-agent', 'other')], 'x'))).toBeNull();
+  });
+
+  it('an env.* MACF_LOG_PATH wins over derivation', () => {
+    expect(resolveReceiverLogPath('macf', 'science-agent', '/p', seams([rec('science-agent')], 'macf-science-agent', '/custom/channel.log'))).toBe(
+      '/custom/channel.log',
+    );
+  });
+});
+
+describe('runRoutingE2eCore — which router run is the probe\'s (never a guess)', () => {
+  const run = (id: number): RoutingE2eRouterRun => ({ found: true, id, conclusion: 'success', status: 'completed', url: `https://example.test/run/${String(id)}` });
+  const mentionDeps = (logs: Record<number, string>, runs: readonly RoutingE2eRouterRun[]): RoutingE2eDeps =>
+    evidenceDeps({
+      listRouterRuns: vi.fn(async () => ({ ok: true as const, runs })),
+      readRunLog: vi.fn(async (_r: string, id: number): Promise<TextRead> => ({ kind: 'ok', text: logs[id] ?? '' })),
+      postMention: vi.fn(async () => ({ ok: true as const, url: 'https://example.test/c' })),
+      readTargetRoutingConfig: vi.fn(async (): Promise<RoutingConfig | null> => ({ agents: { 'science-agent': { app_name: 'macf-science-agent' } } })),
+      recv: { kind: 'ok', text: JSON.stringify({ ts: '2099-01-01T00:00:00.000Z', event: 'notify_received', type: 'mention', issue: 5 }) },
+    });
+  const opts = { targetRepo: 'o/r', mode: 'mention' as const, issue: 5 };
+
+  it('timestamp is taken before the post: a title fetch taking 30s cannot hide the run or the receipt', async () => {
+    const T0 = Date.parse('2026-01-01T00:00:00Z');
+    let t = T0;
+    const runAt = T0 + 1000; // created 1s after the post
+    const base = mentionDeps({ 1: 'Routed mention to science-agent via mTLS POST\nISSUE_NUMBER: 5' }, []);
+    const deps: RoutingE2eDeps = {
+      ...base,
+      now: () => t,
+      sleep: async () => {},
+      readIssueTitle: vi.fn(async () => {
+        t += 30_000;
+        return 'probe';
+      }),
+      // Faithful to the real lister: only runs created >= since - 5s.
+      listRouterRuns: vi.fn(async (_r: string, sinceIso: string) => ({
+        ok: true as const,
+        runs: runAt >= Date.parse(sinceIso) - 5000 ? [{ ...run(1), title: 'probe' }] : [],
+      })),
+      readReceiverLog: vi.fn(async () => ({
+        read: { kind: 'ok' as const, text: JSON.stringify({ ts: new Date(runAt).toISOString(), event: 'notify_received', type: 'mention', issue: 5 }) },
+        path: '/l',
+      })),
+    };
+    const r = await runRoutingE2eCore(deps, opts);
+    expect(r.routerRun?.id).toBe(1);
+    expect(r.evidence?.verdict).toBe('delivered');
+  });
+
+  it('two concurrent runs, only one names the issue: that one is judged', async () => {
+    const r = await runRoutingE2eCore(
+      mentionDeps({ 1: 'Routed mention to science-agent via mTLS POST\nISSUE_NUMBER: 9', 2: 'Routed mention to science-agent via mTLS POST\nISSUE_NUMBER: 5' }, [run(1), run(2)]),
+      opts,
+    );
+    expect(r.evidence?.verdict).toBe('delivered');
+    expect(r.routerRun?.id).toBe(2);
+  });
+
+  it('two runs that both name the issue are ambiguous, not guessed', async () => {
+    const log = 'Routed mention to science-agent via mTLS POST\nISSUE_NUMBER: 5';
+    const r = await runRoutingE2eCore(mentionDeps({ 1: log, 2: log }, [run(1), run(2)]), opts);
+    expect(r.evidence?.verdict).toBe('unknown');
+    expect(r.message).toBe("ambiguous: 2 router runs started in the window and the log could not single out the probe's");
+  });
+
+  it('two untitled runs where neither names the issue are ambiguous', async () => {
+    const r = await runRoutingE2eCore(mentionDeps({ 1: 'nothing', 2: 'nothing' }, [run(1), run(2)]), opts);
+    expect(r.evidence?.verdict).toBe('unknown');
+    expect(r.message).toContain('ambiguous: 2 router runs');
+  });
+
+  it('a single untitled candidate is used as-is (no title to tell it apart)', async () => {
+    const r = await runRoutingE2eCore(mentionDeps({ 1: 'Routed mention to science-agent via mTLS POST' }, [run(1)]), opts);
+    expect(r.evidence?.verdict).toBe('delivered');
+  });
+
+  const PROBE_TITLE = 'e2e: first cross-agent message (2026-10-16)';
+  const titled = (id: number, title: string): RoutingE2eRouterRun => ({ ...run(id), title });
+  const titledDeps = (logs: Record<number, string>, runs: readonly RoutingE2eRouterRun[]): RoutingE2eDeps => ({
+    ...mentionDeps(logs, runs),
+    readIssueTitle: vi.fn(async () => PROBE_TITLE),
+  });
+
+  it('a SINGLE run triggered by another issue (other display_title) is never taken as the probe\'s (Codex)', async () => {
+    const r = await runRoutingE2eCore(titledDeps({ 1: 'Routed mention to science-agent via mTLS POST' }, [titled(1, 'some other issue')]), opts);
+    expect(r.evidence?.verdict).toBe('no-run');
+  });
+
+  it('an unrelated run completing first does not end the wait: the probe\'s run appearing on a later poll is judged (Codex)', async () => {
+    const listRouterRuns = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true as const, runs: [titled(1, 'some other issue')] })
+      .mockResolvedValue({ ok: true as const, runs: [titled(1, 'some other issue'), titled(2, PROBE_TITLE)] });
+    let clock = 0;
+    const deps = {
+      ...titledDeps({ 1: 'Routed mention to science-agent via mTLS POST', 2: 'Routed mention to science-agent via mTLS POST' }, []),
+      listRouterRuns,
+      maxPolls: 3,
+      pollIntervalMs: 1000,
+      now: () => clock,
+      sleep: async (ms: number) => {
+        clock += ms;
+      },
+    };
+    const r = await runRoutingE2eCore(deps, opts);
+    expect(listRouterRuns.mock.calls.length).toBeGreaterThan(1);
+    expect(r.evidence?.verdict).toBe('delivered');
+    expect(r.routerRun?.id).toBe(2);
+  });
+
+  it('the probe\'s titled self-route run is judged a self-route even though its log names no issue (real shape)', async () => {
+    // Real self-route and failed runs carry no ISSUE_NUMBER (verified on macf-trial, 2026-10-16) —
+    // only display_title ties them to the probe.
+    const r = await runRoutingE2eCore(
+      titledDeps({ 1: 'Routed mention to science-agent via mTLS POST', 2: 'Actor is the same agent, skipping self-routing' }, [titled(1, 'some other issue'), titled(2, PROBE_TITLE)]),
+      opts,
+    );
+    expect(r.evidence?.verdict).toBe('self-route');
+  });
+
+  it('a single run still in progress at the deadline is judged (reported unfinished), not reported missing', async () => {
+    const inProgress: RoutingE2eRouterRun = { found: true, id: 1, conclusion: null, status: 'in_progress', url: 'https://example.test/run/1', title: PROBE_TITLE };
+    const r = await runRoutingE2eCore(titledDeps({}, [inProgress]), opts);
+    expect(r.evidence?.verdict).toBe('unknown');
   });
 });

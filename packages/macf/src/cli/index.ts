@@ -978,7 +978,7 @@ routing
     'FRESHNESS (registry instance_id == live /health), (4) MACF_CA_CERT present + ' +
     'parses, (5) tmux_session <project>@<routing-label> convention. These prove the ' +
     'PLUMBING, NOT end-to-end delivery. Exits non-zero when DEGRADED. Pass --e2e for the ' +
-    'CAPABILITY test instead: files a real issue on --target-repo, labels it there (the full ' +
+    'CAPABILITY test instead (delivery is judged from the router run LOG and a receiver receipt, never from the run status; exits non-zero unless delivered): files a real issue on --target-repo, labels it there (the full ' +
     'router path, not a direct channel-server POST), and polls for the recipient recording ' +
     'delivery -- a RED result there needs no checklist of what to check, it just needs the ' +
     'message to not arrive, and names the stage the chain stopped at.',
@@ -997,6 +997,10 @@ routing
   .option('--e2e', 'Run the routing CAPABILITY probe instead of the static checks (requires --target-repo)', false)
   .option('--target-repo <owner/repo>', 'The --e2e probe target: files + labels the probe issue on THIS repo')
   .option('--target-label <label>', '--e2e: which routing label to probe (default: the target repo\'s sole configured label)')
+  .option('--mode <mode>', '--e2e: label (file + label a probe issue, default) or mention (comment on --issue)', 'label')
+  .option('--recipient <label>', '--e2e: the recipient routing label (alias of --target-label)')
+  .option('--issue <n>', '--e2e mention mode: the existing issue to comment on', (v) => Number(v))
+  .option('--receiver-log <path>', '--e2e: explicit receiver channel.log (default: derived from its identity)')
   .option('--e2e-timeout-sec <n>', '--e2e: how long to wait for the delivery receipt before giving up (default 180)', (v) => Number(v))
   .action(async (opts) => {
     if (opts.e2e) {
@@ -1008,7 +1012,10 @@ routing
       const code = await runRoutingE2e(resolveProjectDir(opts.dir), {
         json: opts.json,
         targetRepo: opts.targetRepo,
-        targetLabel: opts.targetLabel,
+        targetLabel: opts.recipient ?? opts.targetLabel,
+        mode: opts.mode === 'mention' ? 'mention' : 'label',
+        issue: opts.issue,
+        receiverLog: opts.receiverLog,
         timeoutSec: opts.e2eTimeoutSec,
       });
       process.exitCode = code;
