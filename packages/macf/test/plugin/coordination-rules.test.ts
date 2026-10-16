@@ -40,16 +40,8 @@ describe('coordination.md — Issue Lifecycle rule covers both failure modes (#1
     expect(hasSelfClose, 'coordination.md must state that the reporter closes their own issue after merge').toBe(true);
   });
 
-  it('lists all 9 auto-close keyword variants', () => {
-    const text = body();
-    const variants = [
-      'Closes', 'Fixes', 'Resolves',
-      'Close', 'Fix', 'Resolve',
-      'Closed', 'Fixed', 'Resolved',
-    ];
-    for (const v of variants) {
-      expect(text, `coordination.md should mention auto-close keyword "${v}"`).toContain(v);
-    }
+  it('defers the close-keyword list to pr-discipline.md', () => {
+    expect(body()).toContain('pr-discipline.md');
   });
 
   it('recommends "Refs #N" as the safe alternative', () => {
@@ -89,19 +81,14 @@ describe('coordination.md — verify comment actually posted (#143)', () => {
   it('states that describing ≠ doing', () => {
     const text = body();
     expect(text).toMatch(
-      /chat output is invisible|as prose does not post it/i,
+      /in your reply reaches nobody/i,
     );
   });
 
-  it('names the canonical verification command', () => {
+  it('points at the attribution read-back hook instead of a manual check', () => {
     const text = body();
-    expect(text).toMatch(/gh issue view.*--json comments/);
-    expect(text).toMatch(/author\.login/);
-  });
-
-  it('treats the check as mandatory, not optional', () => {
-    const text = body();
-    expect(text).toMatch(/mandatory tail/i);
+    expect(text).toContain('check-gh-attribution.sh');
+    expect(text).toMatch(/reaches nobody/);
   });
 });
 

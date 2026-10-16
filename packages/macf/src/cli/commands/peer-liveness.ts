@@ -128,7 +128,7 @@ export async function probeLocalSession(
 
 /**
  * Derive a peer's canonical tmux session name — `<project>@<routing-label>`
- * (coordination.md "Canonical tmux launch pattern"; the session keys on
+ * (design/agent-launch-and-sandbox.md; the session keys on
  * `routing_label`, NOT the registry's SCREAMING_SNAKE key). `peerName` is
  * the raw registry entry name (e.g. `SCIENCE_AGENT`); `fromVariableSegment`
  * recovers the kebab routing label the session was actually launched under.

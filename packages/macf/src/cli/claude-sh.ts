@@ -125,7 +125,7 @@ export function settingsGetHelperLines(): string[] {
  * tmux session named `<MACF_PROJECT>@<MACF_ROUTING_LABEL>`. Re-attach if
  * the session already exists; otherwise create a new session and exec
  * into it. Eliminates operator-discipline dependency for canonical
- * session naming (coordination.md §Canonical tmux launch pattern).
+ * session naming (design/agent-launch-and-sandbox.md in groundnuty/macf).
  *
  * The session keys on `MACF_ROUTING_LABEL` (the registry key / cert CN /
  * DR-031 watchdog + reconcile/resume target), NOT `MACF_AGENT_NAME` (the
@@ -153,8 +153,8 @@ export function settingsGetHelperLines(): string[] {
 function tmuxSelfWrapLines(): string[] {
   return [
     '',
-    '# Tmux self-wrap (macf#313 Path-2 promotion of coordination.md',
-    '# §Canonical tmux launch pattern). If launched outside tmux and the',
+    '# Tmux self-wrap (macf#313 Path-2 promotion of the canonical',
+    '# tmux launch pattern in design/agent-launch-and-sandbox.md). If launched outside tmux and the',
     '# operator hasn\'t opted out, re-exec inside a tmux session named',
     '# <MACF_PROJECT>@<MACF_ROUTING_LABEL>. Attach if the session exists;',
     '# otherwise create a new one. The second invocation (inside tmux)',

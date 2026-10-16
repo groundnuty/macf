@@ -3,7 +3,7 @@
  *
  * `routing_label` is load-bearing far past the workspace that carries it — it
  * keys the registry variable, the mTLS cert CN, and the tmux session name
- * (`coordination.md` §"Canonical tmux launch pattern"). `apply-repo-init.ts`
+ * (`design/agent-launch-and-sandbox.md`). `apply-repo-init.ts`
  * mints a repo's routing label (and its GitHub issue-assignment label) from
  * the FLEET MANIFEST's `agents[].role` at provisioning time — see that
  * module's own doc for why `role` IS the routing label at THAT layer. But

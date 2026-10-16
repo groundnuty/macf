@@ -203,7 +203,6 @@ The routing-Action's HTTP 200 from the channel server is the result-invariant as
 | `model-era-compatibility.md` | Conventions for cross-version Claude Code agent interop |
 | `observability-wiring.md` | Where OTel + tracing + metrics are wired; conventions for new observability instruments |
 | `check-before-propose.md` | When researching: cite primary sources; verify via tool calls before drafting |
-| `codify-at-correction-time.md` | When discipline gets corrected mid-flow, codify the rule before continuing — prevents recurrence drift |
 | `execute-on-directive.md` | When operator gives a directive (e.g., "merge whenever convenient"), execute promptly without re-confirming |
 
 The `coordination.md` file is the most-cited; it's the single source of truth for cross-cutting rules. Agents read it session-loaded and on `macf rules refresh`.
@@ -212,7 +211,6 @@ The `coordination.md` file is the most-cited; it's the single source of truth fo
 
 - `pr-discipline.md` formal-review-submission requirement ([#297](https://github.com/groundnuty/macf/pull/297)) — agents must use `gh pr review --approve` for LGTM (not `gh pr comment`); engages the `route-by-pr-review-state` Path-2 defense
 - `silent-fallback-hazards.md` canonicalization ([#294](https://github.com/groundnuty/macf/pull/294)) — 8-instance hazard class + Pattern A-E defenses
-- `coordination.md §Issue Lifecycle 1` Inversion warning ([#304](https://github.com/groundnuty/macf/pull/304)) — closure-direction independence from fix-authorship; 4-case enumeration for `{filed, implemented} × {self, peer}`
 - `mention-routing-hygiene.md` §7 broadened scope ([#301](https://github.com/groundnuty/macf/pull/301)) — fleet-agnostic HANDLE_PATTERN
 - `mention-routing-hygiene.md` §7 4-space-indent mechanism clarification ([#299](https://github.com/groundnuty/macf/pull/299)) — addressing-allowance vs code-block-recognition
 

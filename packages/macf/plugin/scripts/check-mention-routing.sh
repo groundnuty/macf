@@ -503,7 +503,7 @@ if [[ "$BODY_FILE_MODE" == "true" ]] && [[ "$BODY_FILE_RESOLVED" == "false" ]]; 
   # Check B: nothing lintable — same silent allow as pre-#944 (no leak
   # check possible without content; operator discipline covers the gap).
   # Check A: WARN (do not block) — unlike Check B, a missing mention is
-  # the exact silent-failure shape coordination.md §Communication 2 warns
+  # the exact silent-failure shape coordination.md §Communication 1 warns
   # about, so make the gap visible even though we can't prove it either
   # way. Bypassed wherever Check A itself doesn't apply — close
   # subcommands (see IS_CLOSE_SUBCOMMAND above), and `create` cases 1/2
@@ -515,7 +515,7 @@ uses --body-file "$BODY_FILE_RAW" and the hook could not resolve its
 content — the file isn't readable yet AND no literal (quoted-delimiter)
 heredoc in this command targets that same path. The hook cannot verify
 this comment carries a routing-active @<bot>[bot] mention
-(coordination.md §Communication 2) or is free of a describing-context leak
+(coordination.md §Communication 1) or is free of a describing-context leak
 (mention-routing-hygiene.md §5).
 
 Proceeding WITHOUT blocking (groundnuty/macf#944 branch 3) — double-check
@@ -683,7 +683,7 @@ fi
 # Check A (groundnuty/macf#244): must-have-mention. Comment-emit commands
 # must contain at least one routing-active @<bot>[bot] mention. Without
 # one, the comment is "invisible" to other agents — coordination.md
-# §Communication 2 names this as the silent-failure mode.
+# §Communication 1 names this as the silent-failure mode.
 #
 # Bypassed for `gh (issue|pr) close --comment` — self-close verification
 # comments are canonically no-recipient (reporter-internal). The close
@@ -714,10 +714,10 @@ if it's deliberately for later."
   fi
   cat >&2 <<ERR
 BLOCKED by MACF mention-routing-hygiene hook: this comment/issue/PR body has
-zero routing-active @<bot>[bot] mentions. Per coordination.md §Communication 2:
+zero routing-active @<bot>[bot] mentions. Per coordination.md §Communication 1:
 
-  "@mention in EVERY comment. Routing depends on it. A comment without
-  @mention is invisible to the recipient agent."
+  "Put an @mention in every comment, because routing depends on it. A
+  comment that only closes your own issue needs none."
 
 Without a routing-active mention, the content is silently invisible to
 peer agents — they have no notification that you posted, even if the
@@ -742,7 +742,7 @@ launch env (or the workspace's .claude/.macf/env.* files) BEFORE running
 ./claude.sh, then relaunch. Need it mid-session? Ask the operator to set
 it + relaunch, or route the specific comment through the operator directly.
 
-Refs: groundnuty/macf#244 (this check); coordination.md §Communication 2
+Refs: groundnuty/macf#244 (this check); coordination.md §Communication 1
 (canonical rule, distributed via \`macf rules refresh\`).
 ERR
   exit 2
