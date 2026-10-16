@@ -88,7 +88,7 @@ The human running the agents. Provides one-time per-project setup (CA, GitHub Ap
 
 ## Pattern A–E (silent-fallback defenses)
 
-Five defense patterns against the silent-fallback hazard class catalogued in `packages/macf/plugin/rules/silent-fallback-hazards.md`:
+Five defense patterns against the silent-fallback hazard class catalogued in `design/silent-fallback-catalog.md`:
 
 - **A** — result-invariant assertion (verify the outcome, not just the surface signal)
 - **B** — dual-source corroboration (cross-check two sources)

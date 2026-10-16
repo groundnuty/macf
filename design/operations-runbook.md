@@ -227,7 +227,7 @@ After permission fix, kill and respawn the channel server (Claude Code's MCP lay
 
 ## 4. Debugging missed notifications
 
-> **Design refs:** [DR-015 (HTTP endpoints)](decisions/DR-015-http-endpoints.md), [DR-020 (notify-wake mechanism)](decisions/DR-020-notify-wake-mechanism.md), [DR-023 (Stage-3 mcp_tool architecture)](decisions/DR-023-stage3-hook-mcp-tool-architecture.md). Code: `packages/macf-channel-server/src/{server,tmux-wake,notify-formatter}.ts`. Cross-link: [`silent-fallback-hazards.md` Instance 3](../packages/macf/plugin/rules/silent-fallback-hazards.md#instance-3--remote-control-ipc-blocking-tmux-send-keys), Instance 6 (cross-agent notification loop), Instance 7 (OTel cumulative-counter), Instance 8 (telemetry-endpoint silent-drop).
+> **Design refs:** [DR-015 (HTTP endpoints)](decisions/DR-015-http-endpoints.md), [DR-020 (notify-wake mechanism)](decisions/DR-020-notify-wake-mechanism.md), [DR-023 (Stage-3 mcp_tool architecture)](decisions/DR-023-stage3-hook-mcp-tool-architecture.md). Code: `packages/macf-channel-server/src/{server,tmux-wake,notify-formatter}.ts`. Cross-link: [`silent-fallback-hazards.md` Instance 3](silent-fallback-catalog.md#known-instances), Instance 6 (cross-agent notification loop), Instance 7 (OTel cumulative-counter), Instance 8 (telemetry-endpoint silent-drop).
 
 ### Failure shape
 
@@ -396,7 +396,7 @@ Stale-registration check per §3.
 
 ## 7. Routing-Action workflow debugging
 
-> **Design refs:** [DR-017 (SSH elimination)](decisions/DR-017-ssh-elimination.md), [DR-020 (notify-wake)](decisions/DR-020-notify-wake-mechanism.md). External: [`groundnuty/macf-actions`](https://github.com/groundnuty/macf-actions) (currently `v3.3.0`). Cross-link: [`silent-fallback-hazards.md` Instance 3](../packages/macf/plugin/rules/silent-fallback-hazards.md#instance-3--remote-control-ipc-blocking-tmux-send-keys) — the canonical hazard class for "exit 0 but recipient never sees it."
+> **Design refs:** [DR-017 (SSH elimination)](decisions/DR-017-ssh-elimination.md), [DR-020 (notify-wake)](decisions/DR-020-notify-wake-mechanism.md). External: [`groundnuty/macf-actions`](https://github.com/groundnuty/macf-actions) (currently `v3.3.0`). Cross-link: [`silent-fallback-hazards.md` Instance 3](silent-fallback-catalog.md#known-instances) — the canonical hazard class for "exit 0 but recipient never sees it."
 
 ### Failure shape
 

@@ -65,7 +65,7 @@ Numbers you can verify yourself; cited across the 7 docs to ground claims in evi
 | 8 npm releases in ~76 hours (v0.2.1 → v0.2.9) | `npm view @groundnuty/macf versions` + `gh release list` |
 | 10/11 PASS rehearsal #13b (21 notify_received events; 11 wake_delivered + 10 wake_skipped) | `groundnuty/macf-science-agent:insights/2026-04-30-rehearsal-13b-empirical-witnesses.md` |
 | 23 DRs / 7 phase specs / 13 canonical rules / 16 research notes | `ls design/decisions/`, `ls design/phases/`, `ls packages/macf/plugin/rules/`, `ls research/` |
-| 8 silent-fallback hazard instances + Pattern A-E defenses | `packages/macf/plugin/rules/silent-fallback-hazards.md` |
+| 8 silent-fallback hazard instances + Pattern A-E defenses | `design/silent-fallback-catalog.md` |
 
 ## Cross-references
 
