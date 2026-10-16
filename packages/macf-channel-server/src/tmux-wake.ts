@@ -50,10 +50,11 @@
  *   we return 200 regardless of wake-path outcome.
  */
 
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { SpanKind, SpanStatusCode } from '@opentelemetry/api';
+import type { Span } from '@opentelemetry/api';
 import type { Logger } from '@groundnuty/macf-core';
 import { getTracer, SpanNames, Attr } from './tracing.js';
 
@@ -135,25 +136,76 @@ export function resolveTmuxTarget(opts: {
   }
 }
 
+const WAKE_TIMEOUT_MS = 10_000;
+
+interface HelperResult {
+  readonly error?: Error;
+  readonly status: number | null;
+  readonly stderr: string;
+}
+
+/**
+ * Run the helper without blocking the event loop (macf#1491). Resolves
+ * (never rejects) with a spawnSync-shaped result so the logging below is
+ * unchanged. A timeout kills the child and reports an ETIMEDOUT error.
+ */
+function runHelper(scriptPath: string, args: readonly string[]): Promise<HelperResult> {
+  return new Promise((resolve) => {
+    let stderr = '';
+    let settled = false;
+    const done = (r: HelperResult): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(r);
+    };
+    const child = spawn(scriptPath, [...args], { stdio: ['ignore', 'ignore', 'pipe'] });
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      child.stderr.destroy();
+      done({ error: new Error(`spawn ${scriptPath} ETIMEDOUT`), status: null, stderr });
+    }, WAKE_TIMEOUT_MS);
+    child.stderr.setEncoding('utf-8');
+    child.stderr.on('data', (d: string) => { if (stderr.length < 4096) stderr += d; });
+    child.on('error', (error) => { done({ error, status: null, stderr }); });
+    child.on('close', (status) => { done({ status, stderr }); });
+  });
+}
+
+// Per-target tail of pending wakes: two notifications for one pane never
+// type into it at once, and run in arrival order.
+const wakeQueues = new Map<string, Promise<unknown>>();
+
+function enqueueWake<T>(target: string, task: () => Promise<T>): Promise<T> {
+  const prev = wakeQueues.get(target) ?? Promise.resolve();
+  const run = prev.then(task);
+  const tail = run.then(() => undefined, () => undefined);
+  wakeQueues.set(target, tail);
+  void tail.then(() => { if (wakeQueues.get(target) === tail) wakeQueues.delete(target); });
+  return run;
+}
+
 /**
  * Wake a running Claude Code TUI by injecting a prompt via the
- * canonical tmux helper. Returns `true` when the helper ran
- * successfully, `false` on any no-op or error path.
+ * canonical tmux helper. Resolves `true` when the helper ran
+ * successfully, `false` on any no-op or error path. Never rejects.
+ *
+ * Async (macf#1491): the helper sleeps and verifies for 3-10 s, and a
+ * blocking spawn froze /notify, /health and the MCP stdio connection for
+ * that long. Callers that do not need the outcome should not await it.
  *
  * `prompt` is text-only — becomes the TUI's next input. Newlines,
  * quotes, shell-metacharacters are all safe because we pass the
  * prompt as a separate argv to the helper (no shell interpolation).
  */
-export function wakeViaTmux(prompt: string, opts: WakeOptions): boolean {
+export function wakeViaTmux(prompt: string, opts: WakeOptions): Promise<boolean> {
   const tracer = getTracer();
-  // startActiveSpan with sync callback: the wake-path is sync shell-
-  // out via spawnSync, so no async context-propagation complexity.
-  // Span attached to whatever parent is active (typically
-  // macf.server.notify_received when called from the onNotify chain).
+  // Span attached to whatever parent is active at call time (typically
+  // macf.server.notify_received); it ends when the wake finishes.
   return tracer.startActiveSpan(
     SpanNames.TmuxWakeDeliver,
     { kind: SpanKind.INTERNAL },
-    (span): boolean => {
+    async (span: Span): Promise<boolean> => {
       try {
         const scriptPath = join(opts.workspaceDir, '.claude', 'scripts', 'tmux-send-to-claude.sh');
         if (!existsSync(scriptPath)) {
@@ -176,12 +228,7 @@ export function wakeViaTmux(prompt: string, opts: WakeOptions): boolean {
         }
         span.setAttribute(Attr.TmuxTarget, target);
 
-        const result = spawnSync(scriptPath, [target, prompt], {
-          encoding: 'utf-8',
-          // Helper sleeps 1s between the two Enters; give headroom for
-          // pane startup + tmux IPC.
-          timeout: 10_000,
-        });
+        const result = await enqueueWake(target, () => runHelper(scriptPath, [target, prompt]));
 
         if (result.error !== undefined) {
           opts.logger.warn('tmux_wake_failed', {
