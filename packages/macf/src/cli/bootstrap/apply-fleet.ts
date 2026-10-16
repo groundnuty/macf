@@ -317,6 +317,7 @@ import {
   skippedRoutingSecretsPublish,
   toBase64ForSecret,
   tsDeployedLockKey,
+  TS_DEPLOYED_PARTIAL,
   tsPairEncoding,
 } from './apply-routing-secrets.js';
 import type { ComposeAndWriteVaultDeps, VaultRecipientCountResult } from './vault-read.js';
@@ -2794,12 +2795,16 @@ export async function applyFleet(
   // must compose from every-six-available or refuse).
   const routingBundlePublish = await publishRoutingBundle(routingSecretsForPublish, routerCarryingRepos, deps.routingSecretsDeps, refreshOpts);
   // Record, per repo, which pair its routing secrets were just written from — only where EVERY pair-bearing
-  // secret was written this run. A repo with a failed or skipped write keeps its prior record.
+  // secret was written this run. A repo with NO write keeps its prior record; a PARTIAL write invalidates it.
   if (heldPairEncoding !== undefined) {
     const deployedNow: Record<string, string> = {};
     for (const repo of routerCarryingRepos) {
       const names = [ROUTING_BUNDLE_SECRET_NAME, TS_OAUTH_CLIENT_ID_SECRET_NAME, TS_OAUTH_SECRET_SECRET_NAME];
-      if (names.every((n) => written.has(`${repo}\u0000${n}`))) deployedNow[tsDeployedLockKey(repo)] = heldPairEncoding;
+      const done = names.filter((n) => written.has(`${repo}\u0000${n}`)).length;
+      if (done === names.length) deployedNow[tsDeployedLockKey(repo)] = heldPairEncoding;
+      // Some written, not all: the repo holds mixed pairs, and the prior record no longer
+      // describes it. Invalidate it so a later run converges even if the vault is rolled back.
+      else if (done > 0) deployedNow[tsDeployedLockKey(repo)] = TS_DEPLOYED_PARTIAL;
     }
     if (Object.keys(deployedNow).length > 0) {
       const composedDeployed = composeFleetLock({ fleet: manifest.metadata.name, previous: currentLock, agentUpdates: {}, fleetSecrets: deployedNow });

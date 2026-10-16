@@ -46,7 +46,9 @@ import {
   TS_OAUTH_CLIENT_ID_SECRET_NAME,
   TS_OAUTH_SECRET_FLAG,
   TS_OAUTH_SECRET_SECRET_NAME,
+  TS_DEPLOYED_PARTIAL,
 } from '../../../src/cli/bootstrap/apply-routing-secrets.js';
+import { secretFingerprint } from '../../../src/cli/bootstrap/fleet-lock.js';
 import { REGISTRY_SCOPE_UNSATISFIABLE_CODE } from '../../../src/cli/bootstrap/registry-scope-preflight.js';
 import { validateInstallRepositoryScope } from '../../../src/cli/bootstrap/install-scope.js';
 import type { RunnerPlatformEndpointSource } from '../../../src/cli/bootstrap/runner-platform.js';
@@ -2675,6 +2677,18 @@ describe('computePlan — Tailscale OAuth item (groundnuty/macf#1109)', () => {
       expect(drifted?.reason).not.toContain(HELD);
       const ok = item(lockWith(Object.fromEntries(repos.map((r) => [`ts_oauth_deployed:${r}`, HELD]))), secretRepos);
       expect(ok?.verb).toBe('create');
+    });
+
+    it('a PARTIAL record names the repo as a partly-landed rotation, not as drift', () => {
+      const secretRepos = Object.fromEntries(repos.map((r) => [r, names('MACF_ROUTING_BUNDLE')]));
+      const lock = lockWith({
+        [`ts_oauth_deployed:${repos[0]}`]: secretFingerprint(TS_DEPLOYED_PARTIAL),
+        ...Object.fromEntries(repos.slice(1).map((r) => [`ts_oauth_deployed:${r}`, HELD])),
+      });
+      const it1 = item(lock, secretRepos);
+      expect(it1?.verb).toBe('update');
+      expect(it1?.reason).toContain(`an earlier rotation only partly landed (mixed Tailscale pairs): ${repos[0]}`);
+      expect(it1?.reason).not.toContain('deployed with a different Tailscale pair');
     });
 
     it('a repo whose secret names are unknown is named as unchecked, not as needing the rewrite', () => {

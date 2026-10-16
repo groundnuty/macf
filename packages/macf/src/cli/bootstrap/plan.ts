@@ -132,6 +132,7 @@
 import { toVariableSegment } from '@groundnuty/macf-core';
 import type { FleetAgent, FleetLock, FleetManifest } from './fleet-manifest.js';
 import { effectiveFleetFingerprints } from './fleet-manifest.js';
+import { secretFingerprint } from './fleet-lock.js';
 import { buildTrustedActorsValue, deriveAppHandle, deriveControlRepoName, routerCarryingRepos } from './fleet-manifest.js';
 import { formatTable } from '../commands/ps.js';
 import type { VaultAgentObservation, VaultCaObservation, VaultRecipientsObservation, VaultRouterAppObservation, VaultTsOauthObservation } from './vault-read.js';
@@ -157,7 +158,7 @@ import { caCertVariableName } from './apply-ca.js';
 // `apply-routing-secrets.ts` only ever `import type`s `Presence` from THIS
 // module, so a value import going the other way here creates no runtime
 // cycle (only a type-level one, which TS resolves fine).
-import { TS_DEPLOYED_KEY_PREFIX, TS_OAUTH_CLIENT_ID_ENV_VAR, TS_OAUTH_CLIENT_ID_FLAG, TS_OAUTH_SECRET_ENV_VAR, TS_OAUTH_SECRET_FLAG } from './apply-routing-secrets.js';
+import { TS_DEPLOYED_KEY_PREFIX, TS_DEPLOYED_PARTIAL, TS_OAUTH_CLIENT_ID_ENV_VAR, TS_OAUTH_CLIENT_ID_FLAG, TS_OAUTH_SECRET_ENV_VAR, TS_OAUTH_SECRET_FLAG } from './apply-routing-secrets.js';
 import { RUNNER_OPS_ROLE, deriveRunnerOpsHandle, runnerOpsNeeded } from './apply-runner-ops.js';
 // groundnuty/macf#1105 — same one-directional-runtime-dependency shape as
 // the `apply-runner-ops.js` import immediately above (that module ITSELF
@@ -1960,10 +1961,16 @@ function staleTsDeployments(
   heldFingerprint: string | undefined,
   repos: readonly string[],
   secretRepos: Readonly<Record<string, RepoSecretNamesObservation>> | undefined,
-): { readonly drift: readonly string[]; readonly unrecorded: readonly string[]; readonly unchecked: readonly string[] } | undefined {
+): {
+  readonly drift: readonly string[];
+  readonly partial: readonly string[];
+  readonly unrecorded: readonly string[];
+  readonly unchecked: readonly string[];
+} | undefined {
   if (lock === null || heldFingerprint === undefined) return undefined;
   const recorded = effectiveFleetFingerprints(lock) ?? {};
   const drift: string[] = [];
+  const partial: string[] = [];
   const unrecorded: string[] = [];
   const unchecked: string[] = [];
   for (const repo of repos) {
@@ -1975,10 +1982,11 @@ function staleTsDeployments(
     if (!TS_BEARING_SECRETS.some((n) => obs.names.has(n))) continue;
     const fp = recorded[`${TS_DEPLOYED_KEY_PREFIX}${repo}`];
     if (fp === undefined) unrecorded.push(repo);
+    else if (fp === secretFingerprint(TS_DEPLOYED_PARTIAL)) partial.push(repo); // the lock stores values fingerprinted
     else if (fp !== heldFingerprint) drift.push(repo);
   }
-  if (drift.length === 0 && unrecorded.length === 0) return undefined;
-  return { drift, unrecorded, unchecked };
+  if (drift.length === 0 && partial.length === 0 && unrecorded.length === 0) return undefined;
+  return { drift, partial, unrecorded, unchecked };
 }
 
 function tsOauthItem(
@@ -2015,6 +2023,7 @@ function tsOauthItem(
     if (stale !== undefined) {
       const parts: string[] = [];
       if (stale.drift.length > 0) parts.push(`deployed with a different Tailscale pair than the vault holds: ${stale.drift.join(', ')}`);
+      if (stale.partial.length > 0) parts.push(`an earlier rotation only partly landed (mixed Tailscale pairs): ${stale.partial.join(', ')}`);
       if (stale.unrecorded.length > 0) parts.push(`no record of which Tailscale pair was deployed: ${stale.unrecorded.join(', ')}`);
       const unchecked = stale.unchecked.length > 0 ? ` (could not check ${stale.unchecked.join(', ')})` : '';
       return {

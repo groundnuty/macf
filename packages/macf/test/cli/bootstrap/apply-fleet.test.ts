@@ -32,7 +32,7 @@ import type { AppCredentials } from '../../../src/cli/bootstrap/manifest-exchang
 import type { CaApplyDeps } from '../../../src/cli/bootstrap/apply-ca.js';
 import type { RoutingClientApplyDeps } from '../../../src/cli/bootstrap/apply-routing-client.js';
 import type { RoutingSecretsPublishDeps } from '../../../src/cli/bootstrap/apply-routing-secrets.js';
-import { toBase64ForSecret, ALL_ROUTING_SECRET_NAMES, unpackRoutingBundle } from '../../../src/cli/bootstrap/apply-routing-secrets.js';
+import { toBase64ForSecret, ALL_ROUTING_SECRET_NAMES, unpackRoutingBundle, TS_DEPLOYED_PARTIAL } from '../../../src/cli/bootstrap/apply-routing-secrets.js';
 import type { RouterAppVaultRestoreDeps } from '../../../src/cli/bootstrap/apply-router-app.js';
 import { deriveRouterAppHandle } from '../../../src/cli/bootstrap/apply-router-app.js';
 import type { RunnerRegistrationDeps } from '../../../src/cli/bootstrap/apply-routing.js';
@@ -5418,12 +5418,14 @@ agents:
       const CODE = 'groundnuty/demo-code';
       const CTRL = 'groundnuty/demo-fleet-control';
       const bundleWrites = (w: { repo: string; name: string }[]) => w.filter((x) => x.name === 'MACF_ROUTING_BUNDLE').map((x) => x.repo).sort();
+      const PARTIAL_FP = secretFingerprint(TS_DEPLOYED_PARTIAL);
       const deployedKeys = (lock: FleetLock | null) => Object.keys(lock?.fleet_fingerprints ?? {}).filter((k) => k.startsWith('ts_oauth_deployed:')).sort();
 
-      it('a failed bundle write leaves that repo\'s record unchanged; a later run with NO flags and the vault-restored pair rewrites only that repo', async () => {
+      it('a failed bundle write marks that repo PARTIAL (its TS_OAUTH_* did land); a later run with NO flags and the vault-restored pair rewrites only that repo', async () => {
         const manifestPath = manifestPathIn();
         const run1 = await run({ manifestPath, fresh: NEW_PAIR, restored: NEW_PAIR, failBundleOn: CODE });
-        expect(deployedKeys(run1.result.finalLock)).toEqual([`ts_oauth_deployed:${CTRL}`]);
+        expect(deployedKeys(run1.result.finalLock)).toEqual([`ts_oauth_deployed:${CODE}`, `ts_oauth_deployed:${CTRL}`]);
+        expect(run1.result.finalLock!.fleet_fingerprints![`ts_oauth_deployed:${CODE}`]).toBe(PARTIAL_FP);
         const lock1 = run1.result.finalLock!;
         const run2 = await run({ manifestPath, prior: lock1, restored: NEW_PAIR });
         expect(bundleWrites(run2.writes)).toEqual([CODE]);
@@ -5439,10 +5441,10 @@ agents:
         const run1 = await run({ manifestPath, fresh: OLD_PAIR, restored: OLD_PAIR });
         expect(deployedKeys(run1.result.finalLock)).toEqual([`ts_oauth_deployed:${CODE}`, `ts_oauth_deployed:${CTRL}`]);
         const oldFp = run1.result.finalLock!.fleet_fingerprints![`ts_oauth_deployed:${CODE}`];
-        // rotate to the new pair; the write on CODE fails, so CODE keeps the OLD record
+        // rotate to the new pair; the bundle write on CODE fails after its TS_OAUTH_* landed -> PARTIAL
         const run2 = await run({ manifestPath, prior: run1.result.finalLock!, fresh: NEW_PAIR, restored: NEW_PAIR, failBundleOn: CODE });
         const lock2 = run2.result.finalLock!;
-        expect(lock2.fleet_fingerprints![`ts_oauth_deployed:${CODE}`]).toBe(oldFp);
+        expect(lock2.fleet_fingerprints![`ts_oauth_deployed:${CODE}`]).toBe(PARTIAL_FP);
         expect(lock2.fleet_fingerprints![`ts_oauth_deployed:${CTRL}`]).not.toBe(oldFp);
         // a no-flags run with the vault-restored NEW pair finishes the rotation on CODE only
         const run3 = await run({ manifestPath, prior: lock2, restored: NEW_PAIR });
@@ -5450,6 +5452,28 @@ agents:
         const rewritten = run3.writes.find((w) => w.name === 'MACF_ROUTING_BUNDLE')!;
         expect(JSON.parse(Buffer.from(rewritten.value, 'base64').toString('utf-8')).TS_OAUTH_SECRET).toBe('tskey-client-new-secret');
         expect(run3.result.finalLock!.fleet_fingerprints![`ts_oauth_deployed:${CODE}`]).toBe(lock2.fleet_fingerprints![`ts_oauth_deployed:${CTRL}`]);
+      });
+
+      it('pure DRIFT: every repo recorded with the OLD pair, the vault now holds the NEW one -> a no-flags run rewrites them all, then is a no-op', async () => {
+        const manifestPath = manifestPathIn();
+        const OLD_PAIR = { clientId: 'k-old', secret: 'tskey-client-old-secret' };
+        const run1 = await run({ manifestPath, fresh: OLD_PAIR, restored: OLD_PAIR });
+        const run2 = await run({ manifestPath, prior: run1.result.finalLock!, restored: NEW_PAIR });
+        expect(bundleWrites(run2.writes)).toEqual([CODE, CTRL]);
+        const run3 = await run({ manifestPath, prior: run2.result.finalLock!, restored: NEW_PAIR });
+        expect(run3.writes).toEqual([]);
+      });
+
+      it('a partial rotation then a vault ROLLBACK to the old pair still converges: the PARTIAL record never matches (Codex)', async () => {
+        const manifestPath = manifestPathIn();
+        const OLD_PAIR = { clientId: 'k-old', secret: 'tskey-client-old-secret' };
+        const run1 = await run({ manifestPath, fresh: OLD_PAIR, restored: OLD_PAIR });
+        const run2 = await run({ manifestPath, prior: run1.result.finalLock!, fresh: NEW_PAIR, restored: NEW_PAIR, failBundleOn: CODE });
+        // the operator rolls the vault back to the OLD pair and re-runs without flags
+        const run3 = await run({ manifestPath, prior: run2.result.finalLock!, restored: OLD_PAIR });
+        expect(bundleWrites(run3.writes)).toEqual([CODE, CTRL]);
+        const codeSecret = run3.writes.find((w) => w.repo === CODE && w.name === 'TS_OAUTH_SECRET');
+        expect(codeSecret?.value).toBe('tskey-client-old-secret');
       });
 
       it('a vault-restored pair matching every recorded fingerprint writes nothing, and the lock never holds the pair', async () => {

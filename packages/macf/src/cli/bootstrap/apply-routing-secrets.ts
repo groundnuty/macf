@@ -209,6 +209,12 @@ export function tsPairEncoding(clientId: string, secret: string): string {
 
 /** `fleet.lock` `fleet_fingerprints` key recording which Tailscale pair `repo`'s routing secrets were last written from. */
 export const TS_DEPLOYED_KEY_PREFIX = 'ts_oauth_deployed:';
+/**
+ * Recorded for a repo where SOME but not all of its Tailscale-pair-bearing secrets were
+ * written this run: the repo now holds mixed pairs. It never equals a `sha256:` fingerprint,
+ * so the next run with any valid pair held rewrites the repo, even after a vault rollback.
+ */
+export const TS_DEPLOYED_PARTIAL = 'partial-write';
 export function tsDeployedLockKey(repo: string): string {
   return `${TS_DEPLOYED_KEY_PREFIX}${repo}`;
 }
