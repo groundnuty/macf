@@ -460,7 +460,7 @@ network_probe_github() {
   if [ -n "${GH_TOKEN:-}" ]; then
     auth=(-H "Authorization: Bearer ${GH_TOKEN}")
   fi
-  http_status_reachable "${auth[@]}" 'https://api.github.com/'
+  http_status_reachable ${auth[@]+"${auth[@]}"} 'https://api.github.com/'
 }
 
 network_probe_npm() {
