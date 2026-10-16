@@ -15,7 +15,7 @@
  * still present the superseded Chrome-driven mechanism as current, with no
  * tracking issue and no positioning note (#877's own finding).
  *
- * This is the same shape `silent-fallback-hazards-counts.test.ts` (#937)
+ * This is the same shape `silent-fallback-catalog-counts.test.ts` (#937)
  * pins for a different file: an unchecked claim about "what currently
  * happens" silently drifts from what the code actually does. Rather than
  * re-deriving the CLI's own behavior here (that's `apply-fleet.test.ts`'s

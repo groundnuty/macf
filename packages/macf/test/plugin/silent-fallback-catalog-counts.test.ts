@@ -1,5 +1,5 @@
 /**
- * Structural guard: silent-fallback-hazards.md's self-referential instance
+ * Structural guard: design/silent-fallback-catalog.md's self-referential instance
  * counts must derive from the actual `### Instance N` headings (macf#937).
  *
  * The rule catalog stated its own instance count in prose by hand, in
@@ -44,8 +44,10 @@ import { readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
-const rulesPath = join(repoRoot, 'plugin', 'rules', 'silent-fallback-hazards.md');
+// The catalogue is a design reference in the macf repo (design/), not a rule
+// distributed to workspaces; the always-loaded rule is a short summary.
+const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..', '..');
+const rulesPath = join(repoRoot, 'design', 'silent-fallback-catalog.md');
 
 function body(): string {
   return readFileSync(rulesPath, 'utf-8');
@@ -129,7 +131,7 @@ function parseInstanceHeadings(text: string): InstanceHeading[] {
   return out;
 }
 
-describe('silent-fallback-hazards.md — self-referential instance counts stay derivable (#937)', () => {
+describe('silent-fallback-catalog.md — self-referential instance counts stay derivable (#937)', () => {
   it('parses the instance headings and correctly distinguishes real retirement from an incidental substring', () => {
     const headings = parseInstanceHeadings(body());
     expect(headings.length).toBeGreaterThanOrEqual(20);
