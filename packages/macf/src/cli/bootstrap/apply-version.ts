@@ -162,6 +162,7 @@ export function versionRollSkipBreakdown(rolled: FleetRollResult): readonly stri
   if (rolled.busySkipped > 0) parts.push(`${String(rolled.busySkipped)} busy`);
   if (rolled.stalePinSkipped > 0) parts.push(`${String(rolled.stalePinSkipped)} stale-pin`);
   if (rolled.notYetServingSkipped > 0) parts.push(`${String(rolled.notYetServingSkipped)} not-yet-serving`);
+  if (rolled.stuckAtLaunchPromptSkipped > 0) parts.push(`${String(rolled.stuckAtLaunchPromptSkipped)} stuck-at-launch-prompt`);
   return parts;
 }
 
@@ -277,6 +278,8 @@ export function formatVersionRollEvent(ev: UpgradeEvent): string {
       return `${ev.agent}: HALT — verify-green ${ev.reason} (last=${ev.lastVersion ?? 'down'})`;
     case 'stale-pin-skip':
       return `${ev.agent}: STALE-PIN — skip + CONTINUE (launch pin @${ev.pin} != target @${ev.target})`;
+    case 'stuck-at-launch-prompt-skip':
+      return `${ev.agent}: STUCK-AT-LAUNCH-PROMPT — skip + CONTINUE`;
     case 'not-yet-serving-skip':
       return `${ev.agent}: NOT-YET-SERVING — skip + CONTINUE (same instance ${ev.instanceId} still answering)`;
     case 'lock-write-failed':

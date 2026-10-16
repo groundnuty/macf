@@ -224,7 +224,9 @@ export function formatFleetReport(report: FleetPlanReport, target: string, log: 
             // Follow-up to macf#899 — same posture: the SAME pre-restart
             // process instance is still answering /health (relaunch hasn't
             // taken over yet), not a bad release.
-            r.outcome === 'not-yet-serving-skipped'
+            r.outcome === 'not-yet-serving-skipped' ||
+            // macf#1478 — pane waits at a launch prompt; skip + continue.
+            r.outcome === 'stuck-at-launch-prompt-skipped'
           ? '•'
           : '✗';
     log(`    ${mark} ${r.agent} — ${r.outcome}${r.detail ? ` (${r.detail})` : ''}`);
@@ -254,7 +256,8 @@ export function rollLeftAgentBehind(rolled: FleetRollResult): boolean {
     rolled.configDirtySkipped > 0 ||
     rolled.branchSkipped > 0 ||
     rolled.stalePinSkipped > 0 ||
-    rolled.notYetServingSkipped > 0
+    rolled.notYetServingSkipped > 0 ||
+    rolled.stuckAtLaunchPromptSkipped > 0
   );
 }
 
@@ -499,6 +502,13 @@ function emit(ev: UpgradeEvent, log: (s: string) => void): void {
       log(
         `   ${ev.agent}: NOT-YET-SERVING — skip + CONTINUE (same instance ${ev.instanceId} still ` +
         `answering; clear ${ev.agent}'s launch prompt if one is pending, then re-run the upgrade)`,
+      );
+      break;
+    case 'stuck-at-launch-prompt-skip':
+      // macf#1478 — the pane waits at a launch prompt; not a bad release.
+      log(
+        `   ${ev.agent}: STUCK-AT-LAUNCH-PROMPT — skip + CONTINUE (clear the prompt in ` +
+        `${ev.agent}'s pane, then re-run the upgrade)`,
       );
       break;
     case 'fleet-skipped':

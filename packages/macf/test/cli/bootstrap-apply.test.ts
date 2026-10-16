@@ -5712,6 +5712,7 @@ describe('applyExitCode — version-reconcile PARTIAL roll (groundnuty/macf#1151
     ['1 busy'],
     ['1 stale-pin'],
     ['1 not-yet-serving'],
+    ['1 stuck-at-launch-prompt'],
   ])('skipBreakdown = [%s], not halted → 2 (PARTIAL)', (cause) => {
     expect(applyExitCode(resultWith({}), [], partialPhase([cause]))).toBe(2);
   });
