@@ -35,7 +35,7 @@ Diagnose, do not work around it:
 
 ## Hooks
 
-- `check-gh-token.sh` blocks `gh` and `git push` before they run when `GH_TOKEN` is not a bot token. A block means the token the session launched with is not a bot token; a mint inside a command cannot change it. If the message shows prefix `ghs_`, the hook copy is stale: run `macf update` (or `macf rules refresh --dir .`). Otherwise ask the operator to relaunch with `./claude.sh`.
+- `check-gh-token.sh` blocks `gh` and `git push` before they run when `GH_TOKEN` is not a bot token. A block means the token the session launched with is not a bot token; a mint inside a command cannot change it. If the message shows prefix `ghs_`, the hook copy is stale: run `macf update` (in a workspace without `macf init`, `macf rules refresh --dir .`). Otherwise ask the operator to relaunch with `./claude.sh`.
 - `check-gh-attribution.sh` reads who authored what you just posted and warns when it was the user account. Follow its repair steps: delete and re-post as the bot if nobody has replied, otherwise post a correction as the bot.
 
 Both overrides (`MACF_SKIP_TOKEN_CHECK`, `MACF_SKIP_ATTRIBUTION_CHECK`) are read at launch only; setting them inside a session has no effect.

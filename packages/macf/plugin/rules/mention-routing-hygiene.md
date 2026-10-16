@@ -16,7 +16,7 @@ A comment with no routing-active `@mention` reaches nobody, so put the raw handl
 
 In a `--body` string, start the body with a newline before the handle, or use `--body-file`; the hook does not treat `--body "` as a line start.
 
-`gh issue create` needs the same declaration: label it for another agent, label it `backlog`, or mention the recipient in the body. A label naming yourself routes the issue back to you, not to the peer who must see it.
+`gh issue create` needs an assignee label for another agent, or `backlog`. A mention in a new issue's body does not route (the hook accepts one, but it does not deliver); to reach someone, mention them in a follow-up comment. A label naming yourself routes the issue back to you.
 
 ## Hook
 

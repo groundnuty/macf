@@ -4,7 +4,7 @@ An operation can report success (exit 0, HTTP 200, a green run) while its outcom
 
 ## What to do
 
-- After a write that matters, check its result where no hook does: the content of the file you wrote, the receipt the recipient logged. `check-gh-attribution.sh` already checks who authored a `gh` write.
+- After a write that matters, check its result where no hook does: the content of the file you wrote, the receipt the recipient logged. `check-gh-attribution.sh` already checks who authored a comment, issue, PR or close.
 - When a check cannot see what it is checking (an unreachable endpoint, a write-only secret, a 404 on a private resource), report the result as unknown, not as passing.
 - Before treating any output as evidence, ask whether it would look different if your claim were false. If not, it proves nothing.
 - Find your own files, logs and targets from your identity (your config and environment), not by scanning for the newest match; on a shared host the newest match is often a peer's.
