@@ -306,4 +306,18 @@ describe('runDoctor --fix (DR-028)', () => {
     expect(after.permissions.deny).toContain('Edit(~/.claude/settings.json)');
     expect(checkRoleSettings(tmpRoot, 'code-agent').status).toBe('PASS');
   });
+
+  it('--fix turns idle compaction off in an otherwise-compliant workspace (no other drift to trigger the gate)', async () => {
+    writeAgentConfig(tmpRoot, localConfig('code-agent'));
+    installFullFloor(tmpRoot);
+    const path = join(tmpRoot, '.claude', 'settings.json');
+    const before = JSON.parse(readFileSync(path, 'utf-8'));
+    before.idleCompaction = true;
+    writeFileSync(path, JSON.stringify(before, null, 2) + '\n');
+    expect(checkRoleSettings(tmpRoot, 'code-agent').status).toBe('PASS');
+
+    const code = await runDoctor(tmpRoot, { fix: true, yes: true });
+    expect(code).toBe(0);
+    expect(JSON.parse(readFileSync(path, 'utf-8')).idleCompaction).toBe(false);
+  });
 });

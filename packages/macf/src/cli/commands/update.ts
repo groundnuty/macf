@@ -58,7 +58,7 @@ import { updateGitignore } from './init.js';
 import { fetchProjectRules, PROJECT_RULES_SOURCE_ENV } from '../project-rules.js';
 import { reportSeedPromptResponses, seedPromptResponsesConfig } from '../prompt-responses.js';
 import { reportSeedStallSignatures, seedStallSignaturesConfig } from '../stall-signatures.js';
-import { installGhTokenHook, installStartupPickupHook, installPluginSkillPermissions, installSandboxFdAllowRead, installSandboxExcludedCommands } from '../settings-writer.js';
+import { installGhTokenHook, installStartupPickupHook, installPluginSkillPermissions, installSandboxFdAllowRead, installSandboxExcludedCommands, installIdleCompactionOff } from '../settings-writer.js';
 import { detectStaleDist, detectUnknownFreshness } from '../build-info.js';
 import {
   fetchPluginToWorkspace, workspacePluginDir, stripPluginMcpServers, linkPluginCliDist,
@@ -451,6 +451,9 @@ export async function update(
   // preserved. Opt-out via MACF_SANDBOX_EXCLUDED_COMMANDS_SKIP. See
   // macf#211.
   installSandboxExcludedCommands(projectDir);
+
+  // Never idle-compact (CC 2.1.299); enforced, no opt-out. See settings-writer.ts.
+  installIdleCompactionOff(projectDir);
   console.log(`Refreshed sandbox excludedCommands in .claude/settings.json`);
 
   // macf#342 PR-C: monolithic→multi-file migration + claude.sh refresh

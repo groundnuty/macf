@@ -28,6 +28,7 @@ import {
   applyPluginSkillPermissionsTransform,
   applySandboxFdAllowReadTransform,
   applySandboxExcludedCommandsTransform,
+  applyIdleCompactionOffTransform,
   type Settings,
 } from '../../../src/cli/settings-writer.js';
 import type { MacfAgentConfig } from '../../../src/cli/config.js';
@@ -302,6 +303,7 @@ describe('classifyDirtyFile', () => {
       fixedPoint = applyPluginSkillPermissionsTransform(fixedPoint);
       fixedPoint = applySandboxFdAllowReadTransform(fixedPoint);
       fixedPoint = applySandboxExcludedCommandsTransform(fixedPoint);
+      fixedPoint = applyIdleCompactionOffTransform(fixedPoint);
 
       writeWorkspaceFile('.claude/settings.json', JSON.stringify(fixedPoint, null, 2) + '\n');
       expect(classifyDirtyFile('.claude/settings.json', workspace, sampleConfig)).toBe('already-canonical');
@@ -320,6 +322,7 @@ describe('classifyDirtyFile', () => {
       fixedPoint = applyPluginSkillPermissionsTransform(fixedPoint);
       fixedPoint = applySandboxFdAllowReadTransform(fixedPoint);
       fixedPoint = applySandboxExcludedCommandsTransform(fixedPoint);
+      fixedPoint = applyIdleCompactionOffTransform(fixedPoint);
       const withOperatorExtra = { ...fixedPoint, model: 'opus' };
 
       writeWorkspaceFile('.claude/settings.json', JSON.stringify(withOperatorExtra, null, 2) + '\n');

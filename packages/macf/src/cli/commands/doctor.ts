@@ -44,6 +44,8 @@ import {
   installStartupPickupHook,
   installPluginSkillPermissions,
   installSandboxExcludedCommands,
+  installIdleCompactionOff,
+  idleCompactionIsOff,
   installSandboxFdAllowRead,
   MACF_LEGACY_DENY_WRITE_PATTERNS,
   SANDBOX_FD_READ_PATTERN,
@@ -2847,7 +2849,9 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
       (roleCheck !== null && roleCheck.status !== 'PASS') ||
       sandboxCheck.status === 'FAIL' ||
       permsCheck.status === 'WARN' ||
-      botLoginCheck.status === 'WARN';
+      botLoginCheck.status === 'WARN' ||
+      // Its own trigger: an otherwise-compliant workspace with idle compaction on must still be fixed.
+      !idleCompactionIsOff(projectDir);
     if (!needsFix) {
       console.log('');
       console.log('--fix: nothing to fix — settings already satisfy the floor.');
@@ -2870,6 +2874,7 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
         installStartupPickupHook(projectDir);
         installSandboxFdAllowRead(projectDir);
         installSandboxExcludedCommands(projectDir);
+        installIdleCompactionOff(projectDir);
         if (botLoginCheck.status === 'WARN') {
           try {
             const botLogin = await repairBotLogin(projectDir, config);

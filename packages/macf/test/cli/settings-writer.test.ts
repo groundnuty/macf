@@ -8,7 +8,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { installGhTokenHook, MACF_HOOK_COMMAND, MACF_MENTION_HOOK_COMMAND, MACF_LGTM_HOOK_COMMAND, MACF_CLOSE_HOOK_COMMAND, MACF_AUDITOR_HOOK_COMMAND, MACF_TURN_RECEIPT_HOOK_COMMAND, MACF_ATTRIBUTION_HOOK_COMMAND, MACF_REFLECTION_HOOK_COMMAND, MACF_CHANNELS_HOOK_COMMAND, MACF_CHANNEL_ALIVE_HOOK_COMMAND, installStartupPickupHook, MACF_STARTUP_PICKUP_HOOK_COMMAND, MACF_STARTUP_PICKUP_HOOK_TIMEOUT_SECONDS, installPluginSkillPermissions, PLUGIN_SKILL_PERMISSIONS, PLUGIN_MCP_TOOL_PERMISSIONS, ROLE_FLOOR_ALLOW, installSandboxFdAllowRead, SANDBOX_FD_READ_PATTERN, installSandboxExcludedCommands, SANDBOX_EXCLUDED_COMMANDS, getSandboxExcludedCommands, getPermissionsAllow, getPermissionsDeny, canPluginDeliverMigratedHooks } from '../../src/cli/settings-writer.js';
+import { installGhTokenHook, MACF_HOOK_COMMAND, MACF_MENTION_HOOK_COMMAND, MACF_LGTM_HOOK_COMMAND, MACF_CLOSE_HOOK_COMMAND, MACF_AUDITOR_HOOK_COMMAND, MACF_TURN_RECEIPT_HOOK_COMMAND, MACF_ATTRIBUTION_HOOK_COMMAND, MACF_REFLECTION_HOOK_COMMAND, MACF_CHANNELS_HOOK_COMMAND, MACF_CHANNEL_ALIVE_HOOK_COMMAND, installStartupPickupHook, MACF_STARTUP_PICKUP_HOOK_COMMAND, MACF_STARTUP_PICKUP_HOOK_TIMEOUT_SECONDS, installPluginSkillPermissions, PLUGIN_SKILL_PERMISSIONS, PLUGIN_MCP_TOOL_PERMISSIONS, ROLE_FLOOR_ALLOW, installSandboxFdAllowRead, SANDBOX_FD_READ_PATTERN, installSandboxExcludedCommands, installIdleCompactionOff, applyIdleCompactionOffTransform, SANDBOX_EXCLUDED_COMMANDS, getSandboxExcludedCommands, getPermissionsAllow, getPermissionsDeny, canPluginDeliverMigratedHooks } from '../../src/cli/settings-writer.js';
 
 // ── Shared fixtures for the DR-039 Amendment B self-guard (macf#743 review) ──
 //
@@ -2123,5 +2123,71 @@ describe('end-to-end: macf update preserves operator-authored allow entries (mac
     expect(s.permissions.deny).toContain('Bash(sudo *)'); // floor
     // No duplicate of the shared 'Bash(rm -rf /)' entry.
     expect(s.permissions.deny.filter((d: string) => d === 'Bash(rm -rf /)')).toHaveLength(1);
+  });
+});
+
+describe('installIdleCompactionOff (CC 2.1.299 idle compaction, enforced off)', () => {
+  let root: string;
+  const file = (): string => join(root, '.claude', 'settings.json');
+  const read = (): Record<string, unknown> => JSON.parse(readFileSync(file(), 'utf-8')) as Record<string, unknown>;
+
+  beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'macf-idle-compact-')); });
+  afterEach(() => { rmSync(root, { recursive: true, force: true }); });
+
+  it('fresh workspace (no settings.json) -> idleCompaction === false', () => {
+    installIdleCompactionOff(root);
+    expect(read()['idleCompaction']).toBe(false);
+  });
+
+  it('true -> false; every other key deep-equal unchanged', () => {
+    mkdirSync(join(root, '.claude'));
+    const other = {
+      permissions: { allow: ['Bash(ls:*)'], deny: ['Bash(sudo:*)'] },
+      sandbox: { excludedCommands: ['custom:*'] },
+      hooks: { Stop: [{ hooks: [{ type: 'command', command: 'x' }] }] },
+      operatorKey: { nested: [1, 2, 3] },
+    };
+    writeFileSync(file(), JSON.stringify({ ...other, idleCompaction: true }, null, 2));
+    installIdleCompactionOff(root);
+    const { idleCompaction, ...rest } = read();
+    expect(idleCompaction).toBe(false);
+    expect(rest).toEqual(other);
+  });
+
+  it('missing key -> added', () => {
+    mkdirSync(join(root, '.claude'));
+    writeFileSync(file(), JSON.stringify({ model: 'opus' }));
+    installIdleCompactionOff(root);
+    expect(read()).toEqual({ model: 'opus', idleCompaction: false });
+  });
+
+  it('non-boolean junk value is overwritten with false', () => {
+    mkdirSync(join(root, '.claude'));
+    writeFileSync(file(), JSON.stringify({ idleCompaction: 'yes' }));
+    installIdleCompactionOff(root);
+    expect(read()['idleCompaction']).toBe(false);
+  });
+
+  it('second run is a no-op (bytes unchanged)', () => {
+    mkdirSync(join(root, '.claude'));
+    writeFileSync(file(), JSON.stringify({ a: 1, idleCompaction: true }));
+    installIdleCompactionOff(root);
+    const first = readFileSync(file(), 'utf-8');
+    installIdleCompactionOff(root);
+    expect(readFileSync(file(), 'utf-8')).toBe(first);
+  });
+
+  it('has no opt-out env var (MACF_SANDBOX_* skips do not apply)', () => {
+    vi.stubEnv('MACF_SANDBOX_EXCLUDED_COMMANDS_SKIP', '1');
+    vi.stubEnv('MACF_SANDBOX_FD_FIX_SKIP', '1');
+    try {
+      installIdleCompactionOff(root);
+      expect(read()['idleCompaction']).toBe(false);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it('pure transform returns same object when already false', () => {
+    const s = { idleCompaction: false };
+    expect(applyIdleCompactionOffTransform(s)).toBe(s);
   });
 });

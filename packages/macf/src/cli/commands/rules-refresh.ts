@@ -23,7 +23,7 @@ import { copyCanonicalAssetsGuarded } from '../canonical-overwrite-guard.js';
 import { fetchProjectRules, PROJECT_RULES_SOURCE_ENV } from '../project-rules.js';
 import { reportSeedPromptResponses, seedPromptResponsesConfig } from '../prompt-responses.js';
 import { reportSeedStallSignatures, seedStallSignaturesConfig } from '../stall-signatures.js';
-import { installGhTokenHook, installStartupPickupHook, installPluginSkillPermissions, installSandboxFdAllowRead, installSandboxExcludedCommands } from '../settings-writer.js';
+import { installGhTokenHook, installStartupPickupHook, installPluginSkillPermissions, installSandboxFdAllowRead, installSandboxExcludedCommands, installIdleCompactionOff } from '../settings-writer.js';
 
 export interface RulesRefreshOptions {
   /**
@@ -139,6 +139,9 @@ export function rulesRefresh(targetDir: string, options: RulesRefreshOptions = {
   // bash, etc. unsandboxed) — sidesteps claude-code#43454 seccomp
   // regression. macf#211.
   installSandboxExcludedCommands(targetDir);
+
+  // Never idle-compact (CC 2.1.299); enforced, no opt-out. See settings-writer.ts.
+  installIdleCompactionOff(targetDir);
 
   if (rules.length > 0) {
     console.log(`Refreshed ${rules.length} canonical rule file(s) in .claude/rules/:`);
