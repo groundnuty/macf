@@ -94,13 +94,52 @@ pane_text() {
   tmux capture-pane ${target[@]+"${target[@]}"} -p 2>/dev/null || true
 }
 
+# Pane text WITH escape sequences (-e). Used only for verification, to tell
+# typed text from Claude Code's dimmed prompt suggestion / placeholder.
+pane_text_styled() {
+  tmux capture-pane ${target[@]+"${target[@]}"} -p -e 2>/dev/null || true
+}
+
+# Drop every dim (SGR 2) span — from ESC[2m up to the next reset (ESC[0m,
+# ESC[22m or ESC[m), carrying state across lines — then strip all remaining
+# escape sequences. Claude Code renders its predicted-next-prompt suggestion
+# and the empty-box placeholder dim; typed text is never dim. Without this, a
+# suggestion that echoes the prompt just sent makes a SUBMITTED prompt look
+# unsubmitted (false exit 4). Only awk/sed/tr, already required here.
+strip_dim() {
+  awk '
+    BEGIN { esc = sprintf("%c", 27); dim = 0 }
+    {
+      line = $0; out = ""
+      while (length(line) > 0) {
+        if (match(line, esc "\\[[0-9;]*m")) {
+          if (!dim) out = out substr(line, 1, RSTART - 1)
+          seq = substr(line, RSTART + 2, RLENGTH - 3)
+          line = substr(line, RSTART + RLENGTH)
+          n = split(seq, p, ";")
+          if (n == 0) dim = 0
+          for (i = 1; i <= n; i++) {
+            if (p[i] == "" || p[i] == "0" || p[i] == "22") dim = 0
+            else if (p[i] == "2") dim = 1
+            else if (p[i] == "38" || p[i] == "48") {
+              if (p[i + 1] == "5") i += 2
+              else if (p[i + 1] == "2") i += 4
+            }
+          }
+        } else { if (!dim) out = out line; line = "" }
+      }
+      print out
+    }' | sed "s/$(printf '\033')\\[[0-9;]*[A-Za-z]//g"
+}
+
 # The whole input region as ONE line: from the last `❯` line down to (not
 # including) the next border line starting with `─`, rows joined with single
 # spaces. Claude Code wraps a long input over several indented rows, so a
 # surviving draft can push our text off the `❯` row. Empty if no `❯` line.
+# Dim spans (suggestions/placeholder) are removed first, see strip_dim.
 # (Leading whitespace is dropped by collapse() at the call site.)
 input_line() {
-  pane_text | awk '
+  pane_text_styled | strip_dim | awk '
     /^❯/ { found = 1; inbox = 1; out = $0; next }
     inbox && /^─/ { inbox = 0; next }
     inbox { out = out " " $0 }
