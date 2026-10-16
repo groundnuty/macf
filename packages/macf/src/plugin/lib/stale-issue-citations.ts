@@ -1,8 +1,8 @@
 import { execFile } from 'node:child_process';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join, relative, sep } from 'node:path';
-import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
+import { isEntrypoint } from './entrypoint.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -552,13 +552,7 @@ async function main(): Promise<void> {
 }
 
 function isMainModule(): boolean {
-  const entry = process.argv[1];
-  if (!entry) return false;
-  try {
-    return import.meta.url === pathToFileURL(entry).href;
-  } catch {
-    return false;
-  }
+  return isEntrypoint(import.meta.url);
 }
 
 if (isMainModule()) {

@@ -11,7 +11,6 @@
  */
 import 'reflect-metadata';
 import { readFileSync } from 'node:fs';
-import { pathToFileURL } from 'node:url';
 import { formatDashboard, formatPeerTable, formatHealthDetail, formatStartupReconcile, formatIssuesOneline } from '../lib/format.js';
 import { getOwnRegistration, listPeers } from '../lib/registry.js';
 import { pingAgent } from '../lib/health.js';
@@ -44,6 +43,7 @@ import {
   type GuestProbeFn,
   type GuestResolveFn,
 } from '../../cli/commands/fleet-guests.js';
+import { isEntrypoint } from '../lib/entrypoint.js';
 
 /**
  * Parse a positive-integer env override, falling back to `undefined` (the
@@ -346,13 +346,7 @@ export async function main(): Promise<void> {
  * `isMainModule()`.
  */
 function isMainModule(): boolean {
-  const entry = process.argv[1];
-  if (!entry) return false;
-  try {
-    return import.meta.url === pathToFileURL(entry).href;
-  } catch {
-    return false;
-  }
+  return isEntrypoint(import.meta.url);
 }
 
 if (isMainModule()) {
