@@ -9,6 +9,7 @@ import { resolveActionsRefToFullTag, isImmutableActionsTag } from '../version-re
 import { detectStaleDist } from '../build-info.js';
 import { findCliPackageRoot } from '../rules.js';
 import { assertRouterWorkflowWellFormed } from './repo-init-router-guard.js';
+import { scanCiWorkflowNames } from './repo-init-ci-workflows.js';
 import { ALL_ROUTING_SECRET_NAMES, ROUTING_BUNDLE_SECRET_NAME } from '../bootstrap/apply-routing-secrets.js';
 
 export interface RepoInitOptions {
@@ -100,6 +101,14 @@ export interface RepoInitOptions {
    * on a v3+ pin; a v1.x/v2.x caller never gets a `with:` block regardless.
    */
   readonly routingRunnerRunsOn?: string;
+  /**
+   * Names for the caller's `workflow_run.workflows` (groundnuty/macf#1479).
+   * Omitted: scanned from the target dir's `.github/workflows/`. An explicit
+   * list (even empty) replaces the scan. Emitted only when non-empty and
+   * the pinned router handles `workflow_run` — see
+   * {@link isCiWorkflowRunCapableActionsVersion}.
+   */
+  readonly ciWorkflows?: readonly string[];
 }
 
 /**
@@ -231,6 +240,29 @@ export function isRunnerRunsOnCapableActionsVersion(version: string): boolean {
   if (major !== minMajor) return major > minMajor;
   if (minor !== minMinor) return minor > minMinor;
   return patch >= minPatch;
+}
+
+/**
+ * First macf-actions tag whose `route-by-ci-completion` accepts
+ * `workflow_run: completed` (groundnuty/macf#1479). The fix is merged on
+ * macf-actions `main` but NOT yet released; no tag carries it. Until this
+ * tag exists, only `main` is capable, so no pinned caller gets a
+ * `workflow_run` block that an older router would ignore while still
+ * spending a runner on it. Verify the tag exists before relying on it:
+ * `gh api repos/groundnuty/macf-actions/git/ref/tags/v3.6.0`.
+ */
+export const MIN_CI_WORKFLOW_RUN_CAPABLE_ACTIONS_VERSION = 'v3.6.0';
+
+/** True for `main` or a fully-pinned tag at/above {@link MIN_CI_WORKFLOW_RUN_CAPABLE_ACTIONS_VERSION}. */
+export function isCiWorkflowRunCapableActionsVersion(version: string): boolean {
+  if (version === 'main') return true;
+  const tuple = parseActionsVersionTuple(version);
+  const min = parseActionsVersionTuple(MIN_CI_WORKFLOW_RUN_CAPABLE_ACTIONS_VERSION)!;
+  if (!tuple) return false;
+  for (let i = 0; i < 3; i++) {
+    if (tuple[i]! !== min[i]!) return tuple[i]! > min[i]!;
+  }
+  return true;
 }
 
 /**
@@ -445,6 +477,7 @@ export interface V3WorkflowInputs {
 export function generateWorkflow(
   actionsVersion: string,
   v3Inputs?: V3WorkflowInputs,
+  ciWorkflows: readonly string[] = [],
 ): string {
   const lines = [
     'name: Agent Router',
@@ -472,6 +505,18 @@ export function generateWorkflow(
     // router is byte-consistent with macf's own committed router.
     '  check_suite:',
     '    types: [completed]',
+    // GitHub does not trigger workflows from check suites created by GitHub
+    // Actions, so the check_suite trigger above only fires for third-party CI.
+    // Actions CI reaches the router through workflow_run, which needs the CI
+    // workflow names (macf#1479). Absent for a repo with no CI, and for a pin
+    // whose router would ignore it.
+    ...(ciWorkflows.length > 0 && isCiWorkflowRunCapableActionsVersion(actionsVersion)
+      ? [
+          '  workflow_run:',
+          `    workflows: [${ciWorkflows.map((n) => JSON.stringify(n)).join(', ')}]`,
+          '    types: [completed]',
+        ]
+      : []),
     // The caller MUST grant at least what the reusable workflow's jobs declare,
     // or the reusable-workflow call fails at composition with `startup_failure`
     // — every event is dropped and NOTHING routes. This was the icsoc-2026
@@ -1118,7 +1163,7 @@ export async function repoInit(
   // left alone by a plain re-run is never affected.
   const workflowResult = writeFileSafe(
     workflowPath,
-    generateWorkflow(pinnedVersion, v3Inputs),
+    generateWorkflow(pinnedVersion, v3Inputs, opts.ciWorkflows ?? scanCiWorkflowNames(absDir)),
     opts.force,
     assertRouterWorkflowWellFormed,
   );
