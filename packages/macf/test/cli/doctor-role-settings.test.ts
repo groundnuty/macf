@@ -320,4 +320,26 @@ describe('runDoctor --fix (DR-028)', () => {
     expect(code).toBe(0);
     expect(JSON.parse(readFileSync(path, 'utf-8')).idleCompaction).toBe(false);
   });
+
+  it('--fix strips an invalid mcp__* allow entry from an otherwise-compliant workspace', async () => {
+    writeAgentConfig(tmpRoot, localConfig('code-agent'));
+    installFullFloor(tmpRoot);
+    const path = join(tmpRoot, '.claude', 'settings.json');
+    const before = JSON.parse(readFileSync(path, 'utf-8'));
+    before.permissions.allow.push('mcp__*', 'Bash(operator-extra)');
+    writeFileSync(path, JSON.stringify(before, null, 2) + '\n');
+    const check = checkRoleSettings(tmpRoot, 'code-agent');
+    expect(check.status).toBe('WARN');
+    expect(check.findings.map((f) => f.item)).toEqual(['mcp__*']);
+    expect(check.findings[0]?.message).toContain('Wildcard tool name');
+
+    expect(await runDoctor(tmpRoot, { fix: true, yes: true })).toBe(0);
+    const after = JSON.parse(readFileSync(path, 'utf-8'));
+    expect(after.permissions.allow).not.toContain('mcp__*');
+    expect(after.permissions.allow).toContain('Bash(operator-extra)');
+    expect(checkRoleSettings(tmpRoot, 'code-agent').status).toBe('PASS');
+    const second = readFileSync(path, 'utf-8');
+    expect(await runDoctor(tmpRoot, { fix: true, yes: true })).toBe(0);
+    expect(readFileSync(path, 'utf-8')).toBe(second);
+  });
 });
