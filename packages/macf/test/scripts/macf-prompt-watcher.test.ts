@@ -1506,7 +1506,7 @@ describe('macf-prompt-watcher.sh — outcome check + re-arm (macf#1478)', () => 
     // Old code: judged cleared on the blink, spent max_fires:1, then called
     // the returning prompt UNKNOWN and sent nothing more (1 send).
     expect(r.sends).toBe(2);
-    expect(r.log).toContain('it did not take; re-arming');
+    expect(r.log).toContain('the answer did not take');
     expect(r.log).toContain('cleared and stayed clear');
     expect(r.log + r.stderr).not.toContain('UNKNOWN');
   }, 20_000);
@@ -1515,7 +1515,7 @@ describe('macf-prompt-watcher.sh — outcome check + re-arm (macf#1478)', () => 
     const r = runRearmWatcher({ frame: DEV_CHANNELS_FRAME, clearsAfterSend: 99, blinkCaptures: 0, rearmMax: 3 });
     expect(r.status).toBe(0);
     expect(r.sends).toBe(3);
-    expect(r.stderr).toContain('did NOT clear after 3 auto-answer attempts');
+    expect(r.stderr).toContain('is still on screen after 3 answers');
     expect(r.log + r.stderr).not.toContain('UNKNOWN');
   }, 20_000);
 

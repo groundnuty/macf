@@ -1043,7 +1043,11 @@ describe('rollFleet', () => {
         reason: 'stuck-at-launch-prompt',
       });
       expect(res.results[0]!.detail).toContain("a1's pane");
-      expect(res.results[0]!.detail).toContain('NOT a bad release');
+      // The operator-facing remedy: real tmux session, exact command, operator answers.
+      expect(res.results[0]!.detail).toContain('tmux session g@a1');
+      expect(res.results[0]!.detail).toContain('macf fleet upgrade --execute');
+      expect(res.results[0]!.detail).toContain('same --target');
+      expect(res.results[0]!.detail).toContain('operator answers it by hand');
       expect(res.results[0]!.detail).not.toContain('CONFIRMED');
       expect(res.results[1]).toMatchObject({ agent: 'a2', outcome: 'upgraded' });
     };

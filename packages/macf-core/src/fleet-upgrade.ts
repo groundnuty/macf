@@ -733,7 +733,7 @@ export function detectLaunchPrompt(pane: string | null): string | null {
 }
 
 /** Read the pane and classify it; a failed read is "no evidence", never a throw. */
-async function stuckAtPrompt(agent: string, driver: FleetDriver): Promise<HaltClassification | null> {
+async function stuckAtPrompt(agent: string, fleet: string, driver: FleetDriver): Promise<HaltClassification | null> {
   let prompt: string | null;
   try {
     prompt = detectLaunchPrompt(await driver.capturePane(agent));
@@ -744,10 +744,10 @@ async function stuckAtPrompt(agent: string, driver: FleetDriver): Promise<HaltCl
   return {
     reason: 'stuck-at-launch-prompt',
     detail:
-      `stuck-at-launch-prompt: ${agent}'s pane is waiting at a launch prompt (${prompt}), so ` +
-      `the relaunched agent never came up at the target version. This is NOT a bad release. ` +
-      `Remedy: attach to ${agent}'s tmux session, answer or clear the prompt, then re-run the ` +
-      `upgrade. NOT halting the roll — one stuck relaunch endangers no other agent.`,
+      `stuck-at-launch-prompt: ${agent}'s pane shows a prompt waiting for an answer (${prompt}), ` +
+      `so the relaunched agent did not reach the target version. The operator answers it by ` +
+      `hand in tmux session ${fleet}@${agent}, then re-runs the same macf fleet upgrade ` +
+      `--execute command with the same --target. Skipped; the roll continues with the other agents.`,
   };
 }
 
@@ -832,6 +832,7 @@ async function classifyHalt(
   oldInstanceId: string | null,
   targetVersion: string,
   agent: string,
+  fleet: string,
   driver: FleetDriver,
 ): Promise<HaltClassification> {
   const base = `verify-green ${green.reason} (last=${green.lastVersion ?? 'down'})`;
@@ -844,7 +845,7 @@ async function classifyHalt(
   // macf#1478 — a prompt on the pane is positive evidence of WHY the relaunch
   // stalled, so it is checked before every other classification, including
   // the same-instance early return below.
-  const stuck = await stuckAtPrompt(agent, driver);
+  const stuck = await stuckAtPrompt(agent, fleet, driver);
   if (stuck) return stuck;
 
   if (!confirmedOldVersion) {
@@ -1213,6 +1214,7 @@ export async function rollFleet(
       plan.runningInstanceId,
       opts.targetVersion,
       agent,
+      plan.fleet,
       deps.driver,
     );
     const { reason, detail } = classification;

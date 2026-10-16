@@ -364,7 +364,7 @@ export function verifyOutcome(afterFrame: string, entry: PromptResponseEntry): V
  * `/login` modal is Inv 1's existing alert-on-unknown-prompt path (fires
  * when the screen `looksPromptLike`), not a new allowlist entry.
  */
-// macf#1478: no seed entry sets `verify_contains` — the post-answer screen's
+// No seed entry sets `verify_contains` — the post-answer screen's
 // text is not stable across Claude Code versions. The watcher's outcome check
 // is a settle window (MACF_PROMPT_SETTLE_SECS, default 3): the signature must
 // stay absent that long, else the same entry is re-sent (bounded).

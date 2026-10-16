@@ -519,8 +519,9 @@ fleet
     '`bad-release` (HALTS) with a message naming the uncertainty. Never ' +
     'confirmed green within the grace at all (down / unreachable / an ' +
     'unrecognized version) → `relaunch-unconfirmed` → HALTS, unchanged. ' +
-    'When the agent\'s pane is waiting at a launch prompt, it is ' +
-    '`stuck-at-launch-prompt` (skips that ONE agent and CONTINUES; clear the prompt, then re-run), not a bad release. ' +
+    'When the agent\'s pane shows a prompt (`❯ N.` or `(y/n)`), checked before the pin, it is ' +
+    '`stuck-at-launch-prompt` (skips that ONE agent and CONTINUES, even where the pin is stale; ' +
+    'the operator answers it by hand, then re-runs the same command with the same --target). ' +
     'Reconcile after an OBJECT is MANUAL this iteration: resolve the flagged ' +
     'files, then re-run. DRY-RUN by default (prints the plan); --execute ' +
     'rolls. TARGET defaults to npm-latest of @groundnuty/macf.',

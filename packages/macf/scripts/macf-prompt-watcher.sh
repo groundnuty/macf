@@ -44,9 +44,8 @@
 #   when the signature stays absent for the whole settle window. If it comes
 #   back inside the window, the answer did not take: the watcher re-sends to
 #   that same allowlisted entry, up to REARM_MAX attempts in total. An entry
-#   whose own signature is on screen is NEVER an unknown prompt (Inv 1 is about
-#   frames that match no entry); one that exhausts its attempts alerts as
-#   "did not take" and is still not classified UNKNOWN. A frame that matches no
+#   whose attempts ran out is never reclassified as an unknown prompt (Inv 1 is
+#   about frames that match no entry); it alerts once as "did not take". A frame that matches no
 #   entry is still alerted and never answered; Inv 2 and Inv 3 are untouched.
 #
 # DEADLINE MODEL (groundnuty/macf#1041 — fixes the #994-discovered defect below):
@@ -393,14 +392,14 @@ _handle_match() { # <frame> <idx>
       taken=1
       break
     fi
-    _log WARN "\"$name\" signature is back within ${SETTLE}s of the answer — it did not take; re-arming"
+    _log WARN "\"$name\" came back within ${SETTLE}s of answer $attempt/$REARM_MAX; the answer did not take"
   done
   FIRED[$idx]=$((FIRED[idx] + 1))
 
   if [ "$taken" -ne 1 ]; then
     EXHAUSTED[$idx]=1
     FIRED[$idx]=${ACC_MAXFIRES[$idx]}
-    _alert "\"$name\" did NOT clear after $REARM_MAX auto-answer attempts (typed-no-Enter?) — will not retry further; clear the prompt by hand"
+    _alert "\"$name\" is still on screen after $REARM_MAX answers. The watcher will not answer it again; the operator clears it by hand."
     return 0
   fi
   after="$(_capture)"
