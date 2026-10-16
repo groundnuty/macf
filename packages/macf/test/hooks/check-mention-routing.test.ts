@@ -1003,6 +1003,15 @@ describe('check-mention-routing.sh (hook)', () => {
         expect(r.stderr).toContain('skips a label applied by the agent it names');
       });
 
+      it('own label plus a peer label with no -agent suffix (e.g. cv-architect) and no registry warns, not blocks', () => {
+        const r = runHook({
+          command: 'gh issue create --title x --label code-agent,cv-architect --body b',
+          env: { MACF_ROUTING_LABEL: 'code-agent' },
+        });
+        expect(r.status).toBe(0);
+        expect(warningOf(r)).toContain('any of these labels belongs to another agent: cv-architect (');
+      });
+
       it('own label plus a peer label is not blocked as self, and the warning lists only the peer', () => {
         const r = runHook({
           command: 'gh issue create --title x --label code-agent,science-agent --body b',

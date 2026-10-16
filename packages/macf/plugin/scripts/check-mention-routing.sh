@@ -295,9 +295,10 @@ if [[ "$IS_CREATE_SUBCOMMAND" == "true" ]]; then
       [[ "$tok" == "backlog" ]] && CREATE_HAS_BACKLOG_LABEL=true
     done
 
-    # The self check needs no registry: own label present and no other
-    # agent-ish label (in the registry, or named *-agent) means the router
-    # skips it and nobody else is named.
+    # The self check needs no registry: if your own label is the only one
+    # that could name an agent, the router skips it and nobody else is named.
+    # Another label could be an agent's unless a registry that covers this
+    # repo proves it is not; without that proof, warn rather than block.
     if [[ -n "${MACF_ROUTING_LABEL:-}" ]]; then
       self_present=false
       other_agentish=false
@@ -305,10 +306,13 @@ if [[ "$IS_CREATE_SUBCOMMAND" == "true" ]]; then
         if [[ "$tok" == "${MACF_ROUTING_LABEL}" ]]; then
           self_present=true
         elif [[ "$tok" != "backlog" ]]; then
-          if [[ "$tok" == *-agent ]]; then other_agentish=true; fi
-          for rl in ${ROUTING_LABELS[@]+"${ROUTING_LABELS[@]}"}; do
-            [[ "$tok" == "$rl" ]] && other_agentish=true
-          done
+          if [[ "$REGISTRY_READABLE" == "true" ]] && [[ "$TARGET_IS_OWN" == "true" ]]; then
+            for rl in ${ROUTING_LABELS[@]+"${ROUTING_LABELS[@]}"}; do
+              [[ "$tok" == "$rl" ]] && other_agentish=true
+            done
+          else
+            other_agentish=true
+          fi
         fi
       done
       if [[ "$self_present" == "true" ]] && [[ "$other_agentish" == "false" ]]; then
