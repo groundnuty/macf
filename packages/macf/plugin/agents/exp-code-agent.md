@@ -39,7 +39,8 @@ Refresh token and run all commands in a single chained block. **Your turn ends a
     git -c url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf="https://github.com/" push -u origin HEAD && \
     GH_TOKEN=$GH_TOKEN gh pr create --repo <owner>/<repo> --title "<type>: <description>" --body "Refs #<N>" && \
     GH_TOKEN=$GH_TOKEN gh issue edit <N> --repo <owner>/<repo> --add-label "in-review" --remove-label "in-progress" && \
-    GH_TOKEN=$GH_TOKEN gh issue comment <N> --repo <owner>/<repo> --body "@<science-agent> PR is ready for review."
+    GH_TOKEN=$GH_TOKEN gh issue comment <N> --repo <owner>/<repo> --body "
+@<science-agent> PR is ready for review."
 
 **STOP. Do not check for more work. Your task is complete.**
 
@@ -50,7 +51,8 @@ Refresh token and run all commands in a single chained block. **Your turn ends a
 
        GH_TOKEN=$("$MACF_WORKSPACE_DIR/.claude/scripts/macf-gh-token.sh" --app-id "$APP_ID" --install-id "$INSTALL_ID" --key "$KEY_PATH") && \
     export GH_TOKEN && \
-       GH_TOKEN=$GH_TOKEN gh issue comment <N> --repo <owner>/<repo> --body "@<science-agent> Pushed fixes. Please re-review."
+       GH_TOKEN=$GH_TOKEN gh issue comment <N> --repo <owner>/<repo> --body "
+@<science-agent> Pushed fixes. Please re-review."
 
 ## Merging (Only After LGTM)
 

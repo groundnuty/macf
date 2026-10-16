@@ -85,8 +85,8 @@ export const MACF_MENTION_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scripts/ch
 /**
  * LGTM-gate hook command (groundnuty/macf#270 — DR-023 UC-2). Blocks
  * `gh pr merge` invocations when the target PR has no non-author
- * APPROVED review on record. Implements `pr-discipline.md` "no LGTM
- * = no merge" structurally (rule codified via macf#262 / PR #263).
+ * APPROVED review on record. Implements `pr-discipline.md` "Merging"
+ * structurally (rule codified via macf#262 / PR #263).
  *
  * Per the DR-023 amendment (PR #279), this is a bash command-type
  * hook — NOT `type: "mcp_tool"`. PreToolUse-blocking semantics +

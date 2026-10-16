@@ -16,7 +16,8 @@ Before filing, ask yourself: **"Now or backlog?"** Is this blocking current work
 
     GH_TOKEN=$("$MACF_WORKSPACE_DIR/.claude/scripts/macf-gh-token.sh" --app-id "$APP_ID" --install-id "$INSTALL_ID" --key "$KEY_PATH") && \
     export GH_TOKEN && \
-    GH_TOKEN=$GH_TOKEN gh issue create --repo <owner>/<repo> --title "<description>" --label "code-agent" --body "@<code-agent> <detailed requirements>"
+    GH_TOKEN=$GH_TOKEN gh issue create --repo <owner>/<repo> --title "<description>" --label "code-agent" --body "
+@<code-agent> <detailed requirements>"
 
 Always use `--repo` flags — you may work across multiple repositories.
 

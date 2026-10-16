@@ -464,11 +464,10 @@ fi
 # No non-author APPROVED review, and no operator-sanction comment — block.
 cat >&2 <<ERR
 BLOCKED by MACF lgtm-gate hook: PR #${PR_NUMBER} has no non-author APPROVED
-review on record. Per pr-discipline.md "no LGTM = no merge" (canonical rule
+review on record. Per pr-discipline.md "Merging" (canonical rule
 distributed via \`macf rules refresh\`):
 
-  "Without an explicit LGTM from the reviewer, the implementer does NOT
-  merge — even if waiting indefinitely."
+  "Without a non-author approval, do not merge, even if waiting indefinitely."
 
 PR author: ${PR_AUTHOR}
 Non-author APPROVED reviews: 0

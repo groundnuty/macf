@@ -4,7 +4,7 @@ An operation can report success (exit 0, HTTP 200, a green run) while its outcom
 
 ## What to do
 
-- After a write that matters, check its result, not its exit code: the author of the comment you posted, the content of the file you wrote, the receipt the recipient logged. An exit code only says the call returned.
+- After a write that matters, check its result where no hook does: the content of the file you wrote, the receipt the recipient logged. `check-gh-attribution.sh` already checks who authored a `gh` write.
 - When a check cannot see what it is checking (an unreachable endpoint, a write-only secret, a 404 on a private resource), report the result as unknown, not as passing.
 - Before treating any output as evidence, ask whether it would look different if your claim were false. If not, it proves nothing.
 - Find your own files, logs and targets from your identity (your config and environment), not by scanning for the newest match; on a shared host the newest match is often a peer's.
@@ -23,7 +23,7 @@ Other rules and code cite these by letter.
 - B: before the operation, validate the input on the properties you own (non-empty, expected prefix, safe characters), not on a provider's internal format, which can change.
 - C: confirm a tmux delivery by a change in the captured pane content; `#{session_activity}` does not track agent activity.
 - D: at a workflow's start, check every required secret and variable and report all the missing ones in one error.
-- E: let the receiving agent decide from the event type which notifications start a turn, so agents cannot trigger each other in a loop.
+- E: decide in the receiver's code, from the event type, which notifications start a turn, so agents cannot trigger each other in a loop.
 
 ## Instance index
 

@@ -6,12 +6,12 @@ Every change to a persistent artifact (code, tests, docs, config, research) goes
 
 - Branch: `<type>/<issue>-<slug>`, for example `fix/123-empty-agent-name`.
 - Title: conventional commits, `<type>(<scope>): <lowercase description>`.
-- Body: `Refs #N` when another agent filed the issue, because the reporter closes it after verifying. `Closes #N` only for an issue you filed yourself. This covers every close keyword (`Fixes`, `Resolves` and their variants). Hook `check-close-keyword.sh` blocks a close keyword next to another agent's issue; the override is operator-only.
+- Body: `Refs #N` unless you filed the issue yourself, because the reporter closes it after verifying. `Closes #N` only for your own issue. This covers every close keyword (`Fixes`, `Resolves` and their variants). Hook `check-close-keyword.sh` blocks a close keyword next to another agent's issue; the override is operator-only.
 - Discuss the work in the issue thread, so the discussion outlives the PR.
 
 ## How to submit LGTM
 
-Approve or request changes with a formal review, because only that event notifies the PR author; a plain comment does not. Use as written:
+Approve or request changes with a formal review, because the merge gate counts only an APPROVED review, and the review event notifies the PR author without a mention. Use as written:
 
     gh pr review <N> --repo <owner>/<repo> --approve --body-file <file>
     gh pr review <N> --repo <owner>/<repo> --request-changes --body-file <file>
@@ -24,9 +24,9 @@ Use a plain comment review only for questions and partial notes. Confirm the sta
 ## Merging
 
 - The implementer merges after a formal approval from someone other than the author, because the implementer knows whether the branch is ready to land. Hook `check-lgtm-gate.sh` blocks a merge without one; the override is operator-only.
-- Check `gh pr view <N> --json mergeStateStatus` first. `CLEAN`: merge. `BEHIND` or `DIRTY`: merge main into the branch and push. `UNSTABLE` or `BLOCKED`: fix the failing check or the missing review. `UNKNOWN`: wait about a minute. Settings deny force-push, so never rebase and force-push.
+- Check `gh pr view <N> --json mergeStateStatus` first. `CLEAN`: merge. `BEHIND` or `DIRTY`: merge main into the branch and push. `UNSTABLE`: wait for running checks, fix failed ones. `BLOCKED`: get the missing review or check. `UNKNOWN`: wait about a minute. Settings deny force-push, so never rebase and force-push.
 - Squash-merge, then post the handoff on the issue as `coordination.md` describes.
-- If the reviewer is unreachable, mention them again, then escalate to the issue reporter. Do not self-merge.
+- Without a non-author approval, do not merge, even if waiting indefinitely. If the reviewer is unreachable, mention them again, then escalate to the issue reporter.
 
 ## Operator-sanctioned exception
 
@@ -35,4 +35,4 @@ When the operator sanctions a merge without a reviewer approval, the gate clears
 - a formal approval from the operator's login;
 - a PR comment from the operator's login containing `[macf-sanction-merge]`.
 
-The approval counts like any non-author review; the comment form works only when `MACF_OPERATOR_LOGIN` is set for the workspace. If the operator sanctioned verbally instead, record who sanctioned it and why in the squash-commit body or the close comment. `MACF_SKIP_LGTM_CHECK` is read at launch only; setting it inside a session has no effect.
+The approval counts like any non-author review; the comment form works only when `MACF_OPERATOR_LOGIN` is set for the workspace. If the operator sanctions a merge verbally, ask them to approve the PR or post the `[macf-sanction-merge]` comment. If they decline to touch GitHub, merge with `gh api -X PUT repos/<owner>/<repo>/pulls/<N>/merge`, which the gate does not intercept, and record who sanctioned it and why in the squash-commit body. `MACF_SKIP_LGTM_CHECK` is read at launch only; setting it inside a session has no effect.

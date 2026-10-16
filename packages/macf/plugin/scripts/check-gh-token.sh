@@ -121,7 +121,7 @@ the token; that is not the problem:
 
 If the pattern above already accepts your token's shape and it still blocks,
 THEN the token is genuinely malformed — refresh it via the fail-loud helper
-as described in .claude/rules/gh-token-refresh.md.
+as described in .claude/rules/gh-token-attribution-traps.md.
 
 Override (ONLY for intentional user-attributed ops):
   export MACF_SKIP_TOKEN_CHECK=1
@@ -140,7 +140,7 @@ trap recurred 5 times in a single day. See groundnuty/macf#140 and
 
 Fix — refresh the bot token via the fail-loud helper:
 
-  GH_TOKEN=\$(./.claude/scripts/macf-gh-token.sh \\
+  GH_TOKEN=\$("\$MACF_WORKSPACE_DIR/.claude/scripts/macf-gh-token.sh" \\
     --app-id "\$APP_ID" --install-id "\$INSTALL_ID" --key "\$KEY_PATH") || exit 1
   export GH_TOKEN
 
