@@ -443,12 +443,28 @@ gh_https_url() {
 # shell-function redefinition — same technique the `gh` / `npm_view_version`
 # stubs elsewhere in this file use — without any real network call in the
 # test run.
+# A probe answers REACHABILITY, not authorisation (groundnuty/macf#1448): any
+# HTTP status proves the host answered, so only curl's "000" (connect, DNS,
+# TLS, timeout) means unreachable. `-f` was wrong — it turned an anonymous
+# 403 rate-limit response into "github.com is unreachable".
+http_status_reachable() {
+  local code
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$@")" || code="000"
+  [ -n "$code" ] && [ "$code" != "000" ]
+}
+
 network_probe_github() {
-  curl -sf --max-time 5 -o /dev/null 'https://api.github.com/'
+  # Authenticate when a token exists so the unauthenticated per-IP rate limit
+  # cannot interfere; the array keeps an unset token from adding anything.
+  local auth=()
+  if [ -n "${GH_TOKEN:-}" ]; then
+    auth=(-H "Authorization: Bearer ${GH_TOKEN}")
+  fi
+  http_status_reachable "${auth[@]}" 'https://api.github.com/'
 }
 
 network_probe_npm() {
-  curl -sf --max-time 5 -o /dev/null 'https://registry.npmjs.org/-/ping'
+  http_status_reachable 'https://registry.npmjs.org/-/ping'
 }
 
 # preflight_network SUBCOMMAND — read-only reachability assert. Safe to run

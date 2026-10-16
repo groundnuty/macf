@@ -170,6 +170,44 @@ assert_contains "describe_dirty_tree: mixed still names the real modification" "
 assert_contains "describe_dirty_tree: mixed still names a stub" "$DDT_OUT" "stub-1 (0 bytes)"
 assert_not_contains "describe_dirty_tree: mixed does NOT show the sandbox sentence (one entry is real)" "$DDT_OUT" "a sandbox that stubs denied paths"
 
+# --- real network probes (groundnuty/macf#1448) ----------------------------
+# A shell-function `curl` shadows the binary: records argv, prints a chosen
+# http_code only when asked via -w (like real curl), and mimics `-f` by
+# exiting 22 with no output on status >= 400. Runs BEFORE the overrides below.
+CURL_ARGV="$(mktemp)"
+CURL_CODE=200
+curl() {
+  printf '%s\n' "$*" >>"$CURL_ARGV"
+  case " $* " in
+    *" -sf "*|*" -f "*) if [ "$CURL_CODE" -ge 400 ]; then return 22; fi ;;
+  esac
+  case " $* " in *" -w "*) printf '%s' "$CURL_CODE" ;; esac
+  if [ "$CURL_CODE" = "000" ]; then return 7; fi
+}
+
+CURL_CODE=403
+assert_true "network_probe_github: HTTP 403 (rate limit) is reachable" network_probe_github
+if PN_OUT="$(preflight_network "all" 2>&1)"; then PN_RC=0; else PN_RC=$?; fi
+assert_eq "preflight_network: passes on 403/403 (answered, not unreachable)" "0" "$PN_RC"
+CURL_CODE=404
+assert_true "network_probe_npm: HTTP 404 is reachable" network_probe_npm
+CURL_CODE=000
+assert_false "network_probe_github: 000 is unreachable" network_probe_github
+assert_false "network_probe_npm: 000 is unreachable" network_probe_npm
+if PN_OUT="$(preflight_network "all" 2>&1)"; then PN_RC=0; else PN_RC=$?; fi
+assert_true "preflight_network: fails on 000" test "$PN_RC" -ne 0
+assert_contains "preflight_network: 000 keeps the existing sentence" "$PN_OUT" "github.com is unreachable"
+
+CURL_CODE=200
+: >"$CURL_ARGV"
+(GH_TOKEN="ghs_testtoken" network_probe_github)
+assert_contains "network_probe_github: GH_TOKEN set sends Authorization header" "$(cat "$CURL_ARGV")" "Authorization: Bearer ghs_testtoken"
+: >"$CURL_ARGV"
+(unset GH_TOKEN; network_probe_github)
+assert_not_contains "network_probe_github: GH_TOKEN unset sends no Authorization" "$(cat "$CURL_ARGV")" "Authorization"
+unset -f curl
+rm -f "$CURL_ARGV"
+
 # --- preflight_network (groundnuty/macf#1424 — Pattern D precheck) ---------
 # network_probe_github / network_probe_npm overridden (same shell-function-
 # redefinition technique as the `gh` / `npm_view_version` stubs elsewhere in
