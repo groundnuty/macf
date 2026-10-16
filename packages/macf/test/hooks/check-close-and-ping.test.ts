@@ -339,6 +339,30 @@ describe('check-close-and-ping.sh (hook)', () => {
       });
       expect(parseAdditionalContext(r.stdout) ?? '').toContain('#1448');
     });
+
+    it('a quoted --comment holding a literal newline BEFORE the number still resolves (Codex)', () => {
+      const r = runHook({
+        command: 'gh issue close --comment "done\nverified" 42 --repo o/r',
+        stubGh: { 'repos/o/r/issues/42/timeline': { xrefs: [{ number: 9, repo: 'o/r', state: 'open' }] } },
+      });
+      expect(parseAdditionalContext(r.stdout) ?? '').toContain('#9');
+    });
+
+    it('numbers inside a --comment value are never the target', () => {
+      const r = runHook({
+        command: 'gh issue close 7 --comment "see #1449 and 88" --repo groundnuty/macf',
+        stubGh: { 'repos/groundnuty/macf/issues/7/timeline': { xrefs: [{ number: 9, repo: 'groundnuty/macf', state: 'open' }] } },
+      });
+      expect(parseAdditionalContext(r.stdout) ?? '').toContain('#7');
+    });
+
+    it('stops at `&&`: a later command\'s number and --repo are never read', () => {
+      const r = runHook({
+        command: 'gh issue close 7 --repo groundnuty/macf && gh pr view 99 --repo other/repo',
+        stubGh: { 'repos/groundnuty/macf/issues/7/timeline': { xrefs: [{ number: 9, repo: 'groundnuty/macf', state: 'open' }] } },
+      });
+      expect(parseAdditionalContext(r.stdout) ?? '').toContain('#7');
+    });
   });
 
   describe('wrapper / subshell bypass coverage (mirrors check-close-condition.sh)', () => {

@@ -146,23 +146,70 @@ fi
 # still belongs to the close line. Only the FIRST close line is considered
 # (a command with several closes is judged on its first).
 JOINED_COMMAND="$(sed -e ':a' -e '/\\$/N; s/\\\n[[:space:]]*/ /; ta' <<<"$COMMAND" 2>/dev/null || echo "$COMMAND")"
-CLOSE_LINE="$(grep -E "${GH_CLOSE_PATTERN}|${SHELL_C_GH_CLOSE_PATTERN}" <<<"$JOINED_COMMAND" 2>/dev/null | head -n1 || echo "")"
-if [[ -z "$CLOSE_LINE" ]]; then
+# Invocation = the substring from the FIRST close match (wrapper-aware) to
+# the END of the command. Lines BEFORE the match are excluded (the #1453
+# fix); lines AFTER are kept so a quoted argument holding a literal newline
+# before the number (`--comment "a<newline>b" 42`) still resolves. The
+# tokenizer below stops at the first unquoted `&` `;` `|` `)` or newline.
+CLOSE_RE="${GH_CLOSE_PATTERN}|${SHELL_C_GH_CLOSE_PATTERN}"
+if [[ ! "$JOINED_COMMAND" =~ $CLOSE_RE ]]; then
   exit 0
 fi
-TAIL="$(sed -E 's/^.*gh[[:space:]]+issue[[:space:]]+close[[:space:]]+//' <<<"$CLOSE_LINE" 2>/dev/null || echo "")"
-if [[ -z "$TAIL" ]]; then
-  # No positional after `gh issue close` — gh itself will error with a
+MATCH_STR="${BASH_REMATCH[0]}"
+INVOCATION="${JOINED_COMMAND#"${JOINED_COMMAND%%"$MATCH_STR"*}"}"
+GH_CLOSE_WORD='gh[[:space:]]+issue[[:space:]]+close([[:space:]]|$)'
+if [[ ! "$INVOCATION" =~ $GH_CLOSE_WORD ]]; then
+  exit 0
+fi
+AFTER_CLOSE="${INVOCATION#*"${BASH_REMATCH[0]}"}"
+
+# Quote-aware tokenizer: quotes are removed, a quoted value (including one
+# spanning lines) is ONE token, and an unquoted `&` `;` `|` `)` or newline
+# ends the close invocation so a later command's numbers are never read.
+TOKS=()
+CUR=""
+HAVE=0
+QUOTE=""
+for ((i = 0; i < ${#AFTER_CLOSE}; i++)); do
+  c="${AFTER_CLOSE:i:1}"
+  if [[ -n "$QUOTE" ]]; then
+    if [[ "$c" == "$QUOTE" ]]; then
+      QUOTE=""
+    elif [[ "$QUOTE" == '"' && "$c" == $'\\' && "${AFTER_CLOSE:i+1:1}" =~ ^[\"\\]$ ]]; then
+      i=$((i + 1))
+      CUR+="${AFTER_CLOSE:i:1}"
+    else
+      CUR+="$c"
+    fi
+    continue
+  fi
+  case "$c" in
+    "'" | '"') QUOTE="$c"; HAVE=1 ;;
+    '&' | ';' | '|' | ')' | $'\n') break ;;
+    ' ' | $'\t')
+      if ((HAVE)); then TOKS+=("$CUR"); CUR=""; HAVE=0; fi
+      ;;
+    *) CUR+="$c"; HAVE=1 ;;
+  esac
+done
+if ((HAVE)); then TOKS+=("$CUR"); fi
+if [[ ${#TOKS[@]} -eq 0 ]]; then
+  # No positional after the close verb — gh itself will error with a
   # usage message; nothing to check here.
   exit 0
 fi
 
 ISSUE_NUMBER=""
+REPO_VALUE=""
 PREV_FLAG=""
-# shellcheck disable=SC2086
-for tok in $TAIL; do
+for tok in "${TOKS[@]}"; do
   if [[ -n "$PREV_FLAG" ]]; then
+    [[ "$PREV_FLAG" == "--repo" || "$PREV_FLAG" == "-R" ]] && REPO_VALUE="$tok"
     PREV_FLAG=""
+    continue
+  fi
+  if [[ "$tok" =~ ^--repo=(.*) ]]; then
+    REPO_VALUE="${BASH_REMATCH[1]}"
     continue
   fi
   if [[ "$tok" =~ ^--[a-zA-Z0-9-]+= ]]; then
@@ -170,42 +217,27 @@ for tok in $TAIL; do
   fi
   if [[ "$tok" =~ ^-- ]]; then
     case "$tok" in
-      --comment|--duplicate-of|--reason|--repo)
-        PREV_FLAG="$tok"
-        ;;
+      --comment|--duplicate-of|--reason|--repo) PREV_FLAG="$tok" ;;
       *) ;;
     esac
     continue
   fi
   if [[ "$tok" =~ ^-[a-zA-Z]$ ]]; then
     case "$tok" in
-      -c|-r|-R)
-        PREV_FLAG="$tok"
-        ;;
+      -c|-r|-R) PREV_FLAG="$tok" ;;
       *) ;;
     esac
     continue
   fi
+  [[ -n "$ISSUE_NUMBER" ]] && continue
   if [[ "$tok" =~ ^[0-9]+$ ]]; then
     ISSUE_NUMBER="$tok"
-    break
-  fi
-  # URL form: `https://github.com/owner/repo/issues/<N>`.
-  if [[ "$tok" =~ /issues/([0-9]+) ]]; then
+  elif [[ "$tok" =~ /issues/([0-9]+) ]]; then
+    # URL form: `https://github.com/owner/repo/issues/<N>`.
     ISSUE_NUMBER="${BASH_REMATCH[1]}"
-    break
-  fi
-  # `owner/repo#N` shorthand.
-  if [[ "$tok" =~ \#([0-9]+) ]]; then
+  elif [[ "$tok" =~ \#([0-9]+) ]]; then
+    # `owner/repo#N` shorthand.
     ISSUE_NUMBER="${BASH_REMATCH[1]}"
-    break
-  fi
-  # Quoted forms.
-  STRIPPED="${tok#\"}"; STRIPPED="${STRIPPED%\"}"
-  STRIPPED="${STRIPPED#\'}"; STRIPPED="${STRIPPED%\'}"
-  if [[ "$STRIPPED" =~ ^[0-9]+$ ]]; then
-    ISSUE_NUMBER="$STRIPPED"
-    break
   fi
 done
 
@@ -215,14 +247,6 @@ if [[ -z "$ISSUE_NUMBER" ]]; then
   exit 0
 fi
 
-REPO_VALUE=""
-if [[ "$CLOSE_LINE" =~ --repo[[:space:]]+([^[:space:]]+) ]]; then
-  REPO_VALUE="${BASH_REMATCH[1]}"
-elif [[ "$CLOSE_LINE" =~ --repo=([^[:space:]]+) ]]; then
-  REPO_VALUE="${BASH_REMATCH[1]}"
-elif [[ "$CLOSE_LINE" =~ (^|[[:space:]])-R[[:space:]]+([^[:space:]]+) ]]; then
-  REPO_VALUE="${BASH_REMATCH[2]}"
-fi
 # Strip trailing shell-wrapper punctuation that can end up glued to the
 # value when the whole `gh issue close ...` command is itself wrapped in
 # quotes or a subshell (`bash -c '... --repo owner/repo'`, `(... --repo

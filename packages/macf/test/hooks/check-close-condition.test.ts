@@ -337,6 +337,36 @@ describe('check-close-condition.sh (hook)', () => {
       });
       expect(parseAdditionalContext(r.stdout) ?? '').toContain(CONDITION_MARKER);
     });
+
+    it('a quoted --comment holding a literal newline BEFORE the number still resolves (Codex)', () => {
+      const r = runHook({
+        command: 'gh issue close --comment "done\nverified" 42 --repo o/r',
+        stubGh: { 'o/r#42': { body: SECTION_BODY } },
+      });
+      const ctx = parseAdditionalContext(r.stdout) ?? '';
+      expect(ctx).toContain('#42');
+      expect(ctx).toContain(CONDITION_MARKER);
+    });
+
+    it('numbers inside a --comment value are never the target', () => {
+      const r = runHook({
+        command: 'gh issue close 7 --comment "see #1449 and 88" --repo groundnuty/macf',
+        stubGh: { 'groundnuty/macf#7': { body: SECTION_BODY } },
+      });
+      const ctx = parseAdditionalContext(r.stdout) ?? '';
+      expect(ctx).toContain('#7');
+      expect(ctx).toContain(CONDITION_MARKER);
+    });
+
+    it('stops at `&&`: a later command\'s number and --repo are never read', () => {
+      const r = runHook({
+        command: 'gh issue close 7 --repo groundnuty/macf && gh pr view 99 --repo other/repo',
+        stubGh: { 'groundnuty/macf#7': { body: SECTION_BODY } },
+      });
+      const ctx = parseAdditionalContext(r.stdout) ?? '';
+      expect(ctx).toContain('#7');
+      expect(ctx).toContain(CONDITION_MARKER);
+    });
   });
 
   describe('wrapper / subshell bypass coverage (mirrors check-close-keyword.sh)', () => {
