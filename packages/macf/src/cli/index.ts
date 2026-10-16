@@ -33,6 +33,7 @@ import { runRegistryPrune } from './commands/registry-prune.js';
 import { runRestartSelfCommand } from './commands/restart-self.js';
 import { certsInit, certsRecover, certsRotate, issueRoutingClient } from './commands/certs.js';
 import { repoInit } from './commands/repo-init.js';
+import { parseCiWorkflowsOption } from './commands/repo-init-ci-workflows.js';
 import { rulesRefresh } from './commands/rules-refresh.js';
 import { runDoctor } from './commands/doctor.js';
 import { runWhoami } from './commands/whoami.js';
@@ -1392,7 +1393,7 @@ program
       registryType: opts.registryType,
       registryOrg: opts.registryOrg,
       registryUser: opts.registryUser,
-      ciWorkflows: opts.ciWorkflows ? String(opts.ciWorkflows).split(',').map((n: string) => n.trim()).filter(Boolean) : undefined,
+      ciWorkflows: parseCiWorkflowsOption(opts.ciWorkflows),
       force: opts.force,
     });
   });

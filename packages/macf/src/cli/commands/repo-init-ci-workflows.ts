@@ -56,3 +56,12 @@ export function scanCiWorkflowNames(repoDir: string): readonly string[] {
   }
   return [...names].sort();
 }
+
+/**
+ * Parse the `--ci-workflows` option. Absent means "scan the repo"; an
+ * explicit empty value means "subscribe to no CI workflow".
+ */
+export function parseCiWorkflowsOption(raw: unknown): readonly string[] | undefined {
+  if (raw === undefined) return undefined;
+  return String(raw).split(',').map((n) => n.trim()).filter(Boolean);
+}

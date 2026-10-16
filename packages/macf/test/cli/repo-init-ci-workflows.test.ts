@@ -13,7 +13,7 @@ import {
   isCiWorkflowRunCapableActionsVersion,
   repoInit,
 } from '../../src/cli/commands/repo-init.js';
-import { scanCiWorkflowNames } from '../../src/cli/commands/repo-init-ci-workflows.js';
+import { parseCiWorkflowsOption, scanCiWorkflowNames } from '../../src/cli/commands/repo-init-ci-workflows.js';
 
 const V3 = { project: 'macf', registryApiPath: '/orgs/o' };
 type On = Record<string, { workflows?: string[]; types?: string[] }>;
@@ -132,5 +132,13 @@ describe('repoInit — workflow_run end to end (macf#1479)', () => {
   it('an explicit list replaces the scan', async () => {
     await repoInit(dir, { repo: 'o/r', actionsVersion: 'v3.6.0', force: false, ciWorkflows: ['Build'] });
     expect(onOf(written())['workflow_run']?.workflows).toEqual(['Build']);
+  });
+});
+
+describe('parseCiWorkflowsOption', () => {
+  it('absent means scan; an explicit empty value means no CI workflow', () => {
+    expect(parseCiWorkflowsOption(undefined)).toBeUndefined();
+    expect(parseCiWorkflowsOption('')).toEqual([]);
+    expect(parseCiWorkflowsOption('Build, Test ,')).toEqual(['Build', 'Test']);
   });
 });
