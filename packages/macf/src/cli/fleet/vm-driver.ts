@@ -873,16 +873,13 @@ export function createVmExecSeams(
       }
     },
     submit: (session: string, text: string): void => {
-      // The ONLY sanctioned prompt-submit path (the C-u + double-Enter quirk).
-      try {
-        execFileSync(tmuxSubmitScript(workspaceDir), [session, text], { stdio: 'ignore' });
-      } catch (err) {
-        // Exit 3 = "could not verify submission" (no ❯ line) after the one
-        // Enter WAS sent. That is the expected outcome of submitting `/exit`
-        // (the TUI is gone, so no input line remains) — not a failure.
-        // Exit 4 (still unsubmitted) and everything else still throw.
-        if ((err as { status?: number }).status !== 3) throw err;
-      }
+      // The ONLY sanctioned prompt-submit path. Any non-zero exit throws —
+      // including 3 ("could not verify submission"): for an injected prompt that
+      // can mean a modal swallowed the keystrokes, so it must never read as
+      // sent. The one caller for which 3 IS success (`/exit`, after which no
+      // input line remains) tolerates it at its own call site, in
+      // fleet-teardown.ts.
+      execFileSync(tmuxSubmitScript(workspaceDir), [session, text], { stdio: 'ignore' });
     },
     exec: (bin: string, args: readonly string[], cwd: string, env?: NodeJS.ProcessEnv): void => {
       execFileSync(bin, args as string[], { cwd, stdio: 'inherit', env: env ?? process.env });

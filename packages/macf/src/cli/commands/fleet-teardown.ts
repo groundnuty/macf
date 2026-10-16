@@ -114,6 +114,9 @@ export function reachabilityFor(seams: VmDriverSeams, role: string): { readonly 
  * a signal, never `tmux kill-session` — `submit(session, '/exit')` is the
  * ONLY agent-facing primitive this calls.
  */
+/** The submit helper's exit code for "Enter sent, but no input line to verify against". */
+export const SUBMIT_UNVERIFIABLE_EXIT = 3;
+
 export function agentStopDepsOverSeams(seams: VmDriverSeams): TeardownAgentDeps {
   return {
     checkAgentReachability: (role) => Promise.resolve(reachabilityFor(seams, role).reachability),
@@ -126,7 +129,17 @@ export function agentStopDepsOverSeams(seams: VmDriverSeams): TeardownAgentDeps 
       // NEVER a signal, NEVER `tmux kill-session` — see `TeardownAgentDeps`'s
       // doc in teardown.ts for the full mechanism rationale + the live
       // verification (macf#1033, 2026-08-20) that this submit dispatches.
-      seams.submit(session, '/exit');
+      try {
+        seams.submit(session, '/exit');
+      } catch (err) {
+        // The submit helper exits 3 when it sent the Enter but finds no input
+        // line to verify against. After `/exit` that is the expected outcome:
+        // the TUI is gone. Every other failure (including 4, "still sitting
+        // unsubmitted") still propagates.
+        if ((err as { status?: number }).status !== SUBMIT_UNVERIFIABLE_EXIT) {
+          return Promise.reject(err instanceof Error ? err : new Error(String(err)));
+        }
+      }
       return Promise.resolve();
     },
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
