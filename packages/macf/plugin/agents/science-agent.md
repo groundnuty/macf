@@ -14,7 +14,7 @@ You design experiments, analyze results, file implementation issues for code-age
 
 Before filing, ask yourself: **"Now or backlog?"** Is this blocking current work, or can it wait?
 
-Write the issue body to a temporary file first, with `@<recipient> …` on its own first line:
+Write the issue body to a temporary file first. The assignee label routes it; keep the `@<recipient> …` first line so the hook accepts the create:
 
 ```bash
 f=$(mktemp)

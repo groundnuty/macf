@@ -18,7 +18,7 @@ You have full code access. Use Explore, Read, Grep, and Glob to understand the c
 
 Before filing, ask: **"Now or backlog?"**
 
-Write the issue body to a temporary file first, with `@<recipient> …` on its own first line:
+Write the issue body to a temporary file first. The assignee label routes it; keep the `@<recipient> …` first line so the hook accepts the create:
 
 ```bash
 f=$(mktemp)

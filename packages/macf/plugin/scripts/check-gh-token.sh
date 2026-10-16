@@ -108,7 +108,7 @@ GH_TOKEN prefix: ghs_ (a bot installation token — NOT the attribution trap)
 This copy's pattern: ^ghs_[A-Za-z0-9._-]+\$
 
 Your token carries the bot prefix but did not match the pattern above. A
-`ghs_` token is a bot installation token by definition, so the likely cause
+\`ghs_\` token is a bot installation token by definition, so the likely cause
 is that this workspace's copy of check-gh-token.sh predates a widening of
 that pattern (gh-token v2.x mints a ~383-char \`ghs_<app>_<JWT>\` containing
 dots and hyphens; see groundnuty/macf#827 and #1360).
@@ -120,8 +120,9 @@ the token; that is not the problem:
   macf rules refresh --dir .
 
 If the pattern above already accepts your token's shape and it still blocks,
-THEN the token is genuinely malformed — refresh it via the fail-loud helper
-as described in .claude/rules/gh-token-attribution-traps.md.
+THEN the token is genuinely malformed; a mint inside a command cannot replace
+it. Ask the operator to relaunch with ./claude.sh (see
+.claude/rules/gh-token-attribution-traps.md).
 
 Override (ONLY for intentional user-attributed ops) is launch-time / operator
 only: MACF_SKIP_TOKEN_CHECK is read from this session's process env, so an
@@ -140,8 +141,8 @@ trap recurred 5 times in a single day. See groundnuty/macf#140 and
 .claude/rules/gh-token-attribution-traps.md.
 
 Fix — relaunch. The GH_TOKEN this session launched with is not a bot token, and
-a mint inside a command cannot change the env this hook reads. Exit this session
-and run ./claude.sh again. claude.sh full-shape-validates GH_TOKEN at the launch
+a mint inside a command cannot change the env this hook reads. Ask the operator
+to relaunch this session with ./claude.sh. claude.sh full-shape-validates GH_TOKEN at the launch
 boundary (before exec) and re-mints or aborts loudly rather than starting a
 session this hook would then deadlock.
 
