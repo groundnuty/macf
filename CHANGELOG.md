@@ -4,6 +4,60 @@ All notable changes to the `macf` CLI. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.64] — 2026-10-16
+
+**The follow-through on the first cross-agent delivery: every defect it exposed, each found live and cross-reviewed.**
+
+### Added
+
+- **A fleet's control repo can route on the fleet's self-hosted runner.** The control repo is the
+  coordination surface every cross-agent message passes through, and it previously always ran on
+  metered GitHub-hosted runners. The new opt-in `routing.control_repo_runs_on: self-hosted` (refused
+  unless `routing.runner.runs_on` is also `self-hosted`) makes `apply` write the caller's
+  `runner-runs-on`, provision a runner, and write `MACF_TRUSTED_ACTORS`, all through the existing
+  writers. `plan` reports any missing piece and says routing fails, never falls back to hosted.
+  **Existing callers are now rewritten when their runner input drifts** — for the control repo and,
+  closing the same gap, for agent repos, where declaring `routing.runner.runs_on: self-hosted` never
+  rewrote an already-installed hosted caller. Runbook §6.5.1. (#1459)
+- **`macf routing doctor --e2e` asserts delivery from evidence, not from a router run's conclusion.**
+  It finds the router run its probe triggered, requires the routed line for the recipient, and
+  requires a matching `notify_received` in the receiver's channel log. A green run reads the same for
+  a delivered and a silently dropped message. New `--mode mention|label`, `--recipient`, `--issue`,
+  `--receiver-log`. A run is tied to the probe by its `display_title` (the triggering issue's title,
+  which every run carries); runs that still cannot be told apart are reported as ambiguous, never
+  guessed. The receiver's log resolves from the local workspace's identity, never the routing label.
+  The evidence functions are pinned against real router logs. (#1461)
+
+### Fixed
+
+- **`plan` counted organisation secrets as present on a private repo that cannot receive them.** On
+  GitHub Free, organisation secrets do not reach private repositories, yet the API lists them as
+  visible; the control repo's Tailscale pair arrived empty while `plan` read `noop`. An org secret
+  now counts only for a public repo or a known paid plan; an unreadable plan (App tokens cannot see
+  it) is `unknown`, never paid. The remedy offers self-hosted routing only for a withheld Tailscale
+  pair. (#1456)
+- **`bootstrap apply` accepted a placeholder Tailscale OAuth pair and could never replace the bundle
+  it built from it.** The operator's literal `'<CLIENT_ID>'` / `'<SECRET>'` was baked into
+  `MACF_ROUTING_BUNDLE`. The pair is now refused before any write (empty, `<`/`>`, whitespace, or a
+  secret without `tskey-client-`), never echoed. A freshly supplied pair rewrites the bundle and
+  repo-level `TS_OAUTH_*`, and is written to the vault. `fleet.lock` records per repo a fingerprint of
+  the pair its secrets were built from, so an interrupted or rolled-back rotation converges on the
+  next run; `plan` names exactly the repos that need it. (#1458)
+- **The submit helper could misread Claude Code's dimmed prompt suggestion as an unsubmitted
+  prompt.** Verification now reads the input box with `capture-pane -e` and drops dim (SGR 2) spans,
+  parsing combined SGR parameter lists and skipping extended-colour sub-parameters. (#1454)
+- **The close-condition and close-and-ping hooks read the wrong issue number** from a multi-line
+  command — an earlier line's number, a `--comment`'s number, or a later command's. They now read the
+  close invocation itself with a quote-aware tokenizer, honouring shell wrappers. (#1455)
+- **The release precheck reported a GitHub rate limit as "github.com is unreachable"** and refused
+  to release. Any HTTP status now counts as reachable, and the GitHub probe authenticates when
+  `GH_TOKEN` is set. (#1449)
+
+### Dependencies
+
+- TypeScript 6.0.3, with the explicit `rootDir` it requires in `packages/macf` and
+  `packages/macf-channel-server`; `engines.node` `>=22.12.0`. (#1457)
+
 ## [0.2.63] — 2026-10-16
 
 **The first time a fleet's agents were actually up — and the two defects that kept every message
