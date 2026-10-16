@@ -86,6 +86,7 @@ import {
   checkTailscaleOauthPreflight,
   checkTsOauthFlagsComplete,
   resolvedTsOauthPair,
+  validateTsOauthPair,
   ROUTING_APP_ID_SECRET_NAME,
   TS_OAUTH_CLIENT_ID_ENV_VAR,
   TS_OAUTH_SECRET_ENV_VAR,
@@ -3251,6 +3252,10 @@ export async function runBootstrapApply(
     return renderFailure(tsOauthFlagsFailure, opts);
   }
   const resolvedTsOauth = resolvedTsOauthPair(resolvedTsOauthClientId, resolvedTsOauthSecretRaw);
+  if (resolvedTsOauth !== undefined) {
+    const tsOauthMalformed = validateTsOauthPair(resolvedTsOauth.clientId, resolvedTsOauth.secret);
+    if (tsOauthMalformed !== undefined) return renderFailure(tsOauthMalformed, opts);
+  }
 
   const manifestPath = resolvePath(opts.file);
   if (!existsSync(manifestPath)) {

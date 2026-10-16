@@ -23,7 +23,8 @@ import type { AgentInfo, RegistryConfig } from '@groundnuty/macf-core';
 import type { FleetLock, FleetManifest } from './fleet-manifest.js';
 import { deriveAppHandle, deriveControlRepoName, parseFleetLock, ROUTER_EMITTED_LABELS } from './fleet-manifest.js';
 import type { FleetObserverFn, FleetLockSource, ObservedAgentState, ObservedState, Presence } from './plan.js';
-import { readFleetLockFile } from './fleet-lock.js';
+import { readFleetLockFile, secretFingerprint } from './fleet-lock.js';
+import { tsPairEncoding } from './apply-routing-secrets.js';
 import { registryPathPrefix } from '../registry-helper.js';
 import type {
   VaultAgentObservation,
@@ -1983,7 +1984,7 @@ export async function vaultAwareObserver(
   // false 'absent' (Amendment A4).
   const vaultTsOauth: VaultTsOauthObservation =
     raw !== undefined
-      ? { status: 'confirmed', present: vaultTsOauthClientId(raw) !== undefined && vaultTsOauthSecret(raw) !== undefined }
+      ? tsOauthObservationFrom(vaultTsOauthClientId(raw), vaultTsOauthSecret(raw))
       : { status: 'unknown', reason: unknownReason };
 
   // DR-043 §D5 recipient-set reconciliation (macf#957) — deliberately
@@ -2000,4 +2001,10 @@ export async function vaultAwareObserver(
   }
 
   return { ...base, agents, vaultCa, vaultRecipients, vaultRouterApp, vaultTsOauth };
+}
+
+/** Presence of the vault's Tailscale pair, with a fingerprint of the pair (never a value) so plan can compare it to what `fleet.lock` says was deployed. */
+function tsOauthObservationFrom(clientId: string | undefined, secret: string | undefined): VaultTsOauthObservation {
+  if (clientId === undefined || secret === undefined) return { status: 'confirmed', present: false };
+  return { status: 'confirmed', present: true, fingerprint: secretFingerprint(tsPairEncoding(clientId, secret)) };
 }
