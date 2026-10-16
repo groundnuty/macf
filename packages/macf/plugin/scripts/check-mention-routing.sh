@@ -108,27 +108,207 @@ COMMAND="$(jq -r '.tool_input.command // ""' <<<"$INPUT_JSON" 2>/dev/null || ech
 #   gh issue close      gh pr close      (only when --comment is present;
 #                                          plain close has no body)
 #   gh issue create      gh pr create    (groundnuty/macf#1091)
-# One wrapper list feeds both this detector and the segment detector below.
+# One wrapper list feeds the segment reader below.
 WRAP_LIST='sudo[[:space:]]+|env[[:space:]]+([A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+)*|watch[[:space:]]+|ionice[[:space:]]+|setsid[[:space:]]+|nice[[:space:]]+|time[[:space:]]+|[A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+'
-GH_COMMENT_PATTERN='(^|[[:space:];|&])('"$WRAP_LIST"')*gh[[:space:]]+(issue|pr)[[:space:]]+(comment|close|create)([[:space:]]|$)'
 
-# Shell-wrapper bypass: catches `bash -c "gh issue comment ..."` and
-# variants. Same flag-handling logic as check-gh-token.sh.
-SHELL_C_GH_COMMENT_PATTERN='(^|[[:space:];|&])(sudo[[:space:]]+|env[[:space:]]+([A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+)*|[A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+)*(bash|sh|zsh)[[:space:]]+(-[a-zA-Z]+[[:space:]]+)*-[a-zA-Z]*c[[:space:]]+[^[:space:]].*gh[[:space:]]+(issue|pr)[[:space:]]+(comment|close|create)([[:space:]]|$)'
-
-if [[ ! "$COMMAND" =~ $GH_COMMENT_PATTERN ]] && [[ ! "$COMMAND" =~ $SHELL_C_GH_COMMENT_PATTERN ]]; then
-  # Not a body-carrying command — allow.
+# Cheap prefilter: a superset of every form the splitter below accepts.
+if [[ ! "$COMMAND" =~ gh[[:space:]]+(issue|pr)[[:space:]]+(comment|close|create) ]]; then
   exit 0
 fi
 
-# `gh issue close` / `gh pr close` without --comment doesn't post text.
-# Skip — nothing to check.
-if [[ "$COMMAND" =~ gh[[:space:]]+(issue|pr)[[:space:]]+close ]] && [[ ! "$COMMAND" =~ --comment ]]; then
+# ── One quote-aware command splitter (groundnuty/macf#1482) ───────────────
+# Every detector reads commands from this walk, never from regexes over raw
+# text, so text inside a quoted argument or a heredoc body never starts a
+# command. macf_split_text walks once, tracking '...', "..." (backslash
+# escapes), $'...' and heredoc bodies (<<EOF, <<'EOF', <<-EOF). It cuts at ;
+# & | ( ) and newlines outside quotes and heredoc bodies; && and || are two
+# cuts. Each cut piece goes to macf_collect_segment, which strips wrapper
+# prefixes and, for `bash|sh|zsh -c`-style flag clusters (-c -lc -ec -xc ...),
+# unquotes the script and splits it recursively. Results land in EFF_CMDS.
+# Residual: a command substitution inside double quotes is not entered.
+EFF_CMDS=()
+
+# Sets MACF_UNQUOTED to the first shell word of $1, quotes removed.
+macf_unquote_first_word() {
+  local r="$1" i=1 n c nx out=""
+  n=${#r}
+  MACF_UNQUOTED=""
+  if [[ "${r:0:1}" == "'" ]]; then
+    out="${r:1}"; MACF_UNQUOTED="${out%%\'*}"; return 0
+  fi
+  if [[ "${r:0:2}" == "\$'" ]]; then
+    i=2
+    while [[ $i -lt $n ]]; do
+      c="${r:i:1}"; nx="${r:i+1:1}"
+      if [[ "$c" == "\\" ]]; then
+        if [[ "$nx" == "n" ]]; then out+=$'\n'; else out+="$nx"; fi
+        i=$((i + 2)); continue
+      fi
+      [[ "$c" == "'" ]] && break
+      out+="$c"; i=$((i + 1))
+    done
+    MACF_UNQUOTED="$out"; return 0
+  fi
+  if [[ "${r:0:1}" == '"' ]]; then
+    while [[ $i -lt $n ]]; do
+      c="${r:i:1}"; nx="${r:i+1:1}"
+      if [[ "$c" == "\\" ]]; then
+        case "$nx" in
+          '"'|'\'|'$'|'`') out+="$nx" ;;
+          *) out+="$c$nx" ;;
+        esac
+        i=$((i + 2)); continue
+      fi
+      [[ "$c" == '"' ]] && break
+      out+="$c"; i=$((i + 1))
+    done
+    MACF_UNQUOTED="$out"; return 0
+  fi
+  MACF_UNQUOTED="${r%%[[:space:]]*}"
+  return 0
+}
+
+macf_collect_segment() {
+  local seg="$1" depth="$2"
+  local wre='^[[:space:]]*('"$WRAP_LIST"')*'
+  if [[ "$seg" =~ $wre ]]; then
+    seg="${seg:${#BASH_REMATCH[0]}}"
+  fi
+  [[ -z "$seg" ]] && return 0
+  local sre='^(bash|sh|zsh)[[:space:]]+(-[a-zA-Z]+[[:space:]]+)*-[a-zA-Z]*c[[:space:]]+(.*)$'
+  if [[ "$depth" -lt 4 ]] && [[ "$seg" =~ $sre ]]; then
+    macf_unquote_first_word "${BASH_REMATCH[3]}"
+    macf_split_text "$MACF_UNQUOTED" $((depth + 1))
+    return 0
+  fi
+  EFF_CMDS+=("$seg")
+  return 0
+}
+
+# Skips the bodies of the heredocs opened on the line just ended. $1 = text,
+# $2 = index of that newline. Sets MACF_SKIP_TO to the index of the last
+# consumed character; the delimiters come in the HD_DELIMS / HD_STRIPS arrays.
+macf_skip_heredoc_bodies() {
+  local s="$1" i="$2" k line rest cmp
+  rest="${s:i+1}"
+  local consumed=$((i + 1))
+  for ((k = 0; k < ${#HD_DELIMS[@]}; k++)); do
+    while [[ -n "$rest" ]]; do
+      if [[ "$rest" == *$'\n'* ]]; then
+        line="${rest%%$'\n'*}"; rest="${rest#*$'\n'}"; consumed=$((consumed + ${#line} + 1))
+      else
+        line="$rest"; rest=""; consumed=$((consumed + ${#line}))
+      fi
+      cmp="$line"
+      if [[ "${HD_STRIPS[k]}" == "true" ]]; then
+        while [[ "$cmp" == $'\t'* ]]; do cmp="${cmp#$'\t'}"; done
+      fi
+      [[ "$cmp" == "${HD_DELIMS[k]}" ]] && break
+    done
+  done
+  MACF_SKIP_TO=$((consumed - 1))
+  return 0
+}
+
+macf_split_text() {
+  local s="$1" depth="$2" n=${#1} i=0 c nx nx2 cur="" q="" j d strip
+  local -a HD_DELIMS=() HD_STRIPS=()
+  while [[ $i -lt $n ]]; do
+    c="${s:i:1}"; nx="${s:i+1:1}"
+    if [[ "$q" == "s" ]]; then
+      cur+="$c"; [[ "$c" == "'" ]] && q=""
+      i=$((i + 1)); continue
+    fi
+    if [[ "$q" == "a" || "$q" == "d" ]]; then
+      if [[ "$c" == "\\" ]]; then cur+="$c$nx"; i=$((i + 2)); continue; fi
+      cur+="$c"
+      if [[ "$q" == "a" && "$c" == "'" ]] || [[ "$q" == "d" && "$c" == '"' ]]; then q=""; fi
+      i=$((i + 1)); continue
+    fi
+    case "$c" in
+      "'") q="s"; cur+="$c" ;;
+      '"') q="d"; cur+="$c" ;;
+      '$')
+        if [[ "$nx" == "'" ]]; then q="a"; cur+="$c$nx"; i=$((i + 1)); else cur+="$c"; fi ;;
+      "\\") cur+="$c$nx"; i=$((i + 1)) ;;
+      '#')
+        if [[ -z "$cur" || "${cur: -1}" == [[:space:]] ]]; then
+          while [[ $i -lt $n && "${s:i:1}" != $'\n' ]]; do i=$((i + 1)); done
+          continue
+        fi
+        cur+="$c" ;;
+      '<')
+        nx2="${s:i+2:1}"
+        if [[ "$nx" == "<" && "$nx2" != "<" ]]; then
+          j=$((i + 2)); strip=false
+          if [[ "${s:j:1}" == "-" ]]; then strip=true; j=$((j + 1)); fi
+          while [[ "${s:j:1}" == " " || "${s:j:1}" == $'\t' ]]; do j=$((j + 1)); done
+          d=""
+          if [[ "${s:j:1}" == "'" || "${s:j:1}" == '"' ]]; then
+            local qc="${s:j:1}"; j=$((j + 1))
+            while [[ $j -lt $n && "${s:j:1}" != "$qc" ]]; do d+="${s:j:1}"; j=$((j + 1)); done
+            j=$((j + 1))
+          else
+            [[ "${s:j:1}" == "\\" ]] && j=$((j + 1))
+            while [[ $j -lt $n && "${s:j:1}" != [[:space:]\;\|\&\(\)\<\>] ]]; do d+="${s:j:1}"; j=$((j + 1)); done
+          fi
+          cur+="${s:i:j-i}"
+          if [[ -n "$d" ]]; then HD_DELIMS+=("$d"); HD_STRIPS+=("$strip"); fi
+          i=$j; continue
+        fi
+        cur+="$c" ;;
+      '&')
+        if [[ "${cur: -1}" == ">" || "${cur: -1}" == "<" || "$nx" == ">" ]]; then
+          cur+="$c"
+        else
+          macf_collect_segment "$cur" "$depth"; cur=""
+        fi ;;
+      ';'|'|'|'('|')') macf_collect_segment "$cur" "$depth"; cur="" ;;
+      $'\n')
+        macf_collect_segment "$cur" "$depth"; cur=""
+        if [[ ${#HD_DELIMS[@]} -gt 0 ]]; then
+          macf_skip_heredoc_bodies "$s" "$i"
+          i=$MACF_SKIP_TO
+          HD_DELIMS=(); HD_STRIPS=()
+        fi ;;
+      *) cur+="$c" ;;
+    esac
+    i=$((i + 1))
+  done
+  macf_collect_segment "$cur" "$depth"
+  return 0
+}
+
+macf_split_text "$COMMAND" 0
+
+# Classify the commands the walk found. COMMENT_SEGS keeps each comment's own
+# text so a comment chained after a create is judged on its own body.
+IS_PR_CREATE=false
+HAS_ISSUE_CREATE=false
+IS_CLOSE_SUBCOMMAND=false
+HAS_BODY_CMD=false
+COMMENT_SEGS=()
+gh_cmd_re='^gh[[:space:]]+(issue|pr)[[:space:]]+(comment|close|create)([[:space:]]|$)'
+for eff in ${EFF_CMDS[@]+"${EFF_CMDS[@]}"}; do
+  if [[ "$eff" =~ $gh_cmd_re ]]; then
+    kind_sub="${BASH_REMATCH[1]}"
+    kind_verb="${BASH_REMATCH[2]}"
+    case "$kind_verb" in
+      comment) HAS_BODY_CMD=true; COMMENT_SEGS+=("$eff") ;;
+      create)
+        HAS_BODY_CMD=true
+        if [[ "$kind_sub" == "pr" ]]; then IS_PR_CREATE=true; else HAS_ISSUE_CREATE=true; fi ;;
+      close)
+        # `close` without --comment posts no text — nothing to check.
+        if [[ "$eff" =~ --comment ]]; then HAS_BODY_CMD=true; IS_CLOSE_SUBCOMMAND=true; fi ;;
+    esac
+  fi
+done
+if [[ "$HAS_BODY_CMD" != "true" ]]; then
   exit 0
 fi
 
-# Track whether this is a `close` subcommand. Check A
-# (must-have-mention; macf#244) does NOT apply to close subcommands —
+# Check A (must-have-mention; macf#244) does NOT apply to close subcommands —
 # self-close verification comments are canonically no-recipient
 # (reporter-internal verification per coordination.md §Issue Lifecycle 1
 # case 2 self-close pattern: "Verified on main after PR #M merged.
@@ -136,49 +316,17 @@ fi
 # signal, not a routing-active comment requiring an addressed @mention.
 # Check B (must-not-leak; describing-context) still applies on close
 # subcommands — leak prevention is independent of recipient semantics.
-IS_CLOSE_SUBCOMMAND=false
-if [[ "$COMMAND" =~ gh[[:space:]]+(issue|pr)[[:space:]]+close ]]; then
-  IS_CLOSE_SUBCOMMAND=true
-fi
 
 # ── `create`-subcommand + assignee-label discriminator (macf#1091) ────────
 # See the file-header "`create` coverage" section for the full 4-case
 # rationale. Computed here (before the --body-file dispatch below) because
 # the branch-3 warning also needs to know whether Check A applies.
-# A command counts as a create or comment only where a segment starts
-# (command start, or after ; | & ( or a newline, optionally behind sudo /
-# env VAR=x / VAR=x / bash -c "), so prose in a body that names the command
-# never triggers it.
-SEG_WRAP='('"$WRAP_LIST"'|(bash|sh|zsh)[[:space:]]+-c[[:space:]]+["'"'"'])*'
-SEG_SEP='[;|&(]|'$'\n'
-macf_has_segment_cmd() {
-  local re='(^|'"$SEG_SEP"')[[:space:]]*'"$SEG_WRAP"'gh[[:space:]]+'"$1"'([[:space:]]|$)'
-  [[ "$COMMAND" =~ $re ]]
-}
-
 # `gh pr create` is tracked separately from `gh issue create` because case 4
 # ("no confirmed routing signal → BLOCK") does NOT extend to it — see the
 # CHECK_A_APPLIES computation below for why.
-IS_PR_CREATE=false
-if macf_has_segment_cmd 'pr[[:space:]]+create'; then IS_PR_CREATE=true; fi
-HAS_ISSUE_CREATE=false
-if macf_has_segment_cmd 'issue[[:space:]]+create'; then HAS_ISSUE_CREATE=true; fi
 IS_CREATE_SUBCOMMAND=false
 if [[ "$IS_PR_CREATE" == "true" || "$HAS_ISSUE_CREATE" == "true" ]]; then
   IS_CREATE_SUBCOMMAND=true
-fi
-
-# A create followed by chained comments must still check each comment
-# segment: the create exemption covers only the create. CHAIN_COMMENT_TAIL
-# holds the command text from the first chained comment onward (empty when
-# there is none).
-CHAIN_COMMENT_RE='(^|'"$SEG_SEP"')[[:space:]]*'"$SEG_WRAP"'gh[[:space:]]+(issue|pr)[[:space:]]+comment([[:space:]]|$)'
-CHAIN_NEXT_RE='('"$SEG_SEP"')[[:space:]]*'"$SEG_WRAP"'gh[[:space:]]+(issue|pr)[[:space:]]+comment([[:space:]]|$)'
-CHAIN_COMMENT_TAIL=""
-if [[ "$IS_CREATE_SUBCOMMAND" == "true" ]]; then
-  if [[ "$COMMAND" =~ $CHAIN_COMMENT_RE ]]; then
-    CHAIN_COMMENT_TAIL="${COMMAND#"${COMMAND%%"${BASH_REMATCH[0]}"*}"}"
-  fi
 fi
 
 # Extracts every --label/-l VALUE (comma-split, one wrapping-quote layer
@@ -616,21 +764,8 @@ macf_chain_segment_count() {
   macf_count_active <<<"$seg"
 }
 
-if [[ -n "$CHAIN_COMMENT_TAIL" ]]; then
-  seg_rest="$CHAIN_COMMENT_TAIL"
-  seg_guard=0
-  while [[ -n "$seg_rest" ]] && [[ "$seg_guard" -lt 50 ]]; do
-    seg_guard=$((seg_guard + 1))
-    seg_body="${seg_rest:1}"
-    if [[ "$seg_body" =~ $CHAIN_NEXT_RE ]]; then
-      seg_next="${BASH_REMATCH[0]}"
-      seg_head="${seg_body%%"$seg_next"*}"
-      seg="${seg_rest:0:1}$seg_head"
-      seg_rest="${seg_body#"$seg_head"}"
-    else
-      seg="$seg_rest"
-      seg_rest=""
-    fi
+if [[ "$IS_CREATE_SUBCOMMAND" == "true" ]]; then
+  for seg in ${COMMENT_SEGS[@]+"${COMMENT_SEGS[@]}"}; do
     seg_count="$(macf_chain_segment_count "$seg")"
     if [[ "$seg_count" == "0" ]]; then
       cat >&2 <<ERR

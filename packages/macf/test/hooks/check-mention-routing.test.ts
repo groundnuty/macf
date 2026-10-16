@@ -1085,6 +1085,72 @@ describe('check-mention-routing.sh (hook)', () => {
       });
     });
 
+    describe('one quote-aware splitter feeds every detector (groundnuty/macf#1482 round 4)', () => {
+      it('a PR create inside `bash -lc` is not mistaken for an issue create', () => {
+        const r = runCreate(`bash -lc 'gh pr create --title x --body "Refs #1"'`);
+        expect(r.status).toBe(0);
+      });
+
+      it('a PR body with a line that starts with an issue create is not an issue create', () => {
+        const r = runCreate('gh pr create --title x --body "Explain:\ngh issue create --title x --body b"');
+        expect(r.status).toBe(0);
+      });
+
+      it.each([
+        [`sh -ec "gh issue create --title x --body b"`],
+        [`zsh -c 'gh issue create --title x --body b'`],
+        [`bash -xc 'gh issue create --title x --body b'`],
+        [`sudo env A=1 bash -lc "gh issue create --title x --body b"`],
+      ])('detects an issue create inside the wrapper form %s', (command) => {
+        const r = runCreate(command);
+        expect(r.status).toBe(2);
+      });
+
+      it('an escaped quote in a double-quoted script does not end it early', () => {
+        const r = runCreate(`bash -c "echo \\"a\\"; gh issue create --title x --body b"`);
+        expect(r.status).toBe(2);
+      });
+
+      it('a `;` or `&&` inside a quoted body does not start a command', () => {
+        expect(runCreate('gh pr create --title x --body "a; gh issue create --title y --body b"').status).toBe(0);
+        expect(runCreate(`gh pr create --title x --body 'a && gh issue create --title y --body b'`).status).toBe(0);
+      });
+
+      it('a `$\'...\'` argument holding a separator does not start a command', () => {
+        const r = runCreate(`gh pr create --title x --body $'a; gh issue create --title y --body b'`);
+        expect(r.status).toBe(0);
+      });
+
+      it.each([
+        [`cat > /tmp/f <<'EOF'\ngh issue create --title x\nEOF\ngh pr create --title x --body "Refs #1"`],
+        [`cat > /tmp/f <<EOF\ngh issue create --title x\nEOF\ngh pr create --title x --body "Refs #1"`],
+        [`cat > /tmp/f <<-EOF\n\tgh issue create --title x\n\tEOF\ngh pr create --title x --body "Refs #1"`],
+      ])('a heredoc body containing an issue create is not a create (%#)', (command) => {
+        const r = runCreate(command);
+        expect(r.status).toBe(0);
+      });
+
+      it('a real issue create after a heredoc is still detected', () => {
+        const r = runCreate(`cat > /tmp/f <<'EOF'\nbody\nEOF\ngh issue create --title x --body b`);
+        expect(r.status).toBe(2);
+      });
+
+      it('a comment chained after a create inside `bash -lc` is checked on its own', () => {
+        const r = runCreate(
+          `bash -lc 'gh pr create --label science-agent --title x --body b; gh issue comment 1 --body "no mention"'`,
+        );
+        expect(r.status).toBe(2);
+        expect(r.stderr).toContain('chained');
+      });
+
+      it('a `;` inside a chained comment body does not split it from its mention', () => {
+        const r = runCreate(
+          'gh pr create --label science-agent --title x --body b && gh issue comment 1 --body "a; b\n@macf-science-agent[bot] hi"',
+        );
+        expect(r.status).toBe(0);
+      });
+    });
+
     describe('an unconfirmable peer label warns instead of blocking', () => {
       it('auditor-like workspace (registry lists only auditor) filing a peer label → allowed with warning', () => {
         writeFileSync(join(dir, '.github', 'agent-config.json'), JSON.stringify({ agents: { auditor: {} } }));
