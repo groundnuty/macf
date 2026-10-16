@@ -2045,8 +2045,9 @@ export function checkDistributedRuleCurrency(
     if (canonical === null) continue; // name came from this same dir — defensive only
     const onDiskPath = join(targetDir, name);
     // update never writes through a symlink (it would overwrite the target), so it cannot fix one.
-    let isLink = false;
-    try { isLink = lstatSync(onDiskPath).isSymbolicLink(); } catch { isLink = false; }
+    const isLink = ((): boolean => {
+      try { return lstatSync(onDiskPath).isSymbolicLink(); } catch { return false; }
+    })();
     if (isLink) {
       findings.push({ name, reason: 'symlink' });
       continue;
