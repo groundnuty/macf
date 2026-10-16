@@ -20,6 +20,7 @@ import { buildDashboardHealth } from '../lib/build-dashboard-health.js';
 import { getRegistryConfig } from '../lib/registry-config.js';
 import { mintFreshGitHubToken } from '../lib/fresh-github-token.js';
 import { checkAllPendingWork, resolveSelfLogin } from '../lib/work.js';
+import { resolveQueueLabel } from '../lib/queue-label.js';
 import { checkReporterStalls } from '../lib/reporter-stall.js';
 import { getInboxStore } from '../lib/inbox-store.js';
 import { drainInbox } from '../lib/inbox-drain.js';
@@ -271,7 +272,7 @@ export async function main(): Promise<void> {
       // is GitHub-only by design (queries gh api repos/...), so the
       // stale-token-from-long-running-parent class hits here too.
       const token = await mintFreshGitHubToken();
-      const label = process.env['MACF_AGENT_LABEL'] ?? 'code-agent';
+      const label = resolveQueueLabel(process.env);
       // macf#816: queue-source is the UNION of two poison-free legs —
       // DR-038 Decision 7's App-install-set x label join (complete WITHIN
       // the install-set, NOT a single hardcoded/MACF_REGISTRY_REPO repo)
