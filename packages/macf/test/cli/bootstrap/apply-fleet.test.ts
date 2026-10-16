@@ -5433,6 +5433,25 @@ agents:
         expect(run3.writes).toEqual([]);
       });
 
+      it('an interrupted ROTATION on a fleet that already has records: the repo still recorded with the OLD pair is rewritten by a no-flags run (drift, not just unrecorded)', async () => {
+        const manifestPath = manifestPathIn();
+        const OLD_PAIR = { clientId: 'k-old', secret: 'tskey-client-old-secret' };
+        const run1 = await run({ manifestPath, fresh: OLD_PAIR, restored: OLD_PAIR });
+        expect(deployedKeys(run1.result.finalLock)).toEqual([`ts_oauth_deployed:${CODE}`, `ts_oauth_deployed:${CTRL}`]);
+        const oldFp = run1.result.finalLock!.fleet_fingerprints![`ts_oauth_deployed:${CODE}`];
+        // rotate to the new pair; the write on CODE fails, so CODE keeps the OLD record
+        const run2 = await run({ manifestPath, prior: run1.result.finalLock!, fresh: NEW_PAIR, restored: NEW_PAIR, failBundleOn: CODE });
+        const lock2 = run2.result.finalLock!;
+        expect(lock2.fleet_fingerprints![`ts_oauth_deployed:${CODE}`]).toBe(oldFp);
+        expect(lock2.fleet_fingerprints![`ts_oauth_deployed:${CTRL}`]).not.toBe(oldFp);
+        // a no-flags run with the vault-restored NEW pair finishes the rotation on CODE only
+        const run3 = await run({ manifestPath, prior: lock2, restored: NEW_PAIR });
+        expect(bundleWrites(run3.writes)).toEqual([CODE]);
+        const rewritten = run3.writes.find((w) => w.name === 'MACF_ROUTING_BUNDLE')!;
+        expect(JSON.parse(Buffer.from(rewritten.value, 'base64').toString('utf-8')).TS_OAUTH_SECRET).toBe('tskey-client-new-secret');
+        expect(run3.result.finalLock!.fleet_fingerprints![`ts_oauth_deployed:${CODE}`]).toBe(lock2.fleet_fingerprints![`ts_oauth_deployed:${CTRL}`]);
+      });
+
       it('a vault-restored pair matching every recorded fingerprint writes nothing, and the lock never holds the pair', async () => {
         const manifestPath = manifestPathIn();
         const run1 = await run({ manifestPath, fresh: NEW_PAIR, restored: NEW_PAIR });
