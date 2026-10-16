@@ -356,8 +356,58 @@ export async function checkRepoSecretPresence(repo: string, name: string): Promi
  * present/absent split (see that module's own doc).
  */
 export type RepoSecretNamesObservation =
-  | { readonly status: 'confirmed'; readonly names: ReadonlySet<string> }
+  | {
+      readonly status: 'confirmed';
+      readonly names: ReadonlySet<string>;
+      /**
+       * Org-level names the org-secrets endpoint lists for the repo but GitHub
+       * will not hand it (private repo on the free plan) — listed, not
+       * receivable, so never "present". Only ever set on org-secret reads.
+       */
+      readonly withheld?: ReadonlySet<string>;
+    }
   | { readonly status: 'unknown'; readonly reason: string };
+
+/**
+ * Can `repo` actually receive org-level secrets? Pure. Public repos always
+ * can; a private/internal repo only on a plan known to be paid. An unreadable
+ * plan (an App token gets an org object without `plan`) is unknown — never paid.
+ */
+export function classifyOrgSecretReach(
+  listed: ReadonlySet<string>,
+  visibility: string,
+  planName: string | undefined,
+  repo: string,
+): RepoSecretNamesObservation {
+  if (listed.size === 0 || visibility === 'public') return { status: 'confirmed', names: listed };
+  if (planName === undefined || planName === '') {
+    return { status: 'unknown', reason: `the org plan could not be read (an App token cannot see it), so whether org secrets reach the ${visibility} repo ${repo} is unknown` };
+  }
+  if (planName.toLowerCase() === 'free') return { status: 'confirmed', names: new Set<string>(), withheld: listed };
+  return { status: 'confirmed', names: listed };
+}
+
+/** `GET /repos/<repo>` `.visibility` — `undefined` when unreadable. */
+export async function readRepoVisibility(repo: string): Promise<string | undefined> {
+  try {
+    const { stdout } = await execFileAsync('gh', ['api', `repos/${repo}`, '--jq', '.visibility // ""'], { encoding: 'utf-8' });
+    const v = stdout.trim();
+    return v === '' ? undefined : v;
+  } catch {
+    return undefined;
+  }
+}
+
+/** `GET /orgs/<org>` `.plan.name` — `undefined` when absent (App token) or unreadable. */
+export async function readOrgPlanName(org: string): Promise<string | undefined> {
+  try {
+    const { stdout } = await execFileAsync('gh', ['api', `orgs/${org}`, '--jq', '.plan.name // ""'], { encoding: 'utf-8' });
+    const v = stdout.trim();
+    return v === '' ? undefined : v;
+  } catch {
+    return undefined;
+  }
+}
 
 /**
  * Read-only repo-scoped Actions-SECRETS LIST (groundnuty/macf#1336) — lists
@@ -1516,8 +1566,20 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
   const routingSecretRepos: Record<string, RepoSecretNamesObservation> = {};
   const orgSecretRepos: Record<string, RepoSecretNamesObservation> = {};
   // A user-owned fleet has no org secrets: confirmed-empty, not unknown.
-  const readOrgSecrets = async (repo: string): Promise<RepoSecretNamesObservation> =>
-    manifest.owner.type === 'org' ? listOrgSecretNamesVisibleToRepo(repo) : { status: 'confirmed', names: new Set<string>() };
+  // groundnuty/macf#1451 — the org-secrets endpoint LISTS secrets a private
+  // repo on a free org never receives, so a listed name is present only if the
+  // repo can take it. The plan is read once per run.
+  let orgPlan: Promise<string | undefined> | undefined;
+  const readOrgSecrets = async (repo: string): Promise<RepoSecretNamesObservation> => {
+    if (manifest.owner.type !== 'org') return { status: 'confirmed', names: new Set<string>() };
+    const listed = await listOrgSecretNamesVisibleToRepo(repo);
+    if (listed.status !== 'confirmed' || listed.names.size === 0) return listed;
+    const visibility = await readRepoVisibility(repo);
+    if (visibility === undefined) return { status: 'unknown', reason: `the visibility of ${repo} could not be read, so whether org secrets reach it is unknown` };
+    if (visibility === 'public') return listed;
+    orgPlan ??= readOrgPlanName(manifest.owner.account);
+    return classifyOrgSecretReach(listed.names, visibility, await orgPlan, repo);
+  };
   // groundnuty/macf#1128 — already-provisioned-fleet install-scope drift
   // detection: ONE `GET /orgs/{org}/installations` call (never per-agent —
   // the listing already enumerates every App on the org in one shot),

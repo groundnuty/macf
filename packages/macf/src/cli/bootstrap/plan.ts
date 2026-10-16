@@ -1647,8 +1647,18 @@ function routerCallerSecretsItem(
   } else if (verdict.notPassedByCaller.length > 0) {
     parts.push(`the caller (.github/workflows/agent-router.yml) does not pass ${verdict.notPassedByCaller.join(', ')}`);
   }
-  if (verdict.missingFromRepo.length > 0) {
-    parts.push(`the repo has no secret named ${verdict.missingFromRepo.join(', ')}`);
+  const withheld = verdict.orgWithheld ?? [];
+  const trulyMissing = verdict.missingFromRepo.filter((n) => !withheld.includes(n));
+  if (withheld.length > 0) {
+    parts.push(
+      `the org secret${withheld.length > 1 ? 's' : ''} ${withheld.join(', ')} ${withheld.length > 1 ? 'do' : 'does'} not reach ${repo}: organisation secrets are not available to private repositories on the free plan — ` +
+        (withheld.every((n) => n === 'TS_OAUTH_CLIENT_ID' || n === 'TS_OAUTH_SECRET')
+          ? `set ${withheld.length > 1 ? 'them' : 'it'} as repository secrets, or route this repo self-hosted (a self-hosted runner needs no Tailscale pair)`
+          : `set ${withheld.length > 1 ? 'them' : 'it'} as repository secrets — routing self-hosted would not help, since only the Tailscale pair is optional there`),
+    );
+  }
+  if (trulyMissing.length > 0) {
+    parts.push(`the repo has no secret named ${trulyMissing.join(', ')}`);
   }
   return {
     kind: 'router_caller_secrets',
