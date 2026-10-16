@@ -47,6 +47,7 @@
  * Replaces the earlier plugin-update placeholder (P4). With PR #4 adding
  * version pins, this command is the canonical bumper.
  */
+import { recordManagedHashes, copiedAssetPaths, macfDirPaths, SETTINGS_REL } from '../managed-hashes.js';
 import { createInterface } from 'node:readline';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -478,6 +479,12 @@ export async function update(
   // operator's claude.sh would become thin without env files on disk
   // until refreshEnvFiles ran later — leaving a brief window where the
   // launcher would source nothing. Migration writes both atomically.
+  // Recorded once, after the launcher and env writers below: each pushes
+  // only the paths it wrote, so a refused or preserved file keeps its hash.
+  const written: string[] = [
+    ...copiedAssetPaths(outcome.rules, outcome.scripts),
+    SETTINGS_REL,
+  ];
   if (!opts.noMigrateEnvFiles) {
     // DR-029 / macf#623: regenerate claude.sh ONLY when it is macf-managed
     // (carries the managed-header) or absent (fresh workspace). A claude.sh
@@ -505,6 +512,7 @@ export async function update(
     } else {
       const migration = migrateMonolithicClaudeSh(projectDir, config);
       if (migration.migrated) {
+        written.push(...migration.written);
         console.log(
           `Migrated monolithic claude.sh → thin source-loop template + ` +
             `per-concern env files`,
@@ -528,7 +536,7 @@ export async function update(
       // carries the managed-file header warning users not to edit it. See #63.
       // Doesn't depend on config.versions, so it runs even for legacy configs
       // (before the error-exit for missing versions).
-      writeClaudeSh(projectDir, config);
+      written.push(writeClaudeSh(projectDir, config));
       console.log(`Refreshed claude.sh from current launcher template`);
     }
 
@@ -542,6 +550,7 @@ export async function update(
       `preserved ${refresh.preserved.length} operator-managed file(s); ` +
       `warned on ${refresh.warnedHandEdits.length} hand-edit(s)`;
     console.log(summary);
+    written.push(...macfDirPaths([...refresh.refreshed, ...refresh.bootstrapped]));
 
     // Host-toolchain bootstrap (DR-031 piece 4). Re-detect the backend +
     // regenerate .claude/.macf/host-prelude.sh in lockstep with claude.sh.
@@ -549,9 +558,10 @@ export async function update(
     // host's toolchain may have changed since the last update, and the
     // dynamic re-source the file emits must reflect the current backend.
     // The thin claude.sh sources it FIRST (before the env.* loop).
-    writeHostPrelude(projectDir);
+    written.push(writeHostPrelude(projectDir));
     console.log(`Refreshed host-prelude.sh from current toolchain detection`);
   }
+  recordManagedHashes(projectDir, written);
 
   // Resolve the plugin dir claude.sh ACTUALLY MOUNTS (macf#889) — read here,
   // after claude.sh has just been refreshed/preserved above, so a

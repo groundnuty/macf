@@ -67,6 +67,7 @@ import { generateClaudeSh, hasManagedHeader } from '../claude-sh.js';
 import { computeCanonicalRuleFile, computeCanonicalScriptFile } from '../rules.js';
 import { computeCanonicalEnvFileContent } from '../env-files-update.js';
 import { computeCanonicalHostPrelude } from '../host-prelude.js';
+import { matchesLastWritten } from '../managed-hashes.js';
 import {
   readSettings,
   canPluginDeliverMigratedHooks,
@@ -272,9 +273,35 @@ export function classifyDirtyFile(
   workspaceDir: string,
   config: MacfAgentConfig,
 ): DirtyFileTier {
-  try {
-    const norm = normalizeRelPath(relPath);
+  const norm = normalizeRelPath(relPath);
+  if (classifyAgainstRunningMacf(norm, workspaceDir, config) === 'already-canonical') {
+    return 'already-canonical';
+  }
+  return isLastWrittenByMacf(norm, workspaceDir) ? 'already-canonical' : 'genuine-delta';
+}
 
+/**
+ * Second tier (#1476): the file is byte-identical to what macf last wrote
+ * here — possibly an older macf than the one running now, so the comparison
+ * above misses it. `CLAUDE.md` and `env.local.*` are never macf-written, so
+ * they are never recorded and never match.
+ */
+function isLastWrittenByMacf(norm: string, workspaceDir: string): boolean {
+  try {
+    if (isNeverWritten(norm)) return false;
+    const current = readWorkspaceFile(workspaceDir, norm);
+    return current !== null && matchesLastWritten(workspaceDir, norm, current);
+  } catch {
+    return false;
+  }
+}
+
+function classifyAgainstRunningMacf(
+  norm: string,
+  workspaceDir: string,
+  config: MacfAgentConfig,
+): DirtyFileTier {
+  try {
     if (norm === SETTINGS_JSON_PATH) {
       return classifySettingsJson(workspaceDir);
     }

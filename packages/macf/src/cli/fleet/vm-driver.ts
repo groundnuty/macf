@@ -594,7 +594,14 @@ export function createVmDriver(opts: VmDriverOptions, seams: VmDriverSeams): Fle
       // (rollFleet) is completing a transaction it already gated pre-flight —
       // thread it so restart-self relaunches WITHOUT stashing (and without
       // refusing on) macf update's own regeneration.
-      const args = ['restart-self', '--confirm', '--reason', 'fault'];
+      // The roll path (leaveConfigUncommitted) is an upgrade; anything else is
+      // a fault restart. The reason only labels the stash and RESUME note.
+      const args = [
+        'restart-self',
+        '--confirm',
+        '--reason',
+        restartOpts?.leaveConfigUncommitted ? 'upgrade' : 'fault',
+      ];
       if (restartOpts?.leaveConfigUncommitted) args.push('--leave-config-uncommitted');
       // macf#763 — CRITICAL: without this scrub, `restart-self`'s
       // env-over-config `resolveIdentity` derives the ORCHESTRATOR's session

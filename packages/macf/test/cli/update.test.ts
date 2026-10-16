@@ -86,6 +86,7 @@ vi.mock('../../src/cli/rules.js', async (importOriginal) => {
 });
 
 import { update, buildDiff, renderDiff } from '../../src/cli/commands/update.js';
+import { recordManagedHashes, matchesLastWritten } from '../../src/cli/managed-hashes.js';
 import { agentConfigPath, readAgentConfig } from '../../src/cli/config.js';
 import { findCliPackageRoot } from '../../src/cli/rules.js';
 import { fetchPluginToWorkspace, stripPluginMcpServers, linkPluginCliDist } from '../../src/cli/plugin-fetcher.js';
@@ -1051,6 +1052,23 @@ describe('update command', () => {
     }
   });
 
+  it('records the launcher, env files and host-prelude it wrote; not an operator-managed env file it preserved (#1476)', async () => {
+    writeConfig(dir, { cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
+    mockFetchReturning({ cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
+    mkdirSync(join(dir, '.claude', '.macf'), { recursive: true });
+    const operatorTelemetry = '# operator OTLP endpoint\n';
+    writeFileSync(join(dir, '.claude', '.macf', 'env.telemetry'), operatorTelemetry);
+
+    await update(dir, { all: false, cli: false, plugin: false, actions: false, yes: false, dryRun: false });
+
+    const record = JSON.parse(readFileSync(join(dir, '.macf', 'managed-hashes.json'), 'utf-8'));
+    for (const rel of ['claude.sh', '.claude/.macf/env.identity', '.claude/.macf/env.tmux', '.claude/.macf/host-prelude.sh']) {
+      expect(matchesLastWritten(dir, rel, readFileSync(join(dir, rel))), rel).toBe(true);
+      expect(record[rel], rel).toBeDefined();
+    }
+    expect(record['.claude/.macf/env.telemetry']).toBeUndefined();
+  });
+
   it('generates claude.sh fresh when absent (no preserve when nothing to preserve) (#623)', async () => {
     writeConfig(dir, { cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
     mockFetchReturning({ cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
@@ -1297,6 +1315,36 @@ describe('update command', () => {
       expect(allErrors).toMatch(/37 commit\(s\) behind/);
       expect(allErrors).toContain(join('.claude', 'rules', 'coordination.md'));
       expect(code).toBe(0); // the rest of the run still completes normally
+
+      rmSync(fakeRoot, { recursive: true, force: true });
+      rmSync(remote, { recursive: true, force: true });
+    });
+
+    it('DECISIVE (#1476): a refused refresh records nothing — an operator-edited recorded rule keeps its old hash and stays objectable', async () => {
+      writeConfig(dir, { cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
+      mockFetchReturning({ cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
+      const rel = '.claude/rules/coordination.md';
+      const rule = join(dir, rel);
+      mkdirSync(join(dir, '.claude', 'rules'), { recursive: true });
+      writeFileSync(rule, '# what macf wrote last time\n');
+      recordManagedHashes(dir, [rel]);
+      const before = JSON.parse(readFileSync(join(dir, '.macf', 'managed-hashes.json'), 'utf-8'))[rel];
+      const edited = '# what macf wrote last time\nOPERATOR EDIT\n';
+      writeFileSync(rule, edited);
+
+      const fakeRoot = join(dir, '..', `fake-stale-cli-${Math.random().toString(36).slice(2)}`);
+      const remote = join(dir, '..', `fake-stale-remote-${Math.random().toString(36).slice(2)}.git`);
+      makeStaleFakeCliCheckout(fakeRoot, remote, 29);
+      vi.mocked(findCliPackageRoot).mockReturnValueOnce(fakeRoot);
+
+      await update(dir, { all: false, cli: false, plugin: false, actions: false, yes: true, dryRun: false, force: false });
+
+      expect(readFileSync(rule, 'utf-8')).toBe(edited);
+      const after = JSON.parse(readFileSync(join(dir, '.macf', 'managed-hashes.json'), 'utf-8'));
+      expect(after[rel]).toBe(before);
+      expect(matchesLastWritten(dir, rel, edited)).toBe(false);
+      // The scripts the refused copy skipped were never recorded either.
+      expect(Object.keys(after).filter((k) => k.startsWith('.claude/scripts/'))).toEqual([]);
 
       rmSync(fakeRoot, { recursive: true, force: true });
       rmSync(remote, { recursive: true, force: true });

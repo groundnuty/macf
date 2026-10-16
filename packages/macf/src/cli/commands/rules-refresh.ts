@@ -17,6 +17,7 @@
  * canonical files that `macf init` / `macf update` would copy, with no
  * dependence on App credentials, registry, certs, or pin state.
  */
+import { recordManagedHashes, copiedAssetPaths, SETTINGS_REL } from '../managed-hashes.js';
 import { existsSync, statSync } from 'node:fs';
 import { resolveCanonicalBranch } from '../config.js';
 import { copyCanonicalAssetsGuarded } from '../canonical-overwrite-guard.js';
@@ -142,6 +143,7 @@ export function rulesRefresh(targetDir: string, options: RulesRefreshOptions = {
 
   // Never idle-compact (CC 2.1.299); enforced, no opt-out. See settings-writer.ts.
   installIdleCompactionOff(targetDir);
+  recordManagedHashes(targetDir, [...copiedAssetPaths(rules, scripts), SETTINGS_REL]);
 
   if (rules.length > 0) {
     console.log(`Refreshed ${rules.length} canonical rule file(s) in .claude/rules/:`);

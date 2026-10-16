@@ -327,7 +327,8 @@ describe('migrateMonolithicClaudeSh', () => {
     );
 
     const result = migrateMonolithicClaudeSh(tmpRoot, baseConfig);
-    expect(result).toEqual({ migrated: true });
+    expect(result.migrated).toBe(true);
+    expect(result).toMatchObject({ written: expect.arrayContaining([join(tmpRoot, 'claude.sh')]) });
 
     // Thin template marker present after migration
     const after = readFileSync(join(tmpRoot, 'claude.sh'), 'utf-8');
