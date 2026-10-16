@@ -26,6 +26,7 @@
  * through the real entrypoint, not the helper alone.
  */
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { MANAGED_HEADER as MANAGED_RULE_HEADER } from '../../src/cli/rules.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
@@ -74,7 +75,7 @@ describe('checkDistributedRuleCurrency (groundnuty/macf#1360)', () => {
     mkdirSync(join(tmpRoot, '.claude', 'rules'), { recursive: true });
     writeFileSync(
       join(tmpRoot, '.claude', 'rules', 'coordination.md'),
-      '# Coordination Rules (canonical, shared)\n\nOLD pre-refresh shape\n',
+      MANAGED_RULE_HEADER + '# Coordination Rules (canonical, shared)\n\nOLD pre-refresh shape\n',
     );
 
     const result = checkDistributedRuleCurrency(tmpRoot, dirs());

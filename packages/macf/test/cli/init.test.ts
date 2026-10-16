@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { MANAGED_HEADER as MANAGED_RULE_HEADER } from '../../src/cli/rules.js';
 import { execFileSync } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
 import { mkdirSync, rmSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
@@ -1268,7 +1269,7 @@ describe('canonical-overwrite guard integration (groundnuty/macf#1401, extending
     vi.mocked(findCliPackageRoot).mockReturnValueOnce(fakeRoot);
 
     mkdirSync(join(workspaceDir, '.claude', 'rules'), { recursive: true });
-    const sentinel = '<!-- test -->\nWORKSPACE HAS SOMETHING NEWER — should be overwritten by --force\n';
+    const sentinel = MANAGED_RULE_HEADER + 'WORKSPACE HAS SOMETHING NEWER — should be overwritten by --force\n';
     writeFileSync(join(workspaceDir, '.claude', 'rules', 'coordination.md'), sentinel);
 
     const project = `forceinit${Date.now()}${Math.floor(Math.random() * 1e6)}`;

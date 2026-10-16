@@ -40,7 +40,7 @@ import {
   canonicalScriptsDir,
   computeCanonicalRuleFile,
   computeCanonicalScriptFile,
-  copyCanonicalRules,
+  copyCanonicalRulesDetailed,
   copyCanonicalScripts,
   findCliPackageRoot,
   listDistributedRuleNames,
@@ -217,6 +217,8 @@ export function checkCanonicalOverwriteSafety(
 export interface CanonicalCopyOutcome {
   /** Rule basenames actually written (empty when the copy was skipped). */
   readonly rules: readonly string[];
+  /** Operator-authored rule files (no managed header) left in place, not overwritten. */
+  readonly keptRules: readonly string[];
   /** Script basenames actually written (empty when the copy was skipped). */
   readonly scripts: readonly string[];
   /** Retired rule copies deleted (empty when the copy was skipped). */
@@ -275,10 +277,10 @@ export function copyCanonicalAssetsGuarded(
   );
 
   if (guard.kind === 'refuse' && !options.force) {
-    return { rules: [], scripts: [], retiredRules: [], guard, copied: false };
+    return { rules: [], keptRules: [], scripts: [], retiredRules: [], guard, copied: false };
   }
 
-  const rules = copyCanonicalRules(workspaceDir);
+  const { copied: rules, kept: keptRules } = copyCanonicalRulesDetailed(workspaceDir);
   const scripts = copyCanonicalScripts(workspaceDir);
   // Deletion obeys the same verdict as the copy: it is only reached when the
   // copy ran, so a stale-checkout CLI that refuses to overwrite refuses to delete.
@@ -291,6 +293,7 @@ export function copyCanonicalAssetsGuarded(
   }
   return {
     rules,
+    keptRules,
     scripts,
     retiredRules: retired.removed,
     guard,
