@@ -175,6 +175,17 @@ describe('macf#1491 — failures still log their event', () => {
     expect(String(ev?.data['stderr'])).toContain('boom');
   });
 
+  it('a prompt that makes spawn throw (a NUL byte) resolves false and never rejects', async () => {
+    const ws = join(dir, 'ws-nul');
+    installScript(ws, '#!/bin/sh\nexit 0\n');
+    const logger = makeLogger();
+    await expect(wakeViaTmux('bad\u0000prompt', { workspaceDir: ws, session: 'nul', logger })).resolves.toBe(false);
+    const ev = logger.events.find((e) => e.event === 'tmux_wake_failed');
+    expect(ev?.data['reason']).toBe('spawn_error');
+    // The queue for that pane is not wedged.
+    expect(await wakeViaTmux('fine', { workspaceDir: ws, session: 'nul', logger })).toBe(true);
+  });
+
   it('timeout → tmux_wake_failed spawn_error ETIMEDOUT, and the queue is not wedged', async () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     try {

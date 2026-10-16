@@ -149,8 +149,23 @@ interface HelperResult {
  * (never rejects) with a spawnSync-shaped result so the logging below is
  * unchanged. A timeout kills the child and reports an ETIMEDOUT error.
  */
+/** `spawn`, or the Error it throws synchronously (e.g. for a NUL in an argument). */
+function trySpawn(scriptPath: string, args: readonly string[]) {
+  try {
+    return spawn(scriptPath, [...args], { stdio: ['ignore', 'ignore', 'pipe'] });
+  } catch (error) {
+    return error instanceof Error ? error : new Error(String(error));
+  }
+}
+
 function runHelper(scriptPath: string, args: readonly string[]): Promise<HelperResult> {
   return new Promise((resolve) => {
+    const child = trySpawn(scriptPath, args);
+    if (child instanceof Error) {
+      // Resolve as a failed run so the wake never rejects.
+      resolve({ error: child, status: null, stderr: '' });
+      return;
+    }
     let stderr = '';
     let settled = false;
     const done = (r: HelperResult): void => {
@@ -159,7 +174,6 @@ function runHelper(scriptPath: string, args: readonly string[]): Promise<HelperR
       clearTimeout(timer);
       resolve(r);
     };
-    const child = spawn(scriptPath, [...args], { stdio: ['ignore', 'ignore', 'pipe'] });
     const timer = setTimeout(() => {
       child.kill('SIGKILL');
       child.stderr.destroy();
@@ -258,6 +272,14 @@ export function wakeViaTmux(prompt: string, opts: WakeOptions): Promise<boolean>
         span.setAttribute(Attr.WakeOutcome, 'delivered');
         span.setStatus({ code: SpanStatusCode.OK });
         return true;
+      } catch (error) {
+        // Never reject: the server calls this with `void`, so a rejection would be unhandled.
+        const err = error instanceof Error ? error : new Error(String(error));
+        opts.logger.warn('tmux_wake_failed', { reason: 'spawn_error', error: err.message });
+        span.setAttribute(Attr.WakeOutcome, 'spawn_error');
+        span.recordException(err);
+        span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
+        return false;
       } finally {
         span.end();
       }
