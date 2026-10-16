@@ -115,12 +115,17 @@ import {
 import { readAgentConfig, tokenSourceFromConfig, agentCertPath, agentKeyPath } from '../config.js';
 import { createClientFromConfig } from '../registry-helper.js';
 import type { RoutingConfig } from './routing-doctor.js';
+import { judgeEvidence, type EvidenceVerdictResult, type TextRead } from './routing-e2e-evidence.js';
 import { createCallerPinReader, createInstallRepoLister, createRoutingConfigGhReader } from './routing-doctor-gh.js';
 import {
   createIssueCloser,
   createLabelApplier,
+  createMentionPoster,
   createProbeIssueCreator,
   createRouterRunFinder,
+  createRunLogReader,
+  readLocalLog,
+  receiverLogPathFor,
 } from './routing-e2e-gh.js';
 
 // --- Result shape ---
@@ -151,7 +156,10 @@ export type RoutingE2eStage =
   | 'target_unreachable'
   | 'router_not_triggered'
   | 'router_run_failed'
-  | 'delivered_not_confirmed';
+  | 'delivered_not_confirmed'
+  | 'not_routed'
+  | 'router_skipped_self_route'
+  | 'delivery_unverifiable';
 
 export type RoutingE2eVerdict = 'GREEN' | 'RED';
 
@@ -170,6 +178,8 @@ export interface RoutingE2eCleanup {
 /** The routing workflow run found for the probe's `labeled` event, if any. */
 export interface RoutingE2eRouterRun {
   readonly found: boolean;
+  /** The run id, when known (needed to read its log). */
+  readonly id?: number;
   readonly conclusion: string | null;
   readonly status: string | null;
   readonly url: string | null;
@@ -188,6 +198,8 @@ export interface RoutingE2eResult {
   readonly routerRun: RoutingE2eRouterRun | null;
   readonly cleanup: RoutingE2eCleanup;
   readonly elapsedMs: number;
+  /** Evidence-based verdict (router log + receiver receipt); absent in the legacy path. */
+  readonly evidence?: EvidenceVerdictResult;
 }
 
 // --- Injectable seams ---
@@ -218,7 +230,25 @@ export interface RoutingE2eDeps {
   readonly createProbeIssue: (repo: string) => Promise<RoutingE2eCreateIssueResult>;
   readonly applyLabel: (repo: string, issueNumber: number, label: string) => Promise<RoutingE2eLabelResult>;
   readonly closeIssue: (repo: string, issueNumber: number) => Promise<boolean>;
-  readonly findRouterRun: (repo: string, sinceIso: string) => Promise<RoutingE2eRouterRun>;
+  readonly findRouterRun: (
+    repo: string,
+    sinceIso: string,
+    event?: 'issues' | 'issue_comment',
+  ) => Promise<RoutingE2eRouterRun>;
+  /**
+   * When present, delivery is judged from EVIDENCE (the router run's log +
+   * a receiver receipt) and never from the run's conclusion. Production
+   * always supplies it.
+   */
+  readonly readRunLog?: (repo: string, runId: number) => Promise<TextRead>;
+  /** The receiver's channel log, resolved from its identity (the routing-table KEY), never scanned. */
+  readonly readReceiverLog?: (label: string) => Promise<{ readonly read: TextRead; readonly path: string | null }>;
+  /** Mention mode: post one clearly labelled comment on an existing issue. */
+  readonly postMention?: (
+    repo: string,
+    issue: number,
+    botLogin: string,
+  ) => Promise<{ readonly ok: true; readonly url: string } | { readonly ok: false; readonly error: string }>;
   readonly maxPolls?: number;
   readonly pollIntervalMs?: number;
   readonly sleep?: (ms: number) => Promise<void>;
@@ -229,6 +259,9 @@ export interface RoutingE2eDeps {
 export interface RunRoutingE2eOptions {
   readonly targetRepo: string;
   readonly targetLabel?: string;
+  /** `label` (default): file + label a probe issue. `mention`: comment on `issue`. */
+  readonly mode?: 'label' | 'mention';
+  readonly issue?: number;
   /** Poll budget in seconds (derives `maxPolls` at the default interval). */
   readonly timeoutSec?: number;
 }
@@ -454,7 +487,25 @@ export async function runRoutingE2eCore(
     );
   }
 
-  const created = await deps.createProbeIssue(repo);
+  const mode = opts.mode ?? 'label';
+  let created: RoutingE2eCreateIssueResult;
+  if (mode === 'mention') {
+    const botLogin = (await deps.readTargetRoutingConfig(repo))?.agents[targetLabel]?.app_name;
+    if (opts.issue === undefined || !deps.postMention || !botLogin) {
+      return refuse(
+        'probe_creation_failed',
+        repo,
+        targetLabel,
+        'mention mode needs an existing issue to comment on and a bot identity for the recipient in the routing table; nothing was posted.',
+        startedAt,
+        now,
+      );
+    }
+    const posted = await deps.postMention(repo, opts.issue, botLogin);
+    created = posted.ok ? { ok: true, number: opts.issue, url: posted.url } : posted;
+  } else {
+    created = await deps.createProbeIssue(repo);
+  }
   if (!created.ok) {
     return refuse(
       'probe_creation_failed',
@@ -475,7 +526,8 @@ export async function runRoutingE2eCore(
     let closed = false;
     let cleanupError: string | undefined;
     try {
-      closed = await deps.closeIssue(repo, created.number);
+      // Mention mode commented on someone's existing issue: nothing of ours to close.
+      closed = mode === 'label' ? await deps.closeIssue(repo, created.number) : false;
     } catch (err) {
       cleanupError = err instanceof Error ? err.message : String(err);
     }
@@ -484,12 +536,12 @@ export async function runRoutingE2eCore(
       targetRepo: repo,
       targetLabel,
       probeIssue,
-      cleanup: { attempted: true, closed, ...(cleanupError !== undefined ? { error: cleanupError } : {}) },
+      cleanup: { attempted: mode === 'label', closed, ...(cleanupError !== undefined ? { error: cleanupError } : {}) },
       elapsedMs: now() - startedAt,
     };
   };
 
-  const labelResult = await deps.applyLabel(repo, created.number, targetLabel);
+  const labelResult = mode === 'label' ? await deps.applyLabel(repo, created.number, targetLabel) : { ok: true as const };
   if (!labelResult.ok) {
     return finish({
       verdict: 'RED',
@@ -502,11 +554,12 @@ export async function runRoutingE2eCore(
 
   const labeledAtIso = new Date(now()).toISOString();
   const maxPolls = deps.maxPolls ?? deriveMaxPolls(opts.timeoutSec);
+  const healthPolls = mode === 'label' ? maxPolls : 0;
   const intervalMs = deps.pollIntervalMs ?? DEFAULT_E2E_POLL_INTERVAL_MS;
 
   let everReachable = false;
   let delivered = false;
-  for (let i = 0; i < maxPolls; i++) {
+  for (let i = 0; i < healthPolls; i++) {
     const health = await deps.probe(targetInfo.host, targetInfo.port);
     if (health !== null) {
       everReachable = true;
@@ -515,7 +568,50 @@ export async function runRoutingE2eCore(
         break;
       }
     }
-    if (i < maxPolls - 1) await sleep(intervalMs);
+    if (i < healthPolls - 1) await sleep(intervalMs);
+  }
+
+  if (deps.readRunLog) {
+    const event = mode === 'label' ? 'issues' : 'issue_comment';
+    let run: RoutingE2eRouterRun = { found: false, conclusion: null, status: null, url: null };
+    for (let i = 0; i < maxPolls; i++) {
+      run = await deps.findRouterRun(repo, labeledAtIso, event);
+      if (run.found && run.status === 'completed') break;
+      if (i < maxPolls - 1) await sleep(intervalMs);
+    }
+    const runLog = run.found && run.id !== undefined ? await deps.readRunLog(repo, run.id) : null;
+    const recv = deps.readReceiverLog
+      ? await deps.readReceiverLog(targetLabel)
+      : { read: { kind: 'absent' } as TextRead, path: null };
+    const ev = judgeEvidence({
+      mode,
+      recipient: targetLabel,
+      issueNumber: created.number,
+      postedMs: Date.parse(labeledAtIso),
+      run,
+      runLog,
+      healthReceipt: delivered,
+      everReachable,
+      receiverLog: recv.read,
+      receiverLogPath: recv.path,
+    });
+    const stageFor: Record<EvidenceVerdictResult['verdict'], RoutingE2eStage> = {
+      delivered: 'delivered',
+      'no-run': 'router_not_triggered',
+      'router-failed': 'router_run_failed',
+      'not-routed': 'not_routed',
+      'self-route': 'router_skipped_self_route',
+      'routed-but-not-received': 'delivered_not_confirmed',
+      unknown: 'delivery_unverifiable',
+    };
+    const done = await finish({
+      verdict: ev.verdict === 'delivered' ? 'GREEN' : 'RED',
+      stage: stageFor[ev.verdict],
+      message: ev.summary,
+      everReachable,
+      routerRun: run,
+    });
+    return { ...done, evidence: ev };
   }
 
   if (delivered) {
@@ -590,6 +686,7 @@ export function routingE2eToJson(result: RoutingE2eResult): unknown {
       error: result.cleanup.error ?? null,
     },
     elapsed_ms: result.elapsedMs,
+    evidence: result.evidence ?? null,
     // Describes what a GREEN verdict means — nothing was delivered on a RED
     // one, so the caveat would assert something that never happened
     // (macf#1077). `null`, not omitted, so the field is always present and
@@ -611,6 +708,14 @@ export function formatRoutingE2eText(result: RoutingE2eResult): string {
   lines.push('');
   lines.push(result.verdict === 'GREEN' ? '✓ DELIVERED' : `✗ ${result.stage}`);
   lines.push(result.message);
+  if (result.evidence) {
+    lines.push('', `verdict: ${result.evidence.verdict}`);
+    for (const s of result.evidence.stages) lines.push(`  [${s.status}] ${s.name}: ${s.detail}`);
+    if (result.evidence.gaps.length > 0) {
+      lines.push('gaps:');
+      for (const g of result.evidence.gaps) lines.push(`  - ${g}`);
+    }
+  }
   if (result.cleanup.attempted) {
     lines.push(
       result.cleanup.closed
@@ -636,11 +741,15 @@ export interface RunRoutingE2eCliOptions {
   readonly json?: boolean;
   readonly targetRepo: string;
   readonly targetLabel?: string;
+  readonly mode?: 'label' | 'mention';
+  readonly issue?: number;
+  readonly receiverLog?: string;
   readonly timeoutSec?: number;
 }
 
 async function resolveE2eDepsFromRegistry(
   projectDir: string,
+  receiverLogOverride?: string,
 ): Promise<{ readonly ok: true; readonly deps: RoutingE2eDeps } | { readonly ok: false; readonly code: number; readonly message: string }> {
   const config = readAgentConfig(projectDir);
   if (!config) {
@@ -674,6 +783,14 @@ async function resolveE2eDepsFromRegistry(
       applyLabel: createLabelApplier(token),
       closeIssue: createIssueCloser(token),
       findRouterRun: createRouterRunFinder(token),
+      readRunLog: createRunLogReader(token),
+      postMention: createMentionPoster(token),
+      readReceiverLog: async (label) => {
+        // Identity-derived, never scanned: <state>/macf/<project>@<routing label>/channel.log
+        // (the routing-table KEY, the same derivation the launcher bakes into MACF_LOG_PATH).
+        const path = receiverLogOverride ?? receiverLogPathFor(config.project, label);
+        return { read: path ? await readLocalLog(path) : ({ kind: 'absent' } as const), path };
+      },
     },
   };
 }
@@ -692,7 +809,7 @@ export async function runRoutingE2e(
 ): Promise<number> {
   let resolved = deps;
   if (!resolved) {
-    const r = await resolveE2eDepsFromRegistry(projectDir);
+    const r = await resolveE2eDepsFromRegistry(projectDir, opts.receiverLog);
     if (!r.ok) {
       console.error(r.message);
       if (opts.json) {
@@ -706,6 +823,8 @@ export async function runRoutingE2e(
   const result = await runRoutingE2eCore(resolved, {
     targetRepo: opts.targetRepo,
     targetLabel: opts.targetLabel,
+    mode: opts.mode,
+    issue: opts.issue,
     timeoutSec: opts.timeoutSec,
   });
 

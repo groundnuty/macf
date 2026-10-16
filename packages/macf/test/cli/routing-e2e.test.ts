@@ -23,6 +23,8 @@ import {
   type RoutingE2eDeps,
   type RoutingE2eRouterRun,
 } from '../../src/cli/commands/routing-e2e.js';
+import type { TextRead } from '../../src/cli/commands/routing-e2e-evidence.js';
+import { receiverLogPathFor } from '../../src/cli/commands/routing-e2e-gh.js';
 
 const AGENT_INFO: AgentInfo = {
   host: '10.0.0.5',
@@ -337,5 +339,93 @@ describe('routingE2eToJson / formatRoutingE2eText', () => {
     expect(jsonStr).not.toContain(AGENT_INFO.host);
     expect(jsonStr).not.toContain(String(AGENT_INFO.port));
     expect(formatRoutingE2eText(r)).not.toContain(AGENT_INFO.host);
+  });
+});
+
+// --- Evidence-based verdicts: the run's conclusion is never the evidence ---
+
+const ROUTED_LINE = 'router\tRouted issue #42 to science-agent via mTLS POST (HTTP 200)';
+const RECEIPT_LINE = JSON.stringify({ ts: '2099-01-01T00:00:00.000Z', level: 'info', event: 'notify_received', type: 'issue_routed', issue: 42 });
+const DONE_RUN: RoutingE2eRouterRun = { found: true, id: 7, conclusion: 'success', status: 'completed', url: 'https://example.test/run/7' };
+
+const neverMatchedProbe = vi.fn(async () => REACHABLE_NOT_MATCHED_HEALTH);
+
+function evidenceDeps(over: Partial<RoutingE2eDeps> & { log?: string; recv?: TextRead } = {}): RoutingE2eDeps {
+  const { log = ROUTED_LINE, recv = { kind: 'ok', text: RECEIPT_LINE }, ...rest } = over;
+  return baseDeps({
+    probe: neverMatchedProbe,
+    findRouterRun: vi.fn(async () => DONE_RUN),
+    readRunLog: vi.fn(async (): Promise<TextRead> => ({ kind: 'ok', text: log })),
+    readReceiverLog: vi.fn(async () => ({ read: recv, path: '/state/macf/p@science-agent/channel.log' })),
+    ...rest,
+  });
+}
+
+describe('runRoutingE2eCore — evidence verdicts', () => {
+  it('delivered: routed line AND a receiver channel-log receipt', async () => {
+    const r = await runRoutingE2eCore(evidenceDeps(), { targetRepo: 'o/r' });
+    expect(r.verdict).toBe('GREEN');
+    expect(r.evidence?.verdict).toBe('delivered');
+  });
+
+  it('DECISIVE: a green run (conclusion success) with no routed line is not-routed', async () => {
+    const r = await runRoutingE2eCore(evidenceDeps({ log: 'router\tnothing was routed' }), { targetRepo: 'o/r' });
+    expect(DONE_RUN.conclusion).toBe('success');
+    expect(r.evidence?.verdict).toBe('not-routed');
+    expect(r.verdict).toBe('RED');
+  });
+
+  it('a red run with an error line is router-failed and quotes it', async () => {
+    const failed = { ...DONE_RUN, conclusion: 'failure' };
+    const r = await runRoutingE2eCore(
+      evidenceDeps({ findRouterRun: vi.fn(async () => failed), log: 'x\t##[error]Missing secret ROUTING_CLIENT_CERT' }),
+      { targetRepo: 'o/r' },
+    );
+    expect(r.evidence?.verdict).toBe('router-failed');
+    expect(r.evidence?.gaps).toContain('router error: Missing secret ROUTING_CLIENT_CERT');
+  });
+
+  it('routed but no receipt in the channel log is routed-but-not-received', async () => {
+    const r = await runRoutingE2eCore(evidenceDeps({ recv: { kind: 'ok', text: '' } }), { targetRepo: 'o/r' });
+    expect(r.evidence?.verdict).toBe('routed-but-not-received');
+  });
+
+  it('receiver log not local (and endpoint never answered) is unknown, never delivered', async () => {
+    const r = await runRoutingE2eCore(evidenceDeps({ recv: { kind: 'absent' }, probe: vi.fn(async () => null) }), { targetRepo: 'o/r' });
+    expect(r.evidence?.verdict).toBe('unknown');
+    expect(r.message).toContain('not verifiable from this host');
+    expect(r.verdict).toBe('RED');
+  });
+
+  it('a self-route skip line is reported as a self-route, not delivered', async () => {
+    const r = await runRoutingE2eCore(evidenceDeps({ log: 'x\tActor is the same agent, skipping self-routing' }), { targetRepo: 'o/r' });
+    expect(r.evidence?.verdict).toBe('self-route');
+  });
+
+  it('no run within the wait is no-run', async () => {
+    const r = await runRoutingE2eCore(evidenceDeps({ findRouterRun: vi.fn(async () => NOT_FOUND_RUN) }), { targetRepo: 'o/r' });
+    expect(r.evidence?.verdict).toBe('no-run');
+  });
+
+  it('mention mode comments once on the given issue and never closes anything', async () => {
+    const postMention = vi.fn(async () => ({ ok: true as const, url: 'https://example.test/c' }));
+    const deps = evidenceDeps({
+      postMention,
+      readTargetRoutingConfig: vi.fn(async (): Promise<RoutingConfig | null> => ({ agents: { 'science-agent': { app_name: 'macf-science-agent' } } })),
+      recv: { kind: 'ok', text: JSON.stringify({ ts: '2099-01-01T00:00:00.000Z', event: 'notify_received', type: 'mention', issue: 5 }) },
+    });
+    const r = await runRoutingE2eCore(deps, { targetRepo: 'o/r', mode: 'mention', issue: 5 });
+    expect(postMention).toHaveBeenCalledTimes(1);
+    expect(deps.createProbeIssue).not.toHaveBeenCalled();
+    expect(deps.closeIssue).not.toHaveBeenCalled();
+    expect(r.evidence?.verdict).toBe('delivered');
+  });
+});
+
+describe('receiver log path', () => {
+  it('is keyed on the routing label (the table key), never on the bot app name', () => {
+    process.env['XDG_STATE_HOME'] = '/state';
+    expect(receiverLogPathFor('macf-trial', 'code-agent')).toBe('/state/macf/macf-trial@code-agent/channel.log');
+    expect(receiverLogPathFor('macf-trial', 'code-agent')).not.toContain('macf-trial-code-agent');
   });
 });

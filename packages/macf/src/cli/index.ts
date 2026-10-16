@@ -27,7 +27,6 @@ import { runBootstrapControlRepoInit } from './commands/bootstrap-control-repo-i
 import { runManifestScaffold } from './commands/bootstrap-manifest-scaffold.js';
 import { runRoutingDoctor } from './commands/routing-doctor.js';
 import { runRoutingE2e } from './commands/routing-e2e.js';
-import { runRoutingProbe } from './commands/routing-probe.js';
 import { runRunnerAudit } from './commands/runner-audit.js';
 import { runRunnerDeclarationCheck } from './commands/runner-declaration-check.js';
 import { runRegistryPrune } from './commands/registry-prune.js';
@@ -979,7 +978,7 @@ routing
     'FRESHNESS (registry instance_id == live /health), (4) MACF_CA_CERT present + ' +
     'parses, (5) tmux_session <project>@<routing-label> convention. These prove the ' +
     'PLUMBING, NOT end-to-end delivery. Exits non-zero when DEGRADED. Pass --e2e for the ' +
-    'CAPABILITY test instead: files a real issue on --target-repo, labels it there (the full ' +
+    'CAPABILITY test instead (delivery is judged from the router run LOG and a receiver receipt, never from the run status; exits non-zero unless delivered): files a real issue on --target-repo, labels it there (the full ' +
     'router path, not a direct channel-server POST), and polls for the recipient recording ' +
     'delivery -- a RED result there needs no checklist of what to check, it just needs the ' +
     'message to not arrive, and names the stage the chain stopped at.',
@@ -998,6 +997,10 @@ routing
   .option('--e2e', 'Run the routing CAPABILITY probe instead of the static checks (requires --target-repo)', false)
   .option('--target-repo <owner/repo>', 'The --e2e probe target: files + labels the probe issue on THIS repo')
   .option('--target-label <label>', '--e2e: which routing label to probe (default: the target repo\'s sole configured label)')
+  .option('--mode <mode>', '--e2e: label (file + label a probe issue, default) or mention (comment on --issue)', 'label')
+  .option('--recipient <label>', '--e2e: the recipient routing label (alias of --target-label)')
+  .option('--issue <n>', '--e2e mention mode: the existing issue to comment on', (v) => Number(v))
+  .option('--receiver-log <path>', '--e2e: explicit receiver channel.log (default: derived from its identity)')
   .option('--e2e-timeout-sec <n>', '--e2e: how long to wait for the delivery receipt before giving up (default 180)', (v) => Number(v))
   .action(async (opts) => {
     if (opts.e2e) {
@@ -1009,7 +1012,10 @@ routing
       const code = await runRoutingE2e(resolveProjectDir(opts.dir), {
         json: opts.json,
         targetRepo: opts.targetRepo,
-        targetLabel: opts.targetLabel,
+        targetLabel: opts.recipient ?? opts.targetLabel,
+        mode: opts.mode === 'mention' ? 'mention' : 'label',
+        issue: opts.issue,
+        receiverLog: opts.receiverLog,
         timeoutSec: opts.e2eTimeoutSec,
       });
       process.exitCode = code;
@@ -1021,41 +1027,6 @@ routing
       manifestPath: opts.manifest,
     });
     process.exitCode = code;
-  });
-
-routing
-  .command('probe')
-  .description(
-    'Post ONE clearly labelled probe and assert delivery from evidence: the router run LOG must carry ' +
-    'the routed line for the recipient, and (when the receiver runs on this host) its channel log must ' +
-    'show a receipt after the post. A green run proves nothing -- it is green when a message is dropped. ' +
-    'Never closes or deletes anything. Exits non-zero unless delivered.',
-  )
-  .requiredOption('--target-repo <owner/repo>', 'The repo the probe is posted on')
-  .requiredOption('--recipient <label>', 'The routing label of the agent that should receive it')
-  .option('--mode <mode>', 'mention (comment on --issue) or label (new issue, labelled)', 'mention')
-  .option('--issue <n>', 'mention mode: the existing issue to comment on', (v) => Number(v))
-  .option('--receiver-log <path>', 'Explicit receiver channel.log (default: derived from its identity)')
-  .option('--receiver-project <project>', 'Receiver project for the log path (default: this workspace\'s)')
-  .option('--timeout-sec <n>', 'How long to wait for the router run (default 180)', (v) => Number(v))
-  .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd)')
-  .option('--json', 'Emit the structured result as JSON', false)
-  .action(async (opts) => {
-    if (opts.mode !== 'mention' && opts.mode !== 'label') {
-      console.error('--mode must be "mention" or "label".');
-      process.exitCode = 1;
-      return;
-    }
-    process.exitCode = await runRoutingProbe(resolveProjectDir(opts.dir), {
-      targetRepo: opts.targetRepo,
-      recipient: opts.recipient,
-      mode: opts.mode,
-      issue: opts.issue,
-      receiverLog: opts.receiverLog,
-      receiverProject: opts.receiverProject,
-      timeoutSec: opts.timeoutSec,
-      json: opts.json,
-    });
   });
 
 routing

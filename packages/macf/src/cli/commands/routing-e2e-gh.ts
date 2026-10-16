@@ -9,7 +9,11 @@
  * only read. The token is forwarded as `GH_TOKEN` in the subprocess env.
  */
 import { execFile } from 'node:child_process';
+import { readFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { promisify } from 'node:util';
+import type { TextRead } from './routing-e2e-evidence.js';
 import type { RoutingE2eCreateIssueResult, RoutingE2eLabelResult, RoutingE2eRouterRun } from './routing-e2e.js';
 
 const execFileAsync = promisify(execFile);
@@ -120,9 +124,9 @@ export function createIssueCloser(token: string): (repo: string, issueNumber: nu
  */
 export function createRouterRunFinder(
   token: string,
-): (repo: string, sinceIso: string) => Promise<RoutingE2eRouterRun> {
+): (repo: string, sinceIso: string, event?: 'issues' | 'issue_comment') => Promise<RoutingE2eRouterRun> {
   const env = { ...process.env, GH_TOKEN: token };
-  return async (repo: string, sinceIso: string): Promise<RoutingE2eRouterRun> => {
+  return async (repo: string, sinceIso: string, event: 'issues' | 'issue_comment' = 'issues'): Promise<RoutingE2eRouterRun> => {
     try {
       const { stdout } = await execFileAsync(
         'gh',
@@ -130,7 +134,7 @@ export function createRouterRunFinder(
           'api',
           `repos/${repo}/actions/workflows/agent-router.yml/runs`,
           '-f',
-          'event=issues',
+          `event=${event}`,
           '-f',
           'per_page=10',
           '--jq',
@@ -139,6 +143,7 @@ export function createRouterRunFinder(
         { encoding: 'utf-8', env, maxBuffer: 4 * 1024 * 1024 },
       );
       const runs = JSON.parse(stdout) as readonly {
+        readonly id: number;
         readonly conclusion: string | null;
         readonly status: string;
         readonly created_at: string;
@@ -150,9 +155,69 @@ export function createRouterRunFinder(
         .sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at));
       const run = candidates[0];
       if (!run) return { found: false, conclusion: null, status: null, url: null };
-      return { found: true, conclusion: run.conclusion, status: run.status, url: run.html_url };
+      return { found: true, id: run.id, conclusion: run.conclusion, status: run.status, url: run.html_url };
     } catch {
       return { found: false, conclusion: null, status: null, url: null };
     }
   };
+}
+
+/**
+ * Post ONE clearly labelled comment mentioning the recipient's bot on an
+ * existing issue. Never edits or deletes anything. NEVER throws.
+ */
+export function createMentionPoster(
+  token: string,
+): (repo: string, issue: number, botLogin: string) => Promise<{ ok: true; url: string } | { ok: false; error: string }> {
+  const env = { ...process.env, GH_TOKEN: token };
+  return async (repo, issue, botLogin) => {
+    try {
+      const { stdout } = await execFileAsync(
+        'gh',
+        [
+          'api', `repos/${repo}/issues/${String(issue)}/comments`, '-X', 'POST',
+          '-f', `body=@${botLogin}[bot] Automated routing probe. Safe to ignore; nothing needs doing.`,
+          '--jq', '.html_url',
+        ],
+        { encoding: 'utf-8', env, maxBuffer: 1024 * 1024 },
+      );
+      return { ok: true, url: stdout.trim() };
+    } catch (err) {
+      return { ok: false, error: errMessage(err) };
+    }
+  };
+}
+
+/** The router run's log, read by run id. NEVER throws. */
+export function createRunLogReader(token: string): (repo: string, runId: number) => Promise<TextRead> {
+  const env = { ...process.env, GH_TOKEN: token };
+  return async (repo, runId) => {
+    try {
+      const { stdout } = await execFileAsync('gh', ['run', 'view', String(runId), '--repo', repo, '--log'], {
+        encoding: 'utf-8', env, maxBuffer: 32 * 1024 * 1024,
+      });
+      return { kind: 'ok', text: stdout };
+    } catch (err) {
+      return { kind: 'error', error: errMessage(err) };
+    }
+  };
+}
+
+/**
+ * `<state>/macf/<project>@<routing label>/channel.log` — the receiver's log,
+ * derived from its identity (the routing-table KEY, the same derivation the
+ * launcher bakes into MACF_LOG_PATH), never by scanning the host.
+ */
+export function receiverLogPathFor(project: string, routingLabel: string): string {
+  const state = process.env['XDG_STATE_HOME'] || join(homedir(), '.local', 'state');
+  return join(state, 'macf', `${project}@${routingLabel}`, 'channel.log');
+}
+
+export async function readLocalLog(path: string): Promise<TextRead> {
+  try {
+    return { kind: 'ok', text: await readFile(path, 'utf-8') };
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { kind: 'absent' };
+    return { kind: 'error', error: errMessage(err) };
+  }
 }
