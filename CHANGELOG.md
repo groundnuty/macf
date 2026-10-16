@@ -4,6 +4,12 @@ All notable changes to the `macf` CLI. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.67] — 2026-10-16
+
+### Fixed
+
+- **Each agent's issue queue is its own.** The startup pickup and `/macf-issues` queried the `code-agent` label for every agent: the plugin CLI read `MACF_AGENT_LABEL`, which nothing sets, and fell back to `code-agent`. So a non-code agent never picked up work routed to it while it was down, and its `/macf-issues` showed code's queue. The queue now uses `MACF_ROUTING_LABEL`, which every workspace exports, keeps `MACF_AGENT_LABEL` as an explicit override, and fails loudly when neither is set. (#1489)
+
 ## [0.2.66] — 2026-10-16
 
 **Every defect the 0.2.65 release acceptance on a live fleet turned up, fixed: a fleet upgrade that exposed agent certs, CI-completion routing that had never fired, launch prompts that stalled a relaunch, and mention checks that missed what an agent would actually run.**
