@@ -686,6 +686,30 @@ describe('agentStopDepsOverSeams — the submit contract (groundnuty/macf#1033)'
     expect(submits).toEqual([{ session: 'macf@code-agent', text: '/exit' }]);
   });
 
+  it('/exit whose helper reports "sent but unverifiable" (exit 3) -> treated as sent: the TUI is gone, no input line remains', async () => {
+    const { seams } = minimalSeams({
+      discover: () => [{ agent: 'code-agent', workspace: '/w/macf', registry: 'g', project: 'macf', versionPin: null }],
+      readConfig: (dir) => (dir === '/w/macf' ? { project: 'macf', routingLabel: 'code-agent' } : null),
+      hasSession: (s) => s === 'macf@code-agent',
+      submit: () => {
+        throw Object.assign(new Error('Command failed: tmux-send-to-claude.sh'), { status: 3 });
+      },
+    });
+    await expect(agentStopDepsOverSeams(seams).requestGracefulExit('code-agent')).resolves.toBeUndefined();
+  });
+
+  it('/exit left sitting unsubmitted (exit 4) -> still a failure, never swallowed', async () => {
+    const { seams } = minimalSeams({
+      discover: () => [{ agent: 'code-agent', workspace: '/w/macf', registry: 'g', project: 'macf', versionPin: null }],
+      readConfig: (dir) => (dir === '/w/macf' ? { project: 'macf', routingLabel: 'code-agent' } : null),
+      hasSession: (s) => s === 'macf@code-agent',
+      submit: () => {
+        throw Object.assign(new Error('Command failed: tmux-send-to-claude.sh'), { status: 4 });
+      },
+    });
+    await expect(agentStopDepsOverSeams(seams).requestGracefulExit('code-agent')).rejects.toThrow(/tmux-send-to-claude/);
+  });
+
   it('a dead/unreachable role -> submit is NEVER called (nothing to submit into)', async () => {
     const { seams, submits } = minimalSeams({ discover: () => [] });
     const deps = agentStopDepsOverSeams(seams);
