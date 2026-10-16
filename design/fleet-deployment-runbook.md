@@ -706,6 +706,47 @@ every fleet on the owner account (default) or **per-fleet**. See §7.3 for
 the live, verified failure mode this default produces for a second fleet in
 the same scope.
 
+
+### 6.5.1 `routing.control_repo_runs_on` — the control repo's runner class (opt-in)
+
+```yaml
+routing:
+  runner:
+    runs_on: self-hosted
+  control_repo_runs_on: self-hosted
+```
+
+| Field | Required? | Default | Notes |
+|---|---|---|---|
+| `control_repo_runs_on` | optional | **omitted → the control repo routes on a GitHub-hosted (metered) runner** | the only accepted value is `self-hosted`, and only when `routing.runner.runs_on` is also `self-hosted`; any other combination is refused at parse. |
+
+**Why this is separate from `routing.runner.runs_on`.** The control repo is
+the fleet's coordination surface (DR-043 Amendment M2): every agent App is
+installed there and its routing table lists the whole fleet, so **every
+cross-agent message routes through it**. Declaring agent repos self-hosted
+does NOT move the control repo. It keeps routing hosted until this field
+says otherwise, so existing self-hosted fleets are unchanged by the field's
+existence.
+
+**What `apply` does when it is declared:** writes `runner-runs-on:
+self-hosted` into the control repo's generated router caller, provisions a
+runner for the control repo through the **same** runner-platform contract as
+agent repos (§6.5 mechanism 2), and writes `MACF_TRUSTED_ACTORS` on the
+control repo with every fleet bot, through the same register-before-route
+gate (§6.5 mechanism 1).
+
+**What `plan` reports:** a `routing:<fleet>:control-runner` row, emitted only
+when the field is declared. It is `update` while the caller input, the
+trusted-actors variable or a usable runner is missing, and its reason ends
+*"routing through the control repo FAILS or queues — it does not fall back
+to a hosted runner."* Declared self-hosted never silently runs hosted.
+
+**Hosted, by contrast, needs the Tailscale pair** to reach the agents, so
+when this field is omitted the control repo's `router_caller_secrets` row
+requires `TS_OAUTH_CLIENT_ID` / `TS_OAUTH_SECRET`. On GitHub Free those must
+be **repository** secrets: organisation secrets do not reach a private repo,
+and plan reports them as withheld.
+
 ### 6.6 Environment variables the bootstrap path honors
 
 | Variable | Read by | Effect |
