@@ -121,7 +121,7 @@ Agents also miss things — the same way humans miss things in code review. The 
 
 ## What if my agents disagree? Who decides?
 
-**Human-in-the-loop on substantive disagreement.** Per [`coordination.md` § Peer Dynamic](../packages/macf/plugin/rules/coordination.md) + `peer-dynamic.md`: agents push back, ask for clarification, defend choices with concrete reasoning. If after dialogue they still disagree, escalate to the operator (the human running the swarm).
+**Human-in-the-loop on substantive disagreement.** Per [`coordination.md` § Peer Dynamic](../packages/macf/plugin/rules/coordination.md) + `peer-dynamic.md`: agents push back, ask for clarification on ambiguous work, defend choices with concrete reasoning. If after dialogue they still disagree, escalate to the operator (the human running the swarm).
 
 Agents are peers, not subordinates. There's no "tiebreaker agent" that arbitrates. The escalation goes to the issue's reporter, who decides next steps (their own action, bringing in coordination by another peer, escalating to the operator).
 

@@ -5,7 +5,7 @@
  *
  * **There is no REST path to delete a GitHub App registration — verified
  * 2026-08-13** against the CURRENT GitHub REST docs (WebFetch, not memory —
- * `check-before-propose.md`):
+ * `verify-before-claim.md`):
  *
  *   - `https://docs.github.com/en/apps/maintaining-github-apps/deleting-a-github-app`
  *     describes ONLY a web-UI click-path — "In the left sidebar, click

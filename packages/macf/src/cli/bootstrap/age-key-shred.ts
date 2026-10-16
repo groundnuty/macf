@@ -44,7 +44,7 @@
  * **Best-effort, not a forensic guarantee.** A single overwrite-then-unlink
  * does not defeat copy-on-write filesystems, SSD wear-leveling, filesystem
  * snapshots, or any earlier `cp`/backup of the identity file —
- * `check-before-propose.md`-honest about that: shredding the canonical path
+ * `verify-before-claim.md`-honest about that: shredding the canonical path
  * removes the ordinary, easy-to-forget copy, and is a meaningfully safer
  * default than a plain `rm`, but it is NOT a substitute for full-disk
  * encryption or operator diligence about backups. The doc comment on the
