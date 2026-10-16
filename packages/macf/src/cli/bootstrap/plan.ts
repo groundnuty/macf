@@ -1651,7 +1651,7 @@ function routerCallerSecretsItem(
   const trulyMissing = verdict.missingFromRepo.filter((n) => !withheld.includes(n));
   if (withheld.length > 0) {
     parts.push(
-      `the org secret ${withheld.join(', ')} does not reach ${repo}: organisation secrets are not available to private repositories on the free plan — ` +
+      `the org secret${withheld.length > 1 ? 's' : ''} ${withheld.join(', ')} ${withheld.length > 1 ? 'do' : 'does'} not reach ${repo}: organisation secrets are not available to private repositories on the free plan — ` +
         'set it as a repository secret, or route this repo self-hosted',
     );
   }

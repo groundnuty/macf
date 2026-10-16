@@ -244,7 +244,7 @@ describe('org secrets reach a repo only if the repo can receive them (#1451)', (
   it('private + free + pair only at org level → update, says the org secret does not reach the repo; no rewrite flagged', () => {
     const { r, o } = planRow(FOUR, 'private', 'free');
     expect(r.verb).toBe('update');
-    expect(r.reason).toContain('the org secret TS_OAUTH_CLIENT_ID, TS_OAUTH_SECRET does not reach groundnuty/demo-code');
+    expect(r.reason).toContain('the org secrets TS_OAUTH_CLIENT_ID, TS_OAUTH_SECRET do not reach groundnuty/demo-code');
     expect(r.reason).toContain('organisation secrets are not available to private repositories on the free plan');
     expect(r.reason).toContain('set it as a repository secret, or route this repo self-hosted');
     expect(r.reason).not.toContain('the repo has no secret named');
