@@ -31,6 +31,8 @@ import {
   skippedRoutingSecretsPublish,
   toBase64ForSecret,
   unpackRoutingBundle,
+  validateTsOauthPair,
+  TS_OAUTH_MALFORMED_CODE,
 } from '../../../src/cli/bootstrap/apply-routing-secrets.js';
 import type { RoutingSecretsForPublish, RoutingSecretsPublishDeps, RoutingSecretsPublishResult } from '../../../src/cli/bootstrap/apply-routing-secrets.js';
 import { ROUTING_CLIENT_CERT_SECRET_NAME, ROUTING_CLIENT_KEY_SECRET_NAME } from '../../../src/cli/bootstrap/apply-routing-client.js';
@@ -318,7 +320,7 @@ describe('checkTailscaleOauthPreflight — refuse before gate 1 when declared-an
 
   it('declared, both supplied, vault yields BOTH values -> undefined (proceed)', async () => {
     const result = await checkTailscaleOauthPreflight(true, '/fake/vault.age', '/fake/identity.txt', undefined, {
-      readVault: async () => ({ [TS_OAUTH_CLIENT_ID_SECRET_NAME]: 'ts-client-id', [TS_OAUTH_SECRET_SECRET_NAME]: 'ts-secret' }),
+      readVault: async () => ({ [TS_OAUTH_CLIENT_ID_SECRET_NAME]: 'ts-client-id', [TS_OAUTH_SECRET_SECRET_NAME]: 'tskey-client-abc-def' }),
     });
     expect(result).toBeUndefined();
   });
@@ -798,5 +800,80 @@ describe('determineFleetRoutingFact — the routing-specific composition of perR
   it('an all-succeeding fleet -> no-claim (never a false "can-route" claim — this aggregator only ever asserts failure or silence)', () => {
     const result = resultWith(['o/a', 'o/b']);
     expect(determineFleetRoutingFact(result, ['o/a', 'o/b'])).toEqual({ kind: 'no-claim' });
+  });
+});
+
+const REAL_ID = 'k1234CNTRL';
+const REAL_SECRET = 'tskey-client-k1234CNTRL-abcdef';
+
+describe('validateTsOauthPair — refuses placeholders before anything is written, never echoing a value', () => {
+  it('accepts a real-shaped pair', () => {
+    expect(validateTsOauthPair(REAL_ID, REAL_SECRET)).toBeUndefined();
+  });
+  it('refuses a secret without the tskey-client- prefix, naming the secret', () => {
+    const f = validateTsOauthPair(REAL_ID, 'some-other-secret');
+    expect(f?.code).toBe(TS_OAUTH_MALFORMED_CODE);
+    expect(f?.message).toContain('secret does not start with "tskey-client-"');
+    expect(f?.message).not.toContain('some-other-secret');
+  });
+  it.each(['<SECRET>', '   ', 'tskey-client-<x>', 'tskey-client-a b'])('refuses secret %j without echoing it', (bad) => {
+    const f = validateTsOauthPair(REAL_ID, bad);
+    expect(f?.code).toBe(TS_OAUTH_MALFORMED_CODE);
+    expect(f?.message).toContain('Tailscale OAuth secret');
+    if (bad.trim().length > 0) expect(f?.message).not.toContain(bad);
+  });
+  it.each(['<CLIENT_ID>', '', ' ', 'a b'])('refuses client id %j, naming the client id', (bad) => {
+    const f = validateTsOauthPair(bad, REAL_SECRET);
+    expect(f?.message).toContain('client id');
+    expect(f?.message).not.toContain(REAL_SECRET);
+  });
+});
+
+function freshValues(): RoutingSecretsForPublish {
+  return {
+    ...ALL_AVAILABLE,
+    [TS_OAUTH_CLIENT_ID_SECRET_NAME]: { status: 'available', value: REAL_ID },
+    [TS_OAUTH_SECRET_SECRET_NAME]: { status: 'available', value: REAL_SECRET },
+  };
+}
+
+describe('a freshly supplied pair refreshes what was built from the old one', () => {
+  it('rewrites an existing bundle and existing TS_OAUTH_* secrets, reporting each overwrite', async () => {
+    const writes: { repo: string; name: string }[] = [];
+    const refreshed: string[] = [];
+    const deps = depsWith({ checkRepoSecretPresence: async () => 'present', setRepoSecret: async (repo, name) => void writes.push({ repo, name }) });
+    const opts = { refreshExisting: true, onRefreshed: (n: string, r: string) => void refreshed.push(`${n}@${r}`) };
+    const bundle = await publishRoutingBundle(freshValues(), ['r1', 'r2'], deps, opts);
+    await publishRoutingSecrets(freshValues(), ['r1', 'r2'], deps, opts);
+    expect(bundle['r1']).toEqual({ status: 'already-present' });
+    expect(writes.filter((w) => w.name === ROUTING_BUNDLE_SECRET_NAME).map((w) => w.repo)).toEqual(['r1', 'r2']);
+    expect(writes.filter((w) => w.name === TS_OAUTH_SECRET_SECRET_NAME)).toHaveLength(2);
+    expect(writes.filter((w) => w.name === ROUTING_APP_ID_SECRET_NAME)).toHaveLength(0);
+    expect(refreshed).toContain(`${ROUTING_BUNDLE_SECRET_NAME}@r1`);
+    expect(refreshed).toContain(`${TS_OAUTH_SECRET_SECRET_NAME}@r2`);
+  });
+
+  it('writes the NEW pair into the bundle it rewrites', async () => {
+    const values: string[] = [];
+    const deps = depsWith({ checkRepoSecretPresence: async () => 'present', setRepoSecret: async (_r, name, v) => void (name === ROUTING_BUNDLE_SECRET_NAME && values.push(v)) });
+    await publishRoutingBundle(freshValues(), ['r1'], deps, { refreshExisting: true });
+    const unpacked = unpackRoutingBundle(values[0]!);
+    expect(unpacked[TS_OAUTH_SECRET_SECRET_NAME]).toBe(REAL_SECRET);
+  });
+
+  it('with no fresh pair, existing bundle and secrets are untouched', async () => {
+    const writes: string[] = [];
+    const deps = depsWith({ checkRepoSecretPresence: async () => 'present', setRepoSecret: async (_r, name) => void writes.push(name) });
+    const bundle = await publishRoutingBundle(freshValues(), ['r1'], deps);
+    await publishRoutingSecrets(freshValues(), ['r1'], deps);
+    expect(bundle['r1']).toEqual({ status: 'already-present' });
+    expect(writes).toEqual([]);
+  });
+
+  it('a fresh pair with a bundle that cannot be recomposed fails loudly instead of reporting already-present', async () => {
+    const deps = depsWith({ checkRepoSecretPresence: async () => 'present' });
+    const values = { ...freshValues(), [ROUTING_CLIENT_CERT_SECRET_NAME]: { status: 'unavailable', reason: 'no cert' } } as RoutingSecretsForPublish;
+    const bundle = await publishRoutingBundle(values, ['r1'], deps, { refreshExisting: true });
+    expect(bundle['r1']?.status).toBe('failed');
   });
 });

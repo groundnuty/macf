@@ -433,6 +433,17 @@ export const FleetRoutingRunnerSchema = z
 export const FleetRoutingSchema = z
   .object({
     runner: FleetRoutingRunnerSchema,
+    /**
+     * groundnuty/macf#1446 — opt-in: the fleet's CONTROL repo routes on the
+     * same self-hosted runner class the agent repos do. Deliberately NOT
+     * inherited from `runner.runs_on`: a fleet that already declares
+     * self-hosted agents must keep its control repo exactly as it is until
+     * it asks (the control repo needs its own runner + trusted-actors
+     * variable, and a declared-but-runnerless control repo stops routing
+     * outright). Requires `runner.runs_on: "self-hosted"` (checked below).
+     * Absent = hosted, as before.
+     */
+    control_repo_runs_on: z.literal('self-hosted').optional(),
   })
   .strict();
 
@@ -662,6 +673,16 @@ export const FleetManifestSchema = z
     // versions.actions defaults to the current floating major tag, always
     // capable; an omitted/non-self-hosted routing.runner has nothing to
     // contradict).
+    if (manifest.routing?.control_repo_runs_on !== undefined && manifest.routing.runner.runs_on !== 'self-hosted') {
+      ctx.addIssue({
+        code: 'custom',
+        message:
+          'routing.control_repo_runs_on is "self-hosted" but routing.runner.runs_on is not — the control repo ' +
+          'reuses the fleet runner declaration (labels, warm, platform endpoint), so declare routing.runner ' +
+          'self-hosted first.',
+        path: ['routing', 'control_repo_runs_on'],
+      });
+    }
     if (manifest.routing?.runner.runs_on === 'self-hosted' && manifest.versions?.actions !== undefined) {
       const declaredActions = manifest.versions.actions;
       if (!isSelfHostedCapableActionsVersion(declaredActions)) {
@@ -679,6 +700,11 @@ export const FleetManifestSchema = z
       }
     }
   });
+
+/** groundnuty/macf#1446 — does the manifest declare the control repo self-hosted? One predicate, shared by apply and plan. */
+export function controlRepoSelfHosted(manifest: Pick<FleetManifest, 'routing'>): boolean {
+  return manifest.routing?.control_repo_runs_on === 'self-hosted' && manifest.routing.runner.runs_on === 'self-hosted';
+}
 
 export type FleetMetadata = z.infer<typeof FleetMetadataSchema>;
 export type FleetVersions = z.infer<typeof FleetVersionsSchema>;

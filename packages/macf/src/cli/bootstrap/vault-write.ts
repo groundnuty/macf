@@ -220,8 +220,15 @@ export interface VaultRunnerOpsSecrets {
   readonly pem: string;
 }
 
+/** The operator-supplied Tailscale OAuth pair (DR-043 Amendment C), recorded so a later apply can recompose without the flags. Secret — never log. */
+export interface VaultTsOauthSecrets {
+  readonly clientId: string;
+  readonly secret: string;
+}
+
 export interface VaultPayload {
   readonly agents: readonly VaultAgentSecrets[];
+  readonly tsOauth?: VaultTsOauthSecrets;
   readonly routing?: VaultRoutingSecrets;
   readonly ca?: VaultCaSecrets;
   readonly routingClient?: VaultRoutingClientSecrets;
@@ -407,6 +414,11 @@ export function buildVaultPlaintext(payload: VaultPayload): string {
     }
     emitLine(lines, 'MACF_ROUTING_APP_ID', payload.routingApp.appId);
     emitLine(lines, 'MACF_ROUTING_APP_KEY_B64', toBase64(payload.routingApp.appKeyPem));
+  }
+
+  if (payload.tsOauth !== undefined) {
+    emitLine(lines, 'TS_OAUTH_CLIENT_ID', payload.tsOauth.clientId);
+    emitLine(lines, 'TS_OAUTH_SECRET', payload.tsOauth.secret);
   }
 
   if (lines.length === 0) {

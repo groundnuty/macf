@@ -252,7 +252,8 @@ describe('vaultAwareObserver — DR-043 Amendment D phase 3 (injected deps, no r
       { vaultPath: '/fake/secrets/vault.age', identityPath: '/fake/key.txt' },
       { observe: async () => BASE_OBSERVED, readVault: async () => raw },
     );
-    expect(observed.vaultTsOauth).toEqual({ status: 'confirmed', present: true });
+    expect(observed.vaultTsOauth).toMatchObject({ status: 'confirmed', present: true });
+    expect((observed.vaultTsOauth as { fingerprint?: string }).fingerprint).toMatch(/^sha256:[0-9a-f]{64}$/);
   });
 
   it('a SUCCESSFUL vault read missing the pair -> confirmed, present: false (a decrypted-but-empty vault is a DEFINITE absence, not unknown)', async () => {

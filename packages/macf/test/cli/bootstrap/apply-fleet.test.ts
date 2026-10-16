@@ -18,7 +18,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { applyFleet, shouldWriteBatchedFleetLock, type FleetApplyDeps, type VaultApplyOutcome } from '../../../src/cli/bootstrap/apply-fleet.js';
 import type { FleetAgent, FleetLock, FleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import { parseFleetLock, parseFleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
@@ -32,7 +32,7 @@ import type { AppCredentials } from '../../../src/cli/bootstrap/manifest-exchang
 import type { CaApplyDeps } from '../../../src/cli/bootstrap/apply-ca.js';
 import type { RoutingClientApplyDeps } from '../../../src/cli/bootstrap/apply-routing-client.js';
 import type { RoutingSecretsPublishDeps } from '../../../src/cli/bootstrap/apply-routing-secrets.js';
-import { toBase64ForSecret, ALL_ROUTING_SECRET_NAMES, unpackRoutingBundle } from '../../../src/cli/bootstrap/apply-routing-secrets.js';
+import { toBase64ForSecret, ALL_ROUTING_SECRET_NAMES, unpackRoutingBundle, TS_DEPLOYED_PARTIAL } from '../../../src/cli/bootstrap/apply-routing-secrets.js';
 import type { RouterAppVaultRestoreDeps } from '../../../src/cli/bootstrap/apply-router-app.js';
 import { deriveRouterAppHandle } from '../../../src/cli/bootstrap/apply-router-app.js';
 import type { RunnerRegistrationDeps } from '../../../src/cli/bootstrap/apply-routing.js';
@@ -3642,6 +3642,45 @@ agents:
         expect(result.routing['groundnuty/demo-code']?.status).toBe('created');
       });
 
+      // --- groundnuty/macf#1446 — the control repo joins the SAME provisioning
+      // loop + trusted-actors writer, only when the manifest opts it in.
+      for (const declared of [true, false]) {
+        it(`#1446 control repo ${declared ? 'DECLARED self-hosted: is provisioned AND gets MACF_TRUSTED_ACTORS' : 'NOT declared: is never provisioned and gets no trusted-actors write'}`, async () => {
+          const manifestPath = manifestPathIn();
+          const manifest: FleetManifest = {
+            ...manifestWith([CODE_AGENT]),
+            routing: { runner: { runs_on: 'self-hosted', warm: 1 }, ...(declared ? { control_repo_runs_on: 'self-hosted' as const } : {}) },
+          };
+          const provisioned: string[] = [];
+          const written: string[] = [];
+          const base = trustDepsFor({ checkRunnerUsableByRepo: async () => ({ presence: 'present' }) });
+          const deps: FleetApplyDeps = {
+            ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+            trustDeps: {
+              ...base,
+              createRepoVariable: async (repo: string, name: string, value: string) => {
+                if (name === 'MACF_TRUSTED_ACTORS') written.push(repo);
+                return base.createRepoVariable(repo, name, value);
+              },
+            },
+            runnerPlatformEndpoint: 'http://fake-runner-platform:8088',
+            runnerPlatformFetch: (async (_url: string | URL, init?: RequestInit) => {
+              provisioned.push((JSON.parse(String(init?.body)) as { repo: string }).repo);
+              return new Response(JSON.stringify({ ok: true, applied: [] }), { status: 200 });
+            }) as typeof fetch,
+          };
+          await applyFleet(manifest, manifestPath, null, deps);
+          const control = 'groundnuty/demo-fleet-control';
+          if (declared) {
+            expect(provisioned.sort()).toEqual(['groundnuty/demo-code', control].sort());
+            expect(written).toContain(control);
+          } else {
+            expect(provisioned).toEqual(['groundnuty/demo-code']);
+            expect(written).not.toContain(control);
+          }
+        });
+      }
+
       it('DECISIVE run-2: a REUSED runner-ops outcome still POSTs WITH credentials, sourced from the vault-backed resolveKeyPath fallback (groundnuty/macf#943 follow-up — the run-2 credential-less-POST regression)', async () => {
         const manifestPath = manifestPathIn();
         const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };
@@ -5247,7 +5286,7 @@ agents:
           },
           readVaultTsOauth: async () => {
             readVaultTsOauthCalls += 1;
-            return { clientId: 'ts-client-id', secret: 'ts-secret' };
+            return { clientId: 'ts-client-id', secret: 'tskey-client-ts-secret' };
           },
         },
       };
@@ -5274,7 +5313,7 @@ agents:
       // for a name outside the six, and TS_OAUTH's two calls are ordinary
       // entries in that one list, not a side channel.
       expect(setSecretCalls.filter((c) => c.name === 'TS_OAUTH_CLIENT_ID' && c.value === 'ts-client-id')).toHaveLength(routerCarryingRepos.length);
-      expect(setSecretCalls.filter((c) => c.name === 'TS_OAUTH_SECRET' && c.value === 'ts-secret')).toHaveLength(routerCarryingRepos.length);
+      expect(setSecretCalls.filter((c) => c.name === 'TS_OAUTH_SECRET' && c.value === 'tskey-client-ts-secret')).toHaveLength(routerCarryingRepos.length);
 
       // groundnuty/macf#1112 — the single bundled secret is published
       // ALONGSIDE the six above (never instead of), and unpacks to the
@@ -5297,10 +5336,10 @@ agents:
       // No secret VALUE ever reaches a human/log/--json render surface.
       const rendered = JSON.stringify(fleetApplyResultToJson(result, []));
       expect(rendered).not.toContain('ts-client-id');
-      expect(rendered).not.toContain('ts-secret');
+      expect(rendered).not.toContain('tskey-client-ts-secret');
       const humanText = formatApplyResult(result, []);
       expect(humanText).not.toContain('ts-client-id');
-      expect(humanText).not.toContain('ts-secret');
+      expect(humanText).not.toContain('tskey-client-ts-secret');
     });
 
     it('a vault WITHOUT the Tailscale pair publishes only the other four, and the TS_OAUTH reason states the routing consequence rather than reading as a tidy-up item', async () => {
@@ -5355,6 +5394,157 @@ agents:
       expect(applyExitCode(result)).toBe(0);
     });
 
+    describe('a freshly supplied Tailscale pair refreshes secrets built from an earlier pair', () => {
+      const PRIOR: FleetLock = {
+        schema_version: 1,
+        fleet: 'demo-fleet',
+        agents: [
+          { role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' },
+          { role: 'router', app_id: 'app-router', install_id: 'install-router' },
+        ],
+        fingerprints: { routing_client_key: 'sha256:cafef00d' },
+      };
+      async function run(opts: {
+        fresh?: { clientId: string; secret: string };
+        restored?: { clientId: string; secret: string };
+        prior?: FleetLock;
+        manifestPath?: string;
+        failBundleOn?: string;
+        presence?: 'present' | 'absent';
+      }) {
+        const manifestPath = opts.manifestPath ?? manifestPathIn();
+        const writes: { repo: string; name: string; value: string }[] = [];
+        const logs: string[] = [];
+        const deps: FleetApplyDeps = {
+          ...baseDeps(reusedIdentityDeps(), manifestPath, OK_LABELS_REPO_INIT),
+          log: (line: string) => void logs.push(line),
+          trustDeps: trustDepsFor({ checkRegistryPresence: async () => 'present', readRegistryVariable: async () => 'EXISTING-CA-CERT-PEM' }),
+          routingClientDeps: {
+            mint: async () => {
+              throw new Error('must not mint');
+            },
+            readVaultRoutingClient: async () => ({ certPem: 'VAULT-CLIENT-CERT-PEM', keyPem: 'VAULT-CLIENT-KEY-PEM' }),
+          },
+          routerAppVaultDeps: { readVaultRouterApp: async () => ({ appId: '997', appKeyPem: 'ROUTER-APP-VAULT-PEM' }) },
+          routingSecretsDeps: {
+            checkRepoSecretPresence: async () => opts.presence ?? 'present', // an earlier run already built the bundle + secrets
+            setRepoSecret: async (repo, name, value) => {
+              if (name === 'MACF_ROUTING_BUNDLE' && repo === opts.failBundleOn) throw new Error('transient github error');
+              writes.push({ repo, name, value });
+            },
+            readVaultTsOauth: async () => opts.restored,
+          },
+          ...(opts.fresh !== undefined ? { resolvedTsOauth: opts.fresh } : {}),
+        };
+        const result = await applyFleet(manifestWith([CODE_AGENT]), manifestPath, opts.prior ?? PRIOR, deps);
+        return { result, writes, logs };
+      }
+
+      it('a valid fresh pair with an existing bundle rewrites the bundle (new pair inside) and the repo-level TS_OAUTH_*, and the log says so', async () => {
+        const { writes, logs } = await run({ fresh: { clientId: 'k-new', secret: 'tskey-client-new-secret' } });
+        const bundles = writes.filter((w) => w.name === 'MACF_ROUTING_BUNDLE');
+        expect(bundles.map((b) => b.repo).sort()).toEqual(['groundnuty/demo-code', 'groundnuty/demo-fleet-control']);
+        expect(JSON.parse(Buffer.from(bundles[0]!.value, 'base64').toString('utf-8')).TS_OAUTH_SECRET).toBe('tskey-client-new-secret');
+        expect(writes.filter((w) => w.name === 'TS_OAUTH_SECRET')).toHaveLength(2);
+        expect(writes.some((w) => w.name === 'MACF_ROUTING_APP_ID')).toBe(false);
+        const log = logs.join('\n');
+        expect(log).toContain('Refreshed');
+        expect(log).toContain('MACF_ROUTING_BUNDLE on groundnuty/demo-code');
+        expect(log).not.toContain('tskey-client-new-secret');
+      });
+
+      const NEW_PAIR = { clientId: 'k-new', secret: 'tskey-client-new-secret' };
+      const CODE = 'groundnuty/demo-code';
+      const CTRL = 'groundnuty/demo-fleet-control';
+      const bundleWrites = (w: { repo: string; name: string }[]) => w.filter((x) => x.name === 'MACF_ROUTING_BUNDLE').map((x) => x.repo).sort();
+      const PARTIAL_FP = secretFingerprint(TS_DEPLOYED_PARTIAL);
+      const deployedKeys = (lock: FleetLock | null) => Object.keys(lock?.fleet_fingerprints ?? {}).filter((k) => k.startsWith('ts_oauth_deployed:')).sort();
+
+      it('a failed bundle write marks that repo PARTIAL (its TS_OAUTH_* did land); a later run with NO flags and the vault-restored pair rewrites only that repo', async () => {
+        const manifestPath = manifestPathIn();
+        const run1 = await run({ manifestPath, fresh: NEW_PAIR, restored: NEW_PAIR, failBundleOn: CODE });
+        expect(deployedKeys(run1.result.finalLock)).toEqual([`ts_oauth_deployed:${CODE}`, `ts_oauth_deployed:${CTRL}`]);
+        expect(run1.result.finalLock!.fleet_fingerprints![`ts_oauth_deployed:${CODE}`]).toBe(PARTIAL_FP);
+        const lock1 = run1.result.finalLock!;
+        const run2 = await run({ manifestPath, prior: lock1, restored: NEW_PAIR });
+        expect(bundleWrites(run2.writes)).toEqual([CODE]);
+        expect(deployedKeys(run2.result.finalLock)).toEqual([`ts_oauth_deployed:${CODE}`, `ts_oauth_deployed:${CTRL}`]);
+        // the repo that succeeded in run 1 is not rewritten, and a third run is a no-op
+        const run3 = await run({ manifestPath, prior: run2.result.finalLock!, restored: NEW_PAIR });
+        expect(run3.writes).toEqual([]);
+      });
+
+      it('an interrupted ROTATION on a fleet that already has records: the repo still recorded with the OLD pair is rewritten by a no-flags run (drift, not just unrecorded)', async () => {
+        const manifestPath = manifestPathIn();
+        const OLD_PAIR = { clientId: 'k-old', secret: 'tskey-client-old-secret' };
+        const run1 = await run({ manifestPath, fresh: OLD_PAIR, restored: OLD_PAIR });
+        expect(deployedKeys(run1.result.finalLock)).toEqual([`ts_oauth_deployed:${CODE}`, `ts_oauth_deployed:${CTRL}`]);
+        const oldFp = run1.result.finalLock!.fleet_fingerprints![`ts_oauth_deployed:${CODE}`];
+        // rotate to the new pair; the bundle write on CODE fails after its TS_OAUTH_* landed -> PARTIAL
+        const run2 = await run({ manifestPath, prior: run1.result.finalLock!, fresh: NEW_PAIR, restored: NEW_PAIR, failBundleOn: CODE });
+        const lock2 = run2.result.finalLock!;
+        expect(lock2.fleet_fingerprints![`ts_oauth_deployed:${CODE}`]).toBe(PARTIAL_FP);
+        expect(lock2.fleet_fingerprints![`ts_oauth_deployed:${CTRL}`]).not.toBe(oldFp);
+        // a no-flags run with the vault-restored NEW pair finishes the rotation on CODE only
+        const run3 = await run({ manifestPath, prior: lock2, restored: NEW_PAIR });
+        expect(bundleWrites(run3.writes)).toEqual([CODE]);
+        const rewritten = run3.writes.find((w) => w.name === 'MACF_ROUTING_BUNDLE')!;
+        expect(JSON.parse(Buffer.from(rewritten.value, 'base64').toString('utf-8')).TS_OAUTH_SECRET).toBe('tskey-client-new-secret');
+        expect(run3.result.finalLock!.fleet_fingerprints![`ts_oauth_deployed:${CODE}`]).toBe(lock2.fleet_fingerprints![`ts_oauth_deployed:${CTRL}`]);
+      });
+
+      it('pure DRIFT: every repo recorded with the OLD pair, the vault now holds the NEW one -> a no-flags run rewrites them all, then is a no-op', async () => {
+        const manifestPath = manifestPathIn();
+        const OLD_PAIR = { clientId: 'k-old', secret: 'tskey-client-old-secret' };
+        const run1 = await run({ manifestPath, fresh: OLD_PAIR, restored: OLD_PAIR });
+        const run2 = await run({ manifestPath, prior: run1.result.finalLock!, restored: NEW_PAIR });
+        expect(bundleWrites(run2.writes)).toEqual([CODE, CTRL]);
+        const run3 = await run({ manifestPath, prior: run2.result.finalLock!, restored: NEW_PAIR });
+        expect(run3.writes).toEqual([]);
+      });
+
+      it('a partial rotation then a vault ROLLBACK to the old pair still converges: the PARTIAL record never matches (Codex)', async () => {
+        const manifestPath = manifestPathIn();
+        const OLD_PAIR = { clientId: 'k-old', secret: 'tskey-client-old-secret' };
+        const run1 = await run({ manifestPath, fresh: OLD_PAIR, restored: OLD_PAIR });
+        const run2 = await run({ manifestPath, prior: run1.result.finalLock!, fresh: NEW_PAIR, restored: NEW_PAIR, failBundleOn: CODE });
+        // the operator rolls the vault back to the OLD pair and re-runs without flags
+        const run3 = await run({ manifestPath, prior: run2.result.finalLock!, restored: OLD_PAIR });
+        expect(bundleWrites(run3.writes)).toEqual([CODE, CTRL]);
+        const codeSecret = run3.writes.find((w) => w.repo === CODE && w.name === 'TS_OAUTH_SECRET');
+        expect(codeSecret?.value).toBe('tskey-client-old-secret');
+      });
+
+      it('a vault-restored pair matching every recorded fingerprint writes nothing, and the lock never holds the pair', async () => {
+        const manifestPath = manifestPathIn();
+        const run1 = await run({ manifestPath, fresh: NEW_PAIR, restored: NEW_PAIR });
+        const run2 = await run({ manifestPath, prior: run1.result.finalLock!, restored: NEW_PAIR });
+        expect(run2.writes).toEqual([]);
+        const serialized = JSON.stringify(run2.result.finalLock) + (readFileSync(join(dirname(manifestPath), 'fleet.lock'), 'utf-8'));
+        expect(serialized).not.toContain('k-new');
+        expect(serialized).not.toContain('tskey-client-new-secret');
+      });
+
+      it('a legacy lock with no record and an existing bundle gets one convergent rewrite, then records; the next run writes nothing', async () => {
+        const manifestPath = manifestPathIn();
+        const run1 = await run({ manifestPath, restored: NEW_PAIR });
+        expect(bundleWrites(run1.writes)).toEqual([CODE, CTRL]);
+        const run2 = await run({ manifestPath, prior: run1.result.finalLock!, restored: NEW_PAIR });
+        expect(run2.writes).toEqual([]);
+      });
+
+      it('with no pair held, nothing is written and nothing is recorded', async () => {
+        const { writes, result } = await run({});
+        expect(writes).toEqual([]);
+        expect(deployedKeys(result.finalLock)).toEqual([]);
+      });
+
+      it('a malformed vault-restored pair is never written anywhere', async () => {
+        const { writes } = await run({ restored: { clientId: 'k-old', secret: 'not-a-key' } });
+        expect(writes).toEqual([]);
+      });
+    });
+
     // --- groundnuty/macf#1186 — CONVERGENCE: an already-provisioned fleet
     // (every identity reused, vault genuinely lacks TS_OAUTH) supplies the
     // pair via `deps.resolvedTsOauth` (the `--ts-oauth-client-id`/
@@ -5405,7 +5595,15 @@ agents:
           },
         },
         // The flag/env-resolved pair — the ONLY source this run has for it.
-        resolvedTsOauth: { clientId: 'flag-client-id', secret: 'flag-secret' },
+        resolvedTsOauth: { clientId: 'flag-client-id', secret: 'tskey-client-flag-secret' },
+      };
+      const vaultPlaintexts: string[] = [];
+      deps.vaultDeps = {
+        exists: () => false,
+        encrypt: async (plaintext, _recipients, outPath) => {
+          vaultPlaintexts.push(plaintext);
+          writeFileSync(outPath, 'FAKE-CIPHERTEXT');
+        },
       };
 
       const result = await applyFleet(manifest, manifestPath, priorLock, deps);
@@ -5417,28 +5615,30 @@ agents:
 
       const routerCarryingRepos = ['groundnuty/demo-code', 'groundnuty/demo-fleet-control'];
       expect(setSecretCalls.filter((c) => c.name === 'TS_OAUTH_CLIENT_ID' && c.value === 'flag-client-id')).toHaveLength(routerCarryingRepos.length);
-      expect(setSecretCalls.filter((c) => c.name === 'TS_OAUTH_SECRET' && c.value === 'flag-secret')).toHaveLength(routerCarryingRepos.length);
+      expect(setSecretCalls.filter((c) => c.name === 'TS_OAUTH_SECRET' && c.value === 'tskey-client-flag-secret')).toHaveLength(routerCarryingRepos.length);
       for (const repo of routerCarryingRepos) {
         expect(result.routingSecrets['TS_OAUTH_CLIENT_ID']?.[repo]?.status).toBe('created');
         expect(result.routingSecrets['TS_OAUTH_SECRET']?.[repo]?.status).toBe('created');
       }
 
-      // The decisive negative half: NOTHING else changed. No new vault
-      // write (every identity was reused; `mint`/`startManifestFlow`
-      // throwing above already proves no fresh App/routing-client — this
-      // additionally proves the vault-write step itself never fires for
-      // this run, not merely that its inputs happened to be empty).
-      expect(result.vault.status).toBe('skipped');
+      // The supplied pair is recorded in the vault (and nothing else is
+      // minted — `mint`/`startManifestFlow` throwing above proves that), so a
+      // later apply can recompose without the flags.
+      expect(result.vault.status).toBe('written');
+      expect(vaultPlaintexts).toHaveLength(1);
+      expect(vaultPlaintexts[0]).toContain('TS_OAUTH_CLIENT_ID=');
+      expect(vaultPlaintexts[0]).toContain('TS_OAUTH_SECRET=');
+      expect(vaultPlaintexts[0]).not.toContain('MACF_AGENT_');
 
       expect(applyExitCode(result)).toBe(0);
 
       // The flag-supplied secret value never reaches a render surface.
       const rendered = JSON.stringify(fleetApplyResultToJson(result, []));
       expect(rendered).not.toContain('flag-client-id');
-      expect(rendered).not.toContain('flag-secret');
+      expect(rendered).not.toContain('tskey-client-flag-secret');
       const humanText = formatApplyResult(result, []);
       expect(humanText).not.toContain('flag-client-id');
-      expect(humanText).not.toContain('flag-secret');
+      expect(humanText).not.toContain('tskey-client-flag-secret');
     });
   });
 

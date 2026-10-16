@@ -131,7 +131,10 @@
  */
 import { toVariableSegment } from '@groundnuty/macf-core';
 import type { FleetAgent, FleetLock, FleetManifest } from './fleet-manifest.js';
-import { buildTrustedActorsValue, deriveAppHandle, deriveControlRepoName, routerCarryingRepos } from './fleet-manifest.js';
+import { effectiveFleetFingerprints } from './fleet-manifest.js';
+import { secretFingerprint } from './fleet-lock.js';
+import { controlRepoRunnerItem } from './control-repo-runner.js';
+import { buildTrustedActorsValue, controlRepoSelfHosted, deriveAppHandle, deriveControlRepoName, routerCarryingRepos } from './fleet-manifest.js';
 import { formatTable } from '../commands/ps.js';
 import type { VaultAgentObservation, VaultCaObservation, VaultRecipientsObservation, VaultRouterAppObservation, VaultTsOauthObservation } from './vault-read.js';
 import { countVaultAgentPresence, countVaultCaPresence } from './vault-read.js';
@@ -156,7 +159,7 @@ import { caCertVariableName } from './apply-ca.js';
 // `apply-routing-secrets.ts` only ever `import type`s `Presence` from THIS
 // module, so a value import going the other way here creates no runtime
 // cycle (only a type-level one, which TS resolves fine).
-import { TS_OAUTH_CLIENT_ID_ENV_VAR, TS_OAUTH_CLIENT_ID_FLAG, TS_OAUTH_SECRET_ENV_VAR, TS_OAUTH_SECRET_FLAG } from './apply-routing-secrets.js';
+import { TS_DEPLOYED_KEY_PREFIX, TS_DEPLOYED_PARTIAL, TS_OAUTH_CLIENT_ID_ENV_VAR, TS_OAUTH_CLIENT_ID_FLAG, TS_OAUTH_SECRET_ENV_VAR, TS_OAUTH_SECRET_FLAG } from './apply-routing-secrets.js';
 import { RUNNER_OPS_ROLE, deriveRunnerOpsHandle, runnerOpsNeeded } from './apply-runner-ops.js';
 // groundnuty/macf#1105 — same one-directional-runtime-dependency shape as
 // the `apply-runner-ops.js` import immediately above (that module ITSELF
@@ -312,6 +315,8 @@ export interface ObservedAgentState {
    * match). See `router-caller-secrets.ts`.
    */
   readonly callerSecrets?: CallerSecrets;
+  /** The installed caller's `runner-runs-on:` value (same single read); `undefined` = unreadable OR no such input. */
+  readonly callerRunsOn?: string;
   /**
    * groundnuty/macf#1425 (silent-fallback-hazards.md Instance 18) — the
    * agent-role KEYS present in this repo's committed
@@ -470,6 +475,13 @@ export interface ObservedState {
   readonly orgSecretRepos?: Readonly<Record<string, RepoSecretNamesObservation>>;
   /** What the CONTROL repo's installed router caller passes under `secrets:` (sibling of `agents[role].callerSecrets`). */
   readonly controlRepoCallerSecrets?: CallerSecrets;
+  /** groundnuty/macf#1446 — control-repo runner observations; present ONLY when the manifest declares `routing.control_repo_runs_on`. */
+  readonly controlRepoRunnerRunsOn?: string;
+  readonly controlRepoCallerReadable?: boolean;
+  readonly controlRepoTrustedActors?: string;
+  readonly controlRepoRunnerRegistered?: Presence;
+  readonly controlRepoRunnerHandover?: string;
+  readonly controlRepoRunnerDetail?: string;
   /**
    * Vault-derived per-project CA key/cert presence (DR-043 Amendment D phase
    * 3) — same undefined-vs-observed convention as {@link ObservedAgentState.vault}.
@@ -1647,8 +1659,18 @@ function routerCallerSecretsItem(
   } else if (verdict.notPassedByCaller.length > 0) {
     parts.push(`the caller (.github/workflows/agent-router.yml) does not pass ${verdict.notPassedByCaller.join(', ')}`);
   }
-  if (verdict.missingFromRepo.length > 0) {
-    parts.push(`the repo has no secret named ${verdict.missingFromRepo.join(', ')}`);
+  const withheld = verdict.orgWithheld ?? [];
+  const trulyMissing = verdict.missingFromRepo.filter((n) => !withheld.includes(n));
+  if (withheld.length > 0) {
+    parts.push(
+      `the org secret${withheld.length > 1 ? 's' : ''} ${withheld.join(', ')} ${withheld.length > 1 ? 'do' : 'does'} not reach ${repo}: organisation secrets are not available to private repositories on the free plan — ` +
+        (withheld.every((n) => n === 'TS_OAUTH_CLIENT_ID' || n === 'TS_OAUTH_SECRET')
+          ? `set ${withheld.length > 1 ? 'them' : 'it'} as repository secrets, or route this repo self-hosted (a self-hosted runner needs no Tailscale pair)`
+          : `set ${withheld.length > 1 ? 'them' : 'it'} as repository secrets — routing self-hosted would not help, since only the Tailscale pair is optional there`),
+    );
+  }
+  if (trulyMissing.length > 0) {
+    parts.push(`the repo has no secret named ${trulyMissing.join(', ')}`);
   }
   return {
     kind: 'router_caller_secrets',
@@ -1946,10 +1968,54 @@ const TS_OAUTH_FLAG_PLAN_NOTE =
   `${TS_OAUTH_CLIENT_ID_ENV_VAR}/${TS_OAUTH_SECRET_ENV_VAR} env fallbacks) directly — no pre-existing vault needed ` +
   'for that path.';
 
+const TS_BEARING_SECRETS: readonly string[] = ['MACF_ROUTING_BUNDLE', 'TS_OAUTH_CLIENT_ID', 'TS_OAUTH_SECRET'];
+
+/**
+ * Which repos hold pair-bearing routing secrets that `fleet.lock` does not show as written from the held pair
+ * (secrets are write-only, so the record is all there is to compare). A repo needs the rewrite only when its
+ * confirmed secret names include a pair-bearing one; a repo whose names could not be read is reported as unchecked,
+ * never as needing it. Neither value nor full fingerprint is returned.
+ */
+function staleTsDeployments(
+  lock: FleetLock | null,
+  heldFingerprint: string | undefined,
+  repos: readonly string[],
+  secretRepos: Readonly<Record<string, RepoSecretNamesObservation>> | undefined,
+): {
+  readonly drift: readonly string[];
+  readonly partial: readonly string[];
+  readonly unrecorded: readonly string[];
+  readonly unchecked: readonly string[];
+} | undefined {
+  if (lock === null || heldFingerprint === undefined) return undefined;
+  const recorded = effectiveFleetFingerprints(lock) ?? {};
+  const drift: string[] = [];
+  const partial: string[] = [];
+  const unrecorded: string[] = [];
+  const unchecked: string[] = [];
+  for (const repo of repos) {
+    const obs = secretRepos?.[repo];
+    if (obs === undefined || obs.status === 'unknown') {
+      unchecked.push(repo);
+      continue;
+    }
+    if (!TS_BEARING_SECRETS.some((n) => obs.names.has(n))) continue;
+    const fp = recorded[`${TS_DEPLOYED_KEY_PREFIX}${repo}`];
+    if (fp === undefined) unrecorded.push(repo);
+    else if (fp === secretFingerprint(TS_DEPLOYED_PARTIAL)) partial.push(repo); // the lock stores values fingerprinted
+    else if (fp !== heldFingerprint) drift.push(repo);
+  }
+  if (drift.length === 0 && partial.length === 0 && unrecorded.length === 0) return undefined;
+  return { drift, partial, unrecorded, unchecked };
+}
+
 function tsOauthItem(
   fleetName: string,
   tailscaleOauthRequired: boolean,
   vaultTsOauth: VaultTsOauthObservation | undefined,
+  lock: FleetLock | null,
+  repos: readonly string[],
+  secretRepos: Readonly<Record<string, RepoSecretNamesObservation>> | undefined,
 ): PlanItem {
   const target = `ts_oauth:fleet:${fleetName}:TS_OAUTH`;
   const requirementNote = tailscaleOauthRequired
@@ -1973,6 +2039,21 @@ function tsOauthItem(
   }
 
   if (vaultTsOauth.present) {
+    const stale = staleTsDeployments(lock, vaultTsOauth.fingerprint, repos, secretRepos);
+    if (stale !== undefined) {
+      const parts: string[] = [];
+      if (stale.drift.length > 0) parts.push(`deployed with a different Tailscale pair than the vault holds: ${stale.drift.join(', ')}`);
+      if (stale.partial.length > 0) parts.push(`an earlier rotation only partly landed (mixed Tailscale pairs): ${stale.partial.join(', ')}`);
+      if (stale.unrecorded.length > 0) parts.push(`no record of which Tailscale pair was deployed: ${stale.unrecorded.join(', ')}`);
+      const unchecked = stale.unchecked.length > 0 ? ` (could not check ${stale.unchecked.join(', ')})` : '';
+      return {
+        kind: 'ts_oauth',
+        target,
+        verb: 'update',
+        reason: `${parts.join('; ')} — apply WILL rewrite the routing secrets that carry the Tailscale pair on those repos.${unchecked}`,
+        confirm_required: false,
+      };
+    }
     return {
       kind: 'ts_oauth',
       target,
@@ -2956,7 +3037,7 @@ export function computePlan(
   // reads this fleet's vault for TS_OAUTH_CLIENT_ID/TS_OAUTH_SECRET on every
   // run regardless of `transport.tailscale_oauth_required` (see
   // `tsOauthItem`'s doc).
-  items.push(tsOauthItem(fleetName, manifest.transport.tailscale_oauth_required, observed.vaultTsOauth));
+  items.push(tsOauthItem(fleetName, manifest.transport.tailscale_oauth_required, observed.vaultTsOauth, observed.lock, routerCarryingRepos(manifest), observed.routingSecretRepos));
 
   // groundnuty/macf#1162 — the scope-credential provenance notice, sourced
   // from the MANIFEST declaration UNION the LOCK marker (never lock alone
@@ -3014,8 +3095,9 @@ export function computePlan(
   }
 
   // The control repo carries a router too (every agent App is installed
-  // there; its routing table lists the whole fleet), and its caller never
-  // declares a runner — so it runs hosted and needs the Tailscale pair.
+  // there; its routing table lists the whole fleet). Its caller declares a
+  // runner only when the manifest opts in (routing.control_repo_runs_on,
+  // #1446) — otherwise it runs hosted and needs the Tailscale pair.
   if (observed.controlRepoPresence === 'present') {
     const controlRepo = routerCarryingRepos(manifest).at(-1)!;
     items.push(
@@ -3025,9 +3107,23 @@ export function computePlan(
         observed.controlRepoCallerSecrets,
         observed.routingSecretRepos?.[controlRepo],
         observed.orgSecretRepos?.[controlRepo],
-        false,
+        controlRepoSelfHosted(manifest),
       ),
     );
+    // groundnuty/macf#1446 — the control repo's runner class, explicit, only
+    // when the manifest opts it in (no row at all otherwise).
+    if (controlRepoSelfHosted(manifest)) {
+      items.push(
+        controlRepoRunnerItem(fleetName, controlRepo, buildTrustedActorsValue(fleetName, manifest.agents), {
+          callerRunsOn: observed.controlRepoRunnerRunsOn,
+          callerReadable: observed.controlRepoCallerReadable ?? false,
+          trustedActors: observed.controlRepoTrustedActors,
+          runnerPresence: observed.controlRepoRunnerRegistered,
+          runnerHandover: observed.controlRepoRunnerHandover,
+          runnerDetail: observed.controlRepoRunnerDetail,
+        }),
+      );
+    }
   }
 
   items.push(caRegistryItem(seg, observed.caRegistry, observed.vaultCa));

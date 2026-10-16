@@ -2073,7 +2073,7 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
         // phase, which would otherwise try to decrypt the fake vault path
         // for real and fail, contaminating this test's exit-code assertion.
         { file, yes: true, vaultPath: '/fake/vault.age', identityKeyPath: '/fake/identity.txt', deploy: false },
-        { observe: () => Promise.resolve(EMPTY_OBSERVED), readVault: async () => ({ TS_OAUTH_CLIENT_ID: 'ts-client-id', TS_OAUTH_SECRET: 'ts-secret' }) },
+        { observe: () => Promise.resolve(EMPTY_OBSERVED), readVault: async () => ({ TS_OAUTH_CLIENT_ID: 'ts-client-id', TS_OAUTH_SECRET: 'tskey-client-ts-secret' }) },
         fakeMutateDeps(file, {
           // The preflight (above) and the PUBLISH-time resolution
           // (apply-fleet.ts, via routingSecretsDeps.readVaultTsOauth) are
@@ -2083,7 +2083,7 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
           // just clear the preflight.
           routingSecretsDeps: fakeRoutingSecretsDeps({
             checkRepoSecretPresence: async () => 'present',
-            readVaultTsOauth: async () => ({ clientId: 'ts-client-id', secret: 'ts-secret' }),
+            readVaultTsOauth: async () => ({ clientId: 'ts-client-id', secret: 'tskey-client-ts-secret' }),
           }),
         }),
       );
@@ -2107,11 +2107,34 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
   // case. These tests cover the flag/env resolution path that bypasses the
   // vault requirement entirely.
   describe('groundnuty/macf#1186 — --ts-oauth-client-id/--ts-oauth-secret (flag/env, no vault required)', () => {
+    it('a placeholder pair is refused before any write — the publish seam is never called, the secret is not echoed', async () => {
+      const file = writeManifest(FLEET_YAML_WITH_TAILSCALE);
+      const setSecretCalls: string[] = [];
+      let observed = false;
+      const code = await runBootstrapApply(
+        { file, yes: true, deploy: false, tsOauthClientId: '<CLIENT_ID>', tsOauthSecret: '<SECRET>' },
+        { observe: () => { observed = true; return Promise.resolve(EMPTY_OBSERVED); } },
+        fakeMutateDeps(file, {
+          routingSecretsDeps: fakeRoutingSecretsDeps({
+            checkRepoSecretPresence: async () => 'absent',
+            setRepoSecret: async (_repo, name) => void setSecretCalls.push(name),
+          }),
+        }),
+      );
+      expect(code).not.toBe(0);
+      expect(setSecretCalls).toEqual([]);
+      expect(observed).toBe(false);
+      const out = errs.join('\n');
+      expect(out).toContain('the Tailscale OAuth secret contains');
+      expect(out).toContain('the Tailscale OAuth client id contains');
+      expect(out).not.toContain('<SECRET>');
+    });
+
     it('flag alone (no vault flags at all) satisfies a declared requirement — proceeds past the pre-flight, publishes the flag values', async () => {
       const file = writeManifest(FLEET_YAML_WITH_TAILSCALE);
       const setSecretCalls: { repo: string; name: string; value: string }[] = [];
       const code = await runBootstrapApply(
-        { file, yes: true, deploy: false, tsOauthClientId: 'flag-client-id', tsOauthSecret: 'flag-secret' }, // no vaultPath/identityKeyPath
+        { file, yes: true, deploy: false, tsOauthClientId: 'flag-client-id', tsOauthSecret: 'tskey-client-flag-secret' }, // no vaultPath/identityKeyPath
         { observe: () => Promise.resolve(EMPTY_OBSERVED) },
         // `mutateDeps` is EXPLICITLY given here, so `runBootstrapApply` never
         // calls `resolveMutateDeps` (which is where the CLI-resolved
@@ -2120,7 +2143,7 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
         // set directly here, mirroring `runnerToken`'s own identical
         // "opts.X must ALSO be set" contract for the same reason.
         fakeMutateDeps(file, {
-          resolvedTsOauth: { clientId: 'flag-client-id', secret: 'flag-secret' },
+          resolvedTsOauth: { clientId: 'flag-client-id', secret: 'tskey-client-flag-secret' },
           routingSecretsDeps: fakeRoutingSecretsDeps({
             checkRepoSecretPresence: async () => 'absent',
             setRepoSecret: async (repo, name, value) => {
@@ -2132,13 +2155,13 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       expect(code).toBe(0);
       expect(errs.join('\n')).not.toContain(TAILSCALE_OAUTH_MISSING_CODE);
       expect(setSecretCalls.some((c) => c.name === 'TS_OAUTH_CLIENT_ID' && c.value === 'flag-client-id')).toBe(true);
-      expect(setSecretCalls.some((c) => c.name === 'TS_OAUTH_SECRET' && c.value === 'flag-secret')).toBe(true);
+      expect(setSecretCalls.some((c) => c.name === 'TS_OAUTH_SECRET' && c.value === 'tskey-client-flag-secret')).toBe(true);
     });
 
     it('env fallback alone (MACF_BOOTSTRAP_TS_OAUTH_CLIENT_ID/_SECRET, no flags) also satisfies the pre-flight — the env-var half is exercised, not just the flag half', async () => {
       const file = writeManifest(FLEET_YAML_WITH_TAILSCALE);
       vi.stubEnv(TS_OAUTH_CLIENT_ID_ENV_VAR, 'env-client-id');
-      vi.stubEnv(TS_OAUTH_SECRET_ENV_VAR, 'env-secret');
+      vi.stubEnv(TS_OAUTH_SECRET_ENV_VAR, 'tskey-client-env-secret');
       const setSecretCalls: { repo: string; name: string; value: string }[] = [];
       const code = await runBootstrapApply(
         { file, yes: true, deploy: false }, // no opts.tsOauthClientId/tsOauthSecret — only the env vars
@@ -2150,7 +2173,7 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
         // entirely by `runBootstrapApply`'s own opts/env resolution, which
         // this override cannot influence).
         fakeMutateDeps(file, {
-          resolvedTsOauth: { clientId: 'env-client-id', secret: 'env-secret' },
+          resolvedTsOauth: { clientId: 'env-client-id', secret: 'tskey-client-env-secret' },
           routingSecretsDeps: fakeRoutingSecretsDeps({
             checkRepoSecretPresence: async () => 'absent',
             setRepoSecret: async (repo, name, value) => {
@@ -2162,7 +2185,7 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       expect(code).toBe(0);
       expect(errs.join('\n')).not.toContain(TAILSCALE_OAUTH_MISSING_CODE);
       expect(setSecretCalls.some((c) => c.name === 'TS_OAUTH_CLIENT_ID' && c.value === 'env-client-id')).toBe(true);
-      expect(setSecretCalls.some((c) => c.name === 'TS_OAUTH_SECRET' && c.value === 'env-secret')).toBe(true);
+      expect(setSecretCalls.some((c) => c.name === 'TS_OAUTH_SECRET' && c.value === 'tskey-client-env-secret')).toBe(true);
     });
 
     // groundnuty/macf#1186 — "CLI flag wins over env" cannot be observed
@@ -2235,7 +2258,7 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
 
     it('NEVER logs the supplied secret value anywhere in stdout/stderr across a full run (text AND --json) — only the flag/env NAMES may appear', async () => {
       const TS_OAUTH_CLIENT_ID_SECRET = 'SENTINEL-1186-CLIENT-ID-MUST-NEVER-LEAK';
-      const TS_OAUTH_SECRET_SECRET = 'SENTINEL-1186-SECRET-MUST-NEVER-LEAK';
+      const TS_OAUTH_SECRET_SECRET = 'tskey-client-SENTINEL-1186-MUST-NEVER-LEAK';
       for (const json of [false, true]) {
         const file = writeManifest(FLEET_YAML_WITH_TAILSCALE);
         const code = await runBootstrapApply(
@@ -2273,14 +2296,14 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       const file = writeManifest(FLEET_YAML_WITH_TAILSCALE);
       const secretsFile = writeSecretsFile(
         dirname(file),
-        'MACF_BOOTSTRAP_TS_OAUTH_CLIENT_ID=file-client-id\nMACF_BOOTSTRAP_TS_OAUTH_SECRET=file-secret\n',
+        'MACF_BOOTSTRAP_TS_OAUTH_CLIENT_ID=file-client-id\nMACF_BOOTSTRAP_TS_OAUTH_SECRET=tskey-client-file-secret\n',
       );
       const setSecretCalls: { repo: string; name: string; value: string }[] = [];
       const code = await runBootstrapApply(
         { file, yes: true, deploy: false, secretsFilePath: secretsFile }, // NO tsOauthClientId/tsOauthSecret flags
         { observe: () => Promise.resolve(EMPTY_OBSERVED) },
         fakeMutateDeps(file, {
-          resolvedTsOauth: { clientId: 'file-client-id', secret: 'file-secret' },
+          resolvedTsOauth: { clientId: 'file-client-id', secret: 'tskey-client-file-secret' },
           routingSecretsDeps: fakeRoutingSecretsDeps({
             checkRepoSecretPresence: async () => 'absent',
             setRepoSecret: async (repo, name, value) => {
@@ -2295,7 +2318,7 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       // the file was actually consulted, not merely that SOME value
       // (e.g. from env) satisfied the pre-flight.
       expect(setSecretCalls.some((c) => c.name === 'TS_OAUTH_CLIENT_ID' && c.value === 'file-client-id')).toBe(true);
-      expect(setSecretCalls.some((c) => c.name === 'TS_OAUTH_SECRET' && c.value === 'file-secret')).toBe(true);
+      expect(setSecretCalls.some((c) => c.name === 'TS_OAUTH_SECRET' && c.value === 'tskey-client-file-secret')).toBe(true);
     });
 
     it('DECISIVE 2: a required key missing from the file -> refuses BEFORE the first gate, naming every missing key together, via the FILE\'s own aggregate mechanism', async () => {
@@ -2329,14 +2352,14 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       const file = writeManifest(FLEET_YAML_WITH_TAILSCALE);
       const secretsFile = writeSecretsFile(
         dirname(file),
-        'MACF_BOOTSTRAP_TS_OAUTH_CLIENT_ID=file-client-id\nMACF_BOOTSTRAP_TS_OAUTH_SECRET=file-secret\n',
+        'MACF_BOOTSTRAP_TS_OAUTH_CLIENT_ID=file-client-id\nMACF_BOOTSTRAP_TS_OAUTH_SECRET=tskey-client-file-secret\n',
       );
       const setSecretCalls: { repo: string; name: string; value: string }[] = [];
       const code = await runBootstrapApply(
-        { file, yes: true, deploy: false, secretsFilePath: secretsFile, tsOauthClientId: 'flag-client-id', tsOauthSecret: 'flag-secret' },
+        { file, yes: true, deploy: false, secretsFilePath: secretsFile, tsOauthClientId: 'flag-client-id', tsOauthSecret: 'tskey-client-flag-secret' },
         { observe: () => Promise.resolve(EMPTY_OBSERVED) },
         fakeMutateDeps(file, {
-          resolvedTsOauth: { clientId: 'flag-client-id', secret: 'flag-secret' },
+          resolvedTsOauth: { clientId: 'flag-client-id', secret: 'tskey-client-flag-secret' },
           routingSecretsDeps: fakeRoutingSecretsDeps({
             checkRepoSecretPresence: async () => 'absent',
             setRepoSecret: async (repo, name, value) => {
@@ -2359,7 +2382,7 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       const fleetFile = writeSecretsFile(dir, 'MACF_BOOTSTRAP_TS_OAUTH_CLIENT_ID=fleet-client-id\n', 'fleet-secrets.env');
       const scopeFile = writeSecretsFile(
         dir,
-        'MACF_BOOTSTRAP_TS_OAUTH_CLIENT_ID=scope-client-id\nMACF_BOOTSTRAP_TS_OAUTH_SECRET=scope-secret\n',
+        'MACF_BOOTSTRAP_TS_OAUTH_CLIENT_ID=scope-client-id\nMACF_BOOTSTRAP_TS_OAUTH_SECRET=tskey-client-scope-secret\n',
         'scope-secrets.env',
       );
       const setSecretCalls: { repo: string; name: string; value: string }[] = [];
@@ -2367,7 +2390,7 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
         { file, yes: true, deploy: false, secretsFilePath: fleetFile, scopeSecretsFilePath: scopeFile },
         { observe: () => Promise.resolve(EMPTY_OBSERVED) },
         fakeMutateDeps(file, {
-          resolvedTsOauth: { clientId: 'fleet-client-id', secret: 'scope-secret' },
+          resolvedTsOauth: { clientId: 'fleet-client-id', secret: 'tskey-client-scope-secret' },
           routingSecretsDeps: fakeRoutingSecretsDeps({
             checkRepoSecretPresence: async () => 'absent',
             setRepoSecret: async (repo, name, value) => {
@@ -2382,7 +2405,7 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       // ignored the fleet override. Both keys resolving, from their
       // DIFFERENT declared tiers, is the decisive per-KEY proof.
       expect(setSecretCalls.some((c) => c.name === 'TS_OAUTH_CLIENT_ID' && c.value === 'fleet-client-id')).toBe(true);
-      expect(setSecretCalls.some((c) => c.name === 'TS_OAUTH_SECRET' && c.value === 'scope-secret')).toBe(true);
+      expect(setSecretCalls.some((c) => c.name === 'TS_OAUTH_SECRET' && c.value === 'tskey-client-scope-secret')).toBe(true);
     });
 
     it('a --secrets-file path that does not exist refuses loud, before the manifest is even parsed', async () => {
@@ -2399,13 +2422,13 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       const file = writeManifest(FLEET_YAML_WITH_TAILSCALE);
       const secretsFile = writeSecretsFile(
         dirname(file),
-        'SOME_UNKNOWN_FUTURE_KEY=whatever\nMACF_BOOTSTRAP_TS_OAUTH_CLIENT_ID=file-client-id\nMACF_BOOTSTRAP_TS_OAUTH_SECRET=file-secret\n',
+        'SOME_UNKNOWN_FUTURE_KEY=whatever\nMACF_BOOTSTRAP_TS_OAUTH_CLIENT_ID=file-client-id\nMACF_BOOTSTRAP_TS_OAUTH_SECRET=tskey-client-file-secret\n',
       );
       const code = await runBootstrapApply(
         { file, yes: true, deploy: false, secretsFilePath: secretsFile },
         { observe: () => Promise.resolve(EMPTY_OBSERVED) },
         fakeMutateDeps(file, {
-          resolvedTsOauth: { clientId: 'file-client-id', secret: 'file-secret' },
+          resolvedTsOauth: { clientId: 'file-client-id', secret: 'tskey-client-file-secret' },
           routingSecretsDeps: fakeRoutingSecretsDeps({ checkRepoSecretPresence: async () => 'absent', setRepoSecret: async () => {} }),
         }),
       );
@@ -2414,7 +2437,7 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
 
     it('NEVER logs a secret-file-sourced value anywhere in stdout/stderr (text AND --json)', async () => {
       const SENTINEL_CLIENT_ID = 'SENTINEL-1197-FILE-CLIENT-ID-MUST-NEVER-LEAK';
-      const SENTINEL_SECRET = 'SENTINEL-1197-FILE-SECRET-MUST-NEVER-LEAK';
+      const SENTINEL_SECRET = 'tskey-client-SENTINEL-1197-MUST-NEVER-LEAK';
       for (const json of [false, true]) {
         const file = writeManifest(FLEET_YAML_WITH_TAILSCALE);
         const secretsFile = writeSecretsFile(dirname(file), `MACF_BOOTSTRAP_TS_OAUTH_CLIENT_ID=${SENTINEL_CLIENT_ID}\nMACF_BOOTSTRAP_TS_OAUTH_SECRET=${SENTINEL_SECRET}\n`);
