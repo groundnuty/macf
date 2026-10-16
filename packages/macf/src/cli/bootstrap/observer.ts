@@ -60,6 +60,7 @@ import { caCertVariableName } from './apply-ca.js';
 // read, never a second network read of the identical file (this issue's own
 // "a parallel read is a hazard" requirement).
 import { extractCallerWithKeys } from './runner-declaration-reach.js';
+import { extractCallerSecrets } from './router-caller-secrets.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -1523,6 +1524,8 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
     const routerContent = await readInstalledRouterWorkflow(agent.repo);
     const actionsPin = routerContent === undefined ? undefined : extractActionsPin(routerContent);
     const routerWithKeys = routerContent === undefined ? undefined : extractCallerWithKeys(routerContent)?.withKeys;
+    // Same in-memory read — which secrets the caller passes to the router.
+    const callerSecrets = routerContent === undefined ? undefined : extractCallerSecrets(routerContent);
     // groundnuty/macf#1425 (silent-fallback-hazards.md Instance 18) — a
     // SEPARATE `gh api` read (`.github/agent-config.json` is a sibling file
     // to `.github/workflows/agent-router.yml`, never the same content, so
@@ -1556,6 +1559,7 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
       deployedVersion: lockEntry?.deployed_version,
       actionsPin,
       routerWithKeys,
+      callerSecrets,
       agentConfigRoles,
       archived: repoArchivedMeta.archived,
       installRepositorySelection: findInstallRepositorySelection(orgInstallScopes, deriveAppHandle(manifest.metadata.name, agent.role)),
