@@ -21,6 +21,17 @@ export function extractRunnerRunsOnInput(content: string): string | undefined {
   return m?.[1];
 }
 
+/**
+ * The installed caller does not pass the runner class the manifest declares
+ * (groundnuty/macf#1446): declared self-hosted, caller readable, input absent
+ * or not `self-hosted`. Unreadable caller => false (nothing observed to rewrite
+ * against). Declared hosted => false: this predicate only drives the migration
+ * TO self-hosted.
+ */
+export function runnerInputDrift(declaredSelfHosted: boolean, callerReadable: boolean, callerRunsOn: string | undefined): boolean {
+  return declaredSelfHosted && callerReadable && callerRunsOn !== 'self-hosted';
+}
+
 export interface ControlRepoRunnerObservation {
   /** `undefined` = the installed caller could not be read / is not installed. */
   readonly callerRunsOn: string | undefined;
@@ -44,7 +55,7 @@ export function controlRepoRunnerItem(
   } else if (obs.callerRunsOn !== 'self-hosted') {
     gaps.push(
       `the caller on "${controlRepo}" does not pass "runner-runs-on: self-hosted" ` +
-        `(${obs.callerRunsOn === undefined ? 'no such input' : `it passes "${obs.callerRunsOn}"`}) — apply regenerates it`,
+        `(${obs.callerRunsOn === undefined ? 'no such input' : `it passes "${obs.callerRunsOn}"`}) — apply rewrites the committed agent-router.yml in this run`,
     );
   }
   const varDiffers = obs.trustedActors !== undefined && obs.trustedActors !== desiredTrustedActors;

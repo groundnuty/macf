@@ -39,6 +39,8 @@ function observed(callerYaml: string | undefined, secrets: readonly string[] | '
         app: 'present', appId: '1', install: 'present', installId: '2', repo: 'present', fingerprints: {},
         agentConfigRoles: ['code-agent'],
         callerSecrets: callerYaml === undefined ? undefined : extractCallerSecrets(callerYaml),
+        // Fixtures model a caller that already passes the declared runner class (#1446 drift is tested in control-repo-runner.test.ts).
+        ...(callerYaml === undefined ? {} : { callerRunsOn: 'self-hosted' }),
       },
     },
     caRegistry: 'present',

@@ -313,6 +313,8 @@ export interface ObservedAgentState {
    * match). See `router-caller-secrets.ts`.
    */
   readonly callerSecrets?: CallerSecrets;
+  /** The installed caller's `runner-runs-on:` value (same single read); `undefined` = unreadable OR no such input. */
+  readonly callerRunsOn?: string;
   /**
    * groundnuty/macf#1425 (silent-fallback-hazards.md Instance 18) — the
    * agent-role KEYS present in this repo's committed

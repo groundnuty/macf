@@ -8,6 +8,8 @@ import { controlRepoSelfHosted, FleetManifestSchema } from '../../../src/cli/boo
 import type { FleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import { applyControlRepoInit } from '../../../src/cli/bootstrap/apply-control-repo-init.js';
 import { computePlan } from '../../../src/cli/bootstrap/plan.js';
+import type { ObservedState } from '../../../src/cli/bootstrap/plan.js';
+import { callerSecretRewritesFromObserved, controlCallerSecretRewriteFromObserved } from '../../../src/cli/commands/bootstrap-apply.js';
 
 const WANT = 'f-code-agent[bot]';
 const ready = { callerRunsOn: 'self-hosted', callerReadable: true, trustedActors: WANT, runnerPresence: 'present' as const, runnerHandover: undefined, runnerDetail: undefined };
@@ -99,5 +101,55 @@ describe('plan rows (#1446)', () => {
     const r = rows(manifest(SELF));
     expect(r.caller).not.toBe('noop');
     expect(r.runner).toBeUndefined();
+  });
+});
+
+describe('runner-input drift forces the caller rewrite (#1446 review P1)', () => {
+  const COMPLETE = { inherit: false, names: ['MACF_ROUTING_BUNDLE', 'MACF_ROUTING_APP_ID', 'MACF_ROUTING_APP_KEY', 'ROUTING_CLIENT_CERT', 'ROUTING_CLIENT_KEY'] };
+  const REPO_SECRETS = { status: 'confirmed' as const, names: new Set(['MACF_ROUTING_BUNDLE']) };
+  const obs = (callerRunsOn: string | undefined, readable = true): ObservedState => ({
+    lock: null, caRegistry: 'unknown', caRepos: {},
+    agents: { 'code-agent': { app: 'present', appId: '1', install: 'present', installId: '2', repo: 'present', fingerprints: {}, callerSecrets: COMPLETE, ...(callerRunsOn !== undefined ? { callerRunsOn } : {}) } },
+    controlRepoPresence: 'present', controlRepoCallerSecrets: COMPLETE, controlRepoCallerReadable: readable,
+    ...(callerRunsOn !== undefined ? { controlRepoRunnerRunsOn: callerRunsOn } : {}),
+    routingSecretRepos: { 'o/f-control': REPO_SECRETS, 'o/f-code': REPO_SECRETS },
+    orgSecretRepos: { 'o/f-control': { status: 'confirmed', names: new Set() }, 'o/f-code': { status: 'confirmed', names: new Set() } },
+  });
+  const declared = manifest({ ...SELF, control_repo_runs_on: 'self-hosted' });
+
+  it('hosted control caller + field declared + secrets complete -> rewrite forced', () => {
+    expect(controlCallerSecretRewriteFromObserved(declared, obs(undefined))).toBe(true);
+    expect(controlCallerSecretRewriteFromObserved(declared, obs('ubuntu-latest'))).toBe(true);
+  });
+  it('caller already self-hosted -> no force from this predicate', () => {
+    expect(controlCallerSecretRewriteFromObserved(declared, obs('self-hosted'))).toBe(false);
+  });
+  it('field not declared -> no force, whatever the caller says', () => {
+    expect(controlCallerSecretRewriteFromObserved(manifest(SELF), obs('ubuntu-latest'))).toBe(false);
+  });
+  it('unreadable caller -> no force (nothing observed to compare)', () => {
+    expect(controlCallerSecretRewriteFromObserved(declared, obs(undefined, false))).toBe(false);
+  });
+  it('DECISIVE — existing hosted caller on disk: the observed-state flag drives repoInit force and the rewrite lands runner-runs-on: self-hosted (unforced it does not)', async () => {
+    const wf = (d: string): string => readFileSync(join(d, '.github', 'workflows', 'agent-router.yml'), 'utf-8');
+    const dir = mkdtempSync(join(tmpdir(), 'ctl-drift-'));
+    try {
+      await applyControlRepoInit(dir, manifest(SELF)); // the installed hosted caller
+      expect(wf(dir)).not.toContain('runner-runs-on');
+      const flag = controlCallerSecretRewriteFromObserved(declared, obs(undefined));
+      expect(flag).toBe(true);
+      await applyControlRepoInit(dir, declared, undefined, { actionsVersion: 'v3.5.0', force: false });
+      expect(wf(dir)).not.toContain('runner-runs-on'); // repoInit skips an existing file — the bug
+      await applyControlRepoInit(dir, declared, undefined, { actionsVersion: 'v3.5.0', force: flag });
+      expect(wf(dir)).toContain('runner-runs-on: self-hosted');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  it('agent repos: self-hosted declared + caller without the input -> rewrite; already self-hosted or undeclared -> none', () => {
+    const agentDeclared = manifest(SELF);
+    expect(callerSecretRewritesFromObserved(agentDeclared, obs(undefined))).toEqual({ 'code-agent': true });
+    expect(callerSecretRewritesFromObserved(agentDeclared, obs('self-hosted'))).toEqual({ 'code-agent': false });
+    expect(callerSecretRewritesFromObserved(manifest(), obs(undefined))).toEqual({ 'code-agent': false });
   });
 });

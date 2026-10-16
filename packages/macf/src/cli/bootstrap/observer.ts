@@ -1617,6 +1617,7 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
     const routerWithKeys = routerContent === undefined ? undefined : extractCallerWithKeys(routerContent)?.withKeys;
     // Same in-memory read — which secrets the caller passes to the router.
     const callerSecrets = routerContent === undefined ? undefined : extractCallerSecrets(routerContent);
+    const callerRunsOn = routerContent === undefined ? undefined : extractRunnerRunsOnInput(routerContent);
     // groundnuty/macf#1425 (silent-fallback-hazards.md Instance 18) — a
     // SEPARATE `gh api` read (`.github/agent-config.json` is a sibling file
     // to `.github/workflows/agent-router.yml`, never the same content, so
@@ -1651,6 +1652,7 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
       actionsPin,
       routerWithKeys,
       callerSecrets,
+      ...(callerRunsOn !== undefined ? { callerRunsOn } : {}),
       agentConfigRoles,
       archived: repoArchivedMeta.archived,
       installRepositorySelection: findInstallRepositorySelection(orgInstallScopes, deriveAppHandle(manifest.metadata.name, agent.role)),
