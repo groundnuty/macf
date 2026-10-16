@@ -1151,6 +1151,7 @@ describe('check-mention-routing.sh (hook)', () => {
         ['if ! time gh issue comment 5 --body "done"; then echo no; fi'],
         ['echo ok && \\\ngh issue comment 5 --body done'],
         ['echo ok && gh issue comment 5 \\\n  --body done'],
+        ['cat <<< "hello"\ngh issue comment 1 --body "no recipient"'],
       ])('a comment behind a shell keyword is still checked for a mention (%#)', (command) => {
         const r = runCreate(command);
         expect(r.status).toBe(2);

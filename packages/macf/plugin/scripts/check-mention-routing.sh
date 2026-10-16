@@ -252,6 +252,10 @@ macf_split_text() {
         cur+="$c" ;;
       '<')
         nx2="${s:i+2:1}"
+        if [[ "$nx" == "<" && "$nx2" == "<" ]]; then
+          # A here-string (<<<) is one operator; never read its tail as a heredoc opener.
+          cur+="<<<"; i=$((i + 3)); continue
+        fi
         if [[ "$nx" == "<" && "$nx2" != "<" ]]; then
           j=$((i + 2)); strip=false
           if [[ "${s:j:1}" == "-" ]]; then strip=true; j=$((j + 1)); fi
