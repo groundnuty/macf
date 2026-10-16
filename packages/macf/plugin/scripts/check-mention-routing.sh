@@ -42,17 +42,16 @@
 #      never a hardcoded role list, since fleets choose their own role
 #      names) AND it differs from the acting agent's own routing label.
 #   3. assignee label CONFIRMED naming the ACTING agent itself → BLOCK.
-#      route-by-label "delivers" this to whoever filed it — a no-op — so
-#      a mention is the only real path to anyone else. This is the
-#      failure this hook exists to catch: an issue self-labeled by its
-#      filer got reported as successfully routed (to the filer) while a
-#      blocking design question inside it sat unanswered for several
-#      minutes, because nothing else pointed at the peer who needed to
-#      see it. "Delivered to the person who wrote it" reads identically
-#      to "successfully routed" unless something asserts WHO it reached —
-#      same silent-fallback shape as Instance 12 in this framework's
-#      hazard catalog (a defense that validates a narrower surface than
-#      the rule it enforces).
+#      The router skips a label applied by the agent it names, so the
+#      issue routes to no one. This is the failure this hook exists to
+#      catch: an issue self-labeled by its filer sat unanswered while a
+#      blocking design question inside it waited on a peer who never saw
+#      it. A mention in a NEW issue's body cannot rescue it: the router
+#      runs route-by-mention only for issue_comment, pull_request and
+#      pull_request_review events, never for a new issue's body, so for
+#      the issue-create form cases 3 and 4 block even when the body
+#      carries a mention. (For a PR create a body mention does route, so
+#      there a mention still satisfies the check.)
 #   4. anything else — no labels at all; labels that don't match the
 #      registry; a registry match the hook can't confirm as self or peer
 #      (`$MACF_ROUTING_LABEL` unset) → BLOCK on `gh issue create`; ALLOW on
@@ -109,25 +108,278 @@ COMMAND="$(jq -r '.tool_input.command // ""' <<<"$INPUT_JSON" 2>/dev/null || ech
 #   gh issue close      gh pr close      (only when --comment is present;
 #                                          plain close has no body)
 #   gh issue create      gh pr create    (groundnuty/macf#1091)
-GH_COMMENT_PATTERN='(^|[[:space:];|&])(sudo[[:space:]]+|env[[:space:]]+([A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+)*|watch[[:space:]]+|ionice[[:space:]]+|setsid[[:space:]]+|nice[[:space:]]+|time[[:space:]]+|[A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+)*gh[[:space:]]+(issue|pr)[[:space:]]+(comment|close|create)([[:space:]]|$)'
+# One wrapper list feeds the segment reader below.
+WRAP_LIST='sudo[[:space:]]+|env[[:space:]]+([A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+)*|watch[[:space:]]+|ionice[[:space:]]+|setsid[[:space:]]+|nice[[:space:]]+|time[[:space:]]+|[A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+'
 
-# Shell-wrapper bypass: catches `bash -c "gh issue comment ..."` and
-# variants. Same flag-handling logic as check-gh-token.sh.
-SHELL_C_GH_COMMENT_PATTERN='(^|[[:space:];|&])(sudo[[:space:]]+|env[[:space:]]+([A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+)*|[A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+)*(bash|sh|zsh)[[:space:]]+(-[a-zA-Z]+[[:space:]]+)*-[a-zA-Z]*c[[:space:]]+[^[:space:]].*gh[[:space:]]+(issue|pr)[[:space:]]+(comment|close|create)([[:space:]]|$)'
-
-if [[ ! "$COMMAND" =~ $GH_COMMENT_PATTERN ]] && [[ ! "$COMMAND" =~ $SHELL_C_GH_COMMENT_PATTERN ]]; then
-  # Not a body-carrying command — allow.
+# Cheap prefilter: a superset of every form the splitter below accepts.
+if [[ ! "$COMMAND" =~ gh[[:space:]]+(issue|pr)[[:space:]]+(comment|close|create) ]]; then
   exit 0
 fi
 
-# `gh issue close` / `gh pr close` without --comment doesn't post text.
-# Skip — nothing to check.
-if [[ "$COMMAND" =~ gh[[:space:]]+(issue|pr)[[:space:]]+close ]] && [[ ! "$COMMAND" =~ --comment ]]; then
+# ── One quote-aware command splitter (groundnuty/macf#1482) ───────────────
+# Every detector reads commands from this walk, never from regexes over raw
+# text, so text inside a quoted argument or a heredoc body never starts a
+# command. macf_split_text walks once, tracking '...', "..." (backslash
+# escapes), $'...' and heredoc bodies (<<EOF, <<'EOF', <<-EOF). It cuts at ;
+# & | ( ) and newlines outside quotes and heredoc bodies; && and || are two
+# cuts. Each cut piece goes to macf_collect_segment, which strips wrapper
+# prefixes and, for `bash|sh|zsh -c`-style flag clusters (-c -lc -ec -xc ...),
+# unquotes the script and splits it recursively. Results land in EFF_CMDS.
+# Residual: a command substitution inside double quotes is not entered.
+EFF_CMDS=()
+
+# Sets MACF_UNQUOTED to the first shell word of $1, quotes removed.
+macf_unquote_first_word() {
+  local r="$1" i=1 n c nx out=""
+  n=${#r}
+  MACF_UNQUOTED=""
+  if [[ "${r:0:1}" == "'" ]]; then
+    out="${r:1}"; MACF_UNQUOTED="${out%%\'*}"; return 0
+  fi
+  if [[ "${r:0:2}" == "\$'" ]]; then
+    i=2
+    while [[ $i -lt $n ]]; do
+      c="${r:i:1}"; nx="${r:i+1:1}"
+      if [[ "$c" == "\\" ]]; then
+        if [[ "$nx" == "n" ]]; then out+=$'\n'; else out+="$nx"; fi
+        i=$((i + 2)); continue
+      fi
+      [[ "$c" == "'" ]] && break
+      out+="$c"; i=$((i + 1))
+    done
+    MACF_UNQUOTED="$out"; return 0
+  fi
+  if [[ "${r:0:1}" == '"' ]]; then
+    while [[ $i -lt $n ]]; do
+      c="${r:i:1}"; nx="${r:i+1:1}"
+      if [[ "$c" == "\\" ]]; then
+        case "$nx" in
+          '"'|'\'|'$'|'`') out+="$nx" ;;
+          *) out+="$c$nx" ;;
+        esac
+        i=$((i + 2)); continue
+      fi
+      [[ "$c" == '"' ]] && break
+      out+="$c"; i=$((i + 1))
+    done
+    MACF_UNQUOTED="$out"; return 0
+  fi
+  MACF_UNQUOTED="${r%%[[:space:]]*}"
+  return 0
+}
+
+macf_collect_segment() {
+  local seg="$1" depth="$2"
+  local wre='^[[:space:]]*('"$WRAP_LIST"')*'
+  # Shell reserved words and negation lead a command without changing it
+  # (`if gh ...; then`, `while gh ...; do`, `! gh ...`, `{ gh ...; }`).
+  local kre='^[[:space:]]*(if|then|else|elif|while|until|do|!|\{)([[:space:]]+|$)'
+  local before="" guard=0
+  while [[ "$seg" != "$before" ]] && [[ "$guard" -lt 20 ]]; do
+    before="$seg"; guard=$((guard + 1))
+    if [[ "$seg" =~ $wre ]]; then seg="${seg:${#BASH_REMATCH[0]}}"; fi
+    if [[ "$seg" =~ $kre ]]; then seg="${seg:${#BASH_REMATCH[0]}}"; fi
+  done
+  [[ -z "$seg" ]] && return 0
+  local sre='^(bash|sh|zsh)[[:space:]]+(-[a-zA-Z]+[[:space:]]+)*-[a-zA-Z]*c[[:space:]]+(.*)$'
+  if [[ "$depth" -lt 4 ]] && [[ "$seg" =~ $sre ]]; then
+    macf_unquote_first_word "${BASH_REMATCH[3]}"
+    macf_split_text "$MACF_UNQUOTED" $((depth + 1))
+    return 0
+  fi
+  EFF_CMDS+=("$seg")
+  return 0
+}
+
+# Skips the bodies of the heredocs opened on the line just ended. $1 = text,
+# $2 = index of that newline. Sets MACF_SKIP_TO to the index of the last
+# consumed character; the delimiters come in the HD_DELIMS / HD_STRIPS arrays.
+macf_skip_heredoc_bodies() {
+  local s="$1" i="$2" k line rest cmp
+  rest="${s:i+1}"
+  local consumed=$((i + 1))
+  for ((k = 0; k < ${#HD_DELIMS[@]}; k++)); do
+    while [[ -n "$rest" ]]; do
+      if [[ "$rest" == *$'\n'* ]]; then
+        line="${rest%%$'\n'*}"; rest="${rest#*$'\n'}"; consumed=$((consumed + ${#line} + 1))
+      else
+        line="$rest"; rest=""; consumed=$((consumed + ${#line}))
+      fi
+      cmp="$line"
+      if [[ "${HD_STRIPS[k]}" == "true" ]]; then
+        while [[ "$cmp" == $'\t'* ]]; do cmp="${cmp#$'\t'}"; done
+      fi
+      [[ "$cmp" == "${HD_DELIMS[k]}" ]] && break
+    done
+  done
+  MACF_SKIP_TO=$((consumed - 1))
+  return 0
+}
+
+# Index of the ")" that closes the "(" at $2 in $1, skipping quoted text and
+# nested parens; -1 when unbalanced. Result in MACF_MATCH.
+macf_match_paren() {
+  local s="$1" i="$2" n=${#1} pd=0 c q=""
+  MACF_MATCH=-1
+  while [[ $i -lt $n ]]; do
+    c="${s:i:1}"
+    if [[ "$q" == "s" ]]; then [[ "$c" == "'" ]] && q=""; i=$((i + 1)); continue; fi
+    if [[ "$q" == "d" ]]; then
+      if [[ "$c" == "\\" ]]; then i=$((i + 2)); continue; fi
+      [[ "$c" == '"' ]] && q=""
+      i=$((i + 1)); continue
+    fi
+    case "$c" in
+      "'") q="s" ;;
+      '"') q="d" ;;
+      "\\") i=$((i + 1)) ;;
+      '(') pd=$((pd + 1)) ;;
+      ')') pd=$((pd - 1)); if [[ $pd -eq 0 ]]; then MACF_MATCH=$i; return 0; fi ;;
+    esac
+    i=$((i + 1))
+  done
+  return 0
+}
+
+macf_split_text() {
+  local s="$1" depth="$2" n=${#1} i=0 c nx nx2 cur="" q="" j d strip mm
+  local -a HD_DELIMS=() HD_STRIPS=()
+  while [[ $i -lt $n ]]; do
+    c="${s:i:1}"; nx="${s:i+1:1}"
+    if [[ "$q" == "s" ]]; then
+      cur+="$c"; [[ "$c" == "'" ]] && q=""
+      i=$((i + 1)); continue
+    fi
+    if [[ "$q" == "d" && "$depth" -lt 4 ]]; then
+      # Double quotes stop word splitting, not execution: check what $( ) and ` ` run.
+      if [[ "$c" == '$' && "$nx" == '(' && "${s:i+2:1}" != '(' ]]; then
+        macf_match_paren "$s" $((i + 1))
+        # Save the offset first: the recursive split below reuses MACF_MATCH.
+        mm=$MACF_MATCH
+        if [[ "$mm" -gt $((i + 1)) ]]; then
+          macf_split_text "${s:i+2:mm-i-2}" $((depth + 1))
+          cur+="${s:i:mm-i+1}"; i=$((mm + 1)); continue
+        fi
+      fi
+      if [[ "$c" == '`' ]]; then
+        j=$((i + 1))
+        while [[ $j -lt $n && "${s:j:1}" != '`' ]]; do
+          [[ "${s:j:1}" == "\\" ]] && j=$((j + 1))
+          j=$((j + 1))
+        done
+        if [[ $j -lt $n ]]; then
+          macf_split_text "${s:i+1:j-i-1}" $((depth + 1))
+          cur+="${s:i:j-i+1}"; i=$((j + 1)); continue
+        fi
+      fi
+    fi
+    if [[ "$q" == "a" || "$q" == "d" ]]; then
+      if [[ "$c" == "\\" ]]; then
+        # Inside double quotes a backslash-newline is a line continuation: drop both.
+        if [[ "$q" == "d" && "$nx" == $'\n' ]]; then i=$((i + 2)); continue; fi
+        cur+="$c$nx"; i=$((i + 2)); continue
+      fi
+      cur+="$c"
+      if [[ "$q" == "a" && "$c" == "'" ]] || [[ "$q" == "d" && "$c" == '"' ]]; then q=""; fi
+      i=$((i + 1)); continue
+    fi
+    case "$c" in
+      "'") q="s"; cur+="$c" ;;
+      '"') q="d"; cur+="$c" ;;
+      '$')
+        if [[ "$nx" == "'" ]]; then q="a"; cur+="$c$nx"; i=$((i + 1)); else cur+="$c"; fi ;;
+      "\\")
+        # A backslash-newline is a line continuation, not part of the command: drop both.
+        if [[ "$nx" != $'\n' ]]; then cur+="$c$nx"; fi
+        i=$((i + 1)) ;;
+      '#')
+        if [[ -z "$cur" || "${cur: -1}" == [[:space:]] ]]; then
+          while [[ $i -lt $n && "${s:i:1}" != $'\n' ]]; do i=$((i + 1)); done
+          continue
+        fi
+        cur+="$c" ;;
+      '<')
+        nx2="${s:i+2:1}"
+        if [[ "$nx" == "<" && "$nx2" == "<" ]]; then
+          # A here-string (<<<) is one operator; never read its tail as a heredoc opener.
+          cur+="<<<"; i=$((i + 3)); continue
+        fi
+        if [[ "$nx" == "<" && "$nx2" != "<" ]]; then
+          j=$((i + 2)); strip=false
+          if [[ "${s:j:1}" == "-" ]]; then strip=true; j=$((j + 1)); fi
+          while [[ "${s:j:1}" == " " || "${s:j:1}" == $'\t' ]]; do j=$((j + 1)); done
+          d=""
+          if [[ "${s:j:1}" == "'" || "${s:j:1}" == '"' ]]; then
+            local qc="${s:j:1}"; j=$((j + 1))
+            while [[ $j -lt $n && "${s:j:1}" != "$qc" ]]; do d+="${s:j:1}"; j=$((j + 1)); done
+            j=$((j + 1))
+          else
+            [[ "${s:j:1}" == "\\" ]] && j=$((j + 1))
+            while [[ $j -lt $n && "${s:j:1}" != [[:space:]\;\|\&\(\)\<\>] ]]; do d+="${s:j:1}"; j=$((j + 1)); done
+          fi
+          cur+="${s:i:j-i}"
+          if [[ -n "$d" ]]; then HD_DELIMS+=("$d"); HD_STRIPS+=("$strip"); fi
+          i=$j; continue
+        fi
+        cur+="$c" ;;
+      '&')
+        if [[ "${cur: -1}" == ">" || "${cur: -1}" == "<" || "$nx" == ">" ]]; then
+          cur+="$c"
+        else
+          macf_collect_segment "$cur" "$depth"; cur=""
+        fi ;;
+      ';'|'|'|'('|')') macf_collect_segment "$cur" "$depth"; cur="" ;;
+      $'\n')
+        macf_collect_segment "$cur" "$depth"; cur=""
+        if [[ ${#HD_DELIMS[@]} -gt 0 ]]; then
+          macf_skip_heredoc_bodies "$s" "$i"
+          i=$MACF_SKIP_TO
+          HD_DELIMS=(); HD_STRIPS=()
+        fi ;;
+      *) cur+="$c" ;;
+    esac
+    i=$((i + 1))
+  done
+  macf_collect_segment "$cur" "$depth"
+  return 0
+}
+
+macf_split_text "$COMMAND" 0
+
+# Classify the commands the walk found. COMMENT_SEGS keeps each comment's own
+# text so a comment chained after a create is judged on its own body.
+IS_PR_CREATE=false
+HAS_ISSUE_CREATE=false
+IS_CLOSE_SUBCOMMAND=false
+HAS_BODY_CMD=false
+COMMENT_SEGS=()
+ISSUE_CREATE_SEGS=()
+PR_CREATE_SEGS=()
+gh_cmd_re='^gh[[:space:]]+(issue|pr)[[:space:]]+(comment|close|create)([[:space:]]|$)'
+for eff in ${EFF_CMDS[@]+"${EFF_CMDS[@]}"}; do
+  if [[ "$eff" =~ $gh_cmd_re ]]; then
+    kind_sub="${BASH_REMATCH[1]}"
+    kind_verb="${BASH_REMATCH[2]}"
+    case "$kind_verb" in
+      comment) HAS_BODY_CMD=true; COMMENT_SEGS+=("$eff") ;;
+      create)
+        HAS_BODY_CMD=true
+        if [[ "$kind_sub" == "pr" ]]; then
+          IS_PR_CREATE=true; PR_CREATE_SEGS+=("$eff")
+        else
+          HAS_ISSUE_CREATE=true; ISSUE_CREATE_SEGS+=("$eff")
+        fi ;;
+      close)
+        # `close` without --comment posts no text — nothing to check.
+        if [[ "$eff" =~ --comment ]]; then HAS_BODY_CMD=true; IS_CLOSE_SUBCOMMAND=true; fi ;;
+    esac
+  fi
+done
+if [[ "$HAS_BODY_CMD" != "true" ]]; then
   exit 0
 fi
 
-# Track whether this is a `close` subcommand. Check A
-# (must-have-mention; macf#244) does NOT apply to close subcommands —
+# Check A (must-have-mention; macf#244) does NOT apply to close subcommands —
 # self-close verification comments are canonically no-recipient
 # (reporter-internal verification per coordination.md §Issue Lifecycle 1
 # case 2 self-close pattern: "Verified on main after PR #M merged.
@@ -135,26 +387,17 @@ fi
 # signal, not a routing-active comment requiring an addressed @mention.
 # Check B (must-not-leak; describing-context) still applies on close
 # subcommands — leak prevention is independent of recipient semantics.
-IS_CLOSE_SUBCOMMAND=false
-if [[ "$COMMAND" =~ gh[[:space:]]+(issue|pr)[[:space:]]+close ]]; then
-  IS_CLOSE_SUBCOMMAND=true
-fi
 
 # ── `create`-subcommand + assignee-label discriminator (macf#1091) ────────
 # See the file-header "`create` coverage" section for the full 4-case
 # rationale. Computed here (before the --body-file dispatch below) because
 # the branch-3 warning also needs to know whether Check A applies.
-IS_CREATE_SUBCOMMAND=false
-if [[ "$COMMAND" =~ gh[[:space:]]+(issue|pr)[[:space:]]+create ]]; then
-  IS_CREATE_SUBCOMMAND=true
-fi
-
 # `gh pr create` is tracked separately from `gh issue create` because case 4
 # ("no confirmed routing signal → BLOCK") does NOT extend to it — see the
 # CHECK_A_APPLIES computation below for why.
-IS_PR_CREATE=false
-if [[ "$COMMAND" =~ gh[[:space:]]+pr[[:space:]]+create ]]; then
-  IS_PR_CREATE=true
+IS_CREATE_SUBCOMMAND=false
+if [[ "$IS_PR_CREATE" == "true" || "$HAS_ISSUE_CREATE" == "true" ]]; then
+  IS_CREATE_SUBCOMMAND=true
 fi
 
 # Extracts every --label/-l VALUE (comma-split, one wrapping-quote layer
@@ -208,18 +451,46 @@ macf_extract_labels() {
 # to be known and different from it. Every state the hook can't positively
 # resolve to case 1 or case 2 blocks — ambiguity defaults to BLOCK, not
 # ALLOW, per the operator's ruling.
-CREATE_HAS_BACKLOG_LABEL=false
-CREATE_CONFIRMED_PEER_LABEL=false
-CREATE_CONFIRMED_SELF_LABEL=false
-CREATE_MATCHED_LABELS=""
-if [[ "$IS_CREATE_SUBCOMMAND" == "true" ]]; then
+# Judged for one create segment at a time ($1), so one create's labels never
+# vouch for another create in the same command.
+macf_eval_labels() {
+  local text="$1"
+  CREATE_HAS_BACKLOG_LABEL=false
+  CREATE_CONFIRMED_PEER_LABEL=false
+  CREATE_CONFIRMED_SELF_LABEL=false
+  CREATE_MATCHED_LABELS=""
+  if true; then
   PROJECT_DIR="${CLAUDE_PROJECT_DIR:-}"
   if [[ -z "$PROJECT_DIR" ]]; then
     PROJECT_DIR="$(jq -r '.cwd // ""' <<<"$INPUT_JSON" 2>/dev/null || echo "")"
   fi
   AGENT_CONFIG_PATH="${PROJECT_DIR:+$PROJECT_DIR/.github/agent-config.json}"
   ROUTING_LABELS=()
+  REGISTRY_READABLE=false
+  # The target repo is this workspace's own unless --repo/-R names another
+  # one; the registry read below belongs to this workspace's repo only.
+  TARGET_IS_OWN=true
+  repo_re='(^|[[:space:]])(--repo|-R)(=|[[:space:]]+)([^[:space:]]+)'
+  if [[ "$text" =~ $repo_re ]]; then
+    target_repo="${BASH_REMATCH[4]}"
+    target_repo="${target_repo%\"}"; target_repo="${target_repo#\"}"
+    target_repo="${target_repo%\'}"; target_repo="${target_repo#\'}"
+    origin_url=""
+    if [[ -n "$PROJECT_DIR" ]]; then
+      origin_url="$(git -C "$PROJECT_DIR" remote get-url origin 2>/dev/null || true)"
+    fi
+    origin_url="${origin_url%.git}"
+    origin_name="${origin_url##*[:/]}"
+    origin_rest="${origin_url%/*}"
+    origin_repo="${origin_rest##*[:/]}/$origin_name"
+    lower_target="$(printf '%s' "$target_repo" | tr '[:upper:]' '[:lower:]')"
+    lower_origin="$(printf '%s' "$origin_repo" | tr '[:upper:]' '[:lower:]')"
+    if [[ -z "$origin_url" ]] || [[ "$lower_target" != "$lower_origin" ]]; then
+      TARGET_IS_OWN=false
+    fi
+  fi
   if [[ -n "$AGENT_CONFIG_PATH" ]] && [[ -f "$AGENT_CONFIG_PATH" ]] && [[ -r "$AGENT_CONFIG_PATH" ]]; then
+    REGISTRY_READABLE=true
     # Registry keys = this fleet's actual routing labels (repo-specific;
     # never hardcoded — see repo-init.ts, the file's writer, and the
     # router that reads it the same way).
@@ -237,7 +508,7 @@ if [[ "$IS_CREATE_SUBCOMMAND" == "true" ]]; then
   EXTRACTED_LABELS=()
   while IFS= read -r tok; do
     [[ -n "$tok" ]] && EXTRACTED_LABELS+=("$tok")
-  done < <(macf_extract_labels "$COMMAND")
+  done < <(macf_extract_labels "$text")
 
   if [[ "${#EXTRACTED_LABELS[@]}" -gt 0 ]]; then
     # `backlog` detection is registry-independent — it's a fixed literal
@@ -247,14 +518,37 @@ if [[ "$IS_CREATE_SUBCOMMAND" == "true" ]]; then
       [[ "$tok" == "backlog" ]] && CREATE_HAS_BACKLOG_LABEL=true
     done
 
+    # The self check needs no registry: if your own label is the only one
+    # that could name an agent, the router skips it and nobody else is named.
+    # Another label could be an agent's unless a registry that covers this
+    # repo proves it is not; without that proof, warn rather than block.
+    if [[ -n "${MACF_ROUTING_LABEL:-}" ]]; then
+      self_present=false
+      other_agentish=false
+      for tok in "${EXTRACTED_LABELS[@]}"; do
+        if [[ "$tok" == "${MACF_ROUTING_LABEL}" ]]; then
+          self_present=true
+        elif [[ "$tok" != "backlog" ]]; then
+          if [[ "$REGISTRY_READABLE" == "true" ]] && [[ "$TARGET_IS_OWN" == "true" ]]; then
+            for rl in ${ROUTING_LABELS[@]+"${ROUTING_LABELS[@]}"}; do
+              [[ "$tok" == "$rl" ]] && other_agentish=true
+            done
+          else
+            other_agentish=true
+          fi
+        fi
+      done
+      if [[ "$self_present" == "true" ]] && [[ "$other_agentish" == "false" ]]; then
+        CREATE_CONFIRMED_SELF_LABEL=true
+      fi
+    fi
+
     if [[ "${#ROUTING_LABELS[@]}" -gt 0 ]]; then
       for tok in "${EXTRACTED_LABELS[@]}"; do
         for rl in "${ROUTING_LABELS[@]}"; do
           if [[ "$tok" == "$rl" ]]; then
             CREATE_MATCHED_LABELS+="${CREATE_MATCHED_LABELS:+, }$tok"
-            if [[ -n "${MACF_ROUTING_LABEL:-}" ]] && [[ "$tok" == "${MACF_ROUTING_LABEL}" ]]; then
-              CREATE_CONFIRMED_SELF_LABEL=true
-            elif [[ -n "${MACF_ROUTING_LABEL:-}" ]]; then
+            if [[ -n "${MACF_ROUTING_LABEL:-}" ]] && [[ "$tok" != "${MACF_ROUTING_LABEL}" ]] && [[ "$TARGET_IS_OWN" == "true" ]]; then
               CREATE_CONFIRMED_PEER_LABEL=true
             fi
             # $MACF_ROUTING_LABEL unset: a real assignee label matched, but
@@ -266,42 +560,98 @@ if [[ "$IS_CREATE_SUBCOMMAND" == "true" ]]; then
       done
     fi
   fi
-fi
+  fi
+}
 
 # CHECK_A_APPLIES replaces the old close-only gate on the must-have-mention
 # check (macf#244): close subcommands never require one (self-close verify
 # is reporter-internal — see IS_CLOSE_SUBCOMMAND above); a `create` requires
 # one in cases 3 and 4 (see above); every other subcommand this hook guards
 # (comment) is unchanged — always applies.
-CHECK_A_APPLIES=true
-if [[ "$IS_CLOSE_SUBCOMMAND" == "true" ]]; then
-  CHECK_A_APPLIES=false
-elif [[ "$IS_CREATE_SUBCOMMAND" == "true" ]]; then
-  if [[ "$CREATE_HAS_BACKLOG_LABEL" == "true" ]]; then
-    CHECK_A_APPLIES=false  # case 1: backlog — declared, deliberately unrouted
-  elif [[ "$CREATE_CONFIRMED_PEER_LABEL" == "true" ]]; then
-    CHECK_A_APPLIES=false  # case 2: confirmed routed to a different agent
-  elif [[ "$CREATE_CONFIRMED_SELF_LABEL" == "true" ]]; then
-    CHECK_A_APPLIES=true   # case 3: confirmed self-label — blocks for BOTH
-                            # issue and PR creates (route-by-label really is
-                            # a no-op either way)
-  elif [[ "$IS_PR_CREATE" == "true" ]]; then
-    # Case 4 does NOT extend to `gh pr create`. A PR isn't ambiguous the
-    # way an issue is: it has no "backlog" concept, and its actual routing
-    # signal is the pull_request_review state-change event
-    # (route-by-pr-review-state) plus a separately-mentioned issue
-    # comment — NOT the PR body (pr-discipline.md). agent-identity.md's
-    # canonical "Finishing Work" flow creates every PR unlabeled with
-    # `--body "Refs #<N>"` and no mention; blocking that here would break
-    # every PR the fleet creates, and the override can't fix it mid-session
-    # (MACF_SKIP_MENTION_CHECK is launch-time-only per this hook's own
-    # message below) — an unrecoverable-until-relaunch failure mode far
-    # worse than the gap this fix closes. So case 4 blocks only
-    # `gh issue create`.
-    CHECK_A_APPLIES=false
+CHECK_A_APPLIES=false
+ISSUE_CREATE_WARNING=""
+# The model never sees stderr on exit 0, so an allow-with-warning goes out
+# as additionalContext JSON on stdout when the hook exits 0.
+macf_emit_warning() {
+  local rc=$?
+  if [[ "$rc" -eq 0 ]] && [[ -n "$ISSUE_CREATE_WARNING" ]]; then
+    jq -n --arg ctx "$ISSUE_CREATE_WARNING" \
+      '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "allow", additionalContext: $ctx}}'
   fi
-  # else: case 4 on `gh issue create` — stays true (block)
+}
+trap macf_emit_warning EXIT
+
+# Each create is judged on its own labels; a close or a comment elsewhere in
+# the command never exempts it.
+macf_judge_issue_create() {
+  local seg="$1" tok joined="" reason="" unrouted=false note
+  macf_eval_labels "$seg"
+  # A new issue routes only by its label (route-by-label); a mention in its
+  # body is never delivered. Unless the label is `backlog` or confirmed for
+  # another agent, the issue reaches no one, with or without a mention.
+  [[ "$CREATE_HAS_BACKLOG_LABEL" == "true" || "$CREATE_CONFIRMED_PEER_LABEL" == "true" ]] && return 0
+  # Block only what the hook can prove undeliverable: no label, a confirmed
+  # self-label, or a readable registry for this repo with no other agent's
+  # label. A label it cannot confirm is allowed with a warning, because the
+  # router reads the target repo's registry.
+  for tok in ${EXTRACTED_LABELS[@]+"${EXTRACTED_LABELS[@]}"}; do
+    [[ -n "${MACF_ROUTING_LABEL:-}" ]] && [[ "$tok" == "${MACF_ROUTING_LABEL}" ]] && continue
+    joined+="${joined:+, }$tok"
+  done
+  if [[ "${#EXTRACTED_LABELS[@]}" -eq 0 ]] || [[ "$CREATE_CONFIRMED_SELF_LABEL" == "true" ]]; then
+    unrouted=true
+  elif [[ "$REGISTRY_READABLE" != "true" ]]; then
+    reason="no .github/agent-config.json in this workspace"
+  elif [[ -z "${MACF_ROUTING_LABEL:-}" ]] && [[ -n "$CREATE_MATCHED_LABELS" ]]; then
+    reason="MACF_ROUTING_LABEL is unset"
+  elif [[ "$TARGET_IS_OWN" != "true" ]]; then
+    reason="--repo is not this workspace's repo"
+  else
+    unrouted=true
+  fi
+  if [[ -n "$reason" ]]; then
+    ISSUE_CREATE_WARNING="The hook could not confirm that any of these labels belongs to another agent: $joined ($reason). If one of them is another agent's label in the target repo, the router delivers the issue. If none is, add one with gh issue edit <N> --add-label <label>; adding a label after the issue exists still routes it."
+  fi
+  [[ "$unrouted" == "true" ]] || return 0
+  if [[ "$CREATE_CONFIRMED_SELF_LABEL" == "true" ]]; then
+    note="The router skips a label applied by the agent it names, so this issue reaches no one."
+  else
+    note="A new issue is routed only by its label, and this one has no label for another agent."
+  fi
+  cat >&2 <<ERR
+BLOCKED by MACF mention-routing-hygiene hook: $note
+A mention in a new issue's body is never delivered, because the router reads mentions only on comments and pull requests.
+
+Create it with a label for the agent who should act, or the "backlog" label
+if it is for later. To ping someone, post a comment with a mention after the
+issue exists.
+
+The override (MACF_SKIP_MENTION_CHECK=1) is operator-only and set at launch.
+ERR
+  exit 2
+}
+for seg in ${ISSUE_CREATE_SEGS[@]+"${ISSUE_CREATE_SEGS[@]}"}; do
+  macf_judge_issue_create "$seg"
+done
+
+# A PR body mention does route (pull_request event), so a PR create needs one
+# only when its own label proves the label alone reaches no one. Case 4 does
+# not extend to a PR: an unlabeled `--body "Refs #N"` is the canonical PR
+# call, its routing signal is the review state, and blocking it cannot be
+# recovered mid-session.
+PR_SELF_LABEL=false
+for seg in ${PR_CREATE_SEGS[@]+"${PR_CREATE_SEGS[@]}"}; do
+  macf_eval_labels "$seg"
+  if [[ "$CREATE_HAS_BACKLOG_LABEL" != "true" ]] && [[ "$CREATE_CONFIRMED_SELF_LABEL" == "true" ]]; then
+    CHECK_A_APPLIES=true; PR_SELF_LABEL=true
+  fi
+done
+# A lone comment needs a mention in its text. Beside a create or a close, each
+# comment is checked on its own body by the chained-comment loop below.
+if [[ "${#COMMENT_SEGS[@]}" -gt 0 ]] && [[ "$IS_CREATE_SUBCOMMAND" != "true" ]] && [[ "$IS_CLOSE_SUBCOMMAND" != "true" ]]; then
+  CHECK_A_APPLIES=true
 fi
+CREATE_CONFIRMED_SELF_LABEL="$PR_SELF_LABEL"
 
 # --body-file handling (groundnuty/macf#944).
 #
@@ -460,6 +810,57 @@ macf_extract_heredoc_body() {
   return 0
 }
 
+HANDLE_PATTERN='@[a-zA-Z][a-zA-Z0-9_-]*[[]bot[]]'
+
+# --- Chained comments: each is judged against its own body -----------------
+# Counts routing-active mentions (not backticked) in the text on stdin.
+macf_count_active() {
+  awk -v pat="$HANDLE_PATTERN" '
+    { l = $0; a = 0
+      while (match(l, pat)) {
+        s = a + RSTART; b = (s > 1) ? substr($0, s - 1, 1) : ""; c = substr($0, s + RLENGTH, 1)
+        if (!(b == "`" && c == "`")) n++
+        l = substr(l, RSTART + RLENGTH); a = s + RLENGTH - 1
+      } }
+    END { print n + 0 }'
+}
+
+# Prints the mention count of one chained comment's own body: its --body-file
+# (readable now, or a quoted heredoc in this command) or else its own text.
+# Prints nothing when its file cannot be resolved.
+macf_chain_segment_count() {
+  local seg="$1" re='--body-file(=|[[:space:]]+)([^[:space:]]+)' raw path body
+  if [[ "$seg" =~ $re ]]; then
+    raw="${BASH_REMATCH[2]}"
+    raw="${raw%\"}"; raw="${raw#\"}"; raw="${raw%\'}"; raw="${raw#\'}"
+    path="$(macf_resolve_path_vars "$raw")"
+    if [[ -n "$path" ]] && [[ -f "$path" ]] && [[ -r "$path" ]]; then
+      macf_count_active <"$path"
+    elif body="$(macf_extract_heredoc_body "$raw" "$COMMAND")"; then
+      macf_count_active <<<"$body"
+    fi
+    return 0
+  fi
+  macf_count_active <<<"$seg"
+}
+
+if [[ "$IS_CREATE_SUBCOMMAND" == "true" || "$IS_CLOSE_SUBCOMMAND" == "true" ]]; then
+  for seg in ${COMMENT_SEGS[@]+"${COMMENT_SEGS[@]}"}; do
+    seg_count="$(macf_chain_segment_count "$seg")"
+    if [[ "$seg_count" == "0" ]]; then
+      cat >&2 <<ERR
+BLOCKED by MACF mention-routing-hygiene hook: A comment chained after the create has no mention. Each chained comment needs its own mention of whoever should read it; neither the create nor the other comments cover it.
+
+Add a line starting with the recipient's handle to that comment's body:
+  @<recipient-handle>[bot] <your message>
+
+The override (MACF_SKIP_MENTION_CHECK=1) is operator-only and set at launch.
+ERR
+      exit 2
+    fi
+  done
+fi
+
 # --- Three-branch dispatch ----------------------------------------------
 
 BODY_FILE_MODE=false
@@ -566,7 +967,6 @@ fi
 # operators can use `MACF_SKIP_MENTION_CHECK=1` for the rare legitimate
 # describing reference. The cost of generalization is small; the
 # benefit (fleet-agnostic protection) is durable.
-HANDLE_PATTERN='@[a-zA-Z][a-zA-Z0-9_-]*[[]bot[]]'
 
 # Single AWK pass produces TWO outputs (line-prefix-discriminated):
 #   - `LEAK:<line_no>: <line>` — describing-context leaks (Check B,
@@ -699,18 +1099,9 @@ fi
 # though the automated guard for it doesn't currently scan shell scripts).
 if [[ "$CHECK_A_APPLIES" == "true" ]] && [[ "$ACTIVE_COUNT" == "0" ]]; then
   CREATE_NOTE=""
-  if [[ "$IS_CREATE_SUBCOMMAND" == "true" ]]; then
-    if [[ "$CREATE_CONFIRMED_SELF_LABEL" == "true" ]]; then
-      CREATE_NOTE="
-This issue or pull request is labeled for you, so routing delivers it to
-you and no one else will see it. Add a mention for whoever should read
-it, or the \"backlog\" label if it's for later."
-    else
-      CREATE_NOTE="
-This issue or pull request has no assignee label, so nothing will route
-it to anyone. Add an assignee label, a mention, or the \"backlog\" label
-if it's deliberately for later."
-    fi
+  if [[ "$IS_CREATE_SUBCOMMAND" == "true" ]] && [[ "$CREATE_CONFIRMED_SELF_LABEL" == "true" ]]; then
+    CREATE_NOTE="
+A label on a pull request does not route; only a mention in its body or in a comment does. Add a mention for whoever should read it."
   fi
   cat >&2 <<ERR
 BLOCKED by MACF mention-routing-hygiene hook: this comment/issue/PR body has
