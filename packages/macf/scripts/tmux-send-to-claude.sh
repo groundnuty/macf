@@ -19,6 +19,13 @@
 #     observable this script verifies, retrying Enter a bounded number of
 #     times.
 #
+# The initial C-u is a best-effort pre-clear only: it is cursor-relative
+# (deletes from the cursor to the start of the line), so a draft with the
+# cursor elsewhere survives and our text is appended to it. Verification
+# therefore checks that the `❯` line CONTAINS the prompt's start anywhere,
+# not that it begins with it. Never use C-c here: it interrupts a busy
+# agent's turn, and on an empty box it arms the session-quit.
+#
 # Usage:
 #   tmux-send-to-claude.sh <session> <prompt>
 #

@@ -50,7 +50,11 @@ mode="$(cat "$D/mode")"
 box() { cat "$D/box" 2>/dev/null || true; }
 case "$cmd" in
   send-keys)
-    if [ "$1" = "C-u" ]; then : > "$D/box"; rm -f "$D/paste"; exit 0; fi
+    if [ "$1" = "C-u" ]; then
+      # cursor-relative: with a stale draft and cursor elsewhere, clears nothing
+      [ -e "$D/stale" ] && exit 0
+      : > "$D/box"; rm -f "$D/paste"; exit 0
+    fi
     if [ "$1" = "-l" ]; then
       shift; [ "$1" = "--" ] && shift
       printf '%s' "$1" >> "$D/box"; exit 0
@@ -190,6 +194,17 @@ describe('tmux-send-to-claude.sh', () => {
     const calls = read('calls');
     expect(calls).toContain('capture-pane');
     expect(calls).not.toMatch(/(^|\s)-t(\s|$)/m);
+  });
+
+  it('stale draft survives C-u: text appended, verify still retries, box ends empty', () => {
+    setup('swallow');
+    writeFileSync(join(dir, 'box'), 'operator draft in progress ');
+    writeFileSync(join(dir, 'stale'), '');
+    const r = run(NEW_SCRIPT, 'agent:0', LONG);
+    expect(r.status).toBe(0);
+    expect(enters()).toBe(2); // first Enter swallowed, retry submitted
+    expect(read('transcript')).toContain('operator draft in progress Please review PR 123');
+    expect(read('box').trim()).toBe('');
   });
 
   it('usage error → exit 2', () => {
