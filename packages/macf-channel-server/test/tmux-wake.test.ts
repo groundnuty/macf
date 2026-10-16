@@ -104,17 +104,17 @@ describe('wakeViaTmux', () => {
     chmodSync(scriptPath, 0o755);
   }
 
-  it('returns false when helper script missing — logs skip reason', () => {
+  it('returns false when helper script missing — logs skip reason', async () => {
     const logger = makeLogger();
     expect(existsSync(scriptPath)).toBe(false);
 
-    const result = wakeViaTmux('hello', { workspaceDir, session: 'cv-project', logger });
+    const result = await wakeViaTmux('hello', { workspaceDir, session: 'cv-project', logger });
     expect(result).toBe(false);
     expect(logger.events.map(e => e.event)).toContain('tmux_wake_skipped');
     expect(logger.events[0]?.data['reason']).toBe('helper_missing');
   });
 
-  it('returns false when target cannot be resolved (no session + no tmux env)', () => {
+  it('returns false when target cannot be resolved (no session + no tmux env)', async () => {
     installHelper('#!/bin/sh\nexit 0\n');
     const logger = makeLogger();
     // No session passed; rely on resolveTmuxTarget's auto-detect, which
@@ -126,7 +126,7 @@ describe('wakeViaTmux', () => {
     delete process.env['TMUX'];
     delete process.env['TMUX_PANE'];
     try {
-      const result = wakeViaTmux('hello', { workspaceDir, logger });
+      const result = await wakeViaTmux('hello', { workspaceDir, logger });
       expect(result).toBe(false);
       const skipEvent = logger.events.find(e => e.event === 'tmux_wake_skipped');
       expect(skipEvent).toBeDefined();
@@ -137,7 +137,7 @@ describe('wakeViaTmux', () => {
     }
   });
 
-  it('shells out to helper with session target + prompt as separate argv', () => {
+  it('shells out to helper with session target + prompt as separate argv', async () => {
     // Helper records its argv to a file for inspection.
     const argLog = join(workspaceDir, 'args.log');
     installHelper(
@@ -145,7 +145,7 @@ describe('wakeViaTmux', () => {
     );
     const logger = makeLogger();
 
-    const result = wakeViaTmux('Pick up issue #42', {
+    const result = await wakeViaTmux('Pick up issue #42', {
       workspaceDir,
       session: 'cv-project',
       window: 'cv-architect',
@@ -164,11 +164,11 @@ describe('wakeViaTmux', () => {
     expect(deliveredEvent?.data['prompt_length']).toBe('Pick up issue #42'.length);
   });
 
-  it('returns false on non-zero helper exit + logs stderr snippet', () => {
+  it('returns false on non-zero helper exit + logs stderr snippet', async () => {
     installHelper('#!/bin/sh\necho "tmux: session not found" >&2\nexit 1\n');
     const logger = makeLogger();
 
-    const result = wakeViaTmux('x', { workspaceDir, session: 'missing', logger });
+    const result = await wakeViaTmux('x', { workspaceDir, session: 'missing', logger });
     expect(result).toBe(false);
     const failEvent = logger.events.find(e => e.event === 'tmux_wake_failed');
     expect(failEvent).toBeDefined();
@@ -177,9 +177,9 @@ describe('wakeViaTmux', () => {
     expect(String(failEvent?.data['stderr'])).toContain('tmux: session not found');
   });
 
-  it('passes prompts with shell-metacharacters safely (argv boundary, no shell)', () => {
+  it('passes prompts with shell-metacharacters safely (argv boundary, no shell)', async () => {
     // If the helper were invoked via `sh -c "script $prompt"` the
-    // metacharacters would execute. Because spawnSync uses execvp
+    // metacharacters would execute. Because spawn uses execvp
     // semantics with an argv array, the string is opaque to the shell.
     const argLog = join(workspaceDir, 'args.log');
     installHelper(
@@ -188,7 +188,7 @@ describe('wakeViaTmux', () => {
     const logger = makeLogger();
 
     const nastyPrompt = `; rm -rf /tmp/\`whoami\`; echo "$(cat /etc/hostname)" && touch /tmp/pwned`;
-    const result = wakeViaTmux(nastyPrompt, { workspaceDir, session: 't', logger });
+    const result = await wakeViaTmux(nastyPrompt, { workspaceDir, session: 't', logger });
     expect(result).toBe(true);
 
     const args = require('node:fs').readFileSync(argLog, 'utf-8').trim().split('\n');

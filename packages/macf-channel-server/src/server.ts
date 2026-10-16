@@ -318,7 +318,10 @@ async function main(): Promise<void> {
       // Use the formatted content as the wake prompt — same text
       // Claude would see via the MCP channel, just delivered
       // through the input buffer path so it becomes an actual turn.
-      wakeViaTmux(content, {
+      // macf#1491: not awaited — the wake takes seconds and /notify must
+      // answer once the message is pushed. wakeViaTmux never rejects and
+      // logs its own outcome.
+      void wakeViaTmux(content, {
         workspaceDir: config.workspaceDir,
         session: config.tmuxSession,
         window: config.tmuxWindow,
