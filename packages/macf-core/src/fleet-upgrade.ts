@@ -87,6 +87,7 @@
 import { compareSemver } from './semver.js';
 import type { FleetDriver, FleetState } from './fleet-driver.js';
 import type { WorkspaceRecord } from './discovery.js';
+import { PROMPT_RESPONSES_SEED, looksPromptLike } from './prompt-responses.js';
 import type { VerifyGreenOptions, VerifyGreenResult } from './verify-green.js';
 
 /**
@@ -260,8 +261,22 @@ export type RollOutcome =
  *                             older/mixed-version fleet without that field
  *                             falls straight through to the `bad-release` /
  *                             `stale-pin` pin-check below, UNCHANGED.
+ * - `stuck-at-launch-prompt` — (macf#1478, NEW) the relaunched agent's pane shows
+ *                             a launch prompt that is still waiting for an
+ *                             answer (a known launch ceremony, Claude Code's
+ *                             trust dialog, or an unrecognised numbered menu /
+ *                             `(y/n)` frame). The pane is positive evidence of
+ *                             WHY the target version never confirmed, so the
+ *                             halt names that cause — never a bad release.
+ *                             Terminal; `outcome: 'halted'`. Remedy: clear the
+ *                             prompt in the named pane, then re-run.
  */
-export type HaltReason = 'bad-release' | 'relaunch-unconfirmed' | 'stale-pin' | 'not-yet-serving';
+export type HaltReason =
+  | 'bad-release'
+  | 'relaunch-unconfirmed'
+  | 'stale-pin'
+  | 'not-yet-serving'
+  | 'stuck-at-launch-prompt';
 
 /** The per-agent EXECUTE result. `detail` carries a human-readable summary. */
 export interface AgentRollResult {
@@ -684,7 +699,42 @@ type HaltClassification =
   | { readonly reason: 'relaunch-unconfirmed'; readonly detail: string }
   | { readonly reason: 'bad-release'; readonly detail: string; readonly pin: string | null }
   | { readonly reason: 'stale-pin'; readonly detail: string; readonly pin: string }
-  | { readonly reason: 'not-yet-serving'; readonly detail: string; readonly instanceId: string };
+  | { readonly reason: 'not-yet-serving'; readonly detail: string; readonly instanceId: string }
+  | { readonly reason: 'stuck-at-launch-prompt'; readonly detail: string };
+
+/**
+ * Name the launch prompt a pane is sitting at, or `null` when none shows
+ * (macf#1478). Matches the seeded launch ceremonies, Claude Code's trust
+ * dialog, and any numbered-menu / `(y/n)` frame (`looksPromptLike`).
+ * Pure.
+ */
+export function detectLaunchPrompt(pane: string | null): string | null {
+  if (!pane) return null;
+  for (const entry of PROMPT_RESPONSES_SEED.entries) {
+    if (entry.frame_contains.every((needle) => pane.includes(needle))) return entry.name;
+  }
+  if (/do you trust/i.test(pane)) return 'trust-dialog';
+  return looksPromptLike(pane) ? 'unrecognised-prompt' : null;
+}
+
+/** Read the pane and classify it; a failed read is "no evidence", never a throw. */
+async function stuckAtPrompt(agent: string, driver: FleetDriver): Promise<HaltClassification | null> {
+  let prompt: string | null;
+  try {
+    prompt = detectLaunchPrompt(await driver.capturePane(agent));
+  } catch {
+    return null;
+  }
+  if (prompt === null) return null;
+  return {
+    reason: 'stuck-at-launch-prompt',
+    detail:
+      `stuck-at-launch-prompt: ${agent}'s pane is waiting at a launch prompt (${prompt}), so ` +
+      `the relaunched agent never came up at the target version. This is NOT a bad release. ` +
+      `Remedy: attach to ${agent}'s tmux session, answer or clear the prompt, then re-run the ` +
+      `upgrade. Halting the roll so the stuck agent is cleared before the next one is touched.`,
+  };
+}
 
 /**
  * Classify a failed verify-green against the agent's PRE-upgrade running
@@ -777,6 +827,8 @@ async function classifyHalt(
     compareSemver(green.lastVersion, oldVersion) === 0;
 
   if (!confirmedOldVersion) {
+    const stuck = await stuckAtPrompt(agent, driver);
+    if (stuck) return stuck;
     return { reason: 'relaunch-unconfirmed', detail: `relaunch-unconfirmed: ${base}` };
   }
 
@@ -800,6 +852,11 @@ async function classifyHalt(
       instanceId: oldInstanceId,
     };
   }
+
+  // macf#1478 — a pane waiting at a launch prompt explains the old version
+  // better than a bad release does; check it before the pin.
+  const stuck = await stuckAtPrompt(agent, driver);
+  if (stuck) return stuck;
 
   // macf#899 — POSITIVELY confirmed reachable-at-OLD-version (and, whenever
   // instance-id data was available above, confirmed NOT to be the lingering

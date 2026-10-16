@@ -169,6 +169,7 @@ function makeDriver(opts: {
    * explicitly configure a pin.
    */
   launchPin?: (agent: string) => string | null;
+  pane?: (agent: string) => string | null;
   /**
    * Per-agent inspected-workspace path (macf#1101) — omitted by default
    * (mirrors a driver that doesn't implement the OPTIONAL verb at all), so
@@ -236,7 +237,7 @@ function makeDriver(opts: {
     autoResolveCanonical: async (agent, files) => {
       calls.autoResolveCanonical.push({ agent, files });
     },
-    capturePane: async () => null,
+    capturePane: async (agent) => (opts.pane ? opts.pane(agent) : null),
     upgrade: async (agent) => {
       calls.upgrade.push(agent);
       calls.order.push(`upgrade:${agent}`);
@@ -1015,6 +1016,51 @@ describe('rollFleet', () => {
     // the lock in place; it is never released on a halted roll.
     expect(calls.stopHeartbeat).toEqual(['a1']);
     expect(calls.releaseLock).toEqual([]);
+  });
+
+  describe('stuck at a launch prompt (macf#1478)', () => {
+    const DEV_PANE = 'WARNING\n❯ 1. I am using this for local development\n  2. Exit\n';
+
+    it('wrong-version halt with a known launch prompt on the pane → stuck-at-launch-prompt, still halts, not bad-release', async () => {
+      const { driver } = makeDriver({
+        state: mkState([]),
+        workspaces: [],
+        launchPin: (agent) => (agent === 'a1' ? '0.2.41' : null),
+        pane: () => DEV_PANE,
+      });
+      const { verifyGreen } = makeVerify({
+        a1: { ok: false, reason: 'wrong-version', lastVersion: '0.2.40' },
+      });
+      const res = await rollFleet(twoBehind, { targetVersion: '0.2.41', verifyTimeoutMs: 1000 }, {
+        driver,
+        verifyGreen,
+        ...noWait,
+      });
+      expect(res.halted).toBe(true);
+      expect(res.results[0]).toMatchObject({ agent: 'a1', outcome: 'halted', reason: 'stuck-at-launch-prompt' });
+      expect(res.results[0]!.detail).toContain('dev-channels');
+      expect(res.results[0]!.detail).toContain("a1's pane");
+      expect(res.results[0]!.detail).toContain('NOT a bad release');
+      expect(res.results[0]!.detail).not.toContain('CONFIRMED');
+    });
+
+    it('a pane with no prompt keeps the bad-release classification', async () => {
+      const { driver } = makeDriver({
+        state: mkState([]),
+        workspaces: [],
+        launchPin: (agent) => (agent === 'a1' ? '0.2.41' : null),
+        pane: () => '❯ queued message in the input box\n',
+      });
+      const { verifyGreen } = makeVerify({
+        a1: { ok: false, reason: 'wrong-version', lastVersion: '0.2.40' },
+      });
+      const res = await rollFleet(twoBehind, { targetVersion: '0.2.41', verifyTimeoutMs: 1000 }, {
+        driver,
+        verifyGreen,
+        ...noWait,
+      });
+      expect(res.results[0]).toMatchObject({ outcome: 'halted', reason: 'bad-release' });
+    });
   });
 
   describe('launch-pin discrimination (macf#899)', () => {

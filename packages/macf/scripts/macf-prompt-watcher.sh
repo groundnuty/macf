@@ -35,7 +35,19 @@
 # Opt-out: MACF_PROMPT_AUTORESPOND_DISABLED=1 (also gated in claude.sh).
 # Tunables: MACF_PROMPT_RESPONSES_PATH, MACF_PROMPT_WATCH_WINDOW_SECS (default 90),
 #           MACF_PROMPT_WATCH_INTERVAL_SECS (default 1),
-#           MACF_PROMPT_WATCH_TOTAL_CAP_SECS (default 1800 — see below).
+#           MACF_PROMPT_WATCH_TOTAL_CAP_SECS (default 1800 — see below),
+#           MACF_PROMPT_SETTLE_SECS (default 3), MACF_PROMPT_REARM_MAX (default 3).
+#
+# OUTCOME CHECK + RE-ARM (groundnuty/macf#1478): "the signature is absent right
+#   after the send" is not "the prompt is gone" — a transient redraw clears it
+#   for a moment and the SAME prompt comes back. An answer counts as taken only
+#   when the signature stays absent for the whole settle window. If it comes
+#   back inside the window, the answer did not take: the watcher re-sends to
+#   that same allowlisted entry, up to REARM_MAX attempts in total. An entry
+#   whose own signature is on screen is NEVER an unknown prompt (Inv 1 is about
+#   frames that match no entry); one that exhausts its attempts alerts as
+#   "did not take" and is still not classified UNKNOWN. A frame that matches no
+#   entry is still alerted and never answered; Inv 2 and Inv 3 are untouched.
 #
 # DEADLINE MODEL (groundnuty/macf#1041 — fixes the #994-discovered defect below):
 #   the pre-#1041 deadline was `launch + WINDOW`, computed ONCE at watcher
@@ -153,6 +165,12 @@ INTERVAL="${MACF_PROMPT_WATCH_INTERVAL_SECS:-1}"
 # recomputing it. See the file header "DEADLINE MODEL" section.
 TOTAL_CAP="${MACF_PROMPT_WATCH_TOTAL_CAP_SECS:-1800}"
 case "$TOTAL_CAP" in ''|*[!0-9]*) TOTAL_CAP=1800 ;; esac
+# Outcome-check tunables (macf#1478): how long the signature must stay absent
+# for an answer to count as taken, and the total send attempts per prompt.
+SETTLE="${MACF_PROMPT_SETTLE_SECS:-3}"
+case "$SETTLE" in ''|*[!0-9.]*) SETTLE=3 ;; esac
+REARM_MAX="${MACF_PROMPT_REARM_MAX:-3}"
+case "$REARM_MAX" in ''|*[!0-9]*|0) REARM_MAX=3 ;; esac
 # Never let the cap collapse below the base window. Without this floor,
 # MACF_PROMPT_WATCH_TOTAL_CAP_SECS=0 (or any value under WINDOW) would make
 # HARD_DEADLINE <= launch time, so the poll loop's very first condition is
@@ -230,7 +248,7 @@ _option_on_send_line() {
 
 # --- load + Inv-2-filter the accepted allowlist ------------------------------
 # Parallel arrays, one slot per ACCEPTED entry.
-ACC_NAME=(); ACC_OPT=(); ACC_SEND=(); ACC_VERIFY=(); ACC_MAXFIRES=(); ACC_FC=(); FIRED=()
+ACC_NAME=(); ACC_OPT=(); ACC_SEND=(); ACC_VERIFY=(); ACC_MAXFIRES=(); ACC_FC=(); FIRED=(); EXHAUSTED=()
 
 n="$(jq '.entries | length' "$CONFIG" 2>/dev/null || echo 0)"
 i=0
@@ -261,7 +279,7 @@ while [ "$i" -lt "$n" ]; do
   fi
 
   ACC_NAME+=("$name"); ACC_OPT+=("$opt"); ACC_SEND+=("$send")
-  ACC_VERIFY+=("$verify"); ACC_MAXFIRES+=("$maxf"); ACC_FC+=("$fc"); FIRED+=(0)
+  ACC_VERIFY+=("$verify"); ACC_MAXFIRES+=("$maxf"); ACC_FC+=("$fc"); FIRED+=(0); EXHAUSTED+=(0)
 done
 
 if [ "${#ACC_NAME[@]}" -eq 0 ]; then
@@ -360,30 +378,34 @@ _handle_match() { # <frame> <idx>
   local frame2; frame2="$(_capture)"
   _entry_matches "$frame2" "$idx" || { _log INFO "entry \"$name\" matched but frame not yet stable — deferring"; return 0; }
 
-  _log INFO "auto-answering \"$name\": sending \"$send\" to pane $PANE"
-  if ! _send_ordinal_and_maybe_enter "$idx"; then
-    _alert "send-keys failed for \"$name\""
-    FIRED[$idx]=$((FIRED[idx] + 1))
-    return 0
-  fi
-
-  FIRED[$idx]=$((FIRED[idx] + 1))
-  local after; after="$(_capture)"
-
-  # Verify the RIGHT outcome (DR-033). "Cleared" != "correctly answered".
-  if _entry_matches "$after" "$idx"; then
-    # Not cleared — typed-but-no-effect (RC "typed-no-Enter", silent-fallback
-    # Instance 3). One retry, with the SAME re-check guard as the first
-    # attempt (macf#891), then alert + stop (fire cap protects against loops).
-    _log WARN "\"$name\" still present after send — retrying once"
-    _send_ordinal_and_maybe_enter "$idx" || true
-    after="$(_capture)"
-    if _entry_matches "$after" "$idx"; then
-      _alert "\"$name\" did NOT clear after auto-answer (typed-no-Enter?) — will not retry further"
+  local attempt=0 taken=0 after=""
+  while [ "$attempt" -lt "$REARM_MAX" ]; do
+    attempt=$((attempt + 1))
+    _log INFO "auto-answering \"$name\": sending \"$send\" to pane $PANE (attempt $attempt/$REARM_MAX)"
+    if ! _send_ordinal_and_maybe_enter "$idx"; then
+      _alert "send-keys failed for \"$name\""
+      FIRED[$idx]=$((FIRED[idx] + 1))
       return 0
     fi
-  fi
+    # Outcome check (macf#1478): taken only if the signature STAYS absent for
+    # the whole settle window. A redraw that blinks it out proves nothing.
+    if _settled_clear "$idx"; then
+      taken=1
+      break
+    fi
+    _log WARN "\"$name\" signature is back within ${SETTLE}s of the answer — it did not take; re-arming"
+  done
+  FIRED[$idx]=$((FIRED[idx] + 1))
 
+  if [ "$taken" -ne 1 ]; then
+    EXHAUSTED[$idx]=1
+    FIRED[$idx]=${ACC_MAXFIRES[$idx]}
+    _alert "\"$name\" did NOT clear after $REARM_MAX auto-answer attempts (typed-no-Enter?) — will not retry further; clear the prompt by hand"
+    return 0
+  fi
+  after="$(_capture)"
+
+  # Verify the RIGHT outcome (DR-033). "Cleared" != "correctly answered".
   if [ -n "$verify" ]; then
     if printf '%s' "$after" | grep -qF -- "$verify"; then
       _log INFO "\"$name\" verified: post-answer screen contains expected marker"
@@ -391,8 +413,22 @@ _handle_match() { # <frame> <idx>
       _alert "\"$name\" cleared but the expected post-answer marker is ABSENT — possible WRONG answer (verify the pane)"
     fi
   else
-    _log WARN "\"$name\" cleared, but no verify_contains configured — outcome check is signature-clearance only (weaker; set verify_contains for full verification)"
+    _log INFO "\"$name\" cleared and stayed clear for ${SETTLE}s (settle-window outcome check)"
   fi
+}
+
+# _settled_clear <idx> → 0 if the entry's signature stays ABSENT across the
+# whole settle window; 1 as soon as it reappears (the answer did not take).
+_settled_clear() { # <idx>
+  local idx="$1" t0 now cur
+  t0="$(date +%s.%N 2>/dev/null || date +%s)"
+  while :; do
+    cur="$(_capture)"
+    _entry_matches "$cur" "$idx" && return 1
+    now="$(date +%s.%N 2>/dev/null || date +%s)"
+    awk -v n="$now" -v t="$t0" -v w="$SETTLE" 'BEGIN { exit (n - t >= w) ? 0 : 1 }' && return 0
+    sleep 0.3
+  done
 }
 
 # _prompt_signature <frame> → just the lines that make the frame look like a
@@ -499,7 +535,20 @@ while [ "$(date +%s 2>/dev/null || echo "$deadline")" -lt "$deadline" ]; do
   if [ -n "$frame" ]; then
     matched=0
     for idx in "${!ACC_NAME[@]}"; do
-      [ "${FIRED[$idx]}" -ge "${ACC_MAXFIRES[$idx]}" ] && continue
+      if [ "${FIRED[$idx]}" -ge "${ACC_MAXFIRES[$idx]}" ]; then
+        # Fire cap spent. If this entry's own signature is still on screen it
+        # is NOT an unknown prompt (macf#1478): say what it is, once, and do
+        # not answer again.
+        if [ "${EXHAUSTED[$idx]}" -eq 1 ] && _entry_matches "$frame" "$idx"; then
+          matched=1
+          if [ "$LAST_UNKNOWN" != "exhausted-$idx" ]; then
+            LAST_UNKNOWN="exhausted-$idx"
+            _log INFO "\"${ACC_NAME[$idx]}\" is still on screen after its attempts were spent — not answering again"
+          fi
+          break
+        fi
+        continue
+      fi
       if _entry_matches "$frame" "$idx"; then
         matched=1
         _handle_match "$frame" "$idx"
