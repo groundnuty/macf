@@ -4,6 +4,30 @@ All notable changes to the `macf` CLI. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.65] — 2026-10-16
+
+**The canonical rules every agent loads shrink from about 331,000 to 20,670 characters and are rewritten for the Claude 5 family. Idle compaction is turned off everywhere.**
+
+### Changed
+
+- **The canonical rules are rewritten for the Claude 5 family and loaded only where they apply.** Every agent previously loaded about 331k characters of rules at session start, more than double Claude Code's 150k instruction budget. Most of that was incident history rather than instructions. The always-loaded set is now 20,670 characters, written to Claude Code's own prompt-audit guidance: what to do first, a one-clause reason for each constraint, no emphasis inflation, no provenance. Text injected into Claude's context was reviewed by a Claude model throughout. (#1467, #1471, #1472, #1473, #1474)
+  - `silent-fallback-hazards.md` keeps its name and its "Instance N" citations through an index; the 21-instance catalogue moves verbatim to `design/silent-fallback-catalog.md`, guarded by a sync test. (#1467)
+  - The testing rules and the observability rule load only when a test, launcher or env file is touched (`paths:` frontmatter). (#1471)
+  - The PR, mention and token rules shrink to the facts their hooks cannot enforce, plus a pointer to each hook. The token rule owns the mint procedure: mint in the same Bash call that uses the token, because Bash calls do not share variables. (#1472)
+  - `check-before-propose.md` folds into `verify-before-claim.md`, `execute-on-directive.md` into `peer-dynamic.md`, and `codify-at-correction-time.md` into `reflection-staging.md`. The Opus 4.7-era `model-era-compatibility.md` leaves distribution for a design note. All four are retired: `macf update` removes their managed copies from each workspace. (#1473, #1474)
+  - Contradictions between rules are resolved. Merge state: merge `main` into the branch, never force-push. Directives: act on the operator's, or on the agent that assigned the work, not any peer's. A new issue routes by its label; a mention in its body does not.
+- **The agent templates write comment bodies to a temporary file with a quoted heredoc.** The previous `--body "@…` form was blocked by the mention hook. (#1472)
+- **The token hook's block messages ask the operator to relaunch** rather than suggesting a mint that cannot clear the block. They no longer execute a backticked `ghs_` as a command. (#1472)
+
+### Added
+
+- **The rules writer keeps frontmatter on top and can retire rules.** The managed header goes after a leading `---` block, so `paths:` scoping survives distribution. A new `RETIRED_CANONICAL_RULES` list deletes a retired workspace copy only when it carries the managed header, only inside `.claude/rules/`, and only when the canonical-overwrite guard lets the copy run. Operator-authored files are kept, with a warning. `doctor` reports a managed leftover, and `--fix` removes it. (#1469)
+
+### Fixed
+
+- **Idle compaction is off in every MACF workspace.** Claude Code 2.1.299 compacts a 200K+ token conversation that has been idle about 54 minutes, and fleet agents idle while they wait for routed work. `init`, `update`, `rules refresh` and `doctor --fix` write `"idleCompaction": false`, enforced with no opt-out. The canonical-settings computation applies the same transform, and `doctor --fix` repairs it on its own trigger. (#1464)
+- **A bare `"mcp__*"` allow rule no longer stalls agents at a blocking settings dialog.** Claude Code rejects a glob before a literal `mcp__<server>__` prefix and prompts at startup, which stopped every spawned subagent until a human clicked. The settings writer strips such allow entries (deny and ask are left alone), and `doctor --fix` repairs them. (#1468)
+
 ## [0.2.64] — 2026-10-16
 
 **The follow-through on the first cross-agent delivery: every defect it exposed, each found live and cross-reviewed.**
