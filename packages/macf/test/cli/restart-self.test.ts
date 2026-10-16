@@ -24,6 +24,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import {
   buildRelauncherScript,
   buildResumeNote,
+  createRealDeps,
   coerceReason,
   relauncherGuardLines,
   resolveIdentity,
@@ -688,6 +689,61 @@ describe('runRestartSelf — macf#888 identity-source + conflict surfacing', () 
     const err = errSpy.mock.calls.flat().join('\n');
     expect(err).toContain('/my/caller/workspace');
     expect(err).toContain('cannot resolve the tmux session');
+  });
+});
+
+describe('files macf writes do not count as dirt (dry run + note)', () => {
+  let logSpy: ReturnType<typeof vi.spyOn>;
+  afterEach(() => logSpy?.mockRestore());
+
+  function repoWithDirtyGitignoreOnly(): string {
+    const dir = tempWorkspace();
+    const g = (...a: string[]) => spawnSync('git', a, { cwd: dir });
+    g('init', '--initial-branch=main');
+    g('config', 'user.email', 't@example.com');
+    g('config', 'user.name', 't');
+    writeFileSync(join(dir, '.gitignore'), 'a\n');
+    g('add', '-A');
+    g('commit', '-m', 'init', '--no-verify');
+    writeFileSync(join(dir, '.gitignore'), 'a\n.macf/\n');
+    return dir;
+  }
+
+  it('only .gitignore dirty: dry run says nothing would be stashed and the note says nothing was stashed', async () => {
+    const dir = repoWithDirtyGitignoreOnly();
+    try {
+      logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const { deps } = fakeDeps();
+      const real = createRealDeps(dir);
+      expect(real.hasUncommittedTrackedChanges()).toBe(false);
+      await runRestartSelf(baseOpts({ dryRun: true }), {
+        ...deps,
+        hasUncommittedTrackedChanges: real.hasUncommittedTrackedChanges,
+      });
+      expect(logSpy.mock.calls.flat().join('\n')).toContain('would stash:   no');
+      const note = buildResumeNote({ reason: 'manual', iso: FIXED_NOW.toISOString(), branch: 'main', head: 'sha', stashRef: null });
+      expect(note).toContain(
+        'Nothing was stashed. Files macf writes (.gitignore, .claude/audit.log) stay in the working tree; resume your task.',
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a real tracked change still counts as dirt', () => {
+    const dir = repoWithDirtyGitignoreOnly();
+    try {
+      writeFileSync(join(dir, 'other.txt'), 'x');
+      spawnSync('git', ['add', 'other.txt'], { cwd: dir });
+      expect(createRealDeps(dir).hasUncommittedTrackedChanges()).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('the stashed note names the exception and keeps the recover command', () => {
+    const note = buildResumeNote({ reason: 'manual', iso: FIXED_NOW.toISOString(), branch: 'main', head: 'sha', stashRef: 'stash@{0}' });
+    expect(note).toContain('were stashed, except files macf writes, which stay in the working tree. Recover with `git stash apply stash@{0}`');
   });
 });
 

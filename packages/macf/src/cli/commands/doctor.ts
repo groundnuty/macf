@@ -2553,15 +2553,34 @@ export function checkDiskSpace(
  */
 export interface MacfIgnoreCheckResult {
   readonly status: 'PASS' | 'WARN' | 'UNKNOWN';
+  /** Paths `git check-ignore` does not ignore and that are neither tracked nor re-included. */
   readonly findings: readonly string[];
+  /** Paths already tracked by git; ignore rules cannot apply, `--fix` cannot repair them. */
+  readonly tracked: readonly string[];
+  /** Untracked paths still not ignored although the macf block is present (a `!` re-include). */
+  readonly reincluded: readonly string[];
   readonly detail: string;
 }
 
 const MACF_IGNORE_PROBES = ['.macf/certs', '.claude/.macf/env.github'] as const;
 
+function isTracked(absDir: string, rel: string): boolean {
+  const out = execFileSync('git', ['ls-files', '--', rel], { cwd: absDir, encoding: 'utf-8' });
+  return out.trim().length > 0;
+}
+
+function hasMacfBlock(absDir: string): boolean {
+  try {
+    return /^\/?\.macf(\/(\*{1,2})?)?\s*$/m.test(readFileSync(join(absDir, '.gitignore'), 'utf-8'));
+  } catch {
+    return false;
+  }
+}
+
 export function checkMacfIgnores(workspaceDir: string): MacfIgnoreCheckResult {
   const absDir = resolve(workspaceDir);
-  const findings: string[] = [];
+  const unignored: string[] = [];
+  const tracked: string[] = [];
   let probed = 0;
   for (const rel of MACF_IGNORE_PROBES) {
     if (!existsSync(join(absDir, rel))) continue;
@@ -2570,18 +2589,32 @@ export function checkMacfIgnores(workspaceDir: string): MacfIgnoreCheckResult {
       execFileSync('git', ['check-ignore', '-q', '--', rel], { cwd: absDir, stdio: 'ignore' });
     } catch (err) {
       const status = (err as { status?: number }).status;
-      if (status === 1) findings.push(rel);
-      else return { status: 'UNKNOWN', findings: [], detail: `${absDir} is not a git repository, or git is unavailable` };
+      if (status !== 1) {
+        return { status: 'UNKNOWN', findings: [], tracked: [], reincluded: [], detail: `${absDir} is not a git repository, or git is unavailable` };
+      }
+      if (isTracked(absDir, rel)) tracked.push(rel);
+      else unignored.push(rel);
     }
   }
-  if (findings.length > 0) {
-    return {
-      status: 'WARN',
-      findings,
-      detail: `${findings.join(', ')} not ignored by git — \`git add -A\` would commit certs or identity config`,
-    };
+  const blockPresent = hasMacfBlock(absDir);
+  const reincluded = blockPresent ? unignored : [];
+  const findings = blockPresent ? [] : unignored;
+  const messages = [
+    ...(findings.length > 0
+      ? [`${findings.join(', ')} not ignored by git, so an agent's git add -A would commit its certs and env files.`]
+      : []),
+    ...tracked.map(
+      (p) =>
+        `${p} is tracked by git, so ignore rules do not apply to it. Remove it from the index with git rm --cached ${p} and commit; if that commit was ever pushed, treat the key or token in it as exposed and rotate it.`,
+    ),
+    ...reincluded.map(
+      (p) => `${p} is still not ignored after the macf block was added; a "!" line in .gitignore re-includes it. Remove that line.`,
+    ),
+  ];
+  if (messages.length > 0) {
+    return { status: 'WARN', findings, tracked, reincluded, detail: messages.join(' ') };
   }
-  return { status: 'PASS', findings: [], detail: probed === 0 ? 'no macf certs/env paths present to check' : 'macf certs and env files are git-ignored' };
+  return { status: 'PASS', findings: [], tracked: [], reincluded: [], detail: probed === 0 ? 'no macf certs/env paths present to check' : 'macf certs and env files are git-ignored' };
 }
 
 function printMacfIgnoreSection(check: MacfIgnoreCheckResult): void {
@@ -2589,7 +2622,9 @@ function printMacfIgnoreSection(check: MacfIgnoreCheckResult): void {
   else if (check.status === 'PASS') console.log(`  ✓ ${check.detail}  [PASS]`);
   else {
     console.log(`  ⚠ ${check.detail}  [WARN]`);
-    console.log('    Fix: run `macf doctor --fix` (restores the macf block in .gitignore) or `macf update`.');
+    if (check.findings.length > 0) {
+      console.log('    Fix: run `macf doctor --fix` (restores the macf block in .gitignore) or `macf update`.');
+    }
   }
 }
 
@@ -2943,7 +2978,7 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
       // A retired canonical rule's managed copy still on disk trips the gate alone.
       ruleCurrencyCheck.findings.some((f) => f.reason === 'retired') ||
       // Unignored macf certs/env paths trip the gate alone (#1477).
-      macfIgnoreCheck.status === 'WARN' ||
+      macfIgnoreCheck.findings.length > 0 ||
       // Its own trigger: an otherwise-compliant workspace with idle compaction on must still be fixed.
       !idleCompactionIsOff(projectDir);
     if (!needsFix) {
@@ -2951,14 +2986,14 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
       console.log('--fix: nothing to fix — settings already satisfy the floor.');
     } else {
       console.log('');
-      console.log('--fix will write the role-aware settings floor into .claude/settings.json:');
+      console.log('--fix will:');
       console.log('  - permissions.allow/deny floor (installPluginSkillPermissions)');
       console.log('  - PreToolUse/PostToolUse/UserPromptSubmit/PreCompact/SessionStart hooks (installGhTokenHook)');
       console.log('  - sandbox.filesystem.allowRead + sandbox.excludedCommands');
       for (const f of ruleCurrencyCheck.findings.filter((x) => x.reason === 'retired')) {
         console.log(`  - remove retired managed rule .claude/rules/${f.name}`);
       }
-      if (macfIgnoreCheck.status === 'WARN') {
+      if (macfIgnoreCheck.findings.length > 0) {
         console.log('  - restore the macf block in .gitignore (.macf/, .claude/rules/, .claude/scripts/)');
       }
       if (botLoginCheck.status === 'WARN') {

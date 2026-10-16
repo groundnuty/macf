@@ -258,8 +258,8 @@ export function buildResumeNote(args: {
   const stashLine = stashRef ?? 'none';
   const recovery =
     stashRef === null
-      ? 'Nothing was stashed (working tree was clean) — just resume your task.'
-      : `Your uncommitted tracked changes were stashed. Recover with ` +
+      ? 'Nothing was stashed. Files macf writes (.gitignore, .claude/audit.log) stay in the working tree; resume your task.'
+      : `Your uncommitted tracked changes were stashed, except files macf writes, which stay in the working tree. Recover with ` +
         `\`git stash apply ${stashRef}\` (or \`git stash list\` to find it).`;
   return [
     '# macf restart-self — RESUME',
@@ -819,7 +819,15 @@ export function createRealDeps(workspaceDir: string): RestartSelfDeps {
     now: () => new Date(),
     hasUncommittedTrackedChanges: () => {
       // Tracked, uncommitted (staged OR unstaged); untracked files excluded.
-      const out = git(workspaceDir, ['status', '--porcelain', '--untracked-files=no']);
+      // Files macf writes are never stashed, so they must not count as dirt.
+      const out = git(workspaceDir, [
+        'status',
+        '--porcelain',
+        '--untracked-files=no',
+        '--',
+        '.',
+        ...MACF_NEVER_STASHED_PATHS.map((p) => `:!${p}`),
+      ]);
       return out.length > 0;
     },
     hasUncommittedConfigChanges: () => {

@@ -66,6 +66,35 @@ describe('checkMacfIgnores', () => {
     expect(checkMacfIgnores(dir)).toMatchObject({ status: 'PASS', findings: [] });
   });
 
+  it('reports a tracked secret on its own, never as merely unignored', () => {
+    execFileSync('git', ['add', '-f', '.claude/.macf/env.github'], { cwd: dir });
+    updateGitignore(dir);
+    const r = checkMacfIgnores(dir);
+    expect(r.status).toBe('WARN');
+    expect(r.tracked).toEqual(['.claude/.macf/env.github']);
+    expect(r.findings).toEqual([]);
+    expect(r.detail).toContain(
+      '.claude/.macf/env.github is tracked by git, so ignore rules do not apply to it. Remove it from the index with git rm --cached .claude/.macf/env.github and commit; if that commit was ever pushed, treat the key or token in it as exposed and rotate it.',
+    );
+  });
+
+  it('reports a "!" re-include when the block exists but the path is still not ignored', () => {
+    updateGitignore(dir);
+    writeFileSync(join(dir, '.gitignore'), readFileSync(join(dir, '.gitignore'), 'utf-8') + '!.claude/.macf/\n');
+    const r = checkMacfIgnores(dir);
+    expect(r.status).toBe('WARN');
+    expect(r.reincluded).toEqual(['.claude/.macf/env.github']);
+    expect(r.detail).toContain(
+      '.claude/.macf/env.github is still not ignored after the macf block was added; a "!" line in .gitignore re-includes it. Remove that line.',
+    );
+  });
+
+  it('missing block gives the plain WARN text', () => {
+    expect(checkMacfIgnores(dir).detail).toBe(
+      ".macf/certs, .claude/.macf/env.github not ignored by git, so an agent's git add -A would commit its certs and env files.",
+    );
+  });
+
   it('UNKNOWN outside a git repository (never PASS)', () => {
     const plain = mkdtempSync(join(tmpdir(), 'doctor-macf-ignores-plain-'));
     mkdirSync(join(plain, '.macf', 'certs'), { recursive: true });
@@ -96,5 +125,24 @@ describe('runDoctor --fix with the macf ignores missing', () => {
     for (const p of ['.macf/certs', '.claude/.macf/env.github']) {
       expect(() => execFileSync('git', ['check-ignore', '-q', p], { cwd: dir })).not.toThrow();
     }
+  });
+
+  it('a tracked file stays reported after --fix, which does not claim to repair it', async () => {
+    satisfyFloor();
+    execFileSync('git', ['add', '-f', '.claude/.macf/env.github'], { cwd: dir });
+    updateGitignore(dir);
+    await runDoctor(dir, { fix: true, yes: true });
+    const out = logSpy.mock.calls.flat().join('\n');
+    expect(out).toContain('--fix: nothing to fix');
+    expect(out).toContain('is tracked by git, so ignore rules do not apply to it');
+    expect(out).not.toContain('Fix: run `macf doctor --fix` (restores');
+  });
+
+  it('the --fix header does not claim everything goes into settings.json', async () => {
+    satisfyFloor();
+    await runDoctor(dir, { fix: true, yes: true });
+    const out = logSpy.mock.calls.flat().join('\n');
+    expect(out).toContain('--fix will:');
+    expect(out).not.toContain('--fix will write the role-aware settings floor');
   });
 });
