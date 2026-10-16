@@ -198,7 +198,7 @@ The routing-Action's HTTP 200 from the channel server is the result-invariant as
 | `silent-fallback-hazards.md` | Eight catalogued hazard instances + five defense patterns (A-E); generative framing for new instances; canonicalized via [macf#294](https://github.com/groundnuty/macf/pull/294) |
 | `delegation-template.md` | When to delegate vs do-it-yourself; 6-section issue template; ask-before-filing convention |
 | `peer-dynamic.md` | Push back with evidence, review PRs in context, act on clear directives, ask only for destructive or ambiguous choices |
-| `verify-before-claim.md` | Quote literal output, check comment authorship, re-query state, treat empty results as unknown, cite from `origin/main` |
+| `verify-before-claim.md` | Quote literal output, re-query state before asserting it, cite from a fetched `origin/main`, re-run a peer's evidence |
 | `gh-token-attribution-traps.md` | Class catalog of attribution-trap recurrences; cross-references the structural defense (`check-gh-token.sh`) |
 | `observability-wiring.md` | Where OTel + tracing + metrics are wired; conventions for new observability instruments |
 | `codify-at-correction-time.md` | When discipline gets corrected mid-flow, codify the rule before continuing — prevents recurrence drift |

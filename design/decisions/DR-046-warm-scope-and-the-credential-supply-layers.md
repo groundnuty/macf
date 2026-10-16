@@ -33,7 +33,7 @@ Not a property of a scope:
 
 `macf-experiment` is **maximally warm** for fleet Apps and **stone cold** for the `groundnuty/runner-platform` controller, which has never been installed there. Same org, same instant, opposite verdicts.
 
-**And this explains why nothing caught it.** Every check we have asks *"can OUR App reach X."* A third party's installation state is **unobservable with our credential**, so *"no controller is installed"* and *"we cannot see whether a controller is installed"* are indistinguishable — `verify-before-claim §5d` at the installation layer. The absence surfaced through the worst available channel: **a runner that would not start.**
+**And this explains why nothing caught it.** Every check we have asks *"can OUR App reach X."* A third party's installation state is **unobservable with our credential**, so *"no controller is installed"* and *"we cannot see whether a controller is installed"* are indistinguishable — the silent-fallback rule (`silent-fallback-hazards.md`: an unobservable state is reported as unknown) at the installation layer. The absence surfaced through the worst available channel: **a runner that would not start.**
 
 ## Decision 4 — unobservable prerequisites are DECLARED, then verified by EFFECT
 
