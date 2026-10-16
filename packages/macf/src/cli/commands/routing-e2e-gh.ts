@@ -221,3 +221,33 @@ export async function readLocalLog(path: string): Promise<TextRead> {
     return { kind: 'error', error: errMessage(err) };
   }
 }
+
+/**
+ * EVERY router run for `event` created no earlier than 5 s before `sinceIso`,
+ * oldest first (the finder above returns only the first). Used to disambiguate
+ * concurrent runs by their logs. NEVER throws; degrades to `[]`.
+ */
+export function createRouterRunLister(
+  token: string,
+): (repo: string, sinceIso: string, event: 'issues' | 'issue_comment') => Promise<readonly RoutingE2eRouterRun[]> {
+  const env = { ...process.env, GH_TOKEN: token };
+  return async (repo, sinceIso, event) => {
+    try {
+      const { stdout } = await execFileAsync(
+        'gh',
+        ['api', `repos/${repo}/actions/workflows/agent-router.yml/runs`, '-f', `event=${event}`, '-f', 'per_page=20', '--jq', '.workflow_runs'],
+        { encoding: 'utf-8', env, maxBuffer: 4 * 1024 * 1024 },
+      );
+      const runs = JSON.parse(stdout) as readonly {
+        id: number; conclusion: string | null; status: string; created_at: string; html_url: string;
+      }[];
+      const sinceMs = Date.parse(sinceIso) - RUN_LOOKBACK_BUFFER_MS;
+      return runs
+        .filter((r) => Date.parse(r.created_at) >= sinceMs)
+        .sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at))
+        .map((r) => ({ found: true, id: r.id, conclusion: r.conclusion, status: r.status, url: r.html_url }));
+    } catch {
+      return [];
+    }
+  };
+}

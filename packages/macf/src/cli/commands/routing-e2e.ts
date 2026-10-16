@@ -115,7 +115,7 @@ import {
 import { readAgentConfig, tokenSourceFromConfig, agentCertPath, agentKeyPath } from '../config.js';
 import { createClientFromConfig } from '../registry-helper.js';
 import type { RoutingConfig } from './routing-doctor.js';
-import { judgeEvidence, type EvidenceVerdictResult, type TextRead } from './routing-e2e-evidence.js';
+import { judgeEvidence, selectRun, type EvidenceVerdictResult, type TextRead } from './routing-e2e-evidence.js';
 import { createCallerPinReader, createInstallRepoLister, createRoutingConfigGhReader } from './routing-doctor-gh.js';
 import {
   createIssueCloser,
@@ -123,6 +123,7 @@ import {
   createMentionPoster,
   createProbeIssueCreator,
   createRouterRunFinder,
+  createRouterRunLister,
   createRunLogReader,
   readLocalLog,
   receiverLogPathFor,
@@ -235,6 +236,12 @@ export interface RoutingE2eDeps {
     sinceIso: string,
     event?: 'issues' | 'issue_comment',
   ) => Promise<RoutingE2eRouterRun>;
+  /** Every candidate run (oldest first); falls back to `findRouterRun`'s single run when absent. */
+  readonly listRouterRuns?: (
+    repo: string,
+    sinceIso: string,
+    event: 'issues' | 'issue_comment',
+  ) => Promise<readonly RoutingE2eRouterRun[]>;
   /**
    * When present, delivery is judged from EVIDENCE (the router run's log +
    * a receiver receipt) and never from the run's conclusion. Production
@@ -573,13 +580,24 @@ export async function runRoutingE2eCore(
 
   if (deps.readRunLog) {
     const event = mode === 'label' ? 'issues' : 'issue_comment';
-    let run: RoutingE2eRouterRun = { found: false, conclusion: null, status: null, url: null };
+    const listRuns = async (): Promise<readonly RoutingE2eRouterRun[]> => {
+      if (deps.listRouterRuns) return deps.listRouterRuns(repo, labeledAtIso, event);
+      const one = await deps.findRouterRun(repo, labeledAtIso, event);
+      return one.found ? [one] : [];
+    };
+    let runs: readonly RoutingE2eRouterRun[] = [];
     for (let i = 0; i < maxPolls; i++) {
-      run = await deps.findRouterRun(repo, labeledAtIso, event);
-      if (run.found && run.status === 'completed') break;
+      runs = await listRuns();
+      if (runs.length > 0 && runs.every((r) => r.status === 'completed')) break;
       if (i < maxPolls - 1) await sleep(intervalMs);
     }
-    const runLog = run.found && run.id !== undefined ? await deps.readRunLog(repo, run.id) : null;
+    const candidates = [];
+    for (const r of runs) {
+      candidates.push({ run: r, log: r.id !== undefined && r.status === 'completed' ? await deps.readRunLog(repo, r.id) : null });
+    }
+    const picked = selectRun(candidates, created.number);
+    const run: RoutingE2eRouterRun = picked.kind === 'one' ? picked.run : { found: picked.kind === 'ambiguous', conclusion: null, status: null, url: null };
+    const runLog = picked.kind === 'one' ? picked.log : null;
     const recv = deps.readReceiverLog
       ? await deps.readReceiverLog(targetLabel)
       : { read: { kind: 'absent' } as TextRead, path: null };
@@ -594,6 +612,7 @@ export async function runRoutingE2eCore(
       everReachable,
       receiverLog: recv.read,
       receiverLogPath: recv.path,
+      ...(picked.kind === 'ambiguous' ? { ambiguousRuns: picked.count } : {}),
     });
     const stageFor: Record<EvidenceVerdictResult['verdict'], RoutingE2eStage> = {
       delivered: 'delivered',
@@ -783,6 +802,7 @@ async function resolveE2eDepsFromRegistry(
       applyLabel: createLabelApplier(token),
       closeIssue: createIssueCloser(token),
       findRouterRun: createRouterRunFinder(token),
+      listRouterRuns: createRouterRunLister(token),
       readRunLog: createRunLogReader(token),
       postMention: createMentionPoster(token),
       readReceiverLog: async (label) => {

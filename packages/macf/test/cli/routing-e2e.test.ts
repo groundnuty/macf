@@ -429,3 +429,43 @@ describe('receiver log path', () => {
     expect(receiverLogPathFor('macf-trial', 'code-agent')).not.toContain('macf-trial-code-agent');
   });
 });
+
+describe('runRoutingE2eCore — which router run is the probe\'s (never a guess)', () => {
+  const run = (id: number): RoutingE2eRouterRun => ({ found: true, id, conclusion: 'success', status: 'completed', url: `https://example.test/run/${String(id)}` });
+  const mentionDeps = (logs: Record<number, string>, runs: readonly RoutingE2eRouterRun[]): RoutingE2eDeps =>
+    evidenceDeps({
+      listRouterRuns: vi.fn(async () => runs),
+      readRunLog: vi.fn(async (_r: string, id: number): Promise<TextRead> => ({ kind: 'ok', text: logs[id] ?? '' })),
+      postMention: vi.fn(async () => ({ ok: true as const, url: 'https://example.test/c' })),
+      readTargetRoutingConfig: vi.fn(async (): Promise<RoutingConfig | null> => ({ agents: { 'science-agent': { app_name: 'macf-science-agent' } } })),
+      recv: { kind: 'ok', text: JSON.stringify({ ts: '2099-01-01T00:00:00.000Z', event: 'notify_received', type: 'mention', issue: 5 }) },
+    });
+  const opts = { targetRepo: 'o/r', mode: 'mention' as const, issue: 5 };
+
+  it('two concurrent runs, only one names the issue: that one is judged', async () => {
+    const r = await runRoutingE2eCore(
+      mentionDeps({ 1: 'Routed mention to science-agent via mTLS POST\nISSUE_NUMBER: 9', 2: 'Routed mention to science-agent via mTLS POST\nISSUE_NUMBER: 5' }, [run(1), run(2)]),
+      opts,
+    );
+    expect(r.evidence?.verdict).toBe('delivered');
+    expect(r.routerRun?.id).toBe(2);
+  });
+
+  it('two runs that both name the issue are ambiguous, not guessed', async () => {
+    const log = 'Routed mention to science-agent via mTLS POST\nISSUE_NUMBER: 5';
+    const r = await runRoutingE2eCore(mentionDeps({ 1: log, 2: log }, [run(1), run(2)]), opts);
+    expect(r.evidence?.verdict).toBe('unknown');
+    expect(r.message).toBe("ambiguous: 2 router runs started in the window and the log could not single out the probe's");
+  });
+
+  it('two runs where neither names the issue are ambiguous', async () => {
+    const r = await runRoutingE2eCore(mentionDeps({ 1: 'nothing', 2: 'nothing' }, [run(1), run(2)]), opts);
+    expect(r.evidence?.verdict).toBe('unknown');
+    expect(r.message).toContain('ambiguous: 2 router runs');
+  });
+
+  it('a single candidate is used as-is, even if its log does not name the issue', async () => {
+    const r = await runRoutingE2eCore(mentionDeps({ 1: 'Routed mention to science-agent via mTLS POST' }, [run(1)]), opts);
+    expect(r.evidence?.verdict).toBe('delivered');
+  });
+});

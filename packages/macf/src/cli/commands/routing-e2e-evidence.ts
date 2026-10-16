@@ -58,6 +58,8 @@ export interface EvidenceInput {
   readonly everReachable: boolean;
   readonly receiverLog: TextRead;
   readonly receiverLogPath: string | null;
+  /** Set when several runs started in the window and none could be singled out. */
+  readonly ambiguousRuns?: number;
 }
 
 const SKEW_MS = 5_000;
@@ -129,8 +131,44 @@ function out(
   return { verdict, summary, stages, gaps };
 }
 
+/**
+ * Does a router run log name this issue? Keyed on what the log reliably
+ * carries: the `#N` in a routed line ("Routed issue #N to ...") or the issue
+ * number in the run's env block (`ISSUE_NUMBER: N` / `issue_number: N`).
+ * A bare number elsewhere never counts.
+ */
+export function logNamesIssue(log: string, issue: number): boolean {
+  const n = String(issue);
+  return new RegExp(`#${n}\\b|\\b(?:ISSUE_NUMBER|issue_number|ISSUE)\\b["']?\\s*[:=]\\s*["']?${n}\\b`, 'i').test(log);
+}
+
+export type RunSelection<R> =
+  | { readonly kind: 'none' }
+  | { readonly kind: 'one'; readonly run: R; readonly log: TextRead | null }
+  | { readonly kind: 'ambiguous'; readonly count: number };
+
+/**
+ * Pick THE router run for the probe from every candidate. One candidate:
+ * used as-is. Several: only those whose log names the probe's issue; exactly
+ * one survivor is used, zero or several is ambiguous — never a guess.
+ */
+export function selectRun<R>(
+  candidates: readonly { readonly run: R; readonly log: TextRead | null }[],
+  issue: number,
+): RunSelection<R> {
+  if (candidates.length === 0) return { kind: 'none' };
+  if (candidates.length === 1 && candidates[0]) return { kind: 'one', ...candidates[0] };
+  const named = candidates.filter((c) => c.log?.kind === 'ok' && logNamesIssue(c.log.text, issue));
+  if (named.length === 1 && named[0]) return { kind: 'one', ...named[0] };
+  return { kind: 'ambiguous', count: candidates.length };
+}
+
 export function judgeEvidence(i: EvidenceInput): EvidenceVerdictResult {
   const stages: EvidenceStage[] = [];
+  if (i.ambiguousRuns !== undefined) {
+    const s = `ambiguous: ${String(i.ambiguousRuns)} router runs started in the window and the log could not single out the probe's`;
+    return out('unknown', s, [st('router-run', 'unknown', s), st('routed-line', 'skipped', 'no single run to read'), st('receiver', 'skipped', 'not evaluated')], [s]);
+  }
   if (!i.run.found) {
     const s = 'no router run started for the probe within the wait';
     return out('no-run', s, [st('router-run', 'gap', s), st('routed-line', 'skipped', 'no run to read'), st('receiver', 'skipped', 'nothing was routed')], [s]);
