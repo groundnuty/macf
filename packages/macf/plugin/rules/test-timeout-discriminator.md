@@ -5,6 +5,8 @@ paths:
   - "**/test/**"
   - "**/tests/**"
   - "**/__tests__/**"
+  - "**/test_*.*"
+  - "**/*_test.*"
   - "**/vitest.config.*"
 ---
 # Diagnosing a test timeout
@@ -23,5 +25,5 @@ Run the test alone with the timeout raised, and put a stopwatch on per-unit cost
 
 ## Two cautions
 
-- A per-test timeout written inline, as `it('x', { timeout: 30_000 }, fn)` or `it('x', fn, 30_000)`, overrides `--testTimeout`, so raising the flag changes nothing for that test. Grep `test/` for these before using the flag, and read the match: `setTimeout(fn, 3000)` in a helper looks the same.
+- A per-test timeout written inline, as `it('x', { timeout: 30_000 }, fn)` or `it('x', fn, 30_000)`, overrides `--testTimeout`, so raising the flag changes nothing for that test. Grep the test files for these before using the flag, and read the match: `setTimeout(fn, 3000)` in a helper looks the same.
 - Do not make a timeout pass by checking less. Keep full coverage and shorten the wall time instead.

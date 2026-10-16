@@ -7,7 +7,7 @@ paths:
 ---
 # Observability wiring
 
-The launcher exports Claude Code's OpenTelemetry variables so traces, metrics and logs reach the collector. They are generated into `.claude/.macf/env.telemetry` (`macf init` / `macf update`; source `claude-sh.ts` and `env-files.ts`); edit the generator or re-run `macf update`, not the output.
+The launcher exports Claude Code's OpenTelemetry variables so traces, metrics and logs reach the collector. They live in `.claude/.macf/env.telemetry`, which is operator-managed: `macf init` and `macf update` write it only when it is missing, then leave it alone, so edit it directly.
 
 ## Variables to keep set
 
@@ -18,8 +18,9 @@ The launcher exports Claude Code's OpenTelemetry variables so traces, metrics an
 
 ## Endpoint and opt-out
 
-- `MACF_OTEL_ENDPOINT` overrides the endpoint at `macf update` time. Run `grep OTEL_EXPORTER_OTLP_ENDPOINT .claude/.macf/env.telemetry` to see the active one rather than trusting a value written elsewhere; a retired or wrong endpoint drops telemetry with no error.
-- `MACF_OTEL_DISABLED=1` generates a minimal file with no exports, for hosts with no collector.
+- At launch the endpoint resolves from `MACF_OTEL_ENDPOINT` in the environment, then `settings.local.json`, then the default baked into the file when it was written; `OTEL_EXPORTER_OTLP_ENDPOINT` set in the shell overrides all of these.
+- Run `echo "$OTEL_EXPORTER_OTLP_ENDPOINT"` in a Bash call to see the active endpoint; a retired or wrong one drops telemetry with no error.
+- `MACF_OTEL_DISABLED=1` when the file is first written produces a minimal file with no exports, for hosts with no collector.
 
 ## Check the result
 

@@ -5,6 +5,8 @@ paths:
   - "**/test/**"
   - "**/tests/**"
   - "**/__tests__/**"
+  - "**/test_*.*"
+  - "**/*_test.*"
 ---
 # Writing tests that can fail
 
