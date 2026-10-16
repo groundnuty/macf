@@ -7,7 +7,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { checkDistributedRuleCurrency } from '../../src/cli/commands/doctor.js';
+import { checkDistributedRuleCurrency, printRuleCurrencySection } from '../../src/cli/commands/doctor.js';
 import { copyCanonicalRules, copyCanonicalRulesDetailed } from '../../src/cli/rules.js';
 import { copyCanonicalAssetsGuarded } from '../../src/cli/canonical-overwrite-guard.js';
 
@@ -78,5 +78,25 @@ describe('doctor — collision is its own finding', () => {
     expect(r.findings.find((f) => f.name === 'pr-discipline.md')?.reason).toBe('operator-authored');
     expect(r.findings.find((f) => f.name === 'other.md')?.reason).toBe('missing');
     expect(r.detail).toContain('operator-authored');
+  });
+});
+
+describe('doctor output — a collision alone does not end with the update Fix line', () => {
+  const info = { status: 'INFO' as const, detail: 'not a framework checkout' };
+  const printed = (findings: { name: string; reason: 'stale' | 'missing' | 'retired' | 'operator-authored' }[]): string => {
+    const lines: string[] = [];
+    vi.spyOn(console, 'log').mockImplementation((m?: unknown) => { lines.push(String(m)); });
+    printRuleCurrencySection({ status: 'WARN', checkedCount: 2, totalCount: 2, findings, detail: 'x' }, info);
+    vi.restoreAllMocks();
+    return lines.join('\n');
+  };
+  it('a collision-only section prints no `macf update` Fix line, because update keeps the file', () => {
+    const out = printed([{ name: 'pr-discipline.md', reason: 'operator-authored' }]);
+    expect(out).toContain('collision');
+    expect(out).not.toContain('Fix: run');
+  });
+  it('a stale finding alongside a collision still prints the Fix line', () => {
+    const out = printed([{ name: 'pr-discipline.md', reason: 'operator-authored' }, { name: 'other.md', reason: 'stale' }]);
+    expect(out).toContain('Fix: run');
   });
 });

@@ -2090,7 +2090,7 @@ export function checkDistributedRuleCurrency(
     findings,
     detail:
       `${staleCount} stale, ${missingCount} missing of ${names.length} canonical distributed rule(s)` +
-      (collisionCount > 0 ? `, ${collisionCount} operator-authored file(s) share a canonical name and are kept (rename or delete to resolve)` : '') +
+      (collisionCount > 0 ? `, ${collisionCount} operator-authored file(s) kept under a canonical name` : '') +
       (retiredCount > 0 ? `, ${retiredCount} retired rule copy(ies) still present` : '') +
       ` (canonical ${provenance})`,
   };
@@ -3243,7 +3243,7 @@ function printStrayScriptsSection(check: StrayScriptCheckResult): void {
 }
 
 /** Print the groundnuty/macf#1360 distributed-rule-currency report section for `check`. */
-function printRuleCurrencySection(check: RuleCurrencyCheckResult, checkoutCurrency: CheckoutCurrencyCheckResult): void {
+export function printRuleCurrencySection(check: RuleCurrencyCheckResult, checkoutCurrency: CheckoutCurrencyCheckResult): void {
   if (check.status === 'INFO') {
     console.log(`  ℹ ${check.detail}  [INFO]`);
     return;
@@ -3261,12 +3261,15 @@ function printRuleCurrencySection(check: RuleCurrencyCheckResult, checkoutCurren
     const reasonText =
       f.reason === 'stale' ? 'stale — differs from canonical'
       : f.reason === 'retired' ? 'retired — canonical no longer ships it, but this managed copy is still loaded (`macf update` or `macf doctor --fix` removes it)'
-      : f.reason === 'operator-authored' ? 'collision — no macf managed header, so it is operator-authored and kept; rename it, or delete it to accept the canonical rule'
+      : f.reason === 'operator-authored' ? 'collision — no macf managed header, so it is operator-authored and kept; rename it to keep both, or delete it and run `macf update` to take the canonical rule'
       : 'missing — never distributed';
     console.log(`    ✗ ${f.name} — ${reasonText}`);
   }
   const staleCount = check.findings.filter((f) => f.reason === 'stale' || f.reason === 'retired').length;
-  printDistributionFixLine('.claude/rules/', checkoutCurrency, staleCount);
+  // A collision carries its own remedy, and `macf update` keeps the file, so the update Fix line would mislead.
+  if (check.findings.some((f) => f.reason !== 'operator-authored')) {
+    printDistributionFixLine('.claude/rules/', checkoutCurrency, staleCount);
+  }
 }
 
 /**

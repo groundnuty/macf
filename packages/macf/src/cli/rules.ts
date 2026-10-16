@@ -163,7 +163,7 @@ export function copyCanonicalRulesDetailed(workspaceDir: string, options: {
       warn(
         `  Warning: .claude/rules/${entry.name} has no macf managed header, so it is operator-authored — ` +
         'left in place, not replaced by the canonical rule of the same name. Rename it to keep both, ' +
-        'or delete it to accept the canonical one.',
+        'or delete it and run `macf update` to take the canonical one.',
       );
       continue;
     }
