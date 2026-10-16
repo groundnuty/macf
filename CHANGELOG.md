@@ -4,6 +4,12 @@ All notable changes to the `macf` CLI. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.68] — 2026-10-16
+
+### Fixed
+
+- **The plugin skills and the startup pickup run again.** The plugin CLI exited 0 with no output when started through `.macf/plugin/dist`, the symlink into the npx cache that `macf update` installs. It compared the symlinked `argv[1]` with the real path node gives `import.meta.url`, so `main()` never ran. `/macf-issues`, `/macf-status`, `/macf-peers` and `/macf-ping` printed nothing, and the startup pickup read the silence as "no work". It now compares real paths. Diagnosed by the `macf-trial` writing and science agents. (#1493)
+
 ## [0.2.67] — 2026-10-16
 
 ### Fixed
