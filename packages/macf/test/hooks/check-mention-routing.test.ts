@@ -1152,9 +1152,16 @@ describe('check-mention-routing.sh (hook)', () => {
         ['echo ok && \\\ngh issue comment 5 --body done'],
         ['echo ok && gh issue comment 5 \\\n  --body done'],
         ['cat <<< "hello"\ngh issue comment 1 --body "no recipient"'],
+        ['echo "$(gh issue comment 5 --body done)"'],
+        ['echo "result: `gh issue comment 5 --body done`"'],
       ])('a comment behind a shell keyword is still checked for a mention (%#)', (command) => {
         const r = runCreate(command);
         expect(r.status).toBe(2);
+      });
+
+      it('a quoted literal that only names the command is not a command', () => {
+        const r = runCreate('gh pr create --title x --body "run gh issue comment 5 --body done to reply"');
+        expect(r.status).toBe(0);
       });
 
       it('a continued line with a mention on the comment passes', () => {

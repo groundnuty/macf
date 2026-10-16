@@ -216,6 +216,31 @@ macf_skip_heredoc_bodies() {
   return 0
 }
 
+# Index of the ")" that closes the "(" at $2 in $1, skipping quoted text and
+# nested parens; -1 when unbalanced. Result in MACF_MATCH.
+macf_match_paren() {
+  local s="$1" i="$2" n=${#1} pd=0 c q=""
+  MACF_MATCH=-1
+  while [[ $i -lt $n ]]; do
+    c="${s:i:1}"
+    if [[ "$q" == "s" ]]; then [[ "$c" == "'" ]] && q=""; i=$((i + 1)); continue; fi
+    if [[ "$q" == "d" ]]; then
+      if [[ "$c" == "\\" ]]; then i=$((i + 2)); continue; fi
+      [[ "$c" == '"' ]] && q=""
+      i=$((i + 1)); continue
+    fi
+    case "$c" in
+      "'") q="s" ;;
+      '"') q="d" ;;
+      "\\") i=$((i + 1)) ;;
+      '(') pd=$((pd + 1)) ;;
+      ')') pd=$((pd - 1)); if [[ $pd -eq 0 ]]; then MACF_MATCH=$i; return 0; fi ;;
+    esac
+    i=$((i + 1))
+  done
+  return 0
+}
+
 macf_split_text() {
   local s="$1" depth="$2" n=${#1} i=0 c nx nx2 cur="" q="" j d strip
   local -a HD_DELIMS=() HD_STRIPS=()
@@ -224,6 +249,27 @@ macf_split_text() {
     if [[ "$q" == "s" ]]; then
       cur+="$c"; [[ "$c" == "'" ]] && q=""
       i=$((i + 1)); continue
+    fi
+    if [[ "$q" == "d" && "$depth" -lt 4 ]]; then
+      # Double quotes stop word splitting, not execution: check what $( ) and ` ` run.
+      if [[ "$c" == '$' && "$nx" == '(' && "${s:i+2:1}" != '(' ]]; then
+        macf_match_paren "$s" $((i + 1))
+        if [[ "$MACF_MATCH" -gt $((i + 1)) ]]; then
+          macf_split_text "${s:i+2:MACF_MATCH-i-2}" $((depth + 1))
+          cur+="${s:i:MACF_MATCH-i+1}"; i=$((MACF_MATCH + 1)); continue
+        fi
+      fi
+      if [[ "$c" == '`' ]]; then
+        j=$((i + 1))
+        while [[ $j -lt $n && "${s:j:1}" != '`' ]]; do
+          [[ "${s:j:1}" == "\\" ]] && j=$((j + 1))
+          j=$((j + 1))
+        done
+        if [[ $j -lt $n ]]; then
+          macf_split_text "${s:i+1:j-i-1}" $((depth + 1))
+          cur+="${s:i:j-i+1}"; i=$((j + 1)); continue
+        fi
+      fi
     fi
     if [[ "$q" == "a" || "$q" == "d" ]]; then
       if [[ "$c" == "\\" ]]; then
