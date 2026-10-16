@@ -172,6 +172,7 @@ export function refreshEnvFiles(
   for (const { name, generate } of OPERATOR_ENV_FILES) {
     const path = join(envDir, name);
     if (existsSync(path)) {
+      if (name === 'env.telemetry') migrateTelemetryVersionLiteral(path);
       preserved.push(name);
       continue;
     }
@@ -180,6 +181,37 @@ export function refreshEnvFiles(
   }
 
   return { refreshed, preserved, bootstrapped, warnedHandEdits };
+}
+
+/**
+ * macf#1492: drop the generated `export MACF_VERSION="<semver>"` line from an
+ * existing env.telemetry (env.identity now exports it at launch). Only that
+ * exact line is removed; every other byte is kept. A different line that
+ * still assigns MACF_VERSION is left alone and named in a warning, because
+ * it would override the launch-time value.
+ */
+const GENERATED_VERSION_LINE = /^export MACF_VERSION="(?:\d+\.\d+\.\d+[^"$`\\]*|unknown)"$/;
+const ANY_VERSION_ASSIGN = /^\s*(?:export\s+)?MACF_VERSION=/;
+
+export function migrateTelemetryVersionLiteral(path: string): void {
+  const current = readFileSync(path, 'utf-8');
+  const lines = current.split('\n');
+  const kept: string[] = [];
+  let removed = false;
+  for (const line of lines) {
+    if (GENERATED_VERSION_LINE.test(line.replace(/\r$/, ''))) {
+      removed = true;
+      continue;
+    }
+    if (ANY_VERSION_ASSIGN.test(line)) {
+      process.stderr.write(
+        `Warning: .claude/.macf/env.telemetry sets MACF_VERSION by hand (${line.trim()}).\n` +
+          `  Left unchanged; it overrides the version env.identity reads at launch.\n`,
+      );
+    }
+    kept.push(line);
+  }
+  if (removed) writeFileSync(path, kept.join('\n'), { mode: 0o644 });
 }
 
 // ---------------------------------------------------------------------------

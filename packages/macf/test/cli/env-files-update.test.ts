@@ -21,6 +21,7 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -113,23 +114,55 @@ describe('refreshEnvFiles', () => {
     expect(existsSync(join(tmpRoot, '.claude', '.macf', 'env.tmux'))).toBe(true);
   });
 
-  it('bootstrap-writes env.telemetry with MACF_VERSION baked from config (macf#357 version-refresh-on-update)', () => {
-    // When env.telemetry is absent at refresh time (e.g., operator
-    // intentionally deleted it for a fresh bake, or workspace migrating
-    // from monolithic claude.sh to multi-file env layout for the first
-    // time), the bootstrap-write picks up the workspace's pinned macf
-    // CLI version from config.versions.cli. This is the "version-refresh
-    // on update" path from macf#357 AC.
-    const result = refreshEnvFiles(tmpRoot, baseConfig);
-    expect(result.bootstrapped).toContain('env.telemetry');
-    const telemetry = readFileSync(
-      join(tmpRoot, '.claude', '.macf', 'env.telemetry'),
-      'utf-8',
-    );
-    // baseConfig.versions.cli is '0.1.0' in the test fixture.
-    expect(telemetry).toContain(`export MACF_VERSION="${baseConfig.versions!.cli}"`);
-    expect(telemetry).toContain('service.namespace=${MACF_PROJECT}');
+  it('bootstrap-writes env.telemetry with no MACF_VERSION literal (macf#1492)', () => {
+    refreshEnvFiles(tmpRoot, baseConfig);
+    const telemetry = readFileSync(join(tmpRoot, '.claude', '.macf', 'env.telemetry'), 'utf-8');
+    expect(telemetry).not.toMatch(/MACF_VERSION=/);
     expect(telemetry).toContain('macf.framework=macf');
+  });
+
+  describe('macf#1492 MACF_VERSION migration', () => {
+    const operatorTelemetry = (versionLine: string): string =>
+      ['# my edit', 'export OTEL_X=1', versionLine, 'export MY_VAR="keep me"', ''].join('\n');
+
+    function setup(telemetry: string, cliVersion: string): string {
+      const config = { ...baseConfig, versions: { ...baseConfig.versions!, cli: cliVersion } };
+      refreshEnvFiles(tmpRoot, config);
+      mkdirSync(join(tmpRoot, '.macf'), { recursive: true });
+      writeFileSync(join(tmpRoot, '.macf', 'macf-agent.json'), JSON.stringify(config));
+      const path = join(tmpRoot, '.claude', '.macf', 'env.telemetry');
+      writeFileSync(path, telemetry);
+      refreshEnvFiles(tmpRoot, config);
+      return path;
+    }
+
+    it('removes the stale literal, keeps other lines byte-identical, and launch yields the current version', () => {
+      const path = setup(operatorTelemetry('export MACF_VERSION="0.2.58"'), '0.2.66');
+      expect(readFileSync(path, 'utf-8')).toBe(
+        ['# my edit', 'export OTEL_X=1', 'export MY_VAR="keep me"', ''].join('\n'),
+      );
+      const dir = join(tmpRoot, '.claude', '.macf');
+      const out = execFileSync(
+        'bash',
+        [
+          '-c',
+          // claude.sh's order for the files that matter here (github/certs need real creds)
+          `SCRIPT_DIR="${tmpRoot}"; for f in _helpers identity telemetry; do . "${dir}/env.$f"; done; echo "$MACF_VERSION"`,
+        ],
+        { encoding: 'utf-8', env: { PATH: process.env['PATH'] ?? '' } },
+      );
+      expect(out.trim()).toBe('0.2.66');
+    });
+
+    it('keeps a hand-edited non-matching line and warns naming it', () => {
+      const spy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+      const line = 'export MACF_VERSION="${MY_PIN}"';
+      const path = setup(operatorTelemetry(line), '0.2.66');
+      const warned = spy.mock.calls.map(c => String(c[0])).join('');
+      spy.mockRestore();
+      expect(readFileSync(path, 'utf-8')).toContain(line);
+      expect(warned).toContain(line);
+    });
   });
 
   it('preserves operator-managed env.telemetry when present (operator edits intact)', () => {

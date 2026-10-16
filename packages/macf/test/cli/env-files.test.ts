@@ -484,29 +484,9 @@ describe('generateEnvTelemetry', () => {
       expect(out).toContain('service.version=${MACF_VERSION:-unknown}');
     });
 
-    it('bakes MACF_VERSION literal from config.versions.cli', () => {
-      // Per macf#357 AC: macf init / macf update resolve the workspace's
-      // pinned macf CLI version (.macf/macf-agent.json `versions.cli`)
-      // and write it as a literal export. Workspace's pinned version
-      // ≠ runtime's installed CLI — same workspace can be used by
-      // multiple operators on different CLI versions; the pinned one
-      // is what was canonicalized at the last `macf init`/`update`.
-      const out = generateEnvTelemetry(baseConfig, cleanEnv);
-      expect(out).toContain('export MACF_VERSION="0.1.0"');
-    });
-
-    it('falls back to MACF_VERSION="unknown" when config.versions absent (substrate / legacy)', () => {
-      // Pre-P6 / hand-configured workspaces may lack the `versions`
-      // block entirely (it's `.optional()` on the schema). Those
-      // workspaces should still produce a well-formed env.telemetry
-      // — just with an "unknown" version label rather than
-      // synthesizing a random release pin.
-      const legacyConfig: MacfAgentConfig = {
-        ...baseConfig,
-        versions: undefined,
-      };
-      const out = generateEnvTelemetry(legacyConfig, cleanEnv);
-      expect(out).toContain('export MACF_VERSION="unknown"');
+    it('writes no MACF_VERSION literal (macf#1492); env.identity resolves it at launch', () => {
+      expect(generateEnvTelemetry(baseConfig, cleanEnv)).not.toMatch(/MACF_VERSION=/);
+      expect(generateEnvIdentity(baseConfig)).toContain('.versions.cli');
     });
 
     it('carries service.instance.id = <project>-<agent>@<host>', () => {
@@ -766,7 +746,7 @@ describe('cross-concern invariants', () => {
     }
   });
 
-  it('non-overlap: env.telemetry only emits OTEL_* / CLAUDE_CODE_* / MACF_OTEL_* / MACF_VERSION', () => {
+  it('non-overlap: env.telemetry only emits OTEL_* / CLAUDE_CODE_* / MACF_OTEL_*', () => {
     // macf#357 added MACF_VERSION as a telemetry-class export (it's
     // semantically tied to OTel resource attribute service.version, not
     // identity). All other identity / cert / registry vars stay in their
@@ -777,7 +757,7 @@ describe('cross-concern invariants', () => {
       .filter(l => l.startsWith('export '));
     for (const line of exportLines) {
       expect(line).toMatch(
-        /export (OTEL_|CLAUDE_CODE_|MACF_OTEL_|MACF_VERSION)/,
+        /export (OTEL_|CLAUDE_CODE_|MACF_OTEL_)/,
       );
     }
   });
