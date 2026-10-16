@@ -137,7 +137,20 @@ fi
 #   -r, --reason string         (value-taking)
 #   -R, --repo OWNER/REPO       (value-taking; inherited)
 # No boolean flags exist on this subcommand.
-TAIL="$(sed -E 's/^.*gh[[:space:]]+issue[[:space:]]+close[[:space:]]+//' <<<"$COMMAND" 2>/dev/null || echo "")"
+# groundnuty/macf#1453: isolate the line holding the `gh issue close`
+# invocation FIRST (same fix as check-lgtm-gate.sh / #1410). Detection above
+# is whole-string; extraction must not be — `sed` is per-line, so on a
+# multi-line command every non-matching line (an earlier `gh pr view 1449`,
+# an `echo "#1449: ..."`) passed through untouched into TAIL and its number
+# won. Backslash-continued lines are joined so `--repo` on a continuation
+# still belongs to the close line. Only the FIRST close line is considered
+# (a command with several closes is judged on its first).
+JOINED_COMMAND="$(sed -e ':a' -e '/\\$/N; s/\\\n[[:space:]]*/ /; ta' <<<"$COMMAND" 2>/dev/null || echo "$COMMAND")"
+CLOSE_LINE="$(grep -E "${GH_CLOSE_PATTERN}|${SHELL_C_GH_CLOSE_PATTERN}" <<<"$JOINED_COMMAND" 2>/dev/null | head -n1 || echo "")"
+if [[ -z "$CLOSE_LINE" ]]; then
+  exit 0
+fi
+TAIL="$(sed -E 's/^.*gh[[:space:]]+issue[[:space:]]+close[[:space:]]+//' <<<"$CLOSE_LINE" 2>/dev/null || echo "")"
 if [[ -z "$TAIL" ]]; then
   # No positional after `gh issue close` — gh itself will error with a
   # usage message; nothing to check here.
@@ -203,11 +216,11 @@ if [[ -z "$ISSUE_NUMBER" ]]; then
 fi
 
 REPO_VALUE=""
-if [[ "$COMMAND" =~ --repo[[:space:]]+([^[:space:]]+) ]]; then
+if [[ "$CLOSE_LINE" =~ --repo[[:space:]]+([^[:space:]]+) ]]; then
   REPO_VALUE="${BASH_REMATCH[1]}"
-elif [[ "$COMMAND" =~ --repo=([^[:space:]]+) ]]; then
+elif [[ "$CLOSE_LINE" =~ --repo=([^[:space:]]+) ]]; then
   REPO_VALUE="${BASH_REMATCH[1]}"
-elif [[ "$COMMAND" =~ (^|[[:space:]])-R[[:space:]]+([^[:space:]]+) ]]; then
+elif [[ "$CLOSE_LINE" =~ (^|[[:space:]])-R[[:space:]]+([^[:space:]]+) ]]; then
   REPO_VALUE="${BASH_REMATCH[2]}"
 fi
 # Strip trailing shell-wrapper punctuation that can end up glued to the

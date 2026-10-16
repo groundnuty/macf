@@ -295,6 +295,50 @@ describe('check-close-condition.sh (hook)', () => {
     });
   });
 
+  describe('multi-line commands — target comes from the close line only (#1453)', () => {
+    const MULTI = [
+      'gh pr view 1449 --repo groundnuty/macf --json state',
+      'echo "  #1449: merged"',
+      'gh issue close 1448 --repo groundnuty/macf --comment "done"',
+    ].join('\n');
+
+    it('takes the number after `close`, not an earlier `gh pr view` / `echo "#N"` line', () => {
+      const r = runHook({
+        command: MULTI,
+        // Only 1448 is stubbed with a condition; any lookup of 1449 (or 1) fails the stub.
+        stubGh: { 'groundnuty/macf#1448': { body: SECTION_BODY } },
+      });
+      const ctx = parseAdditionalContext(r.stdout) ?? '';
+      expect(ctx).toContain('#1448');
+      expect(ctx).toContain(CONDITION_MARKER);
+      expect(ctx).not.toContain('#1449');
+    });
+
+    it('single-line close behaves as before', () => {
+      const r = runHook({
+        command: 'gh issue close 1448 --repo groundnuty/macf',
+        stubGh: { 'groundnuty/macf#1448': { body: SECTION_BODY } },
+      });
+      expect(parseAdditionalContext(r.stdout) ?? '').toContain('#1448');
+    });
+
+    it('`bash -c "gh issue close 42 ..."` targets 42', () => {
+      const r = runHook({
+        command: 'echo "#7"\nbash -c "gh issue close 42 --repo groundnuty/macf"',
+        stubGh: { 'groundnuty/macf#42': { body: SECTION_BODY } },
+      });
+      expect(parseAdditionalContext(r.stdout) ?? '').toContain('#42');
+    });
+
+    it('takes --repo from the close line, not an earlier line', () => {
+      const r = runHook({
+        command: 'gh pr view 5 --repo other/repo\ngh issue close 1448 --repo groundnuty/macf',
+        stubGh: { 'groundnuty/macf#1448': { body: SECTION_BODY } },
+      });
+      expect(parseAdditionalContext(r.stdout) ?? '').toContain(CONDITION_MARKER);
+    });
+  });
+
   describe('wrapper / subshell bypass coverage (mirrors check-close-keyword.sh)', () => {
     it('recognizes `sudo gh issue close ...`', () => {
       const r = runHook({

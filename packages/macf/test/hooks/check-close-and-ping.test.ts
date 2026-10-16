@@ -322,6 +322,25 @@ describe('check-close-and-ping.sh (hook)', () => {
     });
   });
 
+  describe('multi-line commands — target comes from the close line only (#1453)', () => {
+    it('queries the timeline of the issue after `close`, not an earlier #N line', () => {
+      const r = runHook({
+        command: [
+          'gh pr view 1449 --repo groundnuty/macf',
+          'echo "  #1449: merged"',
+          'gh issue close 1448 --repo groundnuty/macf --comment "done"',
+        ].join('\n'),
+        // Only 1448's timeline is stubbed; a lookup of 1449 would hit the stub's no-stub error.
+        stubGh: {
+          'repos/groundnuty/macf/issues/1448/timeline': {
+            xrefs: [{ number: 9, repo: 'groundnuty/macf', state: 'open' }],
+          },
+        },
+      });
+      expect(parseAdditionalContext(r.stdout) ?? '').toContain('#1448');
+    });
+  });
+
   describe('wrapper / subshell bypass coverage (mirrors check-close-condition.sh)', () => {
     const XREFS = { xrefs: [{ number: 789, repo: 'groundnuty/macf', state: 'open' as const }] };
 
