@@ -1947,17 +1947,38 @@ const TS_OAUTH_FLAG_PLAN_NOTE =
   `${TS_OAUTH_CLIENT_ID_ENV_VAR}/${TS_OAUTH_SECRET_ENV_VAR} env fallbacks) directly — no pre-existing vault needed ` +
   'for that path.';
 
+const TS_BEARING_SECRETS: readonly string[] = ['MACF_ROUTING_BUNDLE', 'TS_OAUTH_CLIENT_ID', 'TS_OAUTH_SECRET'];
+
 /**
- * Which repos' routing secrets may carry a different Tailscale pair than the vault holds, judged from what `fleet.lock`
- * recorded as deployed (secrets are write-only, so there is no read-back). No pair records at all means a lock written
- * before they existed. Neither value nor full fingerprint is ever returned.
+ * Which repos hold pair-bearing routing secrets that `fleet.lock` does not show as written from the held pair
+ * (secrets are write-only, so the record is all there is to compare). A repo needs the rewrite only when its
+ * confirmed secret names include a pair-bearing one; a repo whose names could not be read is reported as unchecked,
+ * never as needing it. Neither value nor full fingerprint is returned.
  */
-function staleTsDeployments(lock: FleetLock | null, heldFingerprint: string | undefined): { readonly reason: string; readonly repos: readonly string[] } | undefined {
+function staleTsDeployments(
+  lock: FleetLock | null,
+  heldFingerprint: string | undefined,
+  repos: readonly string[],
+  secretRepos: Readonly<Record<string, RepoSecretNamesObservation>> | undefined,
+): { readonly drift: readonly string[]; readonly unrecorded: readonly string[]; readonly unchecked: readonly string[] } | undefined {
   if (lock === null || heldFingerprint === undefined) return undefined;
-  const recorded = Object.entries(effectiveFleetFingerprints(lock) ?? {}).filter(([k]) => k.startsWith(TS_DEPLOYED_KEY_PREFIX));
-  if (recorded.length === 0) return { reason: 'no record of which Tailscale pair was deployed', repos: [] };
-  const drifted = recorded.filter(([, fp]) => fp !== heldFingerprint).map(([k]) => k.slice(TS_DEPLOYED_KEY_PREFIX.length)).sort();
-  return drifted.length > 0 ? { reason: 'deployed with a different Tailscale pair than the vault holds', repos: drifted } : undefined;
+  const recorded = effectiveFleetFingerprints(lock) ?? {};
+  const drift: string[] = [];
+  const unrecorded: string[] = [];
+  const unchecked: string[] = [];
+  for (const repo of repos) {
+    const obs = secretRepos?.[repo];
+    if (obs === undefined || obs.status === 'unknown') {
+      unchecked.push(repo);
+      continue;
+    }
+    if (!TS_BEARING_SECRETS.some((n) => obs.names.has(n))) continue;
+    const fp = recorded[`${TS_DEPLOYED_KEY_PREFIX}${repo}`];
+    if (fp === undefined) unrecorded.push(repo);
+    else if (fp !== heldFingerprint) drift.push(repo);
+  }
+  if (drift.length === 0 && unrecorded.length === 0) return undefined;
+  return { drift, unrecorded, unchecked };
 }
 
 function tsOauthItem(
@@ -1965,6 +1986,8 @@ function tsOauthItem(
   tailscaleOauthRequired: boolean,
   vaultTsOauth: VaultTsOauthObservation | undefined,
   lock: FleetLock | null,
+  repos: readonly string[],
+  secretRepos: Readonly<Record<string, RepoSecretNamesObservation>> | undefined,
 ): PlanItem {
   const target = `ts_oauth:fleet:${fleetName}:TS_OAUTH`;
   const requirementNote = tailscaleOauthRequired
@@ -1988,15 +2011,17 @@ function tsOauthItem(
   }
 
   if (vaultTsOauth.present) {
-    const stale = staleTsDeployments(lock, vaultTsOauth.fingerprint);
+    const stale = staleTsDeployments(lock, vaultTsOauth.fingerprint, repos, secretRepos);
     if (stale !== undefined) {
+      const parts: string[] = [];
+      if (stale.drift.length > 0) parts.push(`deployed with a different Tailscale pair than the vault holds: ${stale.drift.join(', ')}`);
+      if (stale.unrecorded.length > 0) parts.push(`no record of which Tailscale pair was deployed: ${stale.unrecorded.join(', ')}`);
+      const unchecked = stale.unchecked.length > 0 ? ` (could not check ${stale.unchecked.join(', ')})` : '';
       return {
         kind: 'ts_oauth',
         target,
         verb: 'update',
-        reason:
-          `${stale.reason} — apply WILL rewrite the routing secrets that carry the Tailscale pair` +
-          (stale.repos.length > 0 ? ` on: ${stale.repos.join(', ')}.` : ' on every router-carrying repo that already holds them.'),
+        reason: `${parts.join('; ')} — apply WILL rewrite the routing secrets that carry the Tailscale pair on those repos.${unchecked}`,
         confirm_required: false,
       };
     }
@@ -2983,7 +3008,7 @@ export function computePlan(
   // reads this fleet's vault for TS_OAUTH_CLIENT_ID/TS_OAUTH_SECRET on every
   // run regardless of `transport.tailscale_oauth_required` (see
   // `tsOauthItem`'s doc).
-  items.push(tsOauthItem(fleetName, manifest.transport.tailscale_oauth_required, observed.vaultTsOauth, observed.lock));
+  items.push(tsOauthItem(fleetName, manifest.transport.tailscale_oauth_required, observed.vaultTsOauth, observed.lock, routerCarryingRepos(manifest), observed.routingSecretRepos));
 
   // groundnuty/macf#1162 — the scope-credential provenance notice, sourced
   // from the MANIFEST declaration UNION the LOCK marker (never lock alone

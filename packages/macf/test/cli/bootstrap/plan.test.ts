@@ -6,6 +6,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import type { FleetLock, FleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
+import { routerCarryingRepos } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import {
   APPLY_UNIMPLEMENTED_REASONS,
   computePlan,
@@ -2635,6 +2636,54 @@ describe('computePlan — Tailscale OAuth item (groundnuty/macf#1109)', () => {
     expect(item?.verb).toBe('create');
     expect(item?.reason).toContain('WILL publish');
     expect(item?.reason).toContain('NOT declared'); // names the flag mismatch honestly
+  });
+
+  describe('a pending refresh of the deployed Tailscale pair', () => {
+    const HELD = `sha256:${'a'.repeat(64)}`;
+    const OLD = `sha256:${'b'.repeat(64)}`;
+    const repos = routerCarryingRepos(baseManifest());
+    const names = (...n: string[]) => ({ status: 'confirmed' as const, names: new Set(n) });
+    const lockWith = (fp?: Record<string, string>): FleetLock => ({ schema_version: 1, fleet: 'demo-fleet', agents: [], ...(fp !== undefined ? { fleet_fingerprints: fp } : {}) });
+    const item = (lock: FleetLock, secretRepos: ObservedState['routingSecretRepos']) =>
+      computePlan(baseManifest(), {
+        ...EMPTY_OBSERVED,
+        lock,
+        vaultTsOauth: { status: 'confirmed', present: true, fingerprint: HELD },
+        routingSecretRepos: secretRepos,
+      }).items.find((i) => i.kind === 'ts_oauth');
+
+    it('a brand-new fleet (lock present, no routing secrets on any repo) is not an update', () => {
+      const secretRepos = Object.fromEntries(repos.map((r) => [r, names()]));
+      expect(item(lockWith(), secretRepos)?.verb).toBe('create');
+    });
+
+    it('a legacy lock where only one repo holds the bundle is an update naming exactly that repo', () => {
+      expect(repos.length).toBeGreaterThan(1);
+      const secretRepos = Object.fromEntries(repos.map((r, i) => [r, i === 0 ? names('MACF_ROUTING_BUNDLE') : names()]));
+      const it1 = item(lockWith(), secretRepos);
+      expect(it1?.verb).toBe('update');
+      expect(it1?.reason).toContain(`no record of which Tailscale pair was deployed: ${repos[0]}`);
+      expect(it1?.reason).not.toContain(repos[1]!);
+      expect(it1?.reason).not.toContain('every router-carrying repo');
+    });
+
+    it('a recorded pair that differs names the repo as drifted; a matching record is no update', () => {
+      const secretRepos = Object.fromEntries(repos.map((r) => [r, names('TS_OAUTH_SECRET')]));
+      const drifted = item(lockWith({ [`ts_oauth_deployed:${repos[0]}`]: OLD, ...Object.fromEntries(repos.slice(1).map((r) => [`ts_oauth_deployed:${r}`, HELD])) }), secretRepos);
+      expect(drifted?.verb).toBe('update');
+      expect(drifted?.reason).toContain(`deployed with a different Tailscale pair than the vault holds: ${repos[0]}`);
+      expect(drifted?.reason).not.toContain(HELD);
+      const ok = item(lockWith(Object.fromEntries(repos.map((r) => [`ts_oauth_deployed:${r}`, HELD]))), secretRepos);
+      expect(ok?.verb).toBe('create');
+    });
+
+    it('a repo whose secret names are unknown is named as unchecked, not as needing the rewrite', () => {
+      const secretRepos = Object.fromEntries(repos.map((r, i) => [r, i === 0 ? { status: 'unknown' as const, reason: 'x' } : names('MACF_ROUTING_BUNDLE')]));
+      const it1 = item(lockWith(), secretRepos);
+      expect(it1?.verb).toBe('update');
+      expect(it1?.reason).toContain(`could not check ${repos[0]}`);
+      expect(it1?.reason).not.toContain(`no record of which Tailscale pair was deployed: ${repos[0]}`);
+    });
   });
 
   it('vault CONFIRMED absent + tailscale_oauth_required NOT declared -> noop, but the reason states the real routing consequence, not a bland tidy-up note', () => {
