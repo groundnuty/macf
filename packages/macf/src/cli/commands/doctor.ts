@@ -48,6 +48,7 @@ import {
   idleCompactionIsOff,
   installSandboxFdAllowRead,
   MACF_LEGACY_DENY_WRITE_PATTERNS,
+  getInvalidAllowWildcards,
   SANDBOX_FD_READ_PATTERN,
 } from '../settings-writer.js';
 import {
@@ -963,6 +964,24 @@ function legacyDenyWriteFindings(deny: readonly string[]): RoleSettingFinding[] 
   return findings;
 }
 
+/**
+ * Flags a `permissions.allow` entry Claude Code rejects (bare `mcp__*` or a
+ * glob outside the tool position). Presence-based like the legacy-deny check,
+ * so it trips `checkRoleSettings`'s `status !== 'PASS'` — the `--fix`
+ * `needsFix` gate — on its own. Reads settings.json only (repairable).
+ */
+function invalidAllowWildcardFindings(workspaceDir: string): RoleSettingFinding[] {
+  return getInvalidAllowWildcards(workspaceDir).map((entry) => ({
+    category: 'allow' as const,
+    item: entry,
+    severity: 'WARN' as const,
+    message: `invalid allow entry "${entry}" present — Claude Code rejects it ("Wildcard tool ` +
+      'name is not supported in allow rules; globs are permitted only in the tool position after ' +
+      'a literal mcp__<server>__ prefix") and shows a blocking startup dialog that stalls the ' +
+      'agent. Run `macf doctor --fix` or `macf update` to drop it.',
+  }));
+}
+
 function hookFindings(commands: readonly string[], role: string): RoleSettingFinding[] {
   const findings: RoleSettingFinding[] = [];
   for (const hook of expectedHooksForRole(role)) {
@@ -1009,6 +1028,7 @@ export function checkRoleSettings(workspaceDir: string, role: string): RoleSetti
     ...allowFindings(allow, role),
     ...denyFindings(deny),
     ...legacyDenyWriteFindings(deny),
+    ...invalidAllowWildcardFindings(workspaceDir),
     ...hookFindings(commands, role),
   ];
 

@@ -1204,6 +1204,45 @@ export const MACF_LEGACY_DENY_WRITE_PATTERNS: readonly string[] = [
 ];
 
 /**
+ * True when `entry` is a `permissions.allow` rule Claude Code REJECTS at
+ * startup. Claude Code skips such a rule (so it grants nothing) but shows a
+ * BLOCKING dialog first, which swallows a tmux wake and stops every spawned
+ * subagent until a human clicks. Its message, verbatim:
+ *
+ *   Invalid permission rule "mcp__*" was skipped: Wildcard tool name "mcp__*"
+ *   is not supported in allow rules. An allow pattern must name the scope it
+ *   widens — globs are permitted only in the tool position after a literal
+ *   mcp__<server>__ prefix. Deny and ask rules accept wildcards anywhere
+ *
+ * So an `mcp__` allow entry is valid iff it has NO `*` before the end of its
+ * `mcp__<server>__` prefix (server literal, non-empty). Glob in the tool
+ * position (after that prefix) is fine. Removed: `mcp__*`, `mcp__*__x`,
+ * `mcp__a*__b`. Kept: `mcp__srv__*`, `mcp__srv__tool`, `mcp__srv`.
+ * Applies to ALLOW only — never call this on deny/ask.
+ */
+export function isInvalidMcpAllowWildcard(entry: unknown): boolean {
+  if (typeof entry !== 'string' || !entry.startsWith('mcp__')) return false;
+  if (!entry.includes('*')) return false;
+  const rest = entry.slice('mcp__'.length);
+  const sep = rest.indexOf('__');
+  // No `__` terminator → the server part itself contains the glob (`mcp__*`).
+  if (sep <= 0) return true;
+  // Glob inside the server segment (`mcp__a*__b`, `mcp__*__x`) is invalid.
+  return rest.slice(0, sep).includes('*');
+}
+
+/**
+ * Entries in the workspace's OWN `.claude/settings.json` `permissions.allow`
+ * that Claude Code rejects (see `isInvalidMcpAllowWildcard`). Reads
+ * settings.json only — the file `installPluginSkillPermissions` rewrites — so
+ * a finding built on this is one `doctor --fix` can actually repair.
+ */
+export function getInvalidAllowWildcards(workspaceDir: string): readonly string[] {
+  const path = join(resolve(workspaceDir), '.claude', 'settings.json');
+  return readPermissionsArray(path, 'allow').filter(isInvalidMcpAllowWildcard);
+}
+
+/**
  * Install (or refresh) the MACF plugin-skill + MCP-tool pre-approval
  * entries in `.claude/settings.json` (kept-named for back-compat — see
  * `installGhTokenHook`'s doc comment for the same naming convention; this
@@ -1264,6 +1303,8 @@ export function applyPluginSkillPermissionsTransform(settings: Settings): Settin
     if (entry.startsWith(MACF_SKILL_PATTERN_PREFIX)) return false;
     if (entry.startsWith(MACF_MCP_TOOL_PATTERN_PREFIX)) return false;
     if (entry.startsWith(MACF_LEGACY_MCP_TOOL_PATTERN_PREFIX)) return false;
+    // Claude Code rejects these in allow (blocking startup dialog) — strip.
+    if (isInvalidMcpAllowWildcard(entry)) return false;
     return true;
   });
 
