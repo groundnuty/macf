@@ -1377,6 +1377,8 @@ program
     'profile scope for a User owner — never the self-pointing repo scope.')
   .option('--registry-org <org>', 'Org login (for --registry-type org)')
   .option('--registry-user <user>', 'User login (for --registry-type profile)')
+  .option('--ci-workflows <names>', 'Comma-separated CI workflow names for the router\'s workflow_run trigger. ' +
+    'Omitted: scanned from .github/workflows/ (workflows that run on push or pull_request). Needs macf-actions v3.6.0+.')
   .option('--force', 'Overwrite existing files', false)
   .option('--dir <path>', 'Target directory (defaults to current working directory)')
   .action(async (opts) => {
@@ -1390,6 +1392,7 @@ program
       registryType: opts.registryType,
       registryOrg: opts.registryOrg,
       registryUser: opts.registryUser,
+      ciWorkflows: opts.ciWorkflows ? String(opts.ciWorkflows).split(',').map((n: string) => n.trim()).filter(Boolean) : undefined,
       force: opts.force,
     });
   });
