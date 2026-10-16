@@ -78,6 +78,16 @@ describe('checkMacfIgnores', () => {
     );
   });
 
+  it('a key committed under .macf/certs is reported as tracked even after .macf/ is ignored', () => {
+    mkdirSync(join(dir, '.macf', 'certs'), { recursive: true });
+    writeFileSync(join(dir, '.macf', 'certs', 'agent-key.pem'), 'secret');
+    execFileSync('git', ['add', '-f', '.macf/certs/agent-key.pem'], { cwd: dir });
+    updateGitignore(dir);
+    const r = checkMacfIgnores(dir);
+    expect(r.status).toBe('WARN');
+    expect(r.tracked).toContain('.macf/certs');
+  });
+
   it('reports a "!" re-include when the block exists but the path is still not ignored', () => {
     updateGitignore(dir);
     writeFileSync(join(dir, '.gitignore'), readFileSync(join(dir, '.gitignore'), 'utf-8') + '!.claude/.macf/\n');

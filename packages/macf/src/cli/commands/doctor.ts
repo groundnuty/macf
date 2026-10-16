@@ -2600,6 +2600,17 @@ export function checkMacfIgnores(workspaceDir: string): MacfIgnoreCheckResult {
   for (const rel of MACF_IGNORE_PROBES) {
     if (!existsSync(join(absDir, rel))) continue;
     probed += 1;
+    // Tracked first: ignoring a directory does not untrack files already committed under it.
+    let trackedHere: boolean;
+    try {
+      trackedHere = isTracked(absDir, rel);
+    } catch {
+      return { status: 'UNKNOWN', findings: [], tracked: [], reincluded: [], detail: `${absDir} is not a git repository, or git is unavailable` };
+    }
+    if (trackedHere) {
+      tracked.push(rel);
+      continue;
+    }
     try {
       execFileSync('git', ['check-ignore', '-q', '--', rel], { cwd: absDir, stdio: 'ignore' });
     } catch (err) {
@@ -2607,8 +2618,7 @@ export function checkMacfIgnores(workspaceDir: string): MacfIgnoreCheckResult {
       if (status !== 1) {
         return { status: 'UNKNOWN', findings: [], tracked: [], reincluded: [], detail: `${absDir} is not a git repository, or git is unavailable` };
       }
-      if (isTracked(absDir, rel)) tracked.push(rel);
-      else unignored.push(rel);
+      unignored.push(rel);
     }
   }
   const blockPresent = hasMacfBlock(absDir);
