@@ -4,6 +4,41 @@ All notable changes to the `macf` CLI. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.66] — 2026-10-16
+
+**Every defect the 0.2.65 release acceptance on a live fleet turned up, fixed: a fleet upgrade that exposed agent certs, CI-completion routing that had never fired, launch prompts that stalled a relaunch, and mention checks that missed what an agent would actually run.**
+
+### Security
+
+- **A fleet upgrade no longer exposes an agent's certs and env files.**
+  - **Stash:** `restart-self` stashed macf's own `.gitignore` block during `fleet upgrade`, which left `.macf/certs` and `.claude/.macf/env.*` trackable. It now never stashes the files macf writes (`.gitignore`, `.claude/audit.log`), and the roll passes `--reason upgrade`.
+  - **`doctor`:** checks every macf env file and the certs directory. A file already committed is its own finding: remove it from the index, and rotate the key if that commit was pushed. A `!` re-include is reported too. `--fix` restores a missing ignore block without looping. (#1486)
+
+### Fixed
+
+- **CI-completion routing fires for GitHub Actions CI.**
+  - **Cause:** GitHub does not trigger workflows from check suites created by Actions, so `route-by-ci-completion` never ran; `groundnuty/macf` had no `check_suite` run in six months.
+  - **Router:** routes on `workflow_run: completed` (`groundnuty/macf-actions` v3.6.0).
+  - **Generated callers:** subscribe to the repo's CI workflows (scanned, or `--ci-workflows`; an empty value means none) for router pins at or above v3.6.0. (#1487)
+- **The first `fleet upgrade` of a deployed fleet no longer objects to macf's own output.** `init`, `update` and `rules refresh` record a hash of each file they actually write, so the config-dirty gate accepts output of an older macf while still objecting to an edit. (#1486)
+- **A stalled launch prompt is retried, and reported for what it is.**
+  - **Watcher:** an answer counts as taken only if the prompt stays gone for a settle window, and an allowlisted prompt that comes back is answered again (bounded) instead of being classed as unknown. Unlisted frames are still never answered.
+  - **`fleet upgrade`:** an agent whose pane shows a prompt is reported as `stuck-at-launch-prompt`: a skip that names the tmux session, the operator's manual answer, and the exact re-run. It is no longer reported as a bad release. (#1485)
+- **`macf update` keeps an operator's own rule file with a canonical name.**
+  - **Kept files:** a `.claude/rules` file without the managed header is kept with a warning instead of overwritten, and a symlink is never written through.
+  - **`doctor`:** reports both, each with its remedy. (#1484)
+- **The AgentCard advertises the bound port.** It said port 0 when the port was assigned at bind time, so an external A2A client could not reach the agent from its card. (#1481)
+- **The mention hook checks what will actually run, and accepts what will be delivered.**
+  - **Issue creates:** a new issue needs a label for another agent, or `backlog`. A mention in its body never routes, and a label the agent applies to itself routes nowhere. A label the hook cannot confirm warns rather than blocks.
+  - **Chained comments:** each chained comment needs its own mention.
+  - **Splitter:** commands are split by one quote-aware splitter, which understands:
+    - quotes, heredocs and here-strings;
+    - line continuations and shell keywords;
+    - `bash -lc` scripts;
+    - command substitutions inside double quotes.
+
+    A quoted example no longer counts as a command, and a command behind a keyword or a continuation is no longer missed. (#1482)
+
 ## [0.2.65] — 2026-10-16
 
 **The canonical rules every agent loads shrink from about 331,000 to 20,670 characters and are rewritten for the Claude 5 family. Idle compaction is turned off everywhere.**
