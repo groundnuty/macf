@@ -318,7 +318,7 @@ export const MacfAgentConfigSchema = z.object({
   // a real artifact (the comment's author), not a self-attestation. Unset
   // → the sanction-comment path is off; the gate behaves exactly as it did
   // before #822 Part 2 (non-author APPROVED review or MACF_SKIP_LGTM_CHECK
-  // only). See pr-discipline.md §"Operator-sanctioned exception (macf#822)".
+  // only). See pr-discipline.md §"Operator-sanctioned exception".
   operator_login: z.string().min(1).optional(),
 });
 

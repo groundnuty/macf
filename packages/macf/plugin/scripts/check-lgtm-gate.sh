@@ -19,7 +19,7 @@
 # transient disconnect). Same reasoning UC-4 (PR #275) demonstrated.
 #
 # Override: MACF_SKIP_LGTM_CHECK=1 bypasses (launch-time / operator only —
-# per pr-discipline.md §"When the reviewer is absent or unreachable" —
+# per pr-discipline.md §"Merging" —
 # reporter-sanctioned self-merge, urgent revert, etc.).
 #
 # Operator-sanctioned exception, agent-usable (groundnuty/macf#822 Part 2,
@@ -505,7 +505,7 @@ THEIR OWN GitHub login (a formal \`gh pr review --approve\` from them also
 clears the gate via the path above). This is un-forgeable — an agent
 cannot post a comment attributed to the operator's account — so the gate
 verifies a real artifact instead of trusting a self-attestation. See
-pr-discipline.md §"Operator-sanctioned exception (macf#822)".
+pr-discipline.md §"Operator-sanctioned exception".
 
 Refs: groundnuty/macf#270 (this hook); pr-discipline.md (canonical rule);
 DR-023 amendment (bash-form decision rule); macf#262 / PR #263 (rule

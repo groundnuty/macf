@@ -293,7 +293,7 @@ export function generateEnvIdentity(config: MacfAgentConfig): string {
           '# APPROVED review. Un-forgeable — an agent cannot post a GitHub',
           '# comment attributed to the operator\'s own account, so the hook',
           '# verifies a real artifact, not a self-attestation. See',
-          '# pr-discipline.md §"Operator-sanctioned exception (macf#822)".',
+          '# pr-discipline.md §"Operator-sanctioned exception".',
           `export MACF_OPERATOR_LOGIN="${config.operator_login}"`,
         ]
       : []),
