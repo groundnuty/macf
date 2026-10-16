@@ -184,10 +184,23 @@ export function toBase64ForSecret(value: string): string {
  * `RoutingSecretResolution.value` strings, never inspecting or
  * transforming them.
  */
+/**
+ * A pair supplied THIS run (flags/env/secrets file — never a vault-restore)
+ * replaces what an earlier run built from a possibly-wrong pair. `onRefreshed`
+ * reports each overwrite so apply can name the repos it rewrote and why.
+ */
+export interface RoutingRefreshOptions {
+  readonly refreshExisting?: boolean;
+  readonly onRefreshed?: (name: string, repo: string) => void;
+}
+
+const TS_OAUTH_NAMES: readonly RoutingSecretName[] = [TS_OAUTH_CLIENT_ID_SECRET_NAME, TS_OAUTH_SECRET_SECRET_NAME];
+
 export async function publishRoutingSecrets(
   secrets: RoutingSecretsForPublish,
   repos: readonly string[],
   deps: RoutingSecretsPublishDeps,
+  opts: RoutingRefreshOptions = {},
 ): Promise<RoutingSecretsPublishResult> {
   const result = {} as Record<RoutingSecretName, Record<string, EnsureVariableOutcome>>;
   for (const name of ALL_ROUTING_SECRET_NAMES) result[name] = {};
@@ -201,7 +214,14 @@ export async function publishRoutingSecrets(
         continue;
       }
       const legDeps: EnsureVariableDeps = {
-        checkPresence: () => deps.checkRepoSecretPresence(repo, name),
+        checkPresence: async () => {
+          const presence = await deps.checkRepoSecretPresence(repo, name);
+          if (presence === 'present' && opts.refreshExisting === true && TS_OAUTH_NAMES.includes(name) && resolution.status === 'available') {
+            await deps.setRepoSecret(repo, name, resolution.value);
+            opts.onRefreshed?.(name, repo);
+          }
+          return presence;
+        },
         create: async () => {
           if (resolution.status !== 'available') throw new Error(resolution.reason);
           await deps.setRepoSecret(repo, name, resolution.value);
@@ -348,6 +368,7 @@ export async function publishRoutingBundle(
   secrets: RoutingSecretsForPublish,
   repos: readonly string[],
   deps: RoutingSecretsPublishDeps,
+  opts: RoutingRefreshOptions = {},
 ): Promise<Readonly<Record<string, EnsureVariableOutcome>>> {
   const unavailable = ALL_ROUTING_SECRET_NAMES.filter((name) => secrets[name].status === 'unavailable');
   const notRequired = ALL_ROUTING_SECRET_NAMES.filter((name) => secrets[name].status === 'not-required');
@@ -367,7 +388,14 @@ export async function publishRoutingBundle(
   for (const repo of repos) {
     if (bundleValue !== undefined) {
       const legDeps: EnsureVariableDeps = {
-        checkPresence: () => deps.checkRepoSecretPresence(repo, ROUTING_BUNDLE_SECRET_NAME),
+        checkPresence: async () => {
+          const presence = await deps.checkRepoSecretPresence(repo, ROUTING_BUNDLE_SECRET_NAME);
+          if (presence === 'present' && opts.refreshExisting === true) {
+            await deps.setRepoSecret(repo, ROUTING_BUNDLE_SECRET_NAME, bundleValue);
+            opts.onRefreshed?.(ROUTING_BUNDLE_SECRET_NAME, repo);
+          }
+          return presence;
+        },
         create: async () => {
           await deps.setRepoSecret(repo, ROUTING_BUNDLE_SECRET_NAME, bundleValue);
           return 'created';
@@ -380,6 +408,15 @@ export async function publishRoutingBundle(
     // that already carries a bundle from an earlier run is untouched
     // regardless of whether THIS run could recompute one.
     const presence = await deps.checkRepoSecretPresence(repo, ROUTING_BUNDLE_SECRET_NAME);
+    if (presence === 'present' && opts.refreshExisting === true) {
+      result[repo] = {
+        status: 'failed',
+        reason:
+          `${ROUTING_BUNDLE_SECRET_NAME} exists on this repo and a new Tailscale pair was supplied, but the bundle ` +
+          'cannot be recomposed this run (another routing secret is unavailable) — the existing bundle still holds the old pair',
+      };
+      continue;
+    }
     if (presence === 'present') {
       result[repo] = { status: 'already-present' };
       continue;
@@ -605,6 +642,40 @@ export function checkTsOauthFlagsComplete(clientId: string | undefined, secret: 
  * never returns a half-built pair — the two functions share the exact same
  * "non-empty string" predicate on purpose.
  */
+export const TS_OAUTH_MALFORMED_CODE = 'ts_oauth_malformed';
+export const TS_OAUTH_SECRET_PREFIX = 'tskey-client-';
+
+function tsOauthValueProblem(value: string): string | undefined {
+  if (value.trim().length === 0) return 'is empty';
+  if (/[<>]/.test(value)) return 'contains "<" or ">" — it looks like a placeholder, not a real value';
+  if (/\s/.test(value)) return 'contains whitespace';
+  return undefined;
+}
+
+/**
+ * Pattern B at the intake: refuse a placeholder pair BEFORE anything is
+ * written. Names which value failed and why; never echoes either value.
+ * `source` says where the pair came from (e.g. "vault-stored").
+ */
+export function validateTsOauthPair(clientId: string, secret: string, source = 'supplied'): TailscaleOauthPreflightFailure | undefined {
+  const problems: string[] = [];
+  const idProblem = tsOauthValueProblem(clientId);
+  if (idProblem !== undefined) problems.push(`the Tailscale OAuth client id ${idProblem}`);
+  const secretProblem = tsOauthValueProblem(secret);
+  if (secretProblem !== undefined) problems.push(`the Tailscale OAuth secret ${secretProblem}`);
+  else if (!secret.startsWith(TS_OAUTH_SECRET_PREFIX)) {
+    problems.push(`the Tailscale OAuth secret does not start with "${TS_OAUTH_SECRET_PREFIX}"`);
+  }
+  if (problems.length === 0) return undefined;
+  return {
+    code: TS_OAUTH_MALFORMED_CODE,
+    message:
+      `The ${source} Tailscale OAuth pair is not usable: ${problems.join('; ')}. Nothing was written. ` +
+      'Supply the real OAuth client id and secret from the Tailscale admin console ' +
+      `(${TS_OAUTH_CLIENT_ID_FLAG} / ${TS_OAUTH_SECRET_FLAG}).`,
+  };
+}
+
 export function resolvedTsOauthPair(clientId: string | undefined, secret: string | undefined): ResolvedTsOauth | undefined {
   if (clientId === undefined || clientId.length === 0 || secret === undefined || secret.length === 0) return undefined;
   return { clientId, secret };
@@ -717,7 +788,7 @@ export async function checkTailscaleOauthPreflight(
     if (clientId === undefined || clientId.length === 0 || secret === undefined || secret.length === 0) {
       return missing('both fields present in the manifest requirement but absent or empty in the decrypted vault');
     }
-    return undefined;
+    return validateTsOauthPair(clientId, secret, 'vault-stored');
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
     return missing(`vault decrypt failed: ${reason}`);

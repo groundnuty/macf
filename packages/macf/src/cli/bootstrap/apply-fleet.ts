@@ -241,6 +241,7 @@ import type {
   VaultCaSecrets,
   VaultEncryptFn,
   VaultRoutingAppSecrets,
+  VaultTsOauthSecrets,
   VaultRoutingClientSecrets,
   VaultRunnerOpsSecrets,
   WriteVaultDeps,
@@ -301,7 +302,7 @@ import {
 } from './runner-platform.js';
 import type { RoutingClientApplyDeps, RoutingClientMintOutcome, RoutingClientSecretsForPublish } from './apply-routing-client.js';
 import { ROUTING_CLIENT_CERT_SECRET_NAME, ROUTING_CLIENT_KEY_SECRET_NAME, mintRoutingClient, resolveRoutingClientSecretsForPublish } from './apply-routing-client.js';
-import type { ResolvedTsOauth, RoutingSecretResolution, RoutingSecretsForPublish, RoutingSecretsPublishDeps, RoutingSecretsPublishResult } from './apply-routing-secrets.js';
+import type { ResolvedTsOauth, RoutingRefreshOptions, RoutingSecretResolution, RoutingSecretsForPublish, RoutingSecretsPublishDeps, RoutingSecretsPublishResult } from './apply-routing-secrets.js';
 import {
   ROUTING_APP_ID_SECRET_NAME,
   ROUTING_APP_KEY_SECRET_NAME,
@@ -310,6 +311,7 @@ import {
   determineFleetRoutingFact,
   publishRoutingBundle,
   publishRoutingSecrets,
+  validateTsOauthPair,
   skippedRoutingBundlePublish,
   skippedRoutingSecretsPublish,
   toBase64ForSecret,
@@ -2369,6 +2371,15 @@ export async function applyFleet(
   const routingClientSecretsForVault: VaultRoutingClientSecrets | undefined =
     routingClientMint.status === 'minted' ? { clientCertPem: routingClientMint.certPem, clientKeyPem: routingClientMint.keyPem } : undefined;
 
+  // A pair supplied this run is recorded in the vault (once; skipped when the vault already holds it).
+  let tsOauthForVault: VaultTsOauthSecrets | undefined;
+  if (deps.resolvedTsOauth !== undefined && validateTsOauthPair(deps.resolvedTsOauth.clientId, deps.resolvedTsOauth.secret) === undefined) {
+    const vaultExists = (deps.vaultDeps.exists ?? existsSync)(vaultOutPath);
+    const writable = manifest.transport.age_recipients.length > 0 && (!vaultExists || deps.identityKeyPath !== undefined);
+    const stored = deps.routingSecretsDeps.readVaultTsOauth !== undefined ? await deps.routingSecretsDeps.readVaultTsOauth() : undefined;
+    const same = stored?.clientId === deps.resolvedTsOauth.clientId && stored?.secret === deps.resolvedTsOauth.secret;
+    if (writable && !same) tsOauthForVault = deps.resolvedTsOauth;
+  }
   const vault = await settleVault(
     manifest,
     vaultOutPath,
@@ -2378,6 +2389,7 @@ export async function applyFleet(
     pendingRunnerOpsVaultSecrets,
     pendingRoutingAppVaultSecrets,
     deps,
+    tsOauthForVault,
   );
   // groundnuty/macf#1230 — a THIRD reason (alongside "new agent secret" /
   // "new fleet-level secret") this batched lock write must fire: a
@@ -2674,7 +2686,12 @@ export async function applyFleet(
   let tsOauthSecret: RoutingSecretResolution;
   const restoredTsOauth = deps.routingSecretsDeps.readVaultTsOauth !== undefined ? await deps.routingSecretsDeps.readVaultTsOauth() : undefined;
   const suppliedTsOauth: ResolvedTsOauth | undefined = deps.resolvedTsOauth ?? restoredTsOauth;
-  if (suppliedTsOauth !== undefined) {
+  const tsOauthMalformed =
+    suppliedTsOauth !== undefined ? validateTsOauthPair(suppliedTsOauth.clientId, suppliedTsOauth.secret, deps.resolvedTsOauth !== undefined ? 'supplied' : 'vault-stored') : undefined;
+  if (tsOauthMalformed !== undefined) {
+    tsOauthClientId = { status: 'unavailable', reason: tsOauthMalformed.message };
+    tsOauthSecret = { status: 'unavailable', reason: tsOauthMalformed.message };
+  } else if (suppliedTsOauth !== undefined) {
     tsOauthClientId = { status: 'available', value: suppliedTsOauth.clientId };
     tsOauthSecret = { status: 'available', value: suppliedTsOauth.secret };
   } else if (manifest.transport.tailscale_oauth_required) {
@@ -2718,7 +2735,13 @@ export async function applyFleet(
     [TS_OAUTH_CLIENT_ID_SECRET_NAME]: tsOauthClientId,
     [TS_OAUTH_SECRET_SECRET_NAME]: tsOauthSecret,
   };
-  const routingSecretsPublish: RoutingSecretsPublishResult = await publishRoutingSecrets(routingSecretsForPublish, routerCarryingRepos, deps.routingSecretsDeps);
+  // A pair supplied THIS run (not vault-restored) replaces what earlier runs built from the old one.
+  const refreshed: string[] = [];
+  const refreshOpts: RoutingRefreshOptions = {
+    refreshExisting: deps.resolvedTsOauth !== undefined && tsOauthMalformed === undefined,
+    onRefreshed: (name, repo) => refreshed.push(`${name} on ${repo}`),
+  };
+  const routingSecretsPublish: RoutingSecretsPublishResult = await publishRoutingSecrets(routingSecretsForPublish, routerCarryingRepos, deps.routingSecretsDeps, refreshOpts);
 
   // groundnuty/macf#1162 — the FLEET-LEVEL fact the per-repo/per-secret
   // rows below jointly determine but never state on their own (the exact
@@ -2756,7 +2779,13 @@ export async function applyFleet(
   // `routingSecretsForPublish` bag (never a second resolution pass — see
   // `apply-routing-secrets.ts::publishRoutingBundle`'s doc for why this
   // must compose from every-six-available or refuse).
-  const routingBundlePublish = await publishRoutingBundle(routingSecretsForPublish, routerCarryingRepos, deps.routingSecretsDeps);
+  const routingBundlePublish = await publishRoutingBundle(routingSecretsForPublish, routerCarryingRepos, deps.routingSecretsDeps, refreshOpts);
+  if (refreshed.length > 0) {
+    deps.log(
+      `Refreshed ${String(refreshed.length)} routing secret(s) from the Tailscale OAuth pair supplied this run ` +
+        `(replacing values built from an earlier pair): ${refreshed.join(', ')}.`,
+    );
+  }
   {
     const created = Object.values(routingBundlePublish).filter((l) => l.status === 'created').length;
     const alreadyPresent = Object.values(routingBundlePublish).filter((l) => l.status === 'already-present').length;
@@ -3254,8 +3283,10 @@ async function settleVault(
   runnerOpsSecrets: VaultRunnerOpsSecrets | undefined,
   routingAppSecrets: VaultRoutingAppSecrets | undefined,
   deps: FleetApplyDeps,
+  tsOauthSecrets?: VaultTsOauthSecrets,
 ): Promise<VaultApplyOutcome> {
   if (
+    tsOauthSecrets === undefined &&
     pendingVaultAgents.length === 0 &&
     caSecrets === undefined &&
     routingClientSecrets === undefined &&
@@ -3315,6 +3346,7 @@ async function settleVault(
       ...(routingClientSecrets !== undefined ? { routingClient: routingClientSecrets } : {}),
       ...(runnerOpsSecrets !== undefined ? { runnerOps: runnerOpsSecrets } : {}),
       ...(routingAppSecrets !== undefined ? { routingApp: routingAppSecrets } : {}),
+      ...(tsOauthSecrets !== undefined ? { tsOauth: tsOauthSecrets } : {}),
     });
 
     // DR-043 Amendment D (groundnuty/macf#989) — a vault that ALREADY has
