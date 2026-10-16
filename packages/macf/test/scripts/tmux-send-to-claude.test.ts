@@ -47,6 +47,8 @@ printf '%s\\n' "$*" | tr '\\n' ' ' >> "$D/calls"; echo >> "$D/calls"
 cmd="$1"; shift
 if [ "\${1:-}" = "-t" ]; then shift 2; fi
 mode="$(cat "$D/mode")"
+styled=0; for a in "$@"; do [ "$a" = "-e" ] && styled=1; done
+DIM=$'\\033[2m'; RST=$'\\033[0m'
 box() { cat "$D/box" 2>/dev/null || true; }
 case "$cmd" in
   send-keys)
@@ -66,6 +68,8 @@ case "$cmd" in
       if [ -e "$D/paste" ]; then printf '\\n' >> "$D/box"; exit 0; fi
       if [ -s "$D/box" ]; then
         cat "$D/box" >> "$D/transcript"; printf '\\n---\\n' >> "$D/transcript"
+        # echo mode: the TUI predicts a next prompt that repeats this one
+        [ -e "$D/echo" ] && head -n 1 "$D/box" > "$D/suggest"
         : > "$D/box"
       fi
       exit 0
@@ -84,7 +88,14 @@ case "$cmd" in
     if [ "$mode" != noprompt ]; then
       first="$(box | head -n 1)"
       w="$(cat "$D/wrap" 2>/dev/null || echo 0)"
-      if [ -z "$first" ]; then echo '❯ Try "fix a bug"'
+      if [ -z "$first" ]; then
+        # empty box: suggestion (echo mode) or placeholder; dim under -e,
+        # unless echo mode is "typed" (rendered as ordinary text)
+        sug="$(cat "$D/suggest" 2>/dev/null || true)"
+        [ -z "$sug" ] && sug='Try "fix a bug"'
+        if [ "$styled" -eq 1 ] && [ "$(cat "$D/echo" 2>/dev/null)" != typed ]; then
+          echo "❯ \${DIM}\${sug}\${RST}"
+        else echo "❯ $sug"; fi
       elif [ "$w" -le 0 ]; then echo "❯ $first"
       else
         # wrap at word boundaries like the TUI: continuation rows indented 2
@@ -232,7 +243,7 @@ describe('tmux-send-to-claude.sh', () => {
     const tools = join(dir, 'minbin');
     mkdirSync(tools);
     symlinkSync(join(binDir, 'tmux'), join(tools, 'tmux'));
-    for (const t of ['bash', 'env', 'sleep', 'awk', 'cat', 'tr', 'head', 'rm']) {
+    for (const t of ['bash', 'env', 'sleep', 'awk', 'sed', 'cat', 'tr', 'head', 'rm']) {
       symlinkSync(whichBin(t), join(tools, t));
     }
     expect(existsSync(join(tools, 'md5sum'))).toBe(false);
@@ -241,6 +252,26 @@ describe('tmux-send-to-claude.sh', () => {
     expect(r.status).toBe(0);
     expect(enters()).toBe(1);
     expect(read('transcript')).toContain(LONG);
+  });
+
+  describe('dim prompt suggestions (Claude Code 2.1.300)', () => {
+    it('dim suggestion echoing the prompt after submit → exit 0, ONE Enter', () => {
+      setup('normal');
+      writeFileSync(join(dir, 'echo'), 'dim');
+      const r = run(NEW_SCRIPT, 'agent:0', LONG);
+      expect(r.status).toBe(0);
+      expect(enters()).toBe(1);
+      expect(read('suggest')).toContain('Please review PR 123');
+      expect(read('calls')).toMatch(/capture-pane .*-p -e/);
+    });
+
+    it('same echo rendered NOT dim (typed text) → still unsubmitted: retries, exit 4', () => {
+      setup('normal');
+      writeFileSync(join(dir, 'echo'), 'typed');
+      const r = run(NEW_SCRIPT, 'agent:0', LONG);
+      expect(r.status).toBe(4);
+      expect(enters()).toBe(3);
+    });
   });
 
   describe('wrapped input box (continuation rows indented)', () => {
