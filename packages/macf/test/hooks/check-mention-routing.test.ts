@@ -1143,6 +1143,61 @@ describe('check-mention-routing.sh (hook)', () => {
         expect(r.stderr).toContain('chained');
       });
 
+      it.each([
+        ['if gh issue comment 5 --body "done"; then echo ok; fi'],
+        ['while gh issue comment 5 --body "done"; do sleep 1; done'],
+        ['! gh issue comment 5 --body "done"'],
+        ['{ gh issue comment 5 --body "done"; }'],
+        ['if ! time gh issue comment 5 --body "done"; then echo no; fi'],
+      ])('a comment behind a shell keyword is still checked for a mention (%#)', (command) => {
+        const r = runCreate(command);
+        expect(r.status).toBe(2);
+      });
+
+      it('a keyword-led comment with a mention is allowed', () => {
+        const r = runCreate('if gh issue comment 5 --body "x\n@macf-science-agent[bot] done"; then echo ok; fi');
+        expect(r.status).toBe(0);
+      });
+
+      it('an issue create behind a keyword is checked for a label', () => {
+        expect(runCreate('! gh issue create --title x --body b').status).toBe(2);
+        expect(runCreate('if gh issue create --title x --body b; then echo ok; fi').status).toBe(2);
+      });
+
+      it('a close with a comment does not exempt an unlabelled create chained after it', () => {
+        const r = runCreate('gh issue close 1 --comment "Verified" && gh issue create --title x --body b');
+        expect(r.status).toBe(2);
+        expect(r.stderr).toContain('no label for another agent');
+      });
+
+      it('a create before a close is also validated as a create', () => {
+        const r = runCreate('gh issue create --title x --body b && gh issue close 1 --comment "Verified"');
+        expect(r.status).toBe(2);
+      });
+
+      it('a close with a comment and no mention, alone, is still allowed', () => {
+        expect(runCreate('gh issue close 1 --comment "Verified"').status).toBe(0);
+      });
+
+      it('a close does not exempt a mention-less comment chained with it', () => {
+        const r = runCreate('gh issue close 1 --comment "Verified" && gh issue comment 2 --body "no mention"');
+        expect(r.status).toBe(2);
+      });
+
+      it('each issue create is judged on its own label', () => {
+        const r = runCreate(
+          'gh issue create --label science-agent --title x --body b && gh issue create --title y --body b',
+        );
+        expect(r.status).toBe(2);
+      });
+
+      it('a labelled create in a chain still passes with a close', () => {
+        const r = runCreate(
+          'gh issue close 1 --comment "Verified" && gh issue create --label science-agent --title x --body b',
+        );
+        expect(r.status).toBe(0);
+      });
+
       it('a `;` inside a chained comment body does not split it from its mention', () => {
         const r = runCreate(
           'gh pr create --label science-agent --title x --body b && gh issue comment 1 --body "a; b\n@macf-science-agent[bot] hi"',

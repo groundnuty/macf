@@ -171,9 +171,15 @@ macf_unquote_first_word() {
 macf_collect_segment() {
   local seg="$1" depth="$2"
   local wre='^[[:space:]]*('"$WRAP_LIST"')*'
-  if [[ "$seg" =~ $wre ]]; then
-    seg="${seg:${#BASH_REMATCH[0]}}"
-  fi
+  # Shell reserved words and negation lead a command without changing it
+  # (`if gh ...; then`, `while gh ...; do`, `! gh ...`, `{ gh ...; }`).
+  local kre='^[[:space:]]*(if|then|else|elif|while|until|do|!|\{)([[:space:]]+|$)'
+  local before="" guard=0
+  while [[ "$seg" != "$before" ]] && [[ "$guard" -lt 20 ]]; do
+    before="$seg"; guard=$((guard + 1))
+    if [[ "$seg" =~ $wre ]]; then seg="${seg:${#BASH_REMATCH[0]}}"; fi
+    if [[ "$seg" =~ $kre ]]; then seg="${seg:${#BASH_REMATCH[0]}}"; fi
+  done
   [[ -z "$seg" ]] && return 0
   local sre='^(bash|sh|zsh)[[:space:]]+(-[a-zA-Z]+[[:space:]]+)*-[a-zA-Z]*c[[:space:]]+(.*)$'
   if [[ "$depth" -lt 4 ]] && [[ "$seg" =~ $sre ]]; then
@@ -288,6 +294,8 @@ HAS_ISSUE_CREATE=false
 IS_CLOSE_SUBCOMMAND=false
 HAS_BODY_CMD=false
 COMMENT_SEGS=()
+ISSUE_CREATE_SEGS=()
+PR_CREATE_SEGS=()
 gh_cmd_re='^gh[[:space:]]+(issue|pr)[[:space:]]+(comment|close|create)([[:space:]]|$)'
 for eff in ${EFF_CMDS[@]+"${EFF_CMDS[@]}"}; do
   if [[ "$eff" =~ $gh_cmd_re ]]; then
@@ -297,7 +305,11 @@ for eff in ${EFF_CMDS[@]+"${EFF_CMDS[@]}"}; do
       comment) HAS_BODY_CMD=true; COMMENT_SEGS+=("$eff") ;;
       create)
         HAS_BODY_CMD=true
-        if [[ "$kind_sub" == "pr" ]]; then IS_PR_CREATE=true; else HAS_ISSUE_CREATE=true; fi ;;
+        if [[ "$kind_sub" == "pr" ]]; then
+          IS_PR_CREATE=true; PR_CREATE_SEGS+=("$eff")
+        else
+          HAS_ISSUE_CREATE=true; ISSUE_CREATE_SEGS+=("$eff")
+        fi ;;
       close)
         # `close` without --comment posts no text — nothing to check.
         if [[ "$eff" =~ --comment ]]; then HAS_BODY_CMD=true; IS_CLOSE_SUBCOMMAND=true; fi ;;
@@ -380,11 +392,15 @@ macf_extract_labels() {
 # to be known and different from it. Every state the hook can't positively
 # resolve to case 1 or case 2 blocks — ambiguity defaults to BLOCK, not
 # ALLOW, per the operator's ruling.
-CREATE_HAS_BACKLOG_LABEL=false
-CREATE_CONFIRMED_PEER_LABEL=false
-CREATE_CONFIRMED_SELF_LABEL=false
-CREATE_MATCHED_LABELS=""
-if [[ "$IS_CREATE_SUBCOMMAND" == "true" ]]; then
+# Judged for one create segment at a time ($1), so one create's labels never
+# vouch for another create in the same command.
+macf_eval_labels() {
+  local text="$1"
+  CREATE_HAS_BACKLOG_LABEL=false
+  CREATE_CONFIRMED_PEER_LABEL=false
+  CREATE_CONFIRMED_SELF_LABEL=false
+  CREATE_MATCHED_LABELS=""
+  if true; then
   PROJECT_DIR="${CLAUDE_PROJECT_DIR:-}"
   if [[ -z "$PROJECT_DIR" ]]; then
     PROJECT_DIR="$(jq -r '.cwd // ""' <<<"$INPUT_JSON" 2>/dev/null || echo "")"
@@ -396,7 +412,7 @@ if [[ "$IS_CREATE_SUBCOMMAND" == "true" ]]; then
   # one; the registry read below belongs to this workspace's repo only.
   TARGET_IS_OWN=true
   repo_re='(^|[[:space:]])(--repo|-R)(=|[[:space:]]+)([^[:space:]]+)'
-  if [[ "$COMMAND" =~ $repo_re ]]; then
+  if [[ "$text" =~ $repo_re ]]; then
     target_repo="${BASH_REMATCH[4]}"
     target_repo="${target_repo%\"}"; target_repo="${target_repo#\"}"
     target_repo="${target_repo%\'}"; target_repo="${target_repo#\'}"
@@ -433,7 +449,7 @@ if [[ "$IS_CREATE_SUBCOMMAND" == "true" ]]; then
   EXTRACTED_LABELS=()
   while IFS= read -r tok; do
     [[ -n "$tok" ]] && EXTRACTED_LABELS+=("$tok")
-  done < <(macf_extract_labels "$COMMAND")
+  done < <(macf_extract_labels "$text")
 
   if [[ "${#EXTRACTED_LABELS[@]}" -gt 0 ]]; then
     # `backlog` detection is registry-independent — it's a fixed literal
@@ -485,15 +501,15 @@ if [[ "$IS_CREATE_SUBCOMMAND" == "true" ]]; then
       done
     fi
   fi
-fi
+  fi
+}
 
 # CHECK_A_APPLIES replaces the old close-only gate on the must-have-mention
 # check (macf#244): close subcommands never require one (self-close verify
 # is reporter-internal — see IS_CLOSE_SUBCOMMAND above); a `create` requires
 # one in cases 3 and 4 (see above); every other subcommand this hook guards
 # (comment) is unchanged — always applies.
-CHECK_A_APPLIES=true
-ISSUE_CREATE_UNROUTED=false
+CHECK_A_APPLIES=false
 ISSUE_CREATE_WARNING=""
 # The model never sees stderr on exit 0, so an allow-with-warning goes out
 # as additionalContext JSON on stdout when the hook exits 0.
@@ -505,63 +521,46 @@ macf_emit_warning() {
   fi
 }
 trap macf_emit_warning EXIT
-if [[ "$IS_CLOSE_SUBCOMMAND" == "true" ]]; then
-  CHECK_A_APPLIES=false
-elif [[ "$HAS_ISSUE_CREATE" == "true" ]]; then
+
+# Each create is judged on its own labels; a close or a comment elsewhere in
+# the command never exempts it.
+macf_judge_issue_create() {
+  local seg="$1" tok joined="" reason="" unrouted=false note
+  macf_eval_labels "$seg"
   # A new issue routes only by its label (route-by-label); a mention in its
   # body is never delivered. Unless the label is `backlog` or confirmed for
   # another agent, the issue reaches no one, with or without a mention.
-  CHECK_A_APPLIES=false
-  if [[ "$CREATE_HAS_BACKLOG_LABEL" != "true" ]] && [[ "$CREATE_CONFIRMED_PEER_LABEL" != "true" ]]; then
-    # Block only what the hook can prove undeliverable: no label, a
-    # confirmed self-label, or a readable registry for this repo with no
-    # other agent's label. A label it cannot confirm is allowed with a
-    # warning, because the router reads the target repo's registry.
-    ALL_LABELS_JOINED=""
-    for tok in ${EXTRACTED_LABELS[@]+"${EXTRACTED_LABELS[@]}"}; do
-      [[ -n "${MACF_ROUTING_LABEL:-}" ]] && [[ "$tok" == "${MACF_ROUTING_LABEL}" ]] && continue
-      ALL_LABELS_JOINED+="${ALL_LABELS_JOINED:+, }$tok"
-    done
-    UNCONFIRMED_REASON=""
-    if [[ "${#EXTRACTED_LABELS[@]}" -eq 0 ]] || [[ "$CREATE_CONFIRMED_SELF_LABEL" == "true" ]]; then
-      ISSUE_CREATE_UNROUTED=true
-    elif [[ "$REGISTRY_READABLE" != "true" ]]; then
-      UNCONFIRMED_REASON="no .github/agent-config.json in this workspace"
-    elif [[ -z "${MACF_ROUTING_LABEL:-}" ]] && [[ -n "$CREATE_MATCHED_LABELS" ]]; then
-      UNCONFIRMED_REASON="MACF_ROUTING_LABEL is unset"
-    elif [[ "$TARGET_IS_OWN" != "true" ]]; then
-      UNCONFIRMED_REASON="--repo is not this workspace's repo"
-    else
-      ISSUE_CREATE_UNROUTED=true
-    fi
-    if [[ -n "$UNCONFIRMED_REASON" ]]; then
-      ISSUE_CREATE_WARNING="The hook could not confirm that any of these labels belongs to another agent: $ALL_LABELS_JOINED ($UNCONFIRMED_REASON). If one of them is another agent's label in the target repo, the router delivers the issue. If none is, add one with gh issue edit <N> --add-label <label>; adding a label after the issue exists still routes it."
-    fi
-  fi
-elif [[ "$IS_CREATE_SUBCOMMAND" == "true" ]]; then
-  # PR create only. A PR body mention does route (pull_request event).
-  if [[ "$CREATE_HAS_BACKLOG_LABEL" == "true" ]]; then
-    CHECK_A_APPLIES=false
-  elif [[ "$CREATE_CONFIRMED_PEER_LABEL" == "true" ]]; then
-    CHECK_A_APPLIES=false
-  elif [[ "$CREATE_CONFIRMED_SELF_LABEL" == "true" ]]; then
-    CHECK_A_APPLIES=true
+  [[ "$CREATE_HAS_BACKLOG_LABEL" == "true" || "$CREATE_CONFIRMED_PEER_LABEL" == "true" ]] && return 0
+  # Block only what the hook can prove undeliverable: no label, a confirmed
+  # self-label, or a readable registry for this repo with no other agent's
+  # label. A label it cannot confirm is allowed with a warning, because the
+  # router reads the target repo's registry.
+  for tok in ${EXTRACTED_LABELS[@]+"${EXTRACTED_LABELS[@]}"}; do
+    [[ -n "${MACF_ROUTING_LABEL:-}" ]] && [[ "$tok" == "${MACF_ROUTING_LABEL}" ]] && continue
+    joined+="${joined:+, }$tok"
+  done
+  if [[ "${#EXTRACTED_LABELS[@]}" -eq 0 ]] || [[ "$CREATE_CONFIRMED_SELF_LABEL" == "true" ]]; then
+    unrouted=true
+  elif [[ "$REGISTRY_READABLE" != "true" ]]; then
+    reason="no .github/agent-config.json in this workspace"
+  elif [[ -z "${MACF_ROUTING_LABEL:-}" ]] && [[ -n "$CREATE_MATCHED_LABELS" ]]; then
+    reason="MACF_ROUTING_LABEL is unset"
+  elif [[ "$TARGET_IS_OWN" != "true" ]]; then
+    reason="--repo is not this workspace's repo"
   else
-    # Case 4 does not extend to a PR: an unlabeled `--body "Refs #N"` is
-    # the canonical PR call, its routing signal is the review state, and
-    # blocking it cannot be recovered mid-session.
-    CHECK_A_APPLIES=false
+    unrouted=true
   fi
-fi
-
-if [[ "$ISSUE_CREATE_UNROUTED" == "true" ]]; then
+  if [[ -n "$reason" ]]; then
+    ISSUE_CREATE_WARNING="The hook could not confirm that any of these labels belongs to another agent: $joined ($reason). If one of them is another agent's label in the target repo, the router delivers the issue. If none is, add one with gh issue edit <N> --add-label <label>; adding a label after the issue exists still routes it."
+  fi
+  [[ "$unrouted" == "true" ]] || return 0
   if [[ "$CREATE_CONFIRMED_SELF_LABEL" == "true" ]]; then
-    UNROUTED_NOTE="The router skips a label applied by the agent it names, so this issue reaches no one."
+    note="The router skips a label applied by the agent it names, so this issue reaches no one."
   else
-    UNROUTED_NOTE="A new issue is routed only by its label, and this one has no label for another agent."
+    note="A new issue is routed only by its label, and this one has no label for another agent."
   fi
   cat >&2 <<ERR
-BLOCKED by MACF mention-routing-hygiene hook: $UNROUTED_NOTE
+BLOCKED by MACF mention-routing-hygiene hook: $note
 A mention in a new issue's body is never delivered, because the router reads mentions only on comments and pull requests.
 
 Create it with a label for the agent who should act, or the "backlog" label
@@ -571,7 +570,29 @@ issue exists.
 The override (MACF_SKIP_MENTION_CHECK=1) is operator-only and set at launch.
 ERR
   exit 2
+}
+for seg in ${ISSUE_CREATE_SEGS[@]+"${ISSUE_CREATE_SEGS[@]}"}; do
+  macf_judge_issue_create "$seg"
+done
+
+# A PR body mention does route (pull_request event), so a PR create needs one
+# only when its own label proves the label alone reaches no one. Case 4 does
+# not extend to a PR: an unlabeled `--body "Refs #N"` is the canonical PR
+# call, its routing signal is the review state, and blocking it cannot be
+# recovered mid-session.
+PR_SELF_LABEL=false
+for seg in ${PR_CREATE_SEGS[@]+"${PR_CREATE_SEGS[@]}"}; do
+  macf_eval_labels "$seg"
+  if [[ "$CREATE_HAS_BACKLOG_LABEL" != "true" ]] && [[ "$CREATE_CONFIRMED_SELF_LABEL" == "true" ]]; then
+    CHECK_A_APPLIES=true; PR_SELF_LABEL=true
+  fi
+done
+# A lone comment needs a mention in its text. Beside a create or a close, each
+# comment is checked on its own body by the chained-comment loop below.
+if [[ "${#COMMENT_SEGS[@]}" -gt 0 ]] && [[ "$IS_CREATE_SUBCOMMAND" != "true" ]] && [[ "$IS_CLOSE_SUBCOMMAND" != "true" ]]; then
+  CHECK_A_APPLIES=true
 fi
+CREATE_CONFIRMED_SELF_LABEL="$PR_SELF_LABEL"
 
 # --body-file handling (groundnuty/macf#944).
 #
@@ -764,7 +785,7 @@ macf_chain_segment_count() {
   macf_count_active <<<"$seg"
 }
 
-if [[ "$IS_CREATE_SUBCOMMAND" == "true" ]]; then
+if [[ "$IS_CREATE_SUBCOMMAND" == "true" || "$IS_CLOSE_SUBCOMMAND" == "true" ]]; then
   for seg in ${COMMENT_SEGS[@]+"${COMMENT_SEGS[@]}"}; do
     seg_count="$(macf_chain_segment_count "$seg")"
     if [[ "$seg_count" == "0" ]]; then
