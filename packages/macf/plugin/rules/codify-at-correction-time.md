@@ -143,6 +143,6 @@ Observed 2026-04-25: code-agent saved `feedback_verify_at_every_hop_when_citing_
 
 ## Cross-references
 
-- `verify-before-claim.md` §5 — the verify-at-every-hop discipline this rule operationalizes the codification habit for
+- `verify-before-claim.md` — the re-verify-a-peer's-evidence discipline this rule operationalizes the codification habit for
 - `peer-dynamic.md` — the broader peer-correction protocol this rule extends (correct each other through dialogue → codify the dialogue's lessons)
 - `coordination.md` — the substrate-level coordination protocol that makes peer correction reliable enough for codification cascades to emerge

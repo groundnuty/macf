@@ -120,7 +120,7 @@ The `guests` binding is **not** a second addressing gate — `federated_cas` alo
 
 ### Decision A3 — All three call sites, one shared resolver
 
-`notify_peer` + `a2a-client` outbound + `macf-ping` all get cross-project guest resolution (a subset would leave confusing partial capability). All three **reuse `parseGuestAgentRef` + the DR-036 home-project resolver** — one resolution path, no parallel slug-parsing logic (`check-before-propose §4`: the resolver exists; wire the clients into it).
+`notify_peer` + `a2a-client` outbound + `macf-ping` all get cross-project guest resolution (a subset would leave confusing partial capability). All three **reuse `parseGuestAgentRef` + the DR-036 home-project resolver** — one resolution path, no parallel slug-parsing logic (`verify-before-claim.md`: the resolver exists; wire the clients into it).
 
 ### Non-goals of this Step (deferred, explicitly recorded)
 
@@ -134,7 +134,7 @@ The `guests` binding is **not** a second addressing gate — `federated_cas` alo
 
 ### B1 — Declaration home: the shared-registry variable `<PROJECT_SEG>_FEDERATED_CAS`
 
-A fleet declares its federated trust **once**, as a registry variable (DR-006 profile scope — the same namespace as `<PROJECT>_CA_CERT`): e.g. `ICSOC_2026_FEDERATED_CAS = ["ppam-2026"]`. Every agent of that project reads it at channel-server startup and unions it into the trust bundle. **NOT a fleet-config file:** there is no "fleet repo" (every agent owns its own home repo), so a canonical fleet file would need one repo anointed as authoritative — recreating the per-repo drift this amendment eliminates. Per-agent HOME config (`macf-fleet.json`) holds an agent's *own* identity + bindings; **fleet-shared state belongs in the registry** (`check-before-propose §4`: the state has a home).
+A fleet declares its federated trust **once**, as a registry variable (DR-006 profile scope — the same namespace as `<PROJECT>_CA_CERT`): e.g. `ICSOC_2026_FEDERATED_CAS = ["ppam-2026"]`. Every agent of that project reads it at channel-server startup and unions it into the trust bundle. **NOT a fleet-config file:** there is no "fleet repo" (every agent owns its own home repo), so a canonical fleet file would need one repo anointed as authoritative — recreating the per-repo drift this amendment eliminates. Per-agent HOME config (`macf-fleet.json`) holds an agent's *own* identity + bindings; **fleet-shared state belongs in the registry** (`verify-before-claim.md`: the state has a home).
 
 ### B2 — Reload semantics: relaunch-to-apply (v1); live reload is the v2 tier
 

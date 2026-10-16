@@ -9,7 +9,7 @@
  * mTLS server + outbound A2A/notify clients AND the `macf` CLI's `/macf-peers`
  * / `/macf-ping` / `macf fleet status` guest probes need this SAME
  * security-critical trust-resolution logic — duplicating it across two
- * packages would risk the two copies drifting apart (check-before-propose
+ * packages would risk the two copies drifting apart (verify-before-claim.md
  * §4). This module has zero channel-server-specific coupling: it imports
  * only from sibling macf-core modules + node builtins.
  *

@@ -18,7 +18,7 @@
  * and without inventing a deploy fixture (`apply-deploy.ts`'s own deps
  * surface, `AgentDeployDeps`, has no field this test could even inject a
  * `fetchImpl` seam through) — same "assert the fact directly, don't invent
- * a heavier proxy for it" discipline `check-before-propose.md` argues for.
+ * a heavier proxy for it" discipline `verify-before-claim.md` argues for.
  * Same technique this package already uses for a comparable static
  * invariant — see `no-internal-citations-in-user-facing-output.test.ts`.
  */

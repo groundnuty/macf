@@ -31,7 +31,7 @@
  *
  * **Opt-in, gated behind `-f, --file <path>`** (mirrors `fleet
  * deactivate`/`archive`'s existing `-f, --file` convention —
- * `check-before-propose.md`: match the established shape, don't invent a
+ * `verify-before-claim.md`: match the established shape, don't invent a
  * new flag name). Omitted ⇒ `commands/fleet-upgrade.ts` never builds this
  * closure ⇒ `deployed_version` stays unwritten, byte-identical to
  * pre-macf#907 behavior — this feature is additive, never a default that

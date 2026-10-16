@@ -4,13 +4,13 @@
 **Date:** 2026-07-01
 **Trigger:** The 2026-07-01 operator session surfaced a *delivery* problem and a converging set of routed feature issues. Devops built a fleet operational layer (the DR-006 watchdog, resume/nudge-report, the cron installer, the DR-007 upgrade roll) as **reference implementations in `groundnuty/macf-devops-toolkit:fleet/`** — but the agent VMs only ever receive the **macf binary**, so none of it reaches them. Three routed issues (`macf#682` fleet-upgrade + version-visibility, `macf#686` watchdog/resume/install-cron promotion, and the `macf ps` dead-agent enumeration off DR-007 Amendment A / `#141`) all promote operational tooling into the CLI, and — surfaced in the code review of DR-007 (`#682`) and the code↔devops exchange on `#686` — **they all consume the same framework primitives no macf DR yet defines.** This DR defines them, so the subcommands promote onto one substrate.
 
-> **Authorship note.** This DR was drafted in parallel by code-agent (`#687`, the concrete framework contract — the `FleetDriver` interface, discovery shape, verify-green re-resolve, `compareSemver`) and science (`#688`, the two-plane framing) at the same instant — a `check-before-propose §4` "two half-built things racing" miss, ironically on this very DR, resolved by each deferring to the other. This is the merge: code-seeded (the framework-contract half of DR-007), science-authored, consolidating both drafts. Same seed→shape path as `#645`→DR-033.
+> **Authorship note.** This DR was drafted in parallel by code-agent (`#687`, the concrete framework contract — the `FleetDriver` interface, discovery shape, verify-green re-resolve, `compareSemver`) and science (`#688`, the two-plane framing) at the same instant — a `verify-before-claim.md` "two half-built things racing" miss, ironically on this very DR, resolved by each deferring to the other. This is the merge: code-seeded (the framework-contract half of DR-007), science-authored, consolidating both drafts. Same seed→shape path as `#645`→DR-033.
 
 > **The anchor insight.** MACF already has the split this DR formalizes — DR-030 put the fleet-*health commands* in macf; DR-031 put the *primitives* in macf and the *watchdog cron* in devops. This DR does the same for the operational layer: the **runtime-agnostic decision logic + the driver *interface* + the distribution rule + the workspace-discovery primitive are framework (macf)**; the **per-runtime driver bodies + the VM cron + the tested reference impls are devops (DR-006/DR-007)**. It names + generalizes a boundary the fleet already half-lives; it does not invent one.
 
 ## Context — three issues, one missing substrate
 
-`macf#682` (fleet-upgrade), `macf#686` (watchdog/resume/cron), and the `macf ps` dead-enum (`#141`) are not three independent lifts. Each needs the same things, and building them separately would grow divergent copies — the "two half-built enumerations racing" hazard flagged on `#682`, at 4× the surface (`check-before-propose.md §4`):
+`macf#682` (fleet-upgrade), `macf#686` (watchdog/resume/cron), and the `macf ps` dead-enum (`#141`) are not three independent lifts. Each needs the same things, and building them separately would grow divergent copies — the "two half-built enumerations racing" hazard flagged on `#682`, at 4× the surface (`verify-before-claim.md`):
 1. a **decision/driver boundary** — the same rolling/reconcile/busy-gate logic on a VM tmux session, a macOS host, and (far-future) a K8s pod, by swapping only the driver;
 2. a **workspace-discovery primitive** — "what agents exist on this host" — shared by `ps` (alive∪dead), upgrade (group-by-registry → fleets), and the watchdog (desired-set reconcile);
 3. a **distribution contract** — what ships in the binary vs stays per-VM vs rides gitops.
@@ -68,7 +68,7 @@ The decision layer branches on the reconcile tier: **gated-inject → `driver.in
 
 One primitive, three consumers (`ps` dead-enum, upgrade fleet-enum, watchdog desired-set).
 - **Shape (per workspace):** `{ agent (routing-label), workspace, project, registry, versionPin }`. `ps` adds alive/dead (process↔cwd match); upgrade groups by **`project`** (→ fleets, per-fleet target — see Amendment A; `registry` is a demoted non-grouping identifier); the watchdog reconciles the desired-set.
-- **Source — registry-free filesystem discovery, NOT a registry-of-registries.** Scan for the `.macf/` marker under configured root(s) (`MACF_WORKSPACE_ROOT`, env-override + sensible default) — *discovery* (a search path), not a 4th drift-prone source of truth (`check-before-propose §4`; the same reason DR-007 OQ1 rejected a hand-maintained `fleets.yaml`).
+- **Source — registry-free filesystem discovery, NOT a registry-of-registries.** Scan for the `.macf/` marker under configured root(s) (`MACF_WORKSPACE_ROOT`, env-override + sensible default) — *discovery* (a search path), not a 4th drift-prone source of truth (`verify-before-claim.md`; the same reason DR-007 OQ1 rejected a hand-maintained `fleets.yaml`).
 - **Marker-scan is primary** (it reveals the **dead** agents — a stopped agent has a workspace, no process); running-process cwds are a cross-check (alive only). A dead agent's version reads from its on-disk pin.
 
 ## Decision 5 — Version substrate — `/health.version`, `compareSemver`, re-resolve-on-restart
@@ -169,7 +169,7 @@ The canonical subcommands are **native TypeScript** (decision layer unit-tested 
 - **macf DR-036** — cross-fleet delegation; fleet-upgrade selects registry *members*, never guests (a guest is a different registry) — the visibility-vs-supervision invariant, for free.
 - **`macf#682`** (fleet-upgrade + `/health.version`, P1 shipped `#683`), **`#686`** (watchdog/resume/install-cron promotion), **`#141`** (`ps` dead-enum) — the subcommands built on this substrate.
 - **`packages/macf-core/src/semver.ts`** (`#424` `compareSemver`) — §5.
-- **`check-before-propose.md §4`** — the "don't build a parallel source of truth" rule §4 honors (and the authorship-note race lesson).
+- **`verify-before-claim.md`** — the "don't build a parallel source of truth" rule §4 honors (and the authorship-note race lesson).
 
 ## Amendment C — `stale-pin` is not `bad-release`: continue on a confirmed LOCAL cause, halt on anything fleet-wide or unconfirmed (macf#899/#900, 2026-08-13)
 

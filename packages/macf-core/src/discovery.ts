@@ -15,7 +15,7 @@
  * The host-operational plane is registry-FREE (DR-037 Decision 1/4): records are
  * sourced by scanning the filesystem for the `.macf/` marker, NOT by querying any
  * registry. This is a search-path *discovery*, not a fourth drift-prone source of
- * truth (`check-before-propose §4`).
+ * truth (`verify-before-claim.md`).
  */
 import { z } from 'zod';
 import type { RegistryConfig } from './registry/types.js';
