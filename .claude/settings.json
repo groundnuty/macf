@@ -20,8 +20,7 @@
       "Skill(macf-agent:macf-ping)",
       "Skill(macf-agent:macf-notify-peer)",
       "mcp__macf-agent__notify_peer",
-      "mcp__macf-agent__checkpoint_to_memory",
-      "mcp__*"
+      "mcp__macf-agent__checkpoint_to_memory"
     ],
     "deny": [
       "Read(~/.ssh/id_*)",
