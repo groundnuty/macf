@@ -20,6 +20,7 @@ import { tmpdir } from 'node:os';
 import { createInterface } from 'node:readline';
 import { join, resolve } from 'node:path';
 import { fromVariableSegment, proxyAwareFetch } from '@groundnuty/macf-core';
+import { updateGitignore } from './init.js';
 import { readAgentConfig, resolveCanonicalBranch, tokenSourceFromConfig, writeAgentConfig } from '../config.js';
 import type { MacfAgentConfig } from '../config.js';
 import { defaultProcReader, readPkgVersionFs, scanMacfProcesses } from '../proc-scan.js';
@@ -2545,6 +2546,54 @@ export function checkDiskSpace(
 }
 
 /**
+ * Result of the macf-ignore check (groundnuty/macf#1477). A workspace whose
+ * `.gitignore` lacks the macf block exposes `.macf/` (certs, identity) and
+ * `.claude/.macf/env.*` to `git add -A`. Only paths that exist are probed;
+ * `UNKNOWN` when the directory is not a git repository.
+ */
+export interface MacfIgnoreCheckResult {
+  readonly status: 'PASS' | 'WARN' | 'UNKNOWN';
+  readonly findings: readonly string[];
+  readonly detail: string;
+}
+
+const MACF_IGNORE_PROBES = ['.macf/certs', '.claude/.macf/env.github'] as const;
+
+export function checkMacfIgnores(workspaceDir: string): MacfIgnoreCheckResult {
+  const absDir = resolve(workspaceDir);
+  const findings: string[] = [];
+  let probed = 0;
+  for (const rel of MACF_IGNORE_PROBES) {
+    if (!existsSync(join(absDir, rel))) continue;
+    probed += 1;
+    try {
+      execFileSync('git', ['check-ignore', '-q', '--', rel], { cwd: absDir, stdio: 'ignore' });
+    } catch (err) {
+      const status = (err as { status?: number }).status;
+      if (status === 1) findings.push(rel);
+      else return { status: 'UNKNOWN', findings: [], detail: `${absDir} is not a git repository, or git is unavailable` };
+    }
+  }
+  if (findings.length > 0) {
+    return {
+      status: 'WARN',
+      findings,
+      detail: `${findings.join(', ')} not ignored by git — \`git add -A\` would commit certs or identity config`,
+    };
+  }
+  return { status: 'PASS', findings: [], detail: probed === 0 ? 'no macf certs/env paths present to check' : 'macf certs and env files are git-ignored' };
+}
+
+function printMacfIgnoreSection(check: MacfIgnoreCheckResult): void {
+  if (check.status === 'UNKNOWN') console.log(`  ? ${check.detail}  [UNKNOWN]`);
+  else if (check.status === 'PASS') console.log(`  ✓ ${check.detail}  [PASS]`);
+  else {
+    console.log(`  ⚠ ${check.detail}  [WARN]`);
+    console.log('    Fix: run `macf doctor --fix` (restores the macf block in .gitignore) or `macf update`.');
+  }
+}
+
+/**
  * `v<version>` of the running CLI, or `version unknown` if it can't be
  * resolved (fail-soft — never throws, never blocks the currency check).
  * Backs the provenance stamp in `checkDistributedScriptCurrency`'s detail
@@ -2866,6 +2915,12 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
   printManagedFileGitTrackingSection(checkManagedFilesGitTracking(projectDir));
 
   console.log('');
+  console.log('Macf git ignores');
+  console.log('──────────────────────────────────────────────────────────────');
+  const macfIgnoreCheck = checkMacfIgnores(projectDir);
+  printMacfIgnoreSection(macfIgnoreCheck);
+
+  console.log('');
   console.log('Framework checkout currency');
   console.log('──────────────────────────────────────────────────────────────');
   printCheckoutCurrencySection(checkoutCurrency);
@@ -2887,6 +2942,8 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
       botLoginCheck.status === 'WARN' ||
       // A retired canonical rule's managed copy still on disk trips the gate alone.
       ruleCurrencyCheck.findings.some((f) => f.reason === 'retired') ||
+      // Unignored macf certs/env paths trip the gate alone (#1477).
+      macfIgnoreCheck.status === 'WARN' ||
       // Its own trigger: an otherwise-compliant workspace with idle compaction on must still be fixed.
       !idleCompactionIsOff(projectDir);
     if (!needsFix) {
@@ -2900,6 +2957,9 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
       console.log('  - sandbox.filesystem.allowRead + sandbox.excludedCommands');
       for (const f of ruleCurrencyCheck.findings.filter((x) => x.reason === 'retired')) {
         console.log(`  - remove retired managed rule .claude/rules/${f.name}`);
+      }
+      if (macfIgnoreCheck.status === 'WARN') {
+        console.log('  - restore the macf block in .gitignore (.macf/, .claude/rules/, .claude/scripts/)');
       }
       if (botLoginCheck.status === 'WARN') {
         console.log('  - github_app.bot_login in macf-agent.json (resolves the App slug via GET /app)');
@@ -2915,6 +2975,7 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
         installSandboxFdAllowRead(projectDir);
         installSandboxExcludedCommands(projectDir);
         installIdleCompactionOff(projectDir);
+        updateGitignore(projectDir);
         const retiredRemoved = retireCanonicalRules(projectDir).removed;
         if (retiredRemoved.length > 0) {
           console.log(`  Removed retired managed rule(s): ${retiredRemoved.join(', ')}`);
@@ -2940,6 +3001,7 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
         printPermissionsAllowSection(permsCheck);
         printRoleSettingsSection(role, roleCheck);
         printBotLoginSection(botLoginCheck);
+        printMacfIgnoreSection(checkMacfIgnores(projectDir));
       }
     }
   }

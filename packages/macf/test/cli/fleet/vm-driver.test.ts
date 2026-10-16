@@ -33,7 +33,12 @@ import {
 } from '../../../src/cli/fleet/vm-driver.js';
 import { readLockEntry, type MaintenanceLockConfig } from '../../../src/cli/fleet/maintenance-lock.js';
 import { gatherFleetStatus } from '../../../src/cli/commands/fleet.js';
-import { computeCanonicalRuleFile } from '../../../src/cli/rules.js';
+import { recordManagedHashes } from '../../../src/cli/managed-hashes.js';
+import { computeCanonicalRuleFile, copyCanonicalRules } from '../../../src/cli/rules.js';
+import {
+  installGhTokenHook,
+  installPluginSkillPermissions,
+} from '../../../src/cli/settings-writer.js';
 import type { MacfAgentConfig } from '../../../src/cli/config.js';
 
 // --- fixtures ---------------------------------------------------------------
@@ -891,7 +896,7 @@ describe('restart', () => {
     expect(rec.execs).toEqual([
       {
         bin: 'macf',
-        args: ['restart-self', '--confirm', '--reason', 'fault', '--leave-config-uncommitted'],
+        args: ['restart-self', '--confirm', '--reason', 'upgrade', '--leave-config-uncommitted'],
         cwd: '/w/macf',
       },
     ]);
@@ -1587,5 +1592,55 @@ describe('createVmDriver — classifyDirtyConfig / autoResolveCanonical, real gi
     const result = await driver.classifyDirtyConfig('code-agent');
     expect(result.alreadyCanonical).toEqual(['.claude/rules/coordination.md']);
     expect(result.genuineDelta).toEqual(['CLAUDE.md']);
+  });
+
+  // --- groundnuty/macf#1476 item 1: a freshly DEPLOYED workspace ---
+  // Deploy commits the agent template; `macf update` then writes macf's own
+  // output and nothing commits it. The workspace holds what the macf that
+  // deployed it wrote — an OLDER version than the one now rolling it — so
+  // comparing with the running macf's output would call it an operator edit.
+  function deployWithOlderMacf(): void {
+    repo = initRepo({
+      '.claude/rules/pr-discipline.md': '# Commit message format (template)\n',
+      '.claude/settings.json': JSON.stringify({ permissions: { allow: [] } }, null, 2) + '\n',
+      'claude.sh': '#!/usr/bin/env bash\necho hi\n',
+    });
+    copyCanonicalRules(repo);
+    installGhTokenHook(repo);
+    installPluginSkillPermissions(repo);
+    // What an older macf wrote: different from what the running macf generates.
+    const rule = join(repo, '.claude', 'rules', 'pr-discipline.md');
+    writeFileSync(rule, readFileSync(rule, 'utf-8').replace(/\n/, '\nOLDER-VERSION-LINE\n'));
+    recordManagedHashes(repo);
+  }
+
+  it('deployed shape: output of an older macf, left uncommitted → NOT objected', async () => {
+    deployWithOlderMacf();
+    const result = await driverFor(repo).classifyDirtyConfig('code-agent');
+    expect(result.genuineDelta).toEqual([]);
+    expect(result.alreadyCanonical).toEqual(
+      expect.arrayContaining(['.claude/rules/pr-discipline.md', '.claude/settings.json']),
+    );
+  });
+
+  it('deployed shape: an operator edit made after macf wrote the file IS objected', async () => {
+    deployWithOlderMacf();
+    const rule = join(repo, '.claude', 'rules', 'pr-discipline.md');
+    writeFileSync(rule, readFileSync(rule, 'utf-8') + '\nOperator-added rule line.\n');
+    const settings = join(repo, '.claude', 'settings.json');
+    const parsed = JSON.parse(readFileSync(settings, 'utf-8'));
+    writeFileSync(settings, JSON.stringify({ ...parsed, model: 'opus-operator-edit' }) + '\n');
+    const result = await driverFor(repo).classifyDirtyConfig('code-agent');
+    expect(result.genuineDelta).toEqual(
+      expect.arrayContaining(['.claude/rules/pr-discipline.md']),
+    );
+    expect(result.alreadyCanonical).not.toContain('.claude/rules/pr-discipline.md');
+  });
+
+  it('deployed shape with NO record (workspace never updated by a recording macf): an older-output file is objected, as before', async () => {
+    deployWithOlderMacf();
+    rmSync(join(repo, '.macf', 'managed-hashes.json'));
+    const result = await driverFor(repo).classifyDirtyConfig('code-agent');
+    expect(result.genuineDelta).toContain('.claude/rules/pr-discipline.md');
   });
 });

@@ -797,6 +797,12 @@ function makePlan(args: {
 
 // --- Real-deps factory (production wiring) ---
 
+/**
+ * Paths macf writes or maintains that `restart-self` must leave in the working
+ * tree: the ignore block `macf init` appends and the audit log.
+ */
+export const MACF_NEVER_STASHED_PATHS = ['.gitignore', '.claude/audit.log'] as const;
+
 /** Run a git command in `cwd`, returning trimmed stdout (throws on non-zero). */
 function git(cwd: string, args: readonly string[]): string {
   return execFileSync('git', args as string[], { cwd, encoding: 'utf-8' }).trim();
@@ -855,17 +861,15 @@ export function createRealDeps(workspaceDir: string): RestartSelfDeps {
       // touched-config surface — `git stash push -- . ':!<pattern>'` per
       // pattern, which stashes all OTHER tracked dirt while leaving the
       // config-surface paths uncommitted in the working tree.
-      const args = stashOpts?.excludeConfigSurface
-        ? [
-            'stash',
-            'push',
-            '-m',
-            label,
-            '--',
-            '.',
-            ...ROLL_TOUCHED_CONFIG_PATTERNS.map((p) => `:!${p}`),
-          ]
-        : ['stash', 'push', '-m', label];
+      // Files macf itself writes are never stashed (#1477): stashing
+      // `.gitignore` drops the macf ignore block and exposes `.macf/` (certs)
+      // as untracked. Kept apart from ROLL_TOUCHED_CONFIG_PATTERNS, which also
+      // feeds the config-dirty gate.
+      const excluded = [
+        ...MACF_NEVER_STASHED_PATHS,
+        ...(stashOpts?.excludeConfigSurface ? ROLL_TOUCHED_CONFIG_PATTERNS : []),
+      ];
+      const args = ['stash', 'push', '-m', label, '--', '.', ...excluded.map((p) => `:!${p}`)];
       const out = git(workspaceDir, args);
       if (/no local changes/i.test(out)) return { stashed: false };
       let ref = 'stash@{0}';

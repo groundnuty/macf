@@ -47,6 +47,7 @@
  * Replaces the earlier plugin-update placeholder (P4). With PR #4 adding
  * version pins, this command is the canonical bumper.
  */
+import { recordManagedHashes } from '../managed-hashes.js';
 import { createInterface } from 'node:readline';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -454,6 +455,7 @@ export async function update(
 
   // Never idle-compact (CC 2.1.299); enforced, no opt-out. See settings-writer.ts.
   installIdleCompactionOff(projectDir);
+  recordManagedHashes(projectDir);
   console.log(`Refreshed sandbox excludedCommands in .claude/settings.json`);
 
   // macf#342 PR-C: monolithic→multi-file migration + claude.sh refresh
