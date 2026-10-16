@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { MANAGED_HEADER as MANAGED_RULE_HEADER } from '../../src/cli/rules.js';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, readdirSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -87,7 +88,7 @@ describe('copyCanonicalRules', () => {
     const workspace = join(tmpRoot, 'workspace');
     const rulesDir = join(workspace, '.claude', 'rules');
     mkdirSync(rulesDir, { recursive: true });
-    writeFileSync(join(rulesDir, 'coordination.md'), '# stale edits by user\n');
+    writeFileSync(join(rulesDir, 'coordination.md'), MANAGED_RULE_HEADER + '# stale edits by user\n');
 
     copyCanonicalRules(workspace, { canonicalDir: fakeCanonical });
 

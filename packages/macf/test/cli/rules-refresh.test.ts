@@ -3,6 +3,7 @@
  * to any workspace, independent of `.macf/macf-agent.json`.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { MANAGED_HEADER as MANAGED_RULE_HEADER } from '../../src/cli/rules.js';
 import { execFileSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -219,7 +220,7 @@ describe('canonical-overwrite guard integration (groundnuty/macf#1401, extending
     vi.mocked(findCliPackageRoot).mockReturnValueOnce(fakeRoot);
 
     mkdirSync(join(tmpRoot, '.claude', 'rules'), { recursive: true });
-    const sentinel = '<!-- test -->\nWORKSPACE HAS SOMETHING NEWER — should be overwritten by --force\n';
+    const sentinel = MANAGED_RULE_HEADER + 'WORKSPACE HAS SOMETHING NEWER — should be overwritten by --force\n';
     writeFileSync(join(tmpRoot, '.claude', 'rules', 'coordination.md'), sentinel);
 
     const result = rulesRefresh(tmpRoot, { force: true });
