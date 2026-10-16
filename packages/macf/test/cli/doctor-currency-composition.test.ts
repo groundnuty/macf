@@ -37,6 +37,7 @@
  *    helps") this file's own fix was built to avoid.
  */
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { MANAGED_HEADER as MANAGED_RULE_HEADER } from '../../src/cli/rules.js';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -99,7 +100,7 @@ function writeStaleRuleFile(root: string): void {
   mkdirSync(join(root, '.claude', 'rules'), { recursive: true });
   writeFileSync(
     join(root, '.claude', 'rules', 'coordination.md'),
-    '# a rule file that will never match the real canonical bytes (groundnuty/macf#1383 fixture)\n',
+    MANAGED_RULE_HEADER + '# a rule file that will never match the real canonical bytes (groundnuty/macf#1383 fixture)\n',
   );
 }
 

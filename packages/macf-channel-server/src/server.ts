@@ -522,13 +522,15 @@ async function main(): Promise<void> {
   // /.well-known/agent-card.json. Static across the channel-server
   // process lifetime per spec § 4.4.1 (AgentCard version-pinned).
   // groundnuty/macf#370 — A2A Phase 1.
-  const agentCard = buildAgentCard({
+  // Built from the BOUND port: config.port is 0 when the OS assigns it, and
+  // a card naming port 0 is unreachable (macf#1480).
+  const agentCardFor = (boundPort: number) => buildAgentCard({
     // macf#545: the A2A card `name` is the peer-ADDRESSING identity (how a peer
     // resolves us) → the routing label, not the OTEL bot-name.
     agentName: config.routingLabel,
     agentRole: config.agentRole,
     project: config.project,
-    url: `https://${config.advertiseHost}:${config.port}`,
+    url: `https://${config.advertiseHost}:${boundPort}`,
     version: PACKAGE_VERSION,
   });
 
@@ -560,7 +562,7 @@ async function main(): Promise<void> {
     onNotify,
     onHealth: () => health.getHealth(),
     onSign,
-    agentCard,
+    agentCardFor,
     taskStore,
     // DR-038 Slice B: the durable receiver-side inbox — persist-then-ACK
     // (Decision 3) for the direct A2A path (/notify peer_notification +

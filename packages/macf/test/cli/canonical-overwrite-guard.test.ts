@@ -16,6 +16,7 @@
  * under test (assert-the-wrong-path.md Trigger 1).
  */
 import { execFileSync } from 'node:child_process';
+import { MANAGED_HEADER as MANAGED_RULE_HEADER } from '../../src/cli/rules.js';
 import { dirname, join, relative } from 'node:path';
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -318,7 +319,7 @@ describe('copyCanonicalAssetsGuarded (groundnuty/macf#1401 — the shared entry 
     writeFileSync(join(packageRoot, 'plugin', 'rules', 'coordination.md'), ruleFile('OLD CANONICAL\n'));
 
     mkdirSync(join(workspaceDir, '.claude', 'rules'), { recursive: true });
-    const sentinel = ruleFile('WORKSPACE HAS SOMETHING NEWER — should be overwritten by --force\n');
+    const sentinel = MANAGED_RULE_HEADER + 'WORKSPACE HAS SOMETHING NEWER — should be overwritten by --force\n';
     writeFileSync(join(workspaceDir, '.claude', 'rules', 'coordination.md'), sentinel);
 
     const outcome = copyCanonicalAssetsGuarded(workspaceDir, {

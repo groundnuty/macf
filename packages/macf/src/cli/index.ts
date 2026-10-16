@@ -33,6 +33,7 @@ import { runRegistryPrune } from './commands/registry-prune.js';
 import { runRestartSelfCommand } from './commands/restart-self.js';
 import { certsInit, certsRecover, certsRotate, issueRoutingClient } from './commands/certs.js';
 import { repoInit } from './commands/repo-init.js';
+import { parseCiWorkflowsOption } from './commands/repo-init-ci-workflows.js';
 import { rulesRefresh } from './commands/rules-refresh.js';
 import { runDoctor } from './commands/doctor.js';
 import { runWhoami } from './commands/whoami.js';
@@ -519,6 +520,9 @@ fleet
     '`bad-release` (HALTS) with a message naming the uncertainty. Never ' +
     'confirmed green within the grace at all (down / unreachable / an ' +
     'unrecognized version) → `relaunch-unconfirmed` → HALTS, unchanged. ' +
+    'When the agent\'s pane shows a prompt (`❯ N.` or `(y/n)`), checked before the pin, it is ' +
+    '`stuck-at-launch-prompt` (skips that ONE agent and CONTINUES, even where the pin is stale; ' +
+    'the operator answers it by hand, then re-runs the same command with the same --target). ' +
     'Reconcile after an OBJECT is MANUAL this iteration: resolve the flagged ' +
     'files, then re-run. DRY-RUN by default (prints the plan); --execute ' +
     'rolls. TARGET defaults to npm-latest of @groundnuty/macf.',
@@ -1377,6 +1381,8 @@ program
     'profile scope for a User owner — never the self-pointing repo scope.')
   .option('--registry-org <org>', 'Org login (for --registry-type org)')
   .option('--registry-user <user>', 'User login (for --registry-type profile)')
+  .option('--ci-workflows <names>', 'Comma-separated CI workflow names for the router\'s workflow_run trigger. ' +
+    'Omitted: scanned from .github/workflows/ (workflows that run on push or pull_request). Needs macf-actions v3.6.0+.')
   .option('--force', 'Overwrite existing files', false)
   .option('--dir <path>', 'Target directory (defaults to current working directory)')
   .action(async (opts) => {
@@ -1390,6 +1396,7 @@ program
       registryType: opts.registryType,
       registryOrg: opts.registryOrg,
       registryUser: opts.registryUser,
+      ciWorkflows: parseCiWorkflowsOption(opts.ciWorkflows),
       force: opts.force,
     });
   });
