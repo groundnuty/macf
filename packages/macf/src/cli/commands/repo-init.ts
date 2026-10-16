@@ -648,8 +648,17 @@ export function generateWorkflow(
   // six (v1.x: `AGENT_SSH_KEY` + 2; v2.x: 4 — verified live), so blindly
   // emitting the v3 six-name form for them would be wrong.
   if (isBundleCapableActionsVersion(actionsVersion)) {
+    // A reusable workflow sees ONLY the secrets its caller passes. The
+    // bundle is composed only when the vault holds all six values, Tailscale
+    // pair included; a self-hosted fleet has no such pair, so no bundle ever
+    // exists and the router falls back to the six individual secrets — which
+    // the caller must therefore pass too. A passed secret that is not set
+    // evaluates empty, harmlessly, so both forms are always passed.
     lines.push('    secrets:');
     lines.push(`      ${ROUTING_BUNDLE_SECRET_NAME}: \${{ secrets.${ROUTING_BUNDLE_SECRET_NAME} }}`);
+    for (const name of ALL_ROUTING_SECRET_NAMES) {
+      lines.push(`      ${name}: \${{ secrets.${name} }}`);
+    }
   } else if (v3Inputs && isV3PlusActionsVersion(actionsVersion)) {
     lines.push('    secrets:');
     for (const name of ALL_ROUTING_SECRET_NAMES) {

@@ -78,6 +78,14 @@ describe('assertRouterWorkflowWellFormed / findMissingRouterWorkflowRequirements
     expect(findMissingRouterWorkflowRequirements(bundleForm)).toEqual([]);
   });
 
+  it('accepts a caller that passes the bundle AND the six individual names', () => {
+    const both = generateWorkflow('v3.5.0', { project: 'macf', registryApiPath: '/repos/groundnuty/groundnuty' });
+    expect(both).toContain('MACF_ROUTING_BUNDLE:');
+    expect(both).toContain('TS_OAUTH_SECRET: ${{ secrets.TS_OAUTH_SECRET }}');
+    expect(() => assertRouterWorkflowWellFormed(both)).not.toThrow();
+    expect(findMissingRouterWorkflowRequirements(both)).toEqual([]);
+  });
+
   // --- Decisive: each required element is individually detected -----------
   // Table-driven — one corruption per requirement, isolated so exactly one
   // requirement fails per case (verified by the `missing.length === 1` +
