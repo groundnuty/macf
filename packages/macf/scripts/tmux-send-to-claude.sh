@@ -112,14 +112,21 @@ strip_dim() {
     {
       line = $0; out = ""
       while (length(line) > 0) {
-        if (dim) {
-          if (match(line, esc "\\[(0|22)?m")) {
-            line = substr(line, RSTART + RLENGTH); dim = 0
-          } else { line = "" }
-        } else if (match(line, esc "\\[2m")) {
-          out = out substr(line, 1, RSTART - 1)
-          line = substr(line, RSTART + RLENGTH); dim = 1
-        } else { out = out line; line = "" }
+        if (match(line, esc "\\[[0-9;]*m")) {
+          if (!dim) out = out substr(line, 1, RSTART - 1)
+          seq = substr(line, RSTART + 2, RLENGTH - 3)
+          line = substr(line, RSTART + RLENGTH)
+          n = split(seq, p, ";")
+          if (n == 0) dim = 0
+          for (i = 1; i <= n; i++) {
+            if (p[i] == "" || p[i] == "0" || p[i] == "22") dim = 0
+            else if (p[i] == "2") dim = 1
+            else if (p[i] == "38" || p[i] == "48") {
+              if (p[i + 1] == "5") i += 2
+              else if (p[i + 1] == "2") i += 4
+            }
+          }
+        } else { if (!dim) out = out line; line = "" }
       }
       print out
     }' | sed "s/$(printf '\033')\\[[0-9;]*[A-Za-z]//g"

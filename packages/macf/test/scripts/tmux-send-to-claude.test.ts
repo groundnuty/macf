@@ -48,7 +48,7 @@ cmd="$1"; shift
 if [ "\${1:-}" = "-t" ]; then shift 2; fi
 mode="$(cat "$D/mode")"
 styled=0; for a in "$@"; do [ "$a" = "-e" ] && styled=1; done
-DIM=$'\\033[2m'; RST=$'\\033[0m'
+ESC=$'\\033'; DIM=$'\\033[2m'; RST=$'\\033[0m'
 box() { cat "$D/box" 2>/dev/null || true; }
 case "$cmd" in
   send-keys)
@@ -93,8 +93,16 @@ case "$cmd" in
         # unless echo mode is "typed" (rendered as ordinary text)
         sug="$(cat "$D/suggest" 2>/dev/null || true)"
         [ -z "$sug" ] && sug='Try "fix a bug"'
-        if [ "$styled" -eq 1 ] && [ "$(cat "$D/echo" 2>/dev/null)" != typed ]; then
-          echo "❯ \${DIM}\${sug}\${RST}"
+        em="$(cat "$D/echo" 2>/dev/null)"
+        if [ "$styled" -eq 1 ] && [ "$em" != typed ]; then
+          case "$em" in
+            combo) echo "❯ \${ESC}[0;2m\${sug}\${RST}" ;;
+            combo-reset) echo "❯ \${ESC}[2;38;5;244mjunk\${ESC}[0;37m \${sug}" ;;
+            idx2) echo "❯ \${ESC}[38;5;2m\${sug}\${RST}" ;;
+            rgb) echo "❯ \${ESC}[38;2;10;2;30m\${sug}\${RST}" ;;
+            combo-trail) echo "❯ \${ESC}[2;38;5;244m\${sug}\${ESC}[0;37m ok" ;;
+            *) echo "❯ \${DIM}\${sug}\${RST}" ;;
+          esac
         else echo "❯ $sug"; fi
       elif [ "$w" -le 0 ]; then echo "❯ $first"
       else
@@ -272,6 +280,25 @@ describe('tmux-send-to-claude.sh', () => {
       expect(r.status).toBe(4);
       expect(enters()).toBe(3);
     });
+  });
+
+  describe('combined SGR parameter lists', () => {
+    const cases: ReadonlyArray<readonly [string, string, number, number]> = [
+      ['ESC[0;2m dim echo ... ESC[0m → submitted', 'combo', 0, 1],
+      ['ESC[2;38;5;244m dim echo ... ESC[0;37m + plain tail → submitted', 'combo-trail', 0, 1],
+      ['ESC[0;37m resets dim: typed text after it is kept → unsubmitted', 'combo-reset', 4, 3],
+      ['ESC[38;5;2m colour index 2 is NOT dim → unsubmitted', 'idx2', 4, 3],
+      ['ESC[38;2;10;2;30m 24-bit colour is NOT dim → unsubmitted', 'rgb', 4, 3],
+    ];
+    for (const [name, mode, status, nEnters] of cases) {
+      it(name, () => {
+        setup('normal');
+        writeFileSync(join(dir, 'echo'), mode);
+        const r = run(NEW_SCRIPT, 'agent:0', LONG);
+        expect(r.status).toBe(status);
+        expect(enters()).toBe(nEnters);
+      });
+    }
   });
 
   describe('wrapped input box (continuation rows indented)', () => {
