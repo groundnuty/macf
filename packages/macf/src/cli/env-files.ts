@@ -246,6 +246,11 @@ export function generateEnvIdentity(config: MacfAgentConfig): string {
     '# alphabetical order — underscore prefix sorts before letters). Calls',
     '# below resolve at runtime against the function defined there.',
     '',
+    '# CLI version at launch (macf#1492), read from macf-agent.json so it',
+    '# tracks `macf update`. Feeds env.telemetry service.version.',
+    'MACF_VERSION="$(jq -r \'.versions.cli // empty\' "$SCRIPT_DIR/.macf/macf-agent.json" 2>/dev/null || true)"',
+    'export MACF_VERSION="${MACF_VERSION:-unknown}"',
+    '',
     '# Cross-repo path resolution (#140 + #161). Runtime templates reference',
     '# $MACF_WORKSPACE_DIR for absolute-path commands so cd-ing to another',
     '# repo doesn\'t break helper invocations.',
@@ -552,17 +557,15 @@ export function generateEnvRegistry(config: MacfAgentConfig): string {
  * identity / registry-mode vars are already exported when this file
  * sources, so the `${VAR}` expansions resolve at export-time.
  *
- * `MACF_VERSION` is the only baked-as-literal value: it's the macf CLI
- * version pinned in `.macf/macf-agent.json` `versions.cli` at this
- * workspace's last `macf init` / `macf update`. Substrate / hand-
- * configured workspaces (no `versions` block) get `MACF_VERSION=unknown`
- * so OTEL_RESOURCE_ATTRIBUTES gets a clean label rather than an empty
- * string.
+ * `MACF_VERSION` is NOT written here (macf#1492): this file is
+ * operator-managed, so a literal would stay at the first-deployed version.
+ * env.identity (macf-managed) exports it at launch from
+ * `.macf/macf-agent.json` `versions.cli`, `unknown` when absent.
  *
  * @param env — defaults to `process.env`; tests inject a fake.
  */
 export function generateEnvTelemetry(
-  config: MacfAgentConfig,
+  _config: MacfAgentConfig,
   env: NodeJS.ProcessEnv = process.env,
 ): string {
   if (env['MACF_OTEL_DISABLED'] === '1' || env['MACF_OTEL_DISABLED'] === 'true') {
@@ -590,14 +593,6 @@ export function generateEnvTelemetry(
         `Expected a plain URL like http://host:port.`,
     );
   }
-
-  // macf#357: bake the macf CLI version pinned for this workspace. Reads
-  // `versions.cli` from `.macf/macf-agent.json` (resolved at `macf init`
-  // / `macf update`). Falls back to literal "unknown" if the workspace
-  // is pre-P6 / hand-configured / lacks the versions block — keeps the
-  // OTel resource attribute well-formed (no empty-string label that
-  // Prometheus / Tempo would render as missing-but-not-absent).
-  const macfVersion = config.versions?.cli ?? 'unknown';
 
   // OTEL_RESOURCE_ATTRIBUTES — the new attribute set per macf#357.
   // Shell-var expansion at export time pulls identity from env.identity +
@@ -645,9 +640,8 @@ export function generateEnvTelemetry(
     '# OTEL_RESOURCE_ATTRIBUTES (macf#357): identity-bearing labels keyed',
     '# off env.identity + env.registry exports. service.namespace carries',
     '# the project (not the framework — reserve macf.framework=macf for',
-    '# the "all macf agents" filter). service.version baked from',
-    '# .macf/macf-agent.json `versions.cli` at template-write time;',
-    '# unknown when the workspace is pre-P6.',
+    '# the "all macf agents" filter). service.version comes from',
+    '# MACF_VERSION, which env.identity resolves at launch (macf#1492).',
     'export CLAUDE_CODE_ENABLE_TELEMETRY=1',
     'export CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1',
     'export OTEL_TRACES_EXPORTER=otlp',
@@ -660,11 +654,6 @@ export function generateEnvTelemetry(
     `MACF_OTEL_ENDPOINT="\${MACF_OTEL_ENDPOINT:-${endpoint}}"`,
     'export OTEL_EXPORTER_OTLP_ENDPOINT="${OTEL_EXPORTER_OTLP_ENDPOINT:-$MACF_OTEL_ENDPOINT}"',
     'export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf',
-    // macf#357: MACF_VERSION baked literal — workspace's pinned CLI
-    // version. Falls back to "unknown" via ${MACF_VERSION:-unknown} in
-    // the resource-attrs string so substrate workspaces produce a
-    // well-formed label even without re-running macf update.
-    `export MACF_VERSION="${macfVersion}"`,
     `export OTEL_SERVICE_NAME="macf-agent-\${MACF_AGENT_NAME}"`,
     `export OTEL_RESOURCE_ATTRIBUTES="${resourceAttrs}"`,
   ];

@@ -37,6 +37,8 @@
  *
  * See DR-021 for the full rationale + option analysis.
  */
+import { PACKAGE_VERSION } from './package-version.js';
+
 
 /**
  * Build the OTel Resource for the channel server.
@@ -58,6 +60,11 @@
  * Takes `resources`/`semconv` as params (rather than importing) to preserve
  * the zero-cost dynamic-import doctrine — see the module header.
  */
+/** service.version is this server's own version, never the launcher's MACF_VERSION (macf#1492). */
+export function resolveServiceVersion(): string {
+  return PACKAGE_VERSION;
+}
+
 export function buildResource(
   resources: typeof import('@opentelemetry/resources'),
   semconv: typeof import('@opentelemetry/semantic-conventions'),
@@ -106,7 +113,7 @@ export async function bootstrapOtel(): Promise<void> {
     return;
   }
 
-  const serviceVersion = process.env['MACF_VERSION'] ?? '0.0.0';
+  const serviceVersion = resolveServiceVersion();
   const serviceName = process.env['OTEL_SERVICE_NAME'] ?? 'macf';
 
   // Dynamic imports — only resolved when opted in. Lets a workspace

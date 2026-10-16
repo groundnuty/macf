@@ -19,7 +19,8 @@
  * those are integration concerns (`test/e2e/` scope, follow-up PR).
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { bootstrapOtel, buildResource } from '../src/otel.js';
+import { bootstrapOtel, buildResource, resolveServiceVersion } from '../src/otel.js';
+import { PACKAGE_VERSION } from '../src/package-version.js';
 
 describe('bootstrapOtel', () => {
   let originalEnv: string | undefined;
@@ -216,5 +217,17 @@ describe('buildResource (macf#427 — gen_ai.agent.name resource attrs)', () => 
     // Explicit merge is applied last → wins; env-only attrs still survive.
     expect(r.attributes['service.name']).toBe('macf-agent-cv-x');
     expect(r.attributes['gen_ai.agent.name']).toBe('cv-x');
+  });
+});
+
+describe('service.version (macf#1492)', () => {
+  it('is PACKAGE_VERSION even when a stale MACF_VERSION is exported', () => {
+    vi.stubEnv('MACF_VERSION', '0.2.58');
+    try {
+      expect(resolveServiceVersion()).toBe(PACKAGE_VERSION);
+      expect(resolveServiceVersion()).not.toBe('0.2.58');
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 });
