@@ -232,11 +232,16 @@ describe('evaluateCallerRoutingForm', () => {
 describe('org secrets reach a repo only if the repo can receive them (#1451)', () => {
   const REPO = 'groundnuty/demo-code';
   const caller = generateWorkflow('v3.5.0', V3);
-  function planRow(repoNames: readonly string[], visibility: string, plan: string | undefined): { r: PlanItem; o: ObservedState } {
+  function planRow(
+    repoNames: readonly string[],
+    visibility: string,
+    plan: string | undefined,
+    orgNames: readonly string[] = TS,
+  ): { r: PlanItem; o: ObservedState } {
     const base = observed(caller, repoNames);
     const o: ObservedState = {
       ...base,
-      orgSecretRepos: { [REPO]: classifyOrgSecretReach(new Set(TS), visibility, plan, REPO) },
+      orgSecretRepos: { [REPO]: classifyOrgSecretReach(new Set(orgNames), visibility, plan, REPO) },
     };
     return { r: row(computePlan(manifest(false), o).items), o };
   }
@@ -246,9 +251,17 @@ describe('org secrets reach a repo only if the repo can receive them (#1451)', (
     expect(r.verb).toBe('update');
     expect(r.reason).toContain('the org secrets TS_OAUTH_CLIENT_ID, TS_OAUTH_SECRET do not reach groundnuty/demo-code');
     expect(r.reason).toContain('organisation secrets are not available to private repositories on the free plan');
-    expect(r.reason).toContain('set it as a repository secret, or route this repo self-hosted');
+    expect(r.reason).toContain('set them as repository secrets, or route this repo self-hosted (a self-hosted runner needs no Tailscale pair)');
     expect(r.reason).not.toContain('the repo has no secret named');
     expect(callerSecretRewritesFromObserved(manifest(false), o)).toEqual({ 'code-agent': false });
+  });
+  it('private + free + a NON-Tailscale secret only at org level → the self-hosted remedy is NOT offered', () => {
+    const repo = [...TS, ...FOUR.filter((n) => n !== 'ROUTING_CLIENT_CERT')];
+    const { r } = planRow(repo, 'private', 'free', ['ROUTING_CLIENT_CERT']);
+    expect(r.verb).toBe('update');
+    expect(r.reason).toContain('the org secret ROUTING_CLIENT_CERT does not reach groundnuty/demo-code');
+    expect(r.reason).toContain('routing self-hosted would not help');
+    expect(r.reason).not.toContain('or route this repo self-hosted');
   });
   it('private + free + pair at repo level → noop', () => {
     expect(planRow([...FOUR, ...TS], 'private', 'free').r.verb).toBe('noop');
