@@ -242,7 +242,7 @@ macf_match_paren() {
 }
 
 macf_split_text() {
-  local s="$1" depth="$2" n=${#1} i=0 c nx nx2 cur="" q="" j d strip
+  local s="$1" depth="$2" n=${#1} i=0 c nx nx2 cur="" q="" j d strip mm
   local -a HD_DELIMS=() HD_STRIPS=()
   while [[ $i -lt $n ]]; do
     c="${s:i:1}"; nx="${s:i+1:1}"
@@ -254,9 +254,11 @@ macf_split_text() {
       # Double quotes stop word splitting, not execution: check what $( ) and ` ` run.
       if [[ "$c" == '$' && "$nx" == '(' && "${s:i+2:1}" != '(' ]]; then
         macf_match_paren "$s" $((i + 1))
-        if [[ "$MACF_MATCH" -gt $((i + 1)) ]]; then
-          macf_split_text "${s:i+2:MACF_MATCH-i-2}" $((depth + 1))
-          cur+="${s:i:MACF_MATCH-i+1}"; i=$((MACF_MATCH + 1)); continue
+        # Save the offset first: the recursive split below reuses MACF_MATCH.
+        mm=$MACF_MATCH
+        if [[ "$mm" -gt $((i + 1)) ]]; then
+          macf_split_text "${s:i+2:mm-i-2}" $((depth + 1))
+          cur+="${s:i:mm-i+1}"; i=$((mm + 1)); continue
         fi
       fi
       if [[ "$c" == '`' ]]; then
