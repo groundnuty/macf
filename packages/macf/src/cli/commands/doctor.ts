@@ -1498,7 +1498,7 @@ export interface ScriptCurrencyFinding {
   readonly name: string;
   /** `stale` — on disk, but bytes differ from canonical. `missing` — canonical
    *  distributes this name and the workspace has no copy at all. */
-  readonly reason: 'stale' | 'missing' | 'retired';
+  readonly reason: 'stale' | 'missing';
 }
 
 /**
@@ -1952,7 +1952,7 @@ export interface RuleCurrencyFinding {
   readonly name: string;
   /** `stale` — on disk, but content differs from canonical. `missing` —
    *  canonical distributes this name and the workspace has no copy at all. */
-  readonly reason: 'stale' | 'missing';
+  readonly reason: 'stale' | 'missing' | 'retired';
 }
 
 /**
@@ -3172,13 +3172,10 @@ function printScriptCurrencySection(
   }
   console.log(`  ⚠ ${check.detail}  [WARN]`);
   for (const f of check.findings) {
-    const reasonText =
-      f.reason === 'stale' ? 'stale — differs from canonical'
-      : f.reason === 'retired' ? 'retired — canonical no longer ships it, but this managed copy is still loaded (`macf update` or `macf doctor --fix` removes it)'
-      : 'missing — never distributed';
+    const reasonText = f.reason === 'stale' ? 'stale — differs from canonical' : 'missing — never distributed';
     console.log(`    ✗ ${f.name} — ${reasonText}`);
   }
-  const staleCount = check.findings.filter((f) => f.reason === 'stale' || f.reason === 'retired').length;
+  const staleCount = check.findings.filter((f) => f.reason === 'stale').length;
   printDistributionFixLine('.claude/scripts/', checkoutCurrency, staleCount);
   // Both canonical source dirs present here (that's what distinguishes WARN
   // from FAIL) — "both present, a script missing" is the decisive triple's
@@ -3236,10 +3233,13 @@ function printRuleCurrencySection(check: RuleCurrencyCheckResult, checkoutCurren
   }
   console.log(`  ⚠ ${check.detail}  [WARN]`);
   for (const f of check.findings) {
-    const reasonText = f.reason === 'stale' ? 'stale — differs from canonical' : 'missing — never distributed';
+    const reasonText =
+      f.reason === 'stale' ? 'stale — differs from canonical'
+      : f.reason === 'retired' ? 'retired — canonical no longer ships it, but this managed copy is still loaded (`macf update` or `macf doctor --fix` removes it)'
+      : 'missing — never distributed';
     console.log(`    ✗ ${f.name} — ${reasonText}`);
   }
-  const staleCount = check.findings.filter((f) => f.reason === 'stale').length;
+  const staleCount = check.findings.filter((f) => f.reason === 'stale' || f.reason === 'retired').length;
   printDistributionFixLine('.claude/rules/', checkoutCurrency, staleCount);
 }
 
