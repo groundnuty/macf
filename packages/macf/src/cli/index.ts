@@ -27,6 +27,7 @@ import { runBootstrapControlRepoInit } from './commands/bootstrap-control-repo-i
 import { runManifestScaffold } from './commands/bootstrap-manifest-scaffold.js';
 import { runRoutingDoctor } from './commands/routing-doctor.js';
 import { runRoutingE2e } from './commands/routing-e2e.js';
+import { runRoutingProbe } from './commands/routing-probe.js';
 import { runRunnerAudit } from './commands/runner-audit.js';
 import { runRunnerDeclarationCheck } from './commands/runner-declaration-check.js';
 import { runRegistryPrune } from './commands/registry-prune.js';
@@ -1020,6 +1021,41 @@ routing
       manifestPath: opts.manifest,
     });
     process.exitCode = code;
+  });
+
+routing
+  .command('probe')
+  .description(
+    'Post ONE clearly labelled probe and assert delivery from evidence: the router run LOG must carry ' +
+    'the routed line for the recipient, and (when the receiver runs on this host) its channel log must ' +
+    'show a receipt after the post. A green run proves nothing -- it is green when a message is dropped. ' +
+    'Never closes or deletes anything. Exits non-zero unless delivered.',
+  )
+  .requiredOption('--target-repo <owner/repo>', 'The repo the probe is posted on')
+  .requiredOption('--recipient <label>', 'The routing label of the agent that should receive it')
+  .option('--mode <mode>', 'mention (comment on --issue) or label (new issue, labelled)', 'mention')
+  .option('--issue <n>', 'mention mode: the existing issue to comment on', (v) => Number(v))
+  .option('--receiver-log <path>', 'Explicit receiver channel.log (default: derived from its identity)')
+  .option('--receiver-project <project>', 'Receiver project for the log path (default: this workspace\'s)')
+  .option('--timeout-sec <n>', 'How long to wait for the router run (default 180)', (v) => Number(v))
+  .option('--dir <path>', 'Project directory (defaults to auto-discovery from cwd)')
+  .option('--json', 'Emit the structured result as JSON', false)
+  .action(async (opts) => {
+    if (opts.mode !== 'mention' && opts.mode !== 'label') {
+      console.error('--mode must be "mention" or "label".');
+      process.exitCode = 1;
+      return;
+    }
+    process.exitCode = await runRoutingProbe(resolveProjectDir(opts.dir), {
+      targetRepo: opts.targetRepo,
+      recipient: opts.recipient,
+      mode: opts.mode,
+      issue: opts.issue,
+      receiverLog: opts.receiverLog,
+      receiverProject: opts.receiverProject,
+      timeoutSec: opts.timeoutSec,
+      json: opts.json,
+    });
   });
 
 routing
