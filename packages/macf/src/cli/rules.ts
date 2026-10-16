@@ -200,7 +200,7 @@ const FRONTMATTER_RE = /^---[ \t]*\r?\n[\s\S]*?\r?\n---[ \t]*(?:\r?\n|$)/;
  * `retireCanonicalRules`). Append a basename here in the same change that
  * deletes or renames the canonical source.
  */
-export const RETIRED_CANONICAL_RULES: readonly string[] = [];
+export const RETIRED_CANONICAL_RULES: readonly string[] = ['codify-at-correction-time.md'];
 
 /** True when `content` begins with the managed header, directly or right after a leading frontmatter block. */
 function beginsWithManagedHeader(content: string): boolean {

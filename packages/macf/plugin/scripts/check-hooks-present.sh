@@ -46,7 +46,7 @@
 # left a workspace in for anyone who followed it literally. `macf-gh-token.sh`
 # is therefore checked as the single most consequential file in the
 # directory; `macf-whoami.sh` (the token-attribution sanity-check helper
-# coordination.md's Token & Git Hygiene rule 2 points agents at) rides along
+# gh-token-attribution-traps.md points agents at) rides along
 # for the same reason — invoked directly, never hook-registered.
 #
 # Deliberately an EXPLICIT two-name list here, not a call into
@@ -158,7 +158,7 @@ for HELPER_NAME in macf-gh-token.sh macf-whoami.sh; do
   if [ "$HELPER_NAME" = "macf-gh-token.sh" ]; then
     REASON="TOKEN MINTER missing: no guard can mint a ghs_ bot token; every gh call will be blocked"
   else
-    REASON="token-attribution sanity-check helper missing (coordination.md Token & Git Hygiene rule 2)"
+    REASON="token-attribution sanity-check helper missing (gh-token-attribution-traps.md identity check)"
   fi
 
   if [ ! -e "$SCRIPT_PATH" ]; then

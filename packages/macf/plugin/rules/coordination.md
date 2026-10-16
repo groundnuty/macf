@@ -1,319 +1,41 @@
-# Coordination Rules (canonical, shared)
+# Coordination
 
-**This file is the single source of truth for cross-cutting coordination rules that apply to every MACF agent.** It is copied into each agent workspace's `.claude/rules/` by `macf init` and refreshed by `macf update`. Do not edit workspace copies directly — edit this file and re-run `macf update`.
-
-> **Workspaces without full `macf init`** (e.g. `groundnuty/macf` itself, or any Claude Code workspace operated by a bot that isn't a MACF-registered agent) can still get these canonical rules via `macf rules refresh --dir <workspace>`. Same copy, no App credentials or registry required.
-
-The rules here are topology-agnostic: they work whether the project uses a science-agent coordinator (like macf) or peer-to-peer agents with direct user oversight (like CV).
-
----
+Rules every agent in the fleet follows when working through GitHub issues and PRs. Other rules own their own topics: `pr-discipline.md` (reviews, merging), `gh-token-attribution-traps.md` (tokens), `peer-dynamic.md` (disagreement and review manner), `mention-routing-hygiene.md` (handles in prose).
 
 ## Issue Lifecycle
 
-1. **The reporter owns the issue closure.** The agent who opened an issue is the only one who closes it. This rule has two failure modes — both costly, both silent. Check for both before posting a merge-handoff comment.
-
-   **Failure mode A — closing an issue you didn't open.** Two ways this happens:
-   - *Auto-close via PR keywords.* GitHub's auto-close keywords in a PR body or commit message close the referenced issue on merge, bypassing the reporter. **Never use any of these 9 variants when the issue was filed by someone else:** `Closes #N`, `Fixes #N`, `Resolves #N`, `Close #N`, `Fix #N`, `Resolve #N`, `Closed #N`, `Fixed #N`, `Resolved #N`. Use **`Refs #N`** instead. The parser is negation- and context-blind (tables, checklists, quotes, and code fences do *not* shield the keyword), so this is now backstopped structurally: the `check-close-keyword.sh` PreToolUse hook (groundnuty/macf#431) intercepts `gh pr create` / `gh pr edit` whose body or title carries a close-keyword adjacent to a `#N` (or `owner/repo#N`) filed by another agent, and blocks with `exit 2`. Override with `MACF_SKIP_CLOSE_CHECK=1` for a deliberate cross-fix or your own issue.
-   - *Manual close via `gh issue close`.* Don't close someone else's issue even after merging the implementation. Post the handoff comment and stop.
-
-   **Failure mode B — waiting for yourself to close.** When the issue's reporter is YOU (you filed the issue during an audit, a follow-up split-off, or self-observed bug), there is no one else to close it. Don't post `@<other-agent> ready for you to close when verified` — no one is waiting to do that for you. After your PR merges, close the issue yourself with a verification comment. Silent stall otherwise: the queue fills with in-review issues that never clear.
-
-   **Self-check before posting any merge-handoff comment:**
-
-        gh issue view <N> --json author --jq '.author.login'
-
-   - Author is someone else (user or another agent) → post `@<author> PR #M merged, ready for you to close when verified.` and STOP.
-   - Author is YOU (your `app/<bot-name>` login) → close the issue yourself:
-
-            gh issue close <N> --reason completed --comment "Verified on main after PR #M merged. Closing as reporter."
-
-   Also self-check PR bodies before pushing:
-
-        git log -1 --pretty=%B  # or the PR body draft
-        # grep for any of: Closes Fixes Resolves Close Fix Resolve Closed Fixed Resolved
-
-   If any of those appear and the referenced issue was filed by someone else, replace with `Refs #N`.
-
-   **Why this rule matters:** Reporter-owns-closure gives the reporter a chance to verify the fix matches their intent before the issue disappears from their queue. In a multi-agent workflow, the reporter often has context the implementer doesn't (why it was filed at that priority, what the acceptance criteria really meant, what adjacent work it blocks). Auto-close strips that context; reflexive handoff on self-filed issues wastes it.
-
-   **Inversion warning — closure direction is independent of who implemented the fix.** A common failure mode after PR-merge handoffs: the reporter mistakes the implementer for the closer because the implementer just finished the work. Rule 1A says **reporter** owns closure, NOT **fix-author**:
-
-   *(The 4 cases below assume merge-by-implementer per `pr-discipline.md` — `implementer == merger`. Different topologies expand the table accordingly.)*
-
-   - **You filed the issue + you implemented the PR + you merged it** → **you close** (you're both reporter AND implementer).
-   - **You filed the issue + a peer implemented the PR + the peer merged it** → **you still close** (you're the reporter; the peer is implementer-but-not-reporter; their action ends at "post handoff comment + stop" per failure mode A).
-   - **A peer filed the issue + you implemented + you merged the PR** → **the peer closes** (they're the reporter; you @mention them with `ready for you to close when verified` per failure mode A).
-   - **A peer filed the issue + a peer implemented + a peer merged the PR** → **reporter closes**; you're observer.
-
-   The trap is symmetric to failure mode A. Failure mode A is "I close someone else's issue because I implemented the fix" (forgetting that fix-author ≠ reporter); the inverse is "I tell the implementer to self-close my issue because they merged the fix" (same forgetting, opposite direction). Both are the same conceptual mistake — substituting fix-authorship for issue-reportership.
-
-   **Reinforced self-check after any PR-merge that addresses an issue:**
-
-        gh issue view <N> --json author --jq '.author.login'
-
-   - Output is YOUR login → **YOU close** with verification comment (regardless of who implemented). Run `gh issue close <N> --reason completed --comment "..."`.
-   - Output is the peer's login → **THEY close**. Post `@<author> PR #M merged, ready for you to close when verified.` and STOP. Don't try to delegate the closure mechanics back to yourself.
-
-   This check is one cheap shell command; the inversion is silent (the recipient may not catch it if they're not paying attention to attribution).
-
-2. **Work through the queue without prompting.** When an issue is complete, check your assigned-label queue and pick up the next one immediately. Do NOT ask the reporter to ping you or reply "continue" before starting. Only wait when (a) your PR is in review, or (b) the queue is empty. If an issue is ambiguous, ask clarifying questions on that issue and move to the next queued one while waiting.
-
-3. **Never remove your own agent label.** Status labels (`in-progress`, `in-review`, `blocked`) swap as work moves; assignment labels stay.
-
-4. **Issue body is frozen during active work.** Once an assignee has commented "picking up" / added an `in-progress` or `in-review` label / filed a PR referencing the issue, the body **is the assignee's working spec** and should not be edited. Scope corrections, additional requirements, clarifying details, regex fixes — all go as **follow-up comments** in the issue thread.
-
-   **Why:** editing the body mid-flight either changes the target under the assignee's feet (they started on spec v1, are now reading v2) or is silently lost (they don't re-fetch the body after starting). A thread comment is visible, acknowledged, and dated. Both silent failure modes are worse than the tiny friction of posting a comment.
-
-   **When body edits ARE fine:**
-
-   - Before anyone has engaged (issue just-filed, no `in-progress` label, no assignee comments)
-   - The assignee is the one editing their own issue body
-   - Fixing obvious typos or broken links (not scope)
-
-   **When body edits are NOT fine:**
-
-   - Assignee has commented "picking up" / is actively working
-   - An `in-progress` / `in-review` label is set
-   - A PR referencing the issue is open
-
-   If a correction is substantive enough that the assignee would want to re-read from scratch, consider closing the current issue and filing a replacement with a clear back-reference — rather than in-place body rewrite.
-
-5. **Auto-opened issues break the peer-agent-reporter assumptions.** When an issue is filed by `github-actions[bot]` or any other non-human/non-agent bot, the peer-reviewer-verifies-the-fix loop that rules 1-4 assume doesn't apply — the bot-reporter can't verify, can't be routed-to as a reviewer, and can't sanity-check closure. Three specific adaptations:
-
-   - **Use `Refs #N`, not `Closes #N`, in the fix PR body.** The auto-close keyword bypasses the verification step the bot-reporter can't perform. Prefer an explicit close after the next post-merge run independently confirms the fix worked — not the PR merge itself, which fires before verification.
-   - **Route the review ping to `@macf-science-agent[bot]`** (or whichever peer agent would normally review), **not by echoing the `@<bot-reporter>` mention from the auto-open body.** The auto-open's `@mention` addresses the agent who should FIX, not the one who should REVIEW. Self-mention loops don't fire the routing workflow — the PR sits unreviewed.
-   - **Wait for the next auto-run to confirm green, then close with a comment citing the green run's SHA + URL.** If the auto-opening workflow has a self-close-on-green step (e.g., `e2e.yml` has one per #166), trust it — don't pre-empt by closing manually or via PR auto-close keyword. For workflows without a self-close step, close manually only after observing the next run green.
-
-   **Why this rule matters:** lucky timing isn't a verification gate. If a fix is incomplete, auto-close on PR merge closes the issue 2 seconds before the next run fails anew — producing a misleading closure trail. The "stays open until green" contract the auto-open body sets needs to be honored on the machine-enforced side, not relied on operator-discipline.
-
-   **Example auto-opened issues in this repo:** E2E cadence failures on `main` (#149 workflow auto-opens a `code-agent`/`blocked` issue with title prefix `ci(e2e): post-merge suite failing on main`); dependency-drift alerts; future `/sign` / cert-rotation health alarms. The pattern generalizes to any workflow that files on failure.
-
----
+1. The reporter closes the issue, because only the reporter knows whether the fix matches the intent. Before any merge-handoff comment, run `gh issue view <N> --json author --jq '.author.login'`:
+   - The author is someone else: post `@<author> PR #M merged, ready for you to close when verified.` and stop. Do not run `gh issue close`.
+   - The author is you (you opened it, whoever implemented it): close it yourself with a verification comment, `gh issue close <N> --reason completed --comment "..."`. Nobody else will.
+   - In a PR body, use `Refs #N` for an issue someone else filed. Any of the nine close keywords (Closes, Fixes, Resolves, Close, Fix, Resolve, Closed, Fixed, Resolved) fires on merge whatever the surrounding text. Hook `check-close-keyword.sh` blocks it; the override is operator-only.
+2. Work through your queue without prompting: when an issue is done, pick up the next one. Wait only while your PR is in review or the queue is empty. Ask clarifying questions on the issue and move to the next while waiting.
+3. Keep your agent label; only the status labels (`in-progress`, `in-review`, `blocked`) change.
+4. Once an assignee has picked an issue up (comment, `in-progress` label, or open PR), the issue body is their working spec and is frozen. Post scope changes as follow-up comments; the assignee may edit their own issue body. If the change needs a re-read from scratch, file a replacement issue that links back.
+5. For an issue filed by a bot such as `github-actions[bot]`, use `Refs #N` (not `Closes`), route the review ping to a peer reviewer rather than echoing the bot's mention (which does not route), and wait for the next automatic run to confirm green before closing, citing its URL. If the workflow closes the issue on green itself, leave it.
 
 ## Communication
 
-1. **@mention in EVERY comment.** Routing depends on it. A comment without @mention is invisible to the recipient agent.
-
-2. **All discussion in issue comments, not PR comments.** Issue threads are visible on the Projects board and persist after PRs are merged or closed.
-
-3. **Verify your comment actually posted — describing ≠ doing.** Writing a review / LGTM / close-comment / status-update as prose in your response is NOT the same as posting it to GitHub. Only executed `gh issue comment` / `gh pr comment` / `gh issue close` tool calls reach the repo; chat output is invisible to other agents. Treat the verification step as a **mandatory tail**, not optional, on any review-producing turn.
-
-   **After any `gh ... comment` / `gh ... close`:**
-
-        gh issue view <N> --repo <owner>/<repo> --json comments \
-          --jq '.comments[-1].author.login'
-
-   Confirms (a) the comment exists, (b) attribution is correct (bot not user — see Token & Git Hygiene below).
-
-   **Signs you may have missed the tool call:**
-
-   - Your last action was describing a review / decision / close in prose
-   - The recipient's status comment says "waiting for review" or "ready for you to close" with no reply from you visible on the thread
-   - Time has passed since you "reviewed" but no downstream activity (merge, follow-up questions, re-review request) has happened
-
-   When in doubt, run the `gh issue view` check. Cheap to verify; costly to have the assignee wait on a review that never arrived.
-
-4. **Concise comments** — 1-3 sentences unless detail is needed.
-
-5. **Inbound review requests are action asks that block the requester — not status FYIs.** Issue Lifecycle rule 2 covers the implementer's OUTBOUND queue ("work through your assigned-label queue without prompting"). This rule covers the symmetric REVIEWER-side INBOUND obligation, which is just as load-bearing and far easier to strand.
-
-> **Structural promotion — this sweep is now an *injected startup step* (DR-038 Slice C, macf#741).** As of the plugin's SessionStart pull-check, `/macf-issues` **unconditionally composes the §5 sweep instruction** (reviewer / inbound-review+mention / gate) into every session's startup surface — so the sweep is *presented to you on each fresh session*, not left to memory. This promotes §5 from "a discipline the agent might forget" to "an injected startup step" — the same Path-2 logic as the `check-*.sh` hooks (`silent-fallback-hazards.md`): a recurring discipline gets promoted to a deterministic harness mechanism, with the behavioral rule kept as the **definition of what the injected step runs** and the **backstop for anything that arrives mid-session** (the injection fires at startup; a review request or gate that lands *after* startup is still yours to catch via the sweep below before you go idle). The (a)/(b)/(c) prose remains load-bearing on both counts.
-
-   **(a) Treat "PR ready: #N" / "ready for review" as a request that blocks the peer's next move.** When a peer posts a review-request comment on a thread, that is not an informational status update you can note-and-defer — it is an action ask directed at you. The LGTM/merge-gate makes this structural: per `pr-discipline.md`, a peer's PR cannot merge without a reviewer's **formal approval** (`gh pr review --approve`), so until you review, the peer is blocked. Not slowed — blocked, and silently, because nothing on their side surfaces "my reviewer never saw this." A stranded review request stalls the peer indefinitely. Pick it up, review honestly, and submit a formal approve / request-changes (not a plain comment — see `pr-discipline.md §"How to submit LGTM"`; only the formal state-change fires the reviewer-notification routing).
-
-   **(b) Run an INBOUND review-sweep before declaring idle — especially after surfacing from a long single-threaded task.** Before you say "caught up" / "nothing pending" / "your call" / go idle, sweep your repos for review requests addressed to you. This matters most right after you surface from a deep, single-threaded arc (a long workflow, a multi-step investigation): while you were heads-down on one thread, a review request can have arrived on another and been easy to miss.
-
-        # Peer-authored PRs awaiting YOUR review (review not yet given):
-        for r in <your-repos>; do
-          gh pr list --repo "$r" --state open \
-            --json number,author,reviewDecision,title \
-            --jq '.[] | select(.reviewDecision == "REVIEW_REQUIRED" or .reviewDecision == null)
-                       | select(.author.login != "<your-login>")'
-        done
-        # Plus: open threads where you were @mentioned and haven't replied.
-
-   (The query intentionally surfaces *any* peer-authored PR lacking a review, not only those that formally requested you by name — on a small fleet that breadth is a feature: it catches a peer blocked on review even when the request didn't route to you. Narrow it with a requested-reviewer filter on a larger fleet.)
-
-   **Bot-authored PRs count — and they are the ones this sweep actually loses.** The query above already returns `dependabot[bot]` / `github-actions[bot]` PRs, but the rule's *motivation* is peer-blocking, so a bot PR — which blocks no peer and pings nobody — falls outside the felt scope and is skipped in practice. That is a live failure mode, not a hypothetical: the `agent-router` `v3.4.1 → v3.4.2` bump (the fix for agents self-echoing on every approval) was filed by Dependabot **the day after** the fix shipped and sat **36 days** unread, until a human noticed the symptom — while five other dependency PRs, the oldest 113 days, queued behind two stalled majors. **Detection was never the gap; attention was.** So: when you sweep, do not filter bot authors out, and treat an aging dependency PR as work-in-your-queue rather than ambient noise — a stale *router* pin in particular degrades routing for every agent in the fleet, silently (`silent-fallback-hazards.md` Instance 17).
-
-   **Why the sweep is necessary — and why it's mechanism-agnostic.** Routing delivers each notification as a **discrete event at the moment it occurs** — a push to your channel-server, an A2A message — not as a standing inbox you can re-open and re-read later. Once that event has been delivered (or has arrived while you were mid-turn on a different thread), it is not re-presented to you on its own. So a review-request ping that landed while you were deep in another task is gone from the live stream and only recoverable by querying GitHub state directly. This is the **general silent-fallback shape** (see `silent-fallback-hazards.md`): the routing layer reports the ping delivered, but "delivered" does not guarantee "processed by the recipient," and nothing surfaces the gap until the blocked peer escalates. The sweep is the result-invariant check at the reviewer boundary — assert against GitHub state ("are there peer PRs awaiting my review?") rather than trusting that you'd remember every ping that flowed past.
-
-   **Verified motivation:** three operator-surfaced stalls where a peer's review request sat idle (42 min in one case; ~2.5 h in another) because the reviewer went idle without sweeping — the ping had arrived during a long single-threaded task and was never picked back up. In each case the peer's PR was blocked the entire time on a formal approval that never came.
-
-   **(c) Sweep your GATES against GitHub state — don't wait for a ping that may never come.** §5(a)/(b) cover the REVIEWER's inbound obligation (review requests addressed to you). The symmetric gap they don't cover: when YOUR next action is gated on a review/approval landing on **someone else's PR** — you are the *gate-owner*, not the PR author and not the requested reviewer — `route-by-pr-review-state` notifies only the **PR author**, NOT you. A review that clears your gate fires **no signal to you**, and your gate silently reads "pending" (this is `silent-fallback-hazards.md` Instance 13: reviewer ≠ next-actor, which is the *common* case once a fleet collaborates freely). Before recording a gate as satisfied OR as still-blocked, assert its artifact directly:
-
-        # Does the approval my next step is gated on actually exist?
-        gh pr view <N> --repo <owner>/<repo> --json reviews \
-          --jq '[.reviews[] | select(.author.login=="<gate-reviewer>" and .state=="APPROVED")] | length'
-
-   This is the result-invariant (Pattern A) at the **gate boundary** — clear the gate from GitHub state, never from "did I get pinged." It generalizes §5(b)'s reviewer-sweep from the *requested-reviewer* side to the *gate-owner* side. **The load-bearing fix, though, is structural — not this sweep:** a coordination *guarantee* must anchor to a deterministic harness mechanism, so `route-by-pr-review-state` **was extended** to notify everyone with deliberate review-engagement on the PR — formal reviewers + requested reviewers + @mentioned parties, not the author alone (`groundnuty/macf-actions#57`, **shipped in `v3.4.0` and carried by every released tag through `v3.4.2`, which is what consumer fleets pin**). This gate-sweep remains the **behavioral backstop** to that mechanism — not a stopgap waiting on it — the same Path-2 logic as the `check-*.sh` hooks: a recurring discipline gets promoted to a harness mechanism, with the rule kept as a safety-net, not enshrined as the guarantee. A reviewer **SHOULD** also @mention a known gate-owner in the review body (`route-by-mention` carries it) as a courtesy — but that depends on the reviewer remembering, so don't rely on it either.
-
-   **Verified motivation:** `groundnuty/macf` PR #574 (2026-06-26) — code-agent's approval was the framework-feasibility gate devops's impl work depended on; `route-by-pr-review-state` notified the PR author (science) only, devops received no signal, and its gate read "code's review still pending" though the APPROVED review existed. Resolved only by a manual relay + an operator-prompted direct channel push. A one-line gate-sweep would have cleared it immediately.
-
-6. **Operator decisions: one solicitor per decision; attributed relays are trustable.** The operator's attention is the fleet's scarcest resource, and two failure modes waste it symmetrically: soliciting the same decision twice (two agents each ask), and re-soliciting a decision the operator already gave (an agent distrusts a peer's relay and asks again). Both fired on the same decision on 2026-07-04 (the DR-041 tier call: code-agent asked the operator; science then held the relayed answer for the operator's "direct word" — the operator answered the same question twice and flagged the friction). Two rules close them:
-
-   **(a) Single solicitor.** For any operator decision attached to a work item, exactly ONE agent owns the operator-facing question: **the item's owner** (the DR's author for design/ratification decisions; the issue's reporter for issue-scoped ones; the PR's implementer for merge-mechanics). A peer needing that decision routes the question **through the owner** (@mention them), never to the operator in parallel. If you're unsure who owns it, ask the owner-candidate — not the operator.
-
-   **(b) Attributed relays are trustable.** An operator decision relayed by a peer **with clear attribution** (who decided, when, what exactly) is actionable — fold it into design/work and do NOT re-solicit the operator. Re-confirmation is reserved for exactly two cases: **(i) constitutional status-flips** (DR ratification Proposed→Accepted), where the bar is the operator's own signal — and the **preferred form is an operator GitHub artifact** (a comment or approval from the operator's login on the record: un-forgeable, verifiable by anyone, kills the re-confirm loop entirely — the same operator-login-as-trust-anchor principle as the sanctioned-exception mechanism on `groundnuty/macf#822`); **(ii) genuine ambiguity** (two relays conflict, or the relay is materially incomplete). Outside those, re-asking a settled decision is protocol friction, not diligence.
-
-   **Verified motivation (both directions):** the 2026-07-04 double-ask above; and 2026-08-10 `groundnuty/macf` PR #823 — a DR-042 ratification relayed in-session had no operator artifact on the record, so the reviewer (correctly, under the old shape) paused to re-confirm with the operator before approving. One operator comment on the record at ratification time would have made the flip self-verifying with zero re-confirmation.
-
----
+1. Put an @mention in every comment, because routing depends on it.
+2. Discuss on issue threads, not PR comments: issues stay visible on the board after the PR closes.
+3. Writing a review or close comment as prose does not post it (chat output is invisible to other agents). As a mandatory tail, after any `gh issue comment` or `gh pr comment`, check it landed under your bot login: `gh issue view <N> --repo <owner>/<repo> --json comments --jq '.comments[-1].author.login'`.
+4. Keep comments to one to three sentences unless detail is needed.
+5. A review request addressed to you blocks the requester, so treat it as work, not status. Sessions start with `/macf-issues`, which prints the sweep instruction; before declaring idle, run it again for anything that arrived mid-session:
+   - (a) Reviewer sweep: open PRs by others awaiting your review, bot-authored included (a stale router pin degrades routing for everyone), and threads where you were mentioned and have not replied. Answer a review with `gh pr review --approve` or `--request-changes`; a plain comment does not notify the author.
+   - (b) Gate sweep: when your next step waits on someone else's PR review, check GitHub (`gh pr view <N> --json reviews`), not a ping, because the router notifies the author, formal reviewers, requested reviewers and mentioned parties only. When you review a PR a third agent is gated on, @mention that agent in the review body.
+6. Operator decisions have one solicitor: the owner of the work item (the DR author, the issue reporter, or the PR implementer). A peer who needs the decision asks the owner, not the operator. A decision relayed with clear attribution (who, when, what) is actionable; ask the operator again only to flip a DR's status, which needs an operator artifact on the record, or when relays conflict.
 
 ## When You're Stuck — Escalation
 
-1. **Treat definitive GitHub states as action signals, not wait signals.** For PR merge status, check `gh pr view <N> --json mergeStateStatus,mergeable`:
-   - `CLEAN` → merge
-   - `UNKNOWN` → GitHub is still computing; wait up to ~60s
-   - `DIRTY` / `CONFLICTING` → rebase onto main and resolve conflicts
-   - `BEHIND` → rebase onto main, force-push
-   - `BLOCKED` → check reviews / required checks / branch protection
-   - `UNSTABLE` → a required check failed; fix it
-
-   Only `UNKNOWN` means "keep waiting." Anything else means your turn to act.
-
-   **Exception — CI-completion routing (macf-actions v1.3+).** When you receive a CI-completion routing notification (`PR #N: CI SUCCESS/FAILED ...`) and `gh pr view` returns `UNKNOWN` or `UNSTABLE` immediately after, the notification was fired by one workflow's `check_suite.completed` while another workflow on the same commit is still in-flight. The rollup hasn't resolved yet. Wait ~30s and re-query; don't force-merge until the full rollup goes `CLEAN`. See `groundnuty/macf-actions#6` for background.
-
-2. **Escalate to the issue reporter.** When you've tried to resolve and are still stuck, @mention the reporter of the issue you're working on:
-
-        GH_TOKEN=$GH_TOKEN gh issue comment <N> --repo <owner>/<repo> --body "@<reporter> blocked on <X> — tried <Y>, need <Z>."
-
-   Universal rule: an agent escalates to the entity that tasked it — which is the issue reporter. Same entity that owns closing the issue (see Issue Lifecycle rule 1). This holds across any topology:
-   - macf (code-agent → science-agent → user)
-   - CV (cv-agents → user directly)
-   - Experiments (workers → experiment orchestrator → science-agent)
-
-   The chain flows from who opened the issue. You don't need to know the topology — you just @mention the reporter.
-
-3. **The reporter decides the next step.** They may act directly, involve a coordinator, or bring in the user. Do not reach past the reporter to the user unless the reporter has explicitly said they can't help.
-
----
-
-## Peer Dynamic
-
-You are a peer to the agents and humans you work with, not a subordinate and not a superior.
-
-- **Push back** when an issue has wrong scope, missing context, flawed design, or conflicts with prior decisions
-- **Ask clarifying questions** before proceeding on ambiguous requirements — wait for answers
-- **Defend your implementation choices** with concrete reasoning if the reviewer disagrees
-- **Accept valid feedback** and push fixes promptly
-- **Research before implementing** — your training data may be outdated. Look up current SDK/library/API docs (context7, WebSearch, WebFetch) before using them
-
-The goal is correctness through dialogue, not compliance.
-
----
-
-## Canonical tmux launch pattern
-
-**One session per agent, named `<project>@<agent>`.** Post-v0.2.10, `claude.sh` self-wraps in tmux with this naming structurally — bare `./claude.sh` produces the canonical session. Pre-v0.2.10 consumers (and operators wanting manual launch) use the explicit form:
-
-        # Post-v0.2.10 (canonical, structural — recommended for new consumers):
-        cd /path/to/academic-resume && ./claude.sh
-        #   Self-wraps in tmux session "academic-resume@cv-architect" automatically.
-        #   Re-attaches if the session exists; creates new if not.
-
-        # Pre-v0.2.10 (manual wrap, still works post-v0.2.10 with MACF_NO_TMUX_WRAP=1):
-        tmux new-session -d -s "academic-resume@cv-architect" \
-          "cd /path/to/academic-resume && ./claude.sh"
-
-        tmux new-session -d -s "academic-resume@cv-project-archaeologist" \
-          "cd /path/to/academic-resume && ./claude.sh"
-
-**Why this matters:** when the channel server's `tmux-wake` path (macf#185) auto-detects its own tmux target via `$TMUX_PANE` or `tmux display-message`, a **shared session with one window per agent** produces ambiguous resolution — two server processes in different windows of the same session can end up with identical auto-detected targets, and wakes land on the wrong pane. Empirically observed during the 2026-04-21 bilateral e2e smoke (chain broke when archaeologist's wake delivered to cv-architect's pane).
-
-**One session per agent** gives each server process a deterministic `$TMUX_PANE` + one-window-per-session context where `display-message` can't be ambiguous.
-
-**Session-name convention `<project>@<routing-label>`** is parseable (both human + script-friendly) and collision-free across projects — two `cv-architect` agents on the same VM (one for `academic-resume`, one for `macf-paper`) stay on separate sessions. **The session keys on the agent's `routing_label` (`MACF_ROUTING_LABEL`), not its OTEL display name (`MACF_AGENT_NAME`).** Why: the DR-031 watchdog + reconcile/resume, the registry key, and the mTLS cert CN all key on `routing_label`; `agent_name` is the OTEL `gen_ai.agent.name` display value only. For an agent where the two differ (science: `agent_name=macf-science-agent`, `routing_label=science-agent`) a session keyed on the display name (`macf@macf-science-agent`) would be invisible to the watchdog targeting `macf@science-agent` (macf#678). Where `agent_name == routing_label` (code/devops/auditor) they coincide, so this is a no-op.
-
-**Bonus**: separate sessions mean multiple terminals can attach to different agents independently — `tmux attach -t academic-resume@cv-architect` on one terminal, `...@cv-project-archaeologist` on another, without windows-switching interference.
-
-**Migration** from a single-session multi-window setup: `tmux rename-session -t <old-name> <new-name>` per agent.
-
-**Path-2 promotion (macf#313, v0.2.10):** the canonical session-naming rule is now structurally enforced by `claude.sh` itself. Consumer workspaces converging on v0.2.10+ via `macf update --plugin` get the self-wrap automatically; substrate launchers (operator-authored, NOT generated by `claude-sh.ts` template) are unaffected. For mixed-version fleets, pre-v0.2.10 consumers continue to need the explicit `tmux new-session` wrap until they update.
-
-**Opt-out (post-v0.2.10):** `MACF_NO_TMUX_WRAP=1 ./claude.sh` skips the self-wrap. For operator-driven manual launches outside tmux, debug sessions, single-shot CLI use, CI environments. Sister convention to `MACF_OTEL_DISABLED=1`, `MACF_SKIP_TOKEN_CHECK=1`, `MACF_SKIP_MENTION_CHECK=1`.
-
----
+1. Read the merge state with `gh pr view <N> --json mergeStateStatus,mergeable` and act:
+   - `CLEAN`: merge. `UNKNOWN`: GitHub is computing; wait up to a minute. After a CI-completion notification, an `UNKNOWN` or `UNSTABLE` rollup may mean another workflow is still running; re-query after about 30 seconds.
+   - `BEHIND` or `DIRTY`: merge main into the branch and resolve conflicts. Do not force-push; settings deny it and review history stays intact.
+   - `BLOCKED`: check reviews, required checks and branch protection. `UNSTABLE`: a required check failed; fix it.
+2. When stuck after trying, @mention the issue's reporter with what you tried and what you need. The reporter decides the next step; do not go past them to the operator unless they say they cannot help.
 
 ## Token & Git Hygiene
 
-1. **Refresh GH_TOKEN before every `gh` or `git push`** — tokens are 1-hour installation tokens. Use the canonical helper, and **fail loud** if it doesn't work:
+Mint `GH_TOKEN` and verify attribution as `gh-token-attribution-traps.md` describes. Push with `-c url.insteadOf` per push and never write a token into a remote URL, because it would persist. Leave no uncommitted changes at the end of a turn, and never commit keys or tokens.
 
-        GH_TOKEN=$("$MACF_WORKSPACE_DIR/.claude/scripts/macf-gh-token.sh" \
-          --app-id "$APP_ID" --install-id "$INSTALL_ID" --key "$KEY_PATH") || exit 1
-        export GH_TOKEN
+## Peer Dynamic
 
-   **Use `$MACF_WORKSPACE_DIR/` as the path prefix, not `./`.** The relative-path form (`./.claude/scripts/...`) breaks the moment you `cd` to another repo for cross-repo work — the `$(...)` substitution returns empty, `export GH_TOKEN=""` silently succeeds, and the next `gh` call falls back to stored user auth. `$MACF_WORKSPACE_DIR` is set by `claude.sh` to the agent's workspace absolute path and resolves regardless of cwd. Same principle for `KEY_PATH`: `claude.sh` rewrites relative key paths to absolute at launch so helper invocations from any cwd still find the key.
-
-   **Why this matters:** the `#140` PreToolUse hook catches this class at tool-call time (empty `GH_TOKEN` → blocks the `gh` call before it runs). But the hook adds friction — the command aborts, the operator retries with the correct pattern. Using absolute paths from the start avoids the abort-retry loop entirely.
-
-   **Never** use the naive `export GH_TOKEN=$(gh token generate ... | jq -r '.token')` pattern — if `gh token generate` fails, jq's success masks the error (no `pipefail`), `GH_TOKEN` becomes the string `"null"`, and every subsequent `gh` operation silently falls back to the stored `gh auth login` as the user. This is the attribution trap: your PRs and comments get written as the user, not the bot, and nothing surfaces the mismatch until cross-agent routing breaks.
-
-   The helper uses `--token-only`, `set -euo pipefail`, validates the `ghs_` prefix, and emits actionable diagnostics (clock drift, missing key, bad PEM, wrong App/installation ID) on failure.
-
-2. **Two different checks — don't conflate them.** (Corrected groundnuty/macf#664 — the prior version of this rule pointed a heading that said *identity* at a script that only reports a **token class**. An agent that ran it, saw `bot installation token`, and concluded its identity check had passed was actively misled: the output never names an agent, only whether `GH_TOKEN` is a bot token or a user token. That's false confidence, worse than no check at all.)
-
-   **Token attribution** — *"is `GH_TOKEN` a bot token, and not a user token?"* — `macf-whoami.sh`'s actual job, unchanged by this correction. Run at session start or when something feels off:
-
-        GH_TOKEN=$GH_TOKEN ./.claude/scripts/macf-whoami.sh
-
-   Bot tokens (`ghs_*`) print `bot installation token`. A user token (`ghp_*`, `gho_*`, `ghu_*`) prints the user login and exits non-zero with a warning — that's the attribution trap firing (see `gh-token-attribution-traps.md`). This confirms the **token's** class. It does **not** tell you which agent you are — don't read a clean run as an identity check.
-
-   **Agent identity** — *"which MACF agent am I — project / agent_name / agent_role / routing_label?"* — the authoritative sources are `.macf/macf-agent.json` (`project` / `agent_name` / `agent_role` / `routing_label` / `github_app.bot_login`) and the `MACF_PROJECT` / `MACF_AGENT_NAME` / `MACF_AGENT_ROLE` / `MACF_ROUTING_LABEL` environment `claude.sh` sources from `env.identity` before it execs `claude` — **never `macf-whoami.sh`, and never a guess from the workspace directory name, the tmux session name, or a token.** As of groundnuty/macf#664, the plugin's `emit-agent-identity.sh` `SessionStart` hook surfaces this into context automatically on **every** session start, including a `claude -c` **resume** — previously an agent only picked up its identity on a genuinely fresh start (nothing else to do at turn 1 prompted the old `macf-whoami.sh` nudge above); a resumed session, already mid-conversation, never had a trigger to run that lookup at all, so it stayed identity-less indefinitely. If you ever need to check by hand: `cat .macf/macf-agent.json`, or `echo "$MACF_AGENT_NAME ($MACF_AGENT_ROLE) in $MACF_PROJECT"`. If **neither** source resolves, the workspace genuinely does not know its identity — say so; don't guess one.
-
-3. **When token generation fails, diagnose — don't work around it.** Common causes observed in practice:
-
-   - **Clock drift** — "JWT could not be decoded" usually means this machine's clock is skewed beyond GitHub's JWT tolerance. Check `timedatectl status` (expect `System clock synchronized: yes`).
-   - **Key mismatch** — `.github-app-key.pem` on disk doesn't match the App's registered public key (typically after a key rotation on GitHub without syncing locally). Compare fingerprints:
-
-            openssl rsa -in "$KEY_PATH" -pubout -outform DER 2>/dev/null | openssl dgst -sha256
-
-     against the SHA256 shown on GitHub → App settings → Private keys.
-   - **Wrong App/installation ID** — double-check `$APP_ID` and `$INSTALL_ID` in `.claude/settings.local.json`.
-   - **Missing App permission** — a 401 on a specific endpoint (e.g. `gh run list` returns 401 while `gh issue list` works) typically means the App lacks the permission for that resource. Coordinator/review agents especially need `actions: read` to debug team workflow runs — see DR-019 for the full required permission set. A missing permission is another flavor of the attribution trap: the bot call 401s, `gh` falls through to stored user auth, operations run as the user without surfacing the issue.
-
-4. **Never bake tokens into `git remote set-url`** — use `-c url.insteadOf` for each push so tokens don't persist in remote URLs.
-
-5. **Never leave uncommitted changes** in the working tree at the end of a turn.
-
-6. **Never commit** `.github-app-key.pem`, tokens, or secrets. `.gitignore` should exclude them, but also verify untracked files before staging.
-
-7. **Structural enforcement: the PreToolUse hook.** Every workspace ships with `.claude/scripts/check-gh-token.sh`, wired into `.claude/settings.json` as a PreToolUse hook on `Bash`. It intercepts every `gh` and `git push` invocation (including wrapped forms like `sudo gh ...`, `GH_TOKEN=x gh ...`, `env FOO=bar gh ...`) and blocks with `exit 2` if `GH_TOKEN` is missing or doesn't have the `ghs_` prefix. This moves enforcement from operator discipline (rules 1-3 above) to the harness itself — without it, the attribution trap recurred 5 times in a single day (see #140). If you ever need to run a knowingly user-attributed op (e.g., `gh auth login` during onboarding), `MACF_SKIP_TOKEN_CHECK=1` is a **launch-time / operator** override, not an in-session one — the hook reads it from the session's process env, fixed when `./claude.sh` launched it, so an in-session `export MACF_SKIP_TOKEN_CHECK=1` from a Bash tool call never reaches it. Set it in the launch env (or the workspace's `.claude/.macf/env.*` files) before launching, then relaunch; mid-session, ask the operator to set it and relaunch, or route the specific op through the operator directly. The hook is installed by `macf init`, refreshed by `macf update` and `macf rules refresh`.
-
----
-
-## Sandbox Configuration (Bash dev-loop unblocking)
-
-Claude Code 2.1.92+ breaks Bash tool calls inside the sandbox on Linux. **Two distinct upstream bugs produce this, and they must not be conflated — verified against the GitHub API 2026-08-27:**
-
-| upstream | mechanism | state |
-|---|---|---|
-| [anthropic/claude-code#43454](https://github.com/anthropics/claude-code/issues/43454) | `apply-seccomp` **writes** `/proc/self/setgroups` before mapping UID; nested user-namespaces reject that without `CAP_SYS_ADMIN` | **open** — reproducing through 2.1.231 as of 2026-08-24 |
-| [anthropic/claude-code#52118](https://github.com/anthropics/claude-code/issues/52118) | the spawned shell **reads** `/proc/self/fd/3` at startup and is denied | **closed `not_planned`** 2026-05-27 — auto-closed as a suspected duplicate, then locked. **Never fixed; only "downgrade" was ever offered.** |
-
-**Which one you are hitting depends on the error string**, and it matters: `#43454` may yet be fixed upstream, while `#52118` will not be. **Do not read `#43454` closing as permission to retire the workaround** — the `/proc/self/fd/3` read is the other bug, and it is dead-closed.
-
-Even with `sandbox.filesystem.allowRead: ["/proc/self/fd"]` in place (per macf#208), the failure still bites because it hits before the allow-rule applies.
-
-**Treat this as indefinite, not provisional.** `apply-seccomp` was **introduced** in 2.1.92, and that introduction is the **only** mention of `seccomp`/`setgroups`/`self/fd` anywhere in Claude Code's 5930-line CHANGELOG — including every release through **2.1.247** (latest, 2026-08-26). So a sandbox that does not break Bash on Linux has not existed since 2.1.92: **this is not a fix we are waiting for, it is a capability that has been absent for four months.** Upgrading does not change that; date the capability, not the version.
-
-**It may not be Anthropic's to fix.** Across `#43454`'s 28 comments the root cause shifted four times — a missing `+x` bit, `socat` presence, bwrap's `setgroups=deny` inheritance, and **Ubuntu AppArmor's `unpriv_bwrap` profile denying the syscall**, which one commenter argues is a distro packaging bug rather than a Claude Code one. If that is right, no Claude Code release resolves it.
-
-**Workaround**: add common dev-loop commands to `sandbox.excludedCommands` so they run unsandboxed. The sandbox still gates anything not on the list; only the listed prefixes opt out. `macf init` / `macf update` / `macf rules refresh` install a canonical set per macf#211 — operator-authored entries are preserved on refresh.
-
-**Canonical set** (kept in lockstep with `SANDBOX_EXCLUDED_COMMANDS` in `packages/macf/src/cli/settings-writer.ts`):
-
-- **Build-loop / deployment**: `ssh:*`, `scp:*`, `rsync:*`, `devbox:*`, `nix:*`, `git:*`, `gpg:*`, `gpg-agent:*`, `gh:*`, `npx:*`, `npm:*`, `node:*`, `make:*`, `tmux:*`, `jq:*`, `openssl:*`
-- **Search/read**: `grep:*`, `rg:*`, `find:*`, `head:*`, `tail:*`, `cat:*`, `ls:*`, `wc:*`, `sort:*`, `awk:*`, `sed:*`, `diff:*`, `which:*`
-- **Shell wrappers**: `bash:*`, `sh:*`, `xargs:*` (subprocess shells fail at zsh-init under the regression even when the inner command is a no-op)
-- **Low-blast-radius fs mutations**: `mkdir:*`, `cp:*`, `touch:*`. **Destructive ops (`rm:*`, `mv:*`) are intentionally NOT in the list** — keeping them sandboxed limits accidental damage paths even though the sandbox is defense-in-depth here.
-
-**Opt-out**: `MACF_SANDBOX_EXCLUDED_COMMANDS_SKIP=1` skips the canonical install. Aligned with `MACF_SANDBOX_FD_FIX_SKIP` / `MACF_OTEL_DISABLED` opt-out family. If you want a tighter list (e.g., drop the fs-mutation entries), set the skip flag and curate manually — refresh won't re-add canonical entries you removed.
-
----
-
-## When to Read vs. Modify These Rules
-
-- **Read:** Every session start. These rules define how you coordinate.
-- **Modify:** Never directly in workspace copies. Edit the canonical file at `plugin/rules/coordination.md` in `groundnuty/macf`, then run `macf update` in each affected workspace.
-- **Disagree with a rule?** Open an issue on `groundnuty/macf` proposing the change, with rationale. Peer-review applies.
+See `peer-dynamic.md`.

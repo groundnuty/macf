@@ -27,7 +27,7 @@ function body(): string {
 
 describe('coordination.md — Issue Lifecycle rule covers both failure modes (#100)', () => {
   it('states that reporter owns closure', () => {
-    expect(body()).toMatch(/reporter (owns|of an issue) (the |)?(issue|clos)/i);
+    expect(body()).toMatch(/the reporter closes the issue/i);
   });
 
   it('states explicitly that if YOU opened it, YOU close it', () => {
@@ -36,9 +36,7 @@ describe('coordination.md — Issue Lifecycle rule covers both failure modes (#1
     // comments on their own issues.
     const text = body();
     const hasSelfClose =
-      /\bclose (it|your own|the issue) (yourself|your)/i.test(text) ||
-      /you (opened|filed|reported).*(?:you|reporter).*close/is.test(text) ||
-      /if you opened/i.test(text);
+      /\bclose it yourself/i.test(text) || /you opened it/i.test(text);
     expect(hasSelfClose, 'coordination.md must state that the reporter closes their own issue after merge').toBe(true);
   });
 
@@ -68,7 +66,7 @@ describe('coordination.md — Issue Lifecycle rule covers both failure modes (#1
 describe('coordination.md — issue body frozen during active work (#141)', () => {
   it('codifies the body-freeze rule', () => {
     const text = body();
-    expect(text).toMatch(/body (is frozen|is the assignee['s]+ working spec|should not be edited)/i);
+    expect(text).toMatch(/working spec and is frozen/i);
   });
 
   it('names the triggers that freeze the body', () => {
@@ -78,12 +76,12 @@ describe('coordination.md — issue body frozen during active work (#141)', () =
 
   it('names comments as the channel for scope changes', () => {
     const text = body();
-    expect(text).toMatch(/follow-up comment|thread comment|issue comment/i);
+    expect(text).toMatch(/follow-up comments/i);
   });
 
   it('allows assignee to edit their own body', () => {
     const text = body();
-    expect(text).toMatch(/assignee.*editing.*own|own issue body/i);
+    expect(text).toMatch(/assignee may edit their own issue body/i);
   });
 });
 
@@ -91,7 +89,7 @@ describe('coordination.md — verify comment actually posted (#143)', () => {
   it('states that describing ≠ doing', () => {
     const text = body();
     expect(text).toMatch(
-      /describing.*not.*doing|describing.*not.*posting|writing.*is not.*posting|chat output is invisible|prose.*not.*same as posting/i,
+      /chat output is invisible|as prose does not post it/i,
     );
   });
 
@@ -103,7 +101,7 @@ describe('coordination.md — verify comment actually posted (#143)', () => {
 
   it('treats the check as mandatory, not optional', () => {
     const text = body();
-    expect(text).toMatch(/mandatory tail|not.*optional|treat this as (mandatory|required)/i);
+    expect(text).toMatch(/mandatory tail/i);
   });
 });
 
@@ -115,16 +113,16 @@ describe('coordination.md — auto-opened issue handling (#164)', () => {
 
   it('forbids Closes keyword on bot-filed issues', () => {
     const text = body();
-    expect(text).toMatch(/Refs.*not.*Closes|don't use.*auto-close|not `Closes/i);
+    expect(text).toMatch(/use `Refs #N` \(not `Closes`\)/i);
   });
 
   it('routes reviews to reviewer, not echoes back to the bot-reporter', () => {
     const text = body();
-    expect(text).toMatch(/don't echo.*@mention|not by echoing|route.*to.*@macf-science-agent/i);
+    expect(text).toMatch(/rather than echoing the bot's mention/i);
   });
 
   it('waits for next-run verification before closing', () => {
     const text = body();
-    expect(text).toMatch(/next.*auto-run|post-merge.*confirm|next.*run.*green|wait for the next auto-run/i);
+    expect(text).toMatch(/wait for the next automatic run to confirm green/i);
   });
 });

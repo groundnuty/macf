@@ -131,8 +131,8 @@ describe('retireCanonicalRules', () => {
     expect(existsSync(join(root, '.claude', 'victim.md'))).toBe(true);
   });
 
-  it('the production list starts empty', () => {
-    expect(RETIRED_CANONICAL_RULES).toEqual([]);
+  it('the production list names the retired rules', () => {
+    expect(RETIRED_CANONICAL_RULES).toEqual(['codify-at-correction-time.md']);
   });
 });
 
