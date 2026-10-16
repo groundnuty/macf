@@ -2,6 +2,7 @@
  * Tests for macf update command — PR #5 of P6 expansion.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { MANAGED_HEADER as MANAGED_RULE_HEADER } from '../../src/cli/rules.js';
 import { dirname, join } from 'node:path';
 import { existsSync, mkdirSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -1312,7 +1313,7 @@ describe('update command', () => {
       vi.mocked(findCliPackageRoot).mockReturnValueOnce(fakeRoot);
 
       mkdirSync(join(dir, '.claude', 'rules'), { recursive: true });
-      const sentinel = '<!-- test -->\nWORKSPACE HAS SOMETHING NEWER — should be overwritten by --force\n';
+      const sentinel = MANAGED_RULE_HEADER + 'WORKSPACE HAS SOMETHING NEWER — should be overwritten by --force\n';
       writeFileSync(join(dir, '.claude', 'rules', 'coordination.md'), sentinel);
 
       // console.warn isn't covered by the outer describe's logSpy/errorSpy
@@ -1351,7 +1352,7 @@ describe('update command', () => {
       vi.mocked(findCliPackageRoot).mockReturnValueOnce(fakeRoot);
 
       mkdirSync(join(dir, '.claude', 'rules'), { recursive: true });
-      const sentinel = 'PRE-EXISTING GARBAGE — should be overwritten normally\n';
+      const sentinel = MANAGED_RULE_HEADER + 'PRE-EXISTING GARBAGE — should be overwritten normally\n';
       writeFileSync(join(dir, '.claude', 'rules', 'coordination.md'), sentinel);
 
       const code = await update(dir, { all: false, cli: false, plugin: false, actions: false, yes: true, dryRun: false, force: false });

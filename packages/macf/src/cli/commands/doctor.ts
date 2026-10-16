@@ -33,6 +33,7 @@ import {
   computeCanonicalScriptFile,
   findCliPackageRoot,
   listDistributedRuleNames,
+  isOperatorAuthoredRule,
   listDistributedScriptNames,
   findRetiredRuleCopies,
   retireCanonicalRules,
@@ -1972,7 +1973,7 @@ export interface RuleCurrencyFinding {
   readonly name: string;
   /** `stale` — on disk, but content differs from canonical. `missing` —
    *  canonical distributes this name and the workspace has no copy at all. */
-  readonly reason: 'stale' | 'missing' | 'retired';
+  readonly reason: 'stale' | 'missing' | 'retired' | 'operator-authored';
 }
 
 /**
@@ -2048,9 +2049,11 @@ export function checkDistributedRuleCurrency(
       continue;
     }
     checkedCount++;
-    if (readFileSync(onDiskPath, 'utf-8') !== canonical) {
-      findings.push({ name, reason: 'stale' });
-    }
+    const onDisk = readFileSync(onDiskPath, 'utf-8');
+    if (onDisk === canonical) continue;
+    // No managed header: operator-authored. update/refresh keep it and --fix
+    // never overwrites it, so report it apart from a stale managed copy.
+    findings.push({ name, reason: isOperatorAuthoredRule(onDisk, canonical, readFileSync(join(rulesDir, name), 'utf-8')) ? 'operator-authored' : 'stale' });
   }
 
   // A retired canonical rule whose managed copy is still on disk stays loaded
@@ -2078,7 +2081,8 @@ export function checkDistributedRuleCurrency(
 
   const staleCount = findings.filter((f) => f.reason === 'stale').length;
   const retiredCount = findings.filter((f) => f.reason === 'retired').length;
-  const missingCount = findings.length - staleCount - retiredCount;
+  const collisionCount = findings.filter((f) => f.reason === 'operator-authored').length;
+  const missingCount = findings.length - staleCount - retiredCount - collisionCount;
   return {
     status: 'WARN',
     checkedCount,
@@ -2086,6 +2090,7 @@ export function checkDistributedRuleCurrency(
     findings,
     detail:
       `${staleCount} stale, ${missingCount} missing of ${names.length} canonical distributed rule(s)` +
+      (collisionCount > 0 ? `, ${collisionCount} operator-authored file(s) share a canonical name and are kept (rename or delete to resolve)` : '') +
       (retiredCount > 0 ? `, ${retiredCount} retired rule copy(ies) still present` : '') +
       ` (canonical ${provenance})`,
   };
@@ -3256,6 +3261,7 @@ function printRuleCurrencySection(check: RuleCurrencyCheckResult, checkoutCurren
     const reasonText =
       f.reason === 'stale' ? 'stale — differs from canonical'
       : f.reason === 'retired' ? 'retired — canonical no longer ships it, but this managed copy is still loaded (`macf update` or `macf doctor --fix` removes it)'
+      : f.reason === 'operator-authored' ? 'collision — no macf managed header, so it is operator-authored and kept; rename it, or delete it to accept the canonical rule'
       : 'missing — never distributed';
     console.log(`    ✗ ${f.name} — ${reasonText}`);
   }
