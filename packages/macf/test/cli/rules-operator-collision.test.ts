@@ -121,3 +121,29 @@ describe('copyCanonicalRulesDetailed — symlinked destinations', () => {
     expect(existsSync(missing)).toBe(false);
   });
 });
+
+describe('doctor — a symlinked rule is reported as a symlink, not stale or missing', () => {
+  it('a link to a stale managed copy and a dangling link both read as symlink', () => {
+    mkdirSync(join(ws(), '.macf'), { recursive: true });
+    mkdirSync(join(ws(), '.claude', 'rules'), { recursive: true });
+    const target = join(root, 'linked.md');
+    writeFileSync(target, '<!--\n  This file is managed by `macf`.\n-->\n# old\n');
+    symlinkSync(target, dst('pr-discipline.md'));
+    symlinkSync(join(root, 'nowhere.md'), dst('other.md'));
+    const r = checkDistributedRuleCurrency(ws(), { canonicalDir: canon });
+    expect(r.findings.find((f) => f.name === 'pr-discipline.md')?.reason).toBe('symlink');
+    expect(r.findings.find((f) => f.name === 'other.md')?.reason).toBe('symlink');
+    expect(r.detail).toContain('symbolic link');
+  });
+  it('a symlink-only section prints no `macf update` Fix line', () => {
+    const lines: string[] = [];
+    vi.spyOn(console, 'log').mockImplementation((m?: unknown) => { lines.push(String(m)); });
+    printRuleCurrencySection(
+      { status: 'WARN', checkedCount: 1, totalCount: 1, findings: [{ name: 'pr-discipline.md', reason: 'symlink' }], detail: 'x' },
+      { status: 'INFO', detail: 'not a framework checkout' },
+    );
+    vi.restoreAllMocks();
+    expect(lines.join('\n')).toContain('symbolic link');
+    expect(lines.join('\n')).not.toContain('Fix: run');
+  });
+});

@@ -15,7 +15,7 @@
  * for the attribution-trap class this prevents).
  */
 import { execFileSync } from 'node:child_process';
-import { existsSync, readdirSync, readFileSync, statfsSync, statSync } from 'node:fs';
+import { existsSync, lstatSync, readdirSync, readFileSync, statfsSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { createInterface } from 'node:readline';
 import { join, resolve } from 'node:path';
@@ -1973,7 +1973,7 @@ export interface RuleCurrencyFinding {
   readonly name: string;
   /** `stale` — on disk, but content differs from canonical. `missing` —
    *  canonical distributes this name and the workspace has no copy at all. */
-  readonly reason: 'stale' | 'missing' | 'retired' | 'operator-authored';
+  readonly reason: 'stale' | 'missing' | 'retired' | 'operator-authored' | 'symlink';
 }
 
 /**
@@ -2044,6 +2044,13 @@ export function checkDistributedRuleCurrency(
     const canonical = computeCanonicalRuleFile(name, { canonicalDir: rulesDir });
     if (canonical === null) continue; // name came from this same dir — defensive only
     const onDiskPath = join(targetDir, name);
+    // update never writes through a symlink (it would overwrite the target), so it cannot fix one.
+    let isLink = false;
+    try { isLink = lstatSync(onDiskPath).isSymbolicLink(); } catch { isLink = false; }
+    if (isLink) {
+      findings.push({ name, reason: 'symlink' });
+      continue;
+    }
     if (!existsSync(onDiskPath)) {
       findings.push({ name, reason: 'missing' });
       continue;
@@ -2082,7 +2089,8 @@ export function checkDistributedRuleCurrency(
   const staleCount = findings.filter((f) => f.reason === 'stale').length;
   const retiredCount = findings.filter((f) => f.reason === 'retired').length;
   const collisionCount = findings.filter((f) => f.reason === 'operator-authored').length;
-  const missingCount = findings.length - staleCount - retiredCount - collisionCount;
+  const symlinkCount = findings.filter((f) => f.reason === 'symlink').length;
+  const missingCount = findings.length - staleCount - retiredCount - collisionCount - symlinkCount;
   return {
     status: 'WARN',
     checkedCount,
@@ -2091,6 +2099,7 @@ export function checkDistributedRuleCurrency(
     detail:
       `${staleCount} stale, ${missingCount} missing of ${names.length} canonical distributed rule(s)` +
       (collisionCount > 0 ? `, ${collisionCount} operator-authored file(s) kept under a canonical name` : '') +
+      (symlinkCount > 0 ? `, ${symlinkCount} symbolic link(s) macf will not write through` : '') +
       (retiredCount > 0 ? `, ${retiredCount} retired rule copy(ies) still present` : '') +
       ` (canonical ${provenance})`,
   };
@@ -3261,13 +3270,14 @@ export function printRuleCurrencySection(check: RuleCurrencyCheckResult, checkou
     const reasonText =
       f.reason === 'stale' ? 'stale — differs from canonical'
       : f.reason === 'retired' ? 'retired — canonical no longer ships it, but this managed copy is still loaded (`macf update` or `macf doctor --fix` removes it)'
+      : f.reason === 'symlink' ? 'symbolic link — macf never writes through it; replace it with a regular file or delete it, then run `macf update`'
       : f.reason === 'operator-authored' ? 'collision — no macf managed header, so it is operator-authored and kept; rename it to keep both, or delete it and run `macf update` to take the canonical rule'
       : 'missing — never distributed';
     console.log(`    ✗ ${f.name} — ${reasonText}`);
   }
   const staleCount = check.findings.filter((f) => f.reason === 'stale' || f.reason === 'retired').length;
   // A collision carries its own remedy, and `macf update` keeps the file, so the update Fix line would mislead.
-  if (check.findings.some((f) => f.reason !== 'operator-authored')) {
+  if (check.findings.some((f) => f.reason !== 'operator-authored' && f.reason !== 'symlink')) {
     printDistributionFixLine('.claude/rules/', checkoutCurrency, staleCount);
   }
 }
