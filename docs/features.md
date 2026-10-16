@@ -200,7 +200,7 @@ The routing-Action's HTTP 200 from the channel server is the result-invariant as
 | `peer-dynamic.md` | Push back with evidence, review PRs in context, act on clear directives, ask only for destructive or ambiguous choices |
 | `verify-before-claim.md` | Quote literal output, re-query state before asserting it, cite from a fetched `origin/main`, re-run a peer's evidence |
 | `gh-token-attribution-traps.md` | Class catalog of attribution-trap recurrences; cross-references the structural defense (`check-gh-token.sh`) |
-| `observability-wiring.md` | Where OTel + tracing + metrics are wired; conventions for new observability instruments |
+| `observability-wiring.md` | Path-scoped (launcher and env files): the exported OTel variable set, opt-out, and checking that traces arrive |
 | `codify-at-correction-time.md` | When discipline gets corrected mid-flow, codify the rule before continuing — prevents recurrence drift |
 
 The `coordination.md` file is the most-cited; it's the single source of truth for cross-cutting rules. Agents read it session-loaded and on `macf rules refresh`.
