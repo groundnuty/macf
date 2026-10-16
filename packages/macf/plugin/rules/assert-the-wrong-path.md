@@ -4,6 +4,7 @@ paths:
   - "**/*.spec.*"
   - "**/test/**"
   - "**/tests/**"
+  - "**/__tests__/**"
 ---
 # Writing tests that can fail
 
