@@ -1,6 +1,6 @@
 # Troubleshooting
 
-Real failure modes catalogued from substrate operating experience + cv-e2e-test rehearsals. Each entry: symptom → diagnosis → fix → cross-reference. Source-of-truth for the hazard class is `packages/macf/plugin/rules/silent-fallback-hazards.md`; this doc translates each instance into operator-actionable form.
+Real failure modes catalogued from substrate operating experience + cv-e2e-test rehearsals. Each entry: symptom → diagnosis → fix → cross-reference. Source-of-truth for the hazard class is `design/silent-fallback-catalog.md`; this doc translates each instance into operator-actionable form.
 
 ## Quick lookup
 
@@ -48,7 +48,7 @@ Expected: `Workspace permissions (macf#296)` section shows `[PASS]` after Write 
 
 **Investigation note** (per [macf#302](https://github.com/groundnuty/macf/issues/302)): cv-architect's substrate-side workaround is to add Write+Edit to `settings.local.json`. The original `settings.json` may have been getting overwritten by an external rehearsal-bootstrap path — not by `macf update`'s settings-writers (which round-trip operator-authored entries cleanly per the regression test in PR #303).
 
-**Cross-references:** [`silent-fallback-hazards.md`](../packages/macf/plugin/rules/silent-fallback-hazards.md) (sister-pattern at the Claude Code permission layer); [features.md § macf doctor](features.md#macf-doctor--three-section-report-v029).
+**Cross-references:** [`silent-fallback-hazards.md`](../design/silent-fallback-catalog.md) (sister-pattern at the Claude Code permission layer); [features.md § macf doctor](features.md#macf-doctor--three-section-report-v029).
 
 ## Silent-fallback Instance 3 — RC mode blocks `tmux send-keys`
 
@@ -60,7 +60,7 @@ Expected: `Workspace permissions (macf#296)` section shows `[PASS]` after Write 
 
 **Workaround (Stage 2 / substrate):** if you observe the silent-buffer pattern, attach to the recipient tmux session (`tmux attach -t <session>:<window>`) and verify the agent is responsive. If RC mode is engaged, exit it (Ctrl+b `:` then `set -g status`); send-keys should work afterward. Substrate workspaces remain on Stage 2 per operator directive 2026-04-27 — the workaround is operator-driven.
 
-**Cross-references:** [`silent-fallback-hazards.md`](../packages/macf/plugin/rules/silent-fallback-hazards.md) Instance 3; [DR-020](../design/decisions/DR-020-notify-wake-mechanism.md); [DR-017](../design/decisions/DR-017-ssh-elimination.md).
+**Cross-references:** [`silent-fallback-hazards.md`](../design/silent-fallback-catalog.md) Instance 3; [DR-020](../design/decisions/DR-020-notify-wake-mechanism.md); [DR-017](../design/decisions/DR-017-ssh-elimination.md).
 
 ## GitHub auto-close keyword (Instance 2)
 
@@ -286,7 +286,7 @@ devbox run -- npm publish --workspace=@groundnuty/macf
 
 ## Cross-references for the broader hazard class
 
-The 8-instance silent-fallback hazard catalog lives in [`packages/macf/plugin/rules/silent-fallback-hazards.md`](../packages/macf/plugin/rules/silent-fallback-hazards.md). For new failure modes that share the "surface succeeds; outcome fails" shape, surface them there as new instances with a Pattern A-E defense classification.
+The 8-instance silent-fallback hazard catalog lives in [`design/silent-fallback-catalog.md`](../design/silent-fallback-catalog.md). For new failure modes that share the "surface succeeds; outcome fails" shape, surface them there as new instances with a Pattern A-E defense classification.
 
 For sister discipline-class catalogs:
 

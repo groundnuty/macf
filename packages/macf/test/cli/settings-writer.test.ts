@@ -8,7 +8,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { installGhTokenHook, MACF_HOOK_COMMAND, MACF_MENTION_HOOK_COMMAND, MACF_LGTM_HOOK_COMMAND, MACF_CLOSE_HOOK_COMMAND, MACF_AUDITOR_HOOK_COMMAND, MACF_TURN_RECEIPT_HOOK_COMMAND, MACF_ATTRIBUTION_HOOK_COMMAND, MACF_REFLECTION_HOOK_COMMAND, MACF_CHANNELS_HOOK_COMMAND, MACF_CHANNEL_ALIVE_HOOK_COMMAND, installStartupPickupHook, MACF_STARTUP_PICKUP_HOOK_COMMAND, MACF_STARTUP_PICKUP_HOOK_TIMEOUT_SECONDS, installPluginSkillPermissions, PLUGIN_SKILL_PERMISSIONS, PLUGIN_MCP_TOOL_PERMISSIONS, ROLE_FLOOR_ALLOW, installSandboxFdAllowRead, SANDBOX_FD_READ_PATTERN, installSandboxExcludedCommands, installIdleCompactionOff, applyIdleCompactionOffTransform, SANDBOX_EXCLUDED_COMMANDS, getSandboxExcludedCommands, getPermissionsAllow, getPermissionsDeny, canPluginDeliverMigratedHooks } from '../../src/cli/settings-writer.js';
+import { installGhTokenHook, MACF_HOOK_COMMAND, MACF_MENTION_HOOK_COMMAND, MACF_LGTM_HOOK_COMMAND, MACF_CLOSE_HOOK_COMMAND, MACF_AUDITOR_HOOK_COMMAND, MACF_TURN_RECEIPT_HOOK_COMMAND, MACF_ATTRIBUTION_HOOK_COMMAND, MACF_REFLECTION_HOOK_COMMAND, MACF_CHANNELS_HOOK_COMMAND, MACF_CHANNEL_ALIVE_HOOK_COMMAND, installStartupPickupHook, MACF_STARTUP_PICKUP_HOOK_COMMAND, MACF_STARTUP_PICKUP_HOOK_TIMEOUT_SECONDS, installPluginSkillPermissions, PLUGIN_SKILL_PERMISSIONS, PLUGIN_MCP_TOOL_PERMISSIONS, ROLE_FLOOR_ALLOW, installSandboxFdAllowRead, SANDBOX_FD_READ_PATTERN, installSandboxExcludedCommands, installIdleCompactionOff, applyIdleCompactionOffTransform, SANDBOX_EXCLUDED_COMMANDS, getSandboxExcludedCommands, getPermissionsAllow, getPermissionsDeny, canPluginDeliverMigratedHooks, isInvalidMcpAllowWildcard, getInvalidAllowWildcards } from '../../src/cli/settings-writer.js';
 
 // ── Shared fixtures for the DR-039 Amendment B self-guard (macf#743 review) ──
 //
@@ -1312,9 +1312,9 @@ describe('installPluginSkillPermissions (macf#189 sub-item 2)', () => {
       }
     });
 
-    it('preserves operator-authored mcp__* wildcard alongside our specific entries', () => {
-      // Operator may have set a wildcard via "yes and don't ask again";
-      // our specific entries are additive. Both end up in permissions.allow.
+    it('strips operator-authored bare mcp__* (Claude Code rejects it) but keeps valid operator entries + ours', () => {
+      // Bare `mcp__*` is rejected by Claude Code in allow rules (blocking
+      // startup dialog) so it is stripped; other operator entries survive.
       mkdirSync(join(tmpRoot, '.claude'), { recursive: true });
       writeFileSync(settingsPath, JSON.stringify({
         permissions: { allow: ['mcp__*', 'Bash(*)'] },
@@ -1323,7 +1323,7 @@ describe('installPluginSkillPermissions (macf#189 sub-item 2)', () => {
       installPluginSkillPermissions(tmpRoot);
 
       const allow = JSON.parse(readFileSync(settingsPath, 'utf-8')).permissions.allow;
-      expect(allow).toContain('mcp__*');                                                     // operator
+      expect(allow).not.toContain('mcp__*');
       expect(allow).toContain('Bash(*)');                                                    // operator
       expect(allow).toContain('mcp__macf-agent__notify_peer');             // ours
       expect(allow).toContain('mcp__macf-agent__checkpoint_to_memory');    // ours
@@ -2063,7 +2063,7 @@ describe('end-to-end: macf update preserves operator-authored allow entries (mac
     expect(allow).toContain('WebSearch');
     expect(allow).toContain('Bash(*)');
     expect(allow).toContain('Agent');
-    expect(allow).toContain('mcp__*');
+    expect(allow).not.toContain('mcp__*');
 
     // MACF-managed: 5 specific Skill entries installed (macf#350 added macf-notify-peer):
     expect(allow).toContain('Skill(macf-agent:macf-status)');
@@ -2189,5 +2189,55 @@ describe('installIdleCompactionOff (CC 2.1.299 idle compaction, enforced off)', 
   it('pure transform returns same object when already false', () => {
     const s = { idleCompaction: false };
     expect(applyIdleCompactionOffTransform(s)).toBe(s);
+  });
+});
+
+describe('invalid mcp__ allow wildcards (Claude Code rejects them at startup)', () => {
+  let tmpRoot: string;
+  let settingsPath: string;
+  beforeEach(() => {
+    tmpRoot = mkdtempSync(join(tmpdir(), 'mcp-wild-'));
+    mkdirSync(join(tmpRoot, '.claude'), { recursive: true });
+    settingsPath = join(tmpRoot, '.claude', 'settings.json');
+  });
+  afterEach(() => rmSync(tmpRoot, { recursive: true, force: true }));
+
+  it.each(['mcp__*', 'mcp__*__x', 'mcp__a*__b'])('predicate flags %s', (e) => {
+    expect(isInvalidMcpAllowWildcard(e)).toBe(true);
+  });
+  it.each([
+    'mcp__macf-agent__*',
+    'mcp__plugin_macf-agent_macf-agent__*',
+    'mcp__macf-agent__notify_peer',
+    'Bash(*)',
+    'Read(**)',
+  ])('predicate keeps %s', (e) => {
+    expect(isInvalidMcpAllowWildcard(e)).toBe(false);
+  });
+
+  it('update strips mcp__* and deep-equals everything else; idempotent', () => {
+    writeFileSync(settingsPath, JSON.stringify({
+      customKey: { nested: [1, 2] },
+      permissions: {
+        allow: ['mcp__*', 'Bash(git status)', 'mcp__other__*', 'mcp__a*__b'],
+        ask: ['mcp__*'],
+        deny: ['mcp__*', 'Bash(rm -rf /)'],
+      },
+    }, null, 2));
+    installPluginSkillPermissions(tmpRoot);
+    const once = readFileSync(settingsPath, 'utf-8');
+    const s = JSON.parse(once);
+    expect(s.permissions.allow).not.toContain('mcp__*');
+    expect(s.permissions.allow).not.toContain('mcp__a*__b');
+    expect(s.permissions.allow).toContain('Bash(git status)');
+    expect(s.permissions.allow).toContain('mcp__other__*');
+    expect(s.permissions.allow).toContain('mcp__macf-agent__notify_peer');
+    expect(s.permissions.deny).toContain('mcp__*');
+    expect(s.permissions.deny).toContain('Bash(rm -rf /)');
+    expect(s.permissions.ask).toEqual(['mcp__*']);
+    expect(s.customKey).toEqual({ nested: [1, 2] });
+    installPluginSkillPermissions(tmpRoot);
+    expect(readFileSync(settingsPath, 'utf-8')).toBe(once);
+    expect(getInvalidAllowWildcards(tmpRoot)).toEqual([]);
   });
 });
