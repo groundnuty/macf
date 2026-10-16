@@ -6,7 +6,7 @@
 # when the body content contains raw `@macf-<role>-agent[bot]` mentions in
 # describing contexts (mid-line, not backticked) — Check B — or, for a
 # routed `create`, carries none at all — Check A. Implements
-# `mention-routing-hygiene.md` §5 + `coordination.md` §Communication 1
+# `mention-routing-hygiene.md` + `coordination.md` §Communication 1
 # structurally.
 #
 # Hook contract: JSON on stdin, exit 0 = allow, exit 2 = block (stderr
@@ -516,7 +516,7 @@ content — the file isn't readable yet AND no literal (quoted-delimiter)
 heredoc in this command targets that same path. The hook cannot verify
 this comment carries a routing-active @<bot>[bot] mention
 (coordination.md §Communication 1) or is free of a describing-context leak
-(mention-routing-hygiene.md §5).
+(mention-routing-hygiene.md, "Addressing and describing").
 
 Proceeding WITHOUT blocking (groundnuty/macf#944 branch 3) — double-check
 the file content manually before it posts.
@@ -647,7 +647,7 @@ if [[ -n "$OFFENDING" ]]; then
 BLOCKED by MACF mention-routing-hygiene hook: this comment/issue/PR body
 contains raw @<bot>[bot] mention(s) in describing-context (mid-line, not
 backticked) which would fire false-positive routing per
-mention-routing-hygiene.md §5.
+mention-routing-hygiene.md, "Addressing and describing".
 
 Offending line(s) within the command:
 $OFFENDING

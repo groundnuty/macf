@@ -131,8 +131,12 @@ describe('retireCanonicalRules', () => {
     expect(existsSync(join(root, '.claude', 'victim.md'))).toBe(true);
   });
 
-  it('the production list names the retired rules', () => {
-    expect(RETIRED_CANONICAL_RULES).toEqual(['codify-at-correction-time.md']);
+  it('every production entry is a plain basename that no longer ships', () => {
+    const shipped = new URL('../../plugin/rules/', import.meta.url);
+    for (const name of RETIRED_CANONICAL_RULES) {
+      expect(name).toMatch(/^[A-Za-z0-9._-]+\.md$/);
+      expect(existsSync(new URL(name, shipped))).toBe(false);
+    }
   });
 });
 

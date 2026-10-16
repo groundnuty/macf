@@ -19,7 +19,7 @@
 # transient disconnect). Same reasoning UC-4 (PR #275) demonstrated.
 #
 # Override: MACF_SKIP_LGTM_CHECK=1 bypasses (launch-time / operator only —
-# per pr-discipline.md §"When the reviewer is absent or unreachable" —
+# per pr-discipline.md §"Merging" —
 # reporter-sanctioned self-merge, urgent revert, etc.).
 #
 # Operator-sanctioned exception, agent-usable (groundnuty/macf#822 Part 2,
@@ -464,11 +464,10 @@ fi
 # No non-author APPROVED review, and no operator-sanction comment — block.
 cat >&2 <<ERR
 BLOCKED by MACF lgtm-gate hook: PR #${PR_NUMBER} has no non-author APPROVED
-review on record. Per pr-discipline.md "no LGTM = no merge" (canonical rule
+review on record. Per pr-discipline.md "Merging" (canonical rule
 distributed via \`macf rules refresh\`):
 
-  "Without an explicit LGTM from the reviewer, the implementer does NOT
-  merge — even if waiting indefinitely."
+  "Without a non-author approval, do not merge, even if waiting indefinitely."
 
 PR author: ${PR_AUTHOR}
 Non-author APPROVED reviews: 0
@@ -505,7 +504,7 @@ THEIR OWN GitHub login (a formal \`gh pr review --approve\` from them also
 clears the gate via the path above). This is un-forgeable — an agent
 cannot post a comment attributed to the operator's account — so the gate
 verifies a real artifact instead of trusting a self-attestation. See
-pr-discipline.md §"Operator-sanctioned exception (macf#822)".
+pr-discipline.md §"Operator-sanctioned exception".
 
 Refs: groundnuty/macf#270 (this hook); pr-discipline.md (canonical rule);
 DR-023 amendment (bash-form decision rule); macf#262 / PR #263 (rule

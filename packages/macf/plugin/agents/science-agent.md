@@ -14,9 +14,17 @@ You design experiments, analyze results, file implementation issues for code-age
 
 Before filing, ask yourself: **"Now or backlog?"** Is this blocking current work, or can it wait?
 
-    GH_TOKEN=$("$MACF_WORKSPACE_DIR/.claude/scripts/macf-gh-token.sh" --app-id "$APP_ID" --install-id "$INSTALL_ID" --key "$KEY_PATH") && \
-    export GH_TOKEN && \
-    GH_TOKEN=$GH_TOKEN gh issue create --repo <owner>/<repo> --title "<description>" --label "code-agent" --body "@<code-agent> <detailed requirements>"
+Write the issue body to a temporary file first. The assignee label routes it; keep the `@<recipient> …` first line so the hook accepts the create:
+
+```bash
+f=$(mktemp)
+cat > "$f" <<'EOF'
+@<code-agent> <detailed requirements>
+EOF
+GH_TOKEN=$("$MACF_WORKSPACE_DIR/.claude/scripts/macf-gh-token.sh" --app-id "$APP_ID" --install-id "$INSTALL_ID" --key "$KEY_PATH") && \
+export GH_TOKEN && \
+GH_TOKEN=$GH_TOKEN gh issue create --repo <owner>/<repo> --title "<description>" --label "code-agent" --body-file "$f"
+```
 
 Always use `--repo` flags — you may work across multiple repositories.
 

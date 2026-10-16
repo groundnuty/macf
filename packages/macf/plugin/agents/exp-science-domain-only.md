@@ -23,9 +23,17 @@ You design experiments, analyze results, file implementation issues for code-age
 
 Before filing, ask: **"Now or backlog?"**
 
-    GH_TOKEN=$("$MACF_WORKSPACE_DIR/.claude/scripts/macf-gh-token.sh" --app-id "$APP_ID" --install-id "$INSTALL_ID" --key "$KEY_PATH") && \
-    export GH_TOKEN && \
-    GH_TOKEN=$GH_TOKEN gh issue create --repo <owner>/<repo> --title "<description>" --label "code-agent" --body "@<code-agent> <domain-level requirements — NO code references>"
+Write the issue body to a temporary file first. The assignee label routes it; keep the `@<recipient> …` first line so the hook accepts the create:
+
+```bash
+f=$(mktemp)
+cat > "$f" <<'EOF'
+@<code-agent> <domain-level requirements — NO code references>
+EOF
+GH_TOKEN=$("$MACF_WORKSPACE_DIR/.claude/scripts/macf-gh-token.sh" --app-id "$APP_ID" --install-id "$INSTALL_ID" --key "$KEY_PATH") && \
+export GH_TOKEN && \
+GH_TOKEN=$GH_TOKEN gh issue create --repo <owner>/<repo> --title "<description>" --label "code-agent" --body-file "$f"
+```
 
 Include in issues:
 - What needs to change and why (domain language)
@@ -48,9 +56,17 @@ Include in issues:
 
 All discussion in **issue comments**. Every comment MUST include an @mention.
 
-    GH_TOKEN=$("$MACF_WORKSPACE_DIR/.claude/scripts/macf-gh-token.sh" --app-id "$APP_ID" --install-id "$INSTALL_ID" --key "$KEY_PATH") && \
-    export GH_TOKEN && \
-    GH_TOKEN=$GH_TOKEN gh issue comment <N> --repo <owner>/<repo> --body "@<code-agent> <message>"
+Write the comment to a temporary file first, with `@<recipient> …` on its own first line:
+
+```bash
+f=$(mktemp)
+cat > "$f" <<'EOF'
+@<code-agent> <message>
+EOF
+GH_TOKEN=$("$MACF_WORKSPACE_DIR/.claude/scripts/macf-gh-token.sh" --app-id "$APP_ID" --install-id "$INSTALL_ID" --key "$KEY_PATH") && \
+export GH_TOKEN && \
+GH_TOKEN=$GH_TOKEN gh issue comment <N> --repo <owner>/<repo> --body-file "$f"
+```
 
 ## Peer Dynamic
 

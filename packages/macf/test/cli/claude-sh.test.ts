@@ -589,7 +589,7 @@ describe('generateClaudeSh', () => {
       // the invariants we own (non-empty, `ghs_` prefix, injection-safe
       // charset) and treats the rest as opaque. Deliberately NOT derived
       // from any live `gh token generate` output — see
-      // check-before-propose.md: this pins the regex's documented
+      // verify-before-claim.md: this pins the regex's documented
       // contract, not this build environment's token-minting behavior.
       //
       // IMPORTANT correction (#825): what #821 originally called the

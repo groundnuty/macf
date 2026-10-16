@@ -356,8 +356,7 @@ publishes (no cleanup needed).
 - **#244 + #272 / mention-routing-hygiene hooks** — `check-mention-routing.sh`
   Check A (must-have-mention) + Check B (must-not-leak describing-context).
 - **#270 / check-lgtm-gate.sh** — blocks `gh pr merge` without non-author
-  APPROVED review. Path-2 promotion of `pr-discipline.md §"no LGTM = no
-  merge"`. v0.2.11.
+  APPROVED review. Path-2 promotion of `pr-discipline.md §"Merging"`. v0.2.11.
 - **#313 / claude-sh tmux self-wrap** — Path-2 promotion of `coordination.md
   §Canonical tmux launch pattern`. v0.2.10.
 - **#349 / MCP tool pre-approval** — `installPluginSkillPermissions` now
