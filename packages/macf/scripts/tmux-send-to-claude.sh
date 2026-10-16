@@ -22,8 +22,9 @@
 # The initial C-u is a best-effort pre-clear only: it is cursor-relative
 # (deletes from the cursor to the start of the line), so a draft with the
 # cursor elsewhere survives and our text is appended to it. Verification
-# therefore checks that the `❯` line CONTAINS the prompt's start anywhere,
-# not that it begins with it. Never use C-c here: it interrupts a busy
+# therefore checks that the input region (the `❯` row plus its wrapped
+# continuation rows, down to the next border) CONTAINS the prompt's start
+# anywhere, not that it begins with it. Never use C-c here: it interrupts a busy
 # agent's turn, and on an empty box it arms the session-quit.
 #
 # Usage:
@@ -88,14 +89,22 @@ collapse() {
   printf '%s' "$*"
 }
 
-pane_hash() {
-  { tmux capture-pane ${target[@]+"${target[@]}"} -p 2>/dev/null || true; } | md5sum
+# Whole pane as text (no hashing: stock macOS has no md5sum).
+pane_text() {
+  tmux capture-pane ${target[@]+"${target[@]}"} -p 2>/dev/null || true
 }
 
-# Last line of the pane starting with the prompt marker; empty if none.
+# The whole input region as ONE line: from the last `❯` line down to (not
+# including) the next border line starting with `─`, rows joined with single
+# spaces. Claude Code wraps a long input over several indented rows, so a
+# surviving draft can push our text off the `❯` row. Empty if no `❯` line.
+# (Leading whitespace is dropped by collapse() at the call site.)
 input_line() {
-  { tmux capture-pane ${target[@]+"${target[@]}"} -p 2>/dev/null || true; } \
-    | { grep '^❯' || true; } | tail -n 1
+  pane_text | awk '
+    /^❯/ { found = 1; inbox = 1; out = $0; next }
+    inbox && /^─/ { inbox = 0; next }
+    inbox { out = out " " $0 }
+    END { if (found) print out }'
 }
 
 # 1. Clear stale input, then type the text with NO Enter in the burst.
@@ -103,11 +112,11 @@ tmux send-keys ${target[@]+"${target[@]}"} C-u
 tmux send-keys ${target[@]+"${target[@]}"} -l -- "$prompt"
 
 # 2. Settle: wait until two consecutive pane samples match (bounded).
-prev="$(pane_hash)"
+prev="$(pane_text)"
 i=0
 while [ "$i" -lt "$settle_max" ]; do
   sleep "$settle_interval"
-  cur="$(pane_hash)"
+  cur="$(pane_text)"
   [ "$cur" = "$prev" ] && break
   prev="$cur"
   i=$((i + 1))

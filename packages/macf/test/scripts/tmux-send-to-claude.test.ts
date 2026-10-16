@@ -16,7 +16,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import {
-  mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, chmodSync,
+  mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, chmodSync, symlinkSync, realpathSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -83,7 +83,21 @@ case "$cmd" in
     echo "────────────────────────"
     if [ "$mode" != noprompt ]; then
       first="$(box | head -n 1)"
-      if [ -z "$first" ]; then echo '❯ Try "fix a bug"'; else echo "❯ $first"; fi
+      w="$(cat "$D/wrap" 2>/dev/null || echo 0)"
+      if [ -z "$first" ]; then echo '❯ Try "fix a bug"'
+      elif [ "$w" -le 0 ]; then echo "❯ $first"
+      else
+        # wrap at word boundaries like the TUI: continuation rows indented 2
+        cur=""; row=0
+        for word in $first; do
+          if [ -z "$cur" ]; then cur="$word"
+          elif [ $(( \${#cur} + 1 + \${#word} )) -gt "$w" ]; then
+            if [ "$row" -eq 0 ]; then echo "❯ $cur"; else echo "  $cur"; fi
+            row=$((row + 1)); cur="$word"
+          else cur="$cur $word"; fi
+        done
+        if [ "$row" -eq 0 ]; then echo "❯ $cur"; else echo "  $cur"; fi
+      fi
     fi
     echo "────────────────────────"
     ;;
@@ -102,15 +116,16 @@ function setup(mode: string): void {
   writeFileSync(join(dir, 'old.sh'), OLD_SCRIPT_BODY);
   writeFileSync(join(dir, 'mode'), mode);
   writeFileSync(join(dir, 'box'), '');
+  writeFileSync(join(dir, 'wrap'), '0');
   writeFileSync(join(dir, 'calls'), '');
 }
 
-function run(script: string, session: string, prompt: string) {
-  const r = spawnSync('bash', [script, session, prompt], {
+function run(script: string, session: string, prompt: string, pathOverride?: string) {
+  const r = spawnSync(pathOverride ? whichBin('bash') : 'bash', [script, session, prompt], {
     encoding: 'utf8',
     env: {
       ...process.env,
-      PATH: `${binDir}:${process.env.PATH}`,
+      PATH: pathOverride ?? `${binDir}:${process.env.PATH}`,
       FAKE_TMUX_DIR: dir,
       MACF_SEND_SETTLE_INTERVAL: '0.02',
       MACF_SEND_VERIFY_WAIT: '0.05',
@@ -118,6 +133,11 @@ function run(script: string, session: string, prompt: string) {
     },
   });
   return r;
+}
+
+function whichBin(name: string): string {
+  const r = spawnSync('sh', ['-c', `command -v ${name}`], { encoding: 'utf8' });
+  return realpathSync(r.stdout.trim());
 }
 
 const read = (f: string) => (existsSync(join(dir, f)) ? readFileSync(join(dir, f), 'utf8') : '');
@@ -205,6 +225,55 @@ describe('tmux-send-to-claude.sh', () => {
     expect(enters()).toBe(2); // first Enter swallowed, retry submitted
     expect(read('transcript')).toContain('operator draft in progress Please review PR 123');
     expect(read('box').trim()).toBe('');
+  });
+
+  it('works with no md5sum on PATH (stock macOS): still submits, one Enter', () => {
+    setup('normal');
+    const tools = join(dir, 'minbin');
+    mkdirSync(tools);
+    symlinkSync(join(binDir, 'tmux'), join(tools, 'tmux'));
+    for (const t of ['bash', 'env', 'sleep', 'awk', 'cat', 'tr', 'head', 'rm']) {
+      symlinkSync(whichBin(t), join(tools, t));
+    }
+    expect(existsSync(join(tools, 'md5sum'))).toBe(false);
+    const r = run(NEW_SCRIPT, 'agent:0', LONG, tools);
+    expect(r.stderr).not.toContain('md5sum');
+    expect(r.status).toBe(0);
+    expect(enters()).toBe(1);
+    expect(read('transcript')).toContain(LONG);
+  });
+
+  describe('wrapped input box (continuation rows indented)', () => {
+    it('stale 70-char draft + prompt, first Enter swallowed: needle on row 2 → retry, 2 Enters', () => {
+      setup('swallow');
+      const draft = 'operator draft still being typed by a human right now, ok ';
+      expect(draft.length).toBeGreaterThan(55);
+      writeFileSync(join(dir, 'box'), draft);
+      writeFileSync(join(dir, 'stale'), '');
+      writeFileSync(join(dir, 'wrap'), '60');
+      const prompt = 'Please review PR 123 and summarise every finding';
+      const r = run(NEW_SCRIPT, 'agent:0', prompt);
+      expect(r.status).toBe(0);
+      expect(enters()).toBe(2);
+      expect(read('transcript')).toContain(prompt);
+    });
+
+    it('long wrapping prompt that does submit: exit 0, one Enter', () => {
+      setup('normal');
+      writeFileSync(join(dir, 'wrap'), '60');
+      const r = run(NEW_SCRIPT, 'agent:0', LONG);
+      expect(r.status).toBe(0);
+      expect(enters()).toBe(1);
+      expect(read('transcript')).toContain(LONG);
+    });
+
+    it('never submits with wrapping on → exit 4 after 3 Enters', () => {
+      setup('never');
+      writeFileSync(join(dir, 'wrap'), '60');
+      const r = run(NEW_SCRIPT, 'agent:0', LONG);
+      expect(r.status).toBe(4);
+      expect(enters()).toBe(3);
+    });
   });
 
   it('usage error → exit 2', () => {
