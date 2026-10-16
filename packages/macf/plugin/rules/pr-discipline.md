@@ -35,4 +35,4 @@ When the operator sanctions a merge without a reviewer approval, the gate clears
 - a formal approval from the operator's login;
 - a PR comment from the operator's login containing `[macf-sanction-merge]`.
 
-Both need `MACF_OPERATOR_LOGIN` set for the workspace. If the operator sanctioned verbally instead, record who sanctioned it and why in the squash-commit body or the close comment. `MACF_SKIP_LGTM_CHECK` is read at launch only; setting it inside a session has no effect.
+The approval counts like any non-author review; the comment form works only when `MACF_OPERATOR_LOGIN` is set for the workspace. If the operator sanctioned verbally instead, record who sanctioned it and why in the squash-commit body or the close comment. `MACF_SKIP_LGTM_CHECK` is read at launch only; setting it inside a session has no effect.
