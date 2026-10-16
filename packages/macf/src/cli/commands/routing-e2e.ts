@@ -127,7 +127,7 @@ import {
   createRouterRunLister,
   createRunLogReader,
   readLocalLog,
-  receiverLogPathFor,
+  resolveReceiverLogPath,
 } from './routing-e2e-gh.js';
 
 // --- Result shape ---
@@ -513,6 +513,11 @@ export async function runRoutingE2eCore(
 
   const mode = opts.mode ?? 'label';
   let created: RoutingE2eCreateIssueResult;
+  // ONE timestamp for the run filter AND the receipt filter, taken immediately
+  // BEFORE the action that fires the router (the mention post / the label
+  // apply) — never after a slow follow-up read (title fetch), which would put
+  // the probe's real run and receipt before the window (a false RED).
+  let labeledAtIso = new Date(now()).toISOString();
   if (mode === 'mention') {
     const botLogin = (await deps.readTargetRoutingConfig(repo))?.agents[targetLabel]?.app_name;
     if (opts.issue === undefined || !deps.postMention || !botLogin) {
@@ -525,6 +530,7 @@ export async function runRoutingE2eCore(
         now,
       );
     }
+    labeledAtIso = new Date(now()).toISOString();
     const posted = await deps.postMention(repo, opts.issue, botLogin);
     const title = deps.readIssueTitle ? await deps.readIssueTitle(repo, opts.issue) : undefined;
     created = posted.ok ? { ok: true, number: opts.issue, url: posted.url, ...(title !== undefined ? { title } : {}) } : posted;
@@ -566,6 +572,7 @@ export async function runRoutingE2eCore(
     };
   };
 
+  if (mode === 'label') labeledAtIso = new Date(now()).toISOString();
   const labelResult = mode === 'label' ? await deps.applyLabel(repo, created.number, targetLabel) : { ok: true as const };
   if (!labelResult.ok) {
     return finish({
@@ -577,7 +584,6 @@ export async function runRoutingE2eCore(
     });
   }
 
-  const labeledAtIso = new Date(now()).toISOString();
   const maxPolls = deps.maxPolls ?? deriveMaxPolls(opts.timeoutSec);
   const intervalMs = deps.pollIntervalMs ?? DEFAULT_E2E_POLL_INTERVAL_MS;
   // ONE deadline for the whole evidence wait (health stage + run stage):
@@ -882,9 +888,9 @@ async function resolveE2eDepsFromRegistry(
       postMention: createMentionPoster(token),
       readIssueTitle: createIssueTitleReader(token),
       readReceiverLog: async (label) => {
-        // Identity-derived, never scanned: <state>/macf/<project>@<routing label>/channel.log
-        // (the routing-table KEY, the same derivation the launcher bakes into MACF_LOG_PATH).
-        const path = receiverLogOverride ?? receiverLogPathFor(config.project, label);
+        // Identity-resolved on THIS host (the workspace declaring project+label), never scanned
+        // and never keyed on the label: the launcher keys on agent_name.
+        const path = receiverLogOverride ?? resolveReceiverLogPath(config.project, label, projectDir);
         return { read: path ? await readLocalLog(path) : ({ kind: 'absent' } as const), path };
       },
     },

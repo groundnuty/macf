@@ -24,7 +24,7 @@ import {
   type RoutingE2eRouterRun,
 } from '../../src/cli/commands/routing-e2e.js';
 import type { TextRead } from '../../src/cli/commands/routing-e2e-evidence.js';
-import { receiverLogPathFor } from '../../src/cli/commands/routing-e2e-gh.js';
+import { receiverLogPathFor, resolveReceiverLogPath } from '../../src/cli/commands/routing-e2e-gh.js';
 
 const AGENT_INFO: AgentInfo = {
   host: '10.0.0.5',
@@ -423,10 +423,41 @@ describe('runRoutingE2eCore — evidence verdicts', () => {
 });
 
 describe('receiver log path', () => {
-  it('is keyed on the routing label (the table key), never on the bot app name', () => {
+  const rec = (agent: string, project = 'macf', workspace = `/ws/${agent}`) => ({ agent, project, workspace, registry: 'r', versionPin: null }) as never;
+  const seams = (recs: readonly unknown[], agentName: string, env: string | null = null) => ({
+    discover: () => recs as never,
+    readConfig: () => ({ agent_name: agentName }),
+    readEnvLogPath: () => env,
+  });
+
+  it('receiverLogPathFor keys on agent_name (never the bot app name)', () => {
     process.env['XDG_STATE_HOME'] = '/state';
     expect(receiverLogPathFor('macf-trial', 'code-agent')).toBe('/state/macf/macf-trial@code-agent/channel.log');
     expect(receiverLogPathFor('macf-trial', 'code-agent')).not.toContain('macf-trial-code-agent');
+  });
+
+  it('label == agent_name (the trial shape) resolves', () => {
+    process.env['XDG_STATE_HOME'] = '/state';
+    expect(resolveReceiverLogPath('macf-trial', 'code-agent', '/p', seams([rec('code-agent', 'macf-trial')], 'code-agent'))).toBe(
+      '/state/macf/macf-trial@code-agent/channel.log',
+    );
+  });
+
+  it('label != agent_name resolves via the workspace agent_name, never the label', () => {
+    process.env['XDG_STATE_HOME'] = '/state';
+    const p = resolveReceiverLogPath('macf', 'science-agent', '/p', seams([rec('science-agent')], 'macf-science-agent'));
+    expect(p).toBe('/state/macf/macf@macf-science-agent/channel.log');
+    expect(p).not.toContain('macf@science-agent/');
+  });
+
+  it('no local workspace for project+label → null (not verifiable), no label-keyed fallback', () => {
+    expect(resolveReceiverLogPath('macf', 'science-agent', '/p', seams([rec('code-agent'), rec('science-agent', 'other')], 'x'))).toBeNull();
+  });
+
+  it('an env.* MACF_LOG_PATH wins over derivation', () => {
+    expect(resolveReceiverLogPath('macf', 'science-agent', '/p', seams([rec('science-agent')], 'macf-science-agent', '/custom/channel.log'))).toBe(
+      '/custom/channel.log',
+    );
   });
 });
 
@@ -441,6 +472,34 @@ describe('runRoutingE2eCore — which router run is the probe\'s (never a guess)
       recv: { kind: 'ok', text: JSON.stringify({ ts: '2099-01-01T00:00:00.000Z', event: 'notify_received', type: 'mention', issue: 5 }) },
     });
   const opts = { targetRepo: 'o/r', mode: 'mention' as const, issue: 5 };
+
+  it('timestamp is taken before the post: a title fetch taking 30s cannot hide the run or the receipt', async () => {
+    const T0 = Date.parse('2026-01-01T00:00:00Z');
+    let t = T0;
+    const runAt = T0 + 1000; // created 1s after the post
+    const base = mentionDeps({ 1: 'Routed mention to science-agent via mTLS POST\nISSUE_NUMBER: 5' }, []);
+    const deps: RoutingE2eDeps = {
+      ...base,
+      now: () => t,
+      sleep: async () => {},
+      readIssueTitle: vi.fn(async () => {
+        t += 30_000;
+        return 'probe';
+      }),
+      // Faithful to the real lister: only runs created >= since - 5s.
+      listRouterRuns: vi.fn(async (_r: string, sinceIso: string) => ({
+        ok: true as const,
+        runs: runAt >= Date.parse(sinceIso) - 5000 ? [{ ...run(1), title: 'probe' }] : [],
+      })),
+      readReceiverLog: vi.fn(async () => ({
+        read: { kind: 'ok' as const, text: JSON.stringify({ ts: new Date(runAt).toISOString(), event: 'notify_received', type: 'mention', issue: 5 }) },
+        path: '/l',
+      })),
+    };
+    const r = await runRoutingE2eCore(deps, opts);
+    expect(r.routerRun?.id).toBe(1);
+    expect(r.evidence?.verdict).toBe('delivered');
+  });
 
   it('two concurrent runs, only one names the issue: that one is judged', async () => {
     const r = await runRoutingE2eCore(

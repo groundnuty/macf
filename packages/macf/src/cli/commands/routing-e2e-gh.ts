@@ -11,6 +11,10 @@
 import { randomBytes } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
+import { readdirSync, readFileSync } from 'node:fs';
+import type { WorkspaceRecord } from '@groundnuty/macf-core';
+import { discoverWorkspaces } from '../discovery.js';
+import { readAgentConfig } from '../config.js';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -212,13 +216,72 @@ export function createRunLogReader(token: string): (repo: string, runId: number)
 }
 
 /**
- * `<state>/macf/<project>@<routing label>/channel.log` — the receiver's log,
- * derived from its identity (the routing-table KEY, the same derivation the
- * launcher bakes into MACF_LOG_PATH), never by scanning the host.
+ * `<state>/macf/<project>@<agent_name>/channel.log` — the SAME expression the
+ * launcher bakes into MACF_LOG_PATH (`env-files.ts`). Keyed on `agent_name`,
+ * NOT the routing label (they differ on the substrate: science is
+ * agent_name `macf-science-agent`, label `science-agent`).
  */
-export function receiverLogPathFor(project: string, routingLabel: string): string {
+export function receiverLogPathFor(project: string, agentName: string): string {
   const state = process.env['XDG_STATE_HOME'] || join(homedir(), '.local', 'state');
-  return join(state, 'macf', `${project}@${routingLabel}`, 'channel.log');
+  return join(state, 'macf', `${project}@${agentName}`, 'channel.log');
+}
+
+export interface ReceiverLogSeams {
+  readonly discover: () => readonly WorkspaceRecord[];
+  readonly readConfig: (workspaceDir: string) => { readonly agent_name: string } | null;
+  /** Literal `export MACF_LOG_PATH=<path>` from the workspace's `.claude/.macf/env.*`, or null. */
+  readonly readEnvLogPath: (workspaceDir: string) => string | null;
+}
+
+/** A literal (no `$`) MACF_LOG_PATH export from env.* files; last file (sorted) wins. */
+export function readEnvLogPathFromDir(workspaceDir: string): string | null {
+  const dir = join(workspaceDir, '.claude', '.macf');
+  let names: string[];
+  try {
+    names = readdirSync(dir).filter((n) => n.startsWith('env.')).sort();
+  } catch {
+    return null;
+  }
+  let found: string | null = null;
+  for (const n of names) {
+    let text: string;
+    try {
+      text = readFileSync(join(dir, n), 'utf-8');
+    } catch {
+      continue;
+    }
+    for (const line of text.split('\n')) {
+      const m = /^\s*export\s+MACF_LOG_PATH=(?:"([^"]*)"|'([^']*)'|(\S+))\s*$/.exec(line);
+      const v = m ? (m[1] ?? m[2] ?? m[3]) : undefined;
+      if (v && !v.includes('$')) found = v;
+    }
+  }
+  return found;
+}
+
+/**
+ * Resolve the recipient's log path from its identity ON THIS HOST: the local
+ * workspace whose config declares `project` + routing label `label`. Its
+ * configured MACF_LOG_PATH wins; else derived from its `agent_name`. No such
+ * workspace → null ("not verifiable from this host"); never a label-keyed guess.
+ */
+export function resolveReceiverLogPath(
+  project: string,
+  label: string,
+  projectDir: string,
+  seams?: ReceiverLogSeams,
+): string | null {
+  const s: ReceiverLogSeams = seams ?? {
+    discover: () => discoverWorkspaces({ cwd: projectDir }),
+    readConfig: (d) => readAgentConfig(d),
+    readEnvLogPath: readEnvLogPathFromDir,
+  };
+  const rec = s.discover().find((r) => r.project === project && r.agent === label);
+  if (!rec) return null;
+  const fromEnv = s.readEnvLogPath(rec.workspace);
+  if (fromEnv) return fromEnv;
+  const cfg = s.readConfig(rec.workspace);
+  return cfg ? receiverLogPathFor(project, cfg.agent_name) : null;
 }
 
 export async function readLocalLog(path: string): Promise<TextRead> {
