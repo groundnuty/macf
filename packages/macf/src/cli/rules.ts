@@ -32,7 +32,7 @@
  */
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
-import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { PACKAGE_VERSION } from '../package-version.js';
 
 const MANAGED_HEADER = [
@@ -178,7 +178,84 @@ export function listDistributedRuleNames(options: {
  * below AND `copyCanonicalRules` above share one implementation.
  */
 function computeCanonicalRuleContent(rawContent: string): string {
-  return rawContent.startsWith('<!--') ? rawContent : MANAGED_HEADER + rawContent;
+  if (rawContent.startsWith('<!--')) return rawContent;
+  // A `---` YAML frontmatter block must stay byte-identical at the very top:
+  // Claude Code reads `paths:` only from there (#1465). The header goes after
+  // the closing `---`, never above it.
+  const fm = FRONTMATTER_RE.exec(rawContent);
+  if (fm !== null) {
+    const block = fm[0].endsWith('\n') ? fm[0] : fm[0] + '\n';
+    return block + MANAGED_HEADER + rawContent.slice(fm[0].length);
+  }
+  return MANAGED_HEADER + rawContent;
+}
+
+const FRONTMATTER_RE = /^---[ \t]*\r?\n[\s\S]*?\r?\n---[ \t]*(?:\r?\n|$)/;
+
+/**
+ * Canonical rule file names that were removed or renamed upstream. A workspace
+ * copy of one stays loaded forever unless something deletes it, so every
+ * distributing command (`init`, `update`, `rules refresh`) removes these —
+ * only when the copy still carries the managed header (see
+ * `retireCanonicalRules`). Append a basename here in the same change that
+ * deletes or renames the canonical source.
+ */
+export const RETIRED_CANONICAL_RULES: readonly string[] = [];
+
+/** True when `content` begins with the managed header, directly or right after a leading frontmatter block. */
+function beginsWithManagedHeader(content: string): boolean {
+  if (content.startsWith(MANAGED_HEADER)) return true;
+  const fm = FRONTMATTER_RE.exec(content);
+  if (fm === null) return false;
+  return content.slice(fm[0].length).startsWith(MANAGED_HEADER);
+}
+
+function assertRetiredNameSafe(name: string): void {
+  if (!/^[A-Za-z0-9._-]+\.md$/.test(name) || name.includes('..')) {
+    throw new Error(`retired canonical rule name must be a plain *.md basename, got: ${name}`);
+  }
+}
+
+/**
+ * Retired rule copies in `<workspace>/.claude/rules/`, split by ownership:
+ * `managed` still begin with the macf managed header (safe to delete);
+ * `operatorAuthored` do not (never touched). Absent files appear in neither.
+ */
+export function findRetiredRuleCopies(workspaceDir: string, options: {
+  readonly retired?: readonly string[];
+} = {}): { readonly managed: readonly string[]; readonly operatorAuthored: readonly string[] } {
+  const managed: string[] = [];
+  const operatorAuthored: string[] = [];
+  const dir = join(resolve(workspaceDir), '.claude', 'rules');
+  for (const name of options.retired ?? RETIRED_CANONICAL_RULES) {
+    assertRetiredNameSafe(name);
+    const path = join(dir, name);
+    if (!existsSync(path) || !lstatSync(path).isFile()) continue;
+    (beginsWithManagedHeader(readFileSync(path, 'utf-8')) ? managed : operatorAuthored).push(name);
+  }
+  return { managed, operatorAuthored };
+}
+
+/**
+ * Delete each retired rule copy that still carries the managed header; keep
+ * (and warn once per file about) any without it. Deletes nothing outside
+ * `.claude/rules/` and nothing not named in `retired`. Idempotent.
+ */
+export function retireCanonicalRules(workspaceDir: string, options: {
+  readonly retired?: readonly string[];
+  readonly warn?: (message: string) => void;
+} = {}): { readonly removed: readonly string[]; readonly kept: readonly string[] } {
+  const warn = options.warn ?? ((m: string) => console.warn(m));
+  const { managed, operatorAuthored } = findRetiredRuleCopies(workspaceDir, options);
+  const dir = join(resolve(workspaceDir), '.claude', 'rules');
+  for (const name of managed) unlinkSync(join(dir, name));
+  for (const name of operatorAuthored) {
+    warn(
+      `  Warning: .claude/rules/${name} is a retired canonical rule name but has no macf managed ` +
+      'header, so it is operator-authored — left in place. Delete it by hand if it is not wanted.',
+    );
+  }
+  return { removed: managed, kept: operatorAuthored };
 }
 
 /**

@@ -45,6 +45,7 @@ import {
   findCliPackageRoot,
   listDistributedRuleNames,
   listDistributedScriptNames,
+  retireCanonicalRules,
 } from './rules.js';
 
 export type CanonicalOverwriteGuardResult =
@@ -218,6 +219,8 @@ export interface CanonicalCopyOutcome {
   readonly rules: readonly string[];
   /** Script basenames actually written (empty when the copy was skipped). */
   readonly scripts: readonly string[];
+  /** Retired rule copies deleted (empty when the copy was skipped). */
+  readonly retiredRules: readonly string[];
   /** The guard's own verdict — callers report `guard.detail` on `refuse` / `unknown`. */
   readonly guard: CanonicalOverwriteGuardResult;
   /**
@@ -259,6 +262,8 @@ export function copyCanonicalAssetsGuarded(
     /** Deliberate-downgrade escape — proceed even on a `refuse` verdict. */
     readonly force?: boolean;
     readonly gitRunner?: GitRunner;
+    /** Test seam: retired rule names (defaults to `RETIRED_CANONICAL_RULES`). */
+    readonly retiredRules?: readonly string[];
   },
 ): CanonicalCopyOutcome {
   const packageRoot = options.packageRoot ?? findCliPackageRoot();
@@ -270,12 +275,24 @@ export function copyCanonicalAssetsGuarded(
   );
 
   if (guard.kind === 'refuse' && !options.force) {
-    return { rules: [], scripts: [], guard, copied: false };
+    return { rules: [], scripts: [], retiredRules: [], guard, copied: false };
   }
 
+  const rules = copyCanonicalRules(workspaceDir);
+  const scripts = copyCanonicalScripts(workspaceDir);
+  // Deletion obeys the same verdict as the copy: it is only reached when the
+  // copy ran, so a stale-checkout CLI that refuses to overwrite refuses to delete.
+  const retired = retireCanonicalRules(
+    workspaceDir,
+    options.retiredRules !== undefined ? { retired: options.retiredRules } : {},
+  );
+  if (retired.removed.length > 0) {
+    console.log(`  Retired ${retired.removed.length} removed canonical rule(s) from .claude/rules/: ${retired.removed.join(', ')}`);
+  }
   return {
-    rules: copyCanonicalRules(workspaceDir),
-    scripts: copyCanonicalScripts(workspaceDir),
+    rules,
+    scripts,
+    retiredRules: retired.removed,
     guard,
     copied: true,
   };

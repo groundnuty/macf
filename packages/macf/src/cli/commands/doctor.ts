@@ -34,6 +34,8 @@ import {
   findCliPackageRoot,
   listDistributedRuleNames,
   listDistributedScriptNames,
+  findRetiredRuleCopies,
+  retireCanonicalRules,
 } from '../rules.js';
 import {
   getHookCommands,
@@ -1970,7 +1972,7 @@ export interface RuleCurrencyFinding {
   readonly name: string;
   /** `stale` — on disk, but content differs from canonical. `missing` —
    *  canonical distributes this name and the workspace has no copy at all. */
-  readonly reason: 'stale' | 'missing';
+  readonly reason: 'stale' | 'missing' | 'retired';
 }
 
 /**
@@ -2002,6 +2004,8 @@ export function checkDistributedRuleCurrency(
   workspaceDir: string,
   options: {
     readonly canonicalDir?: string;
+    /** Test seam: retired rule names (defaults to `RETIRED_CANONICAL_RULES`). */
+    readonly retiredRules?: readonly string[];
   } = {},
 ): RuleCurrencyCheckResult {
   const absDir = resolve(workspaceDir);
@@ -2049,6 +2053,14 @@ export function checkDistributedRuleCurrency(
     }
   }
 
+  // A retired canonical rule whose managed copy is still on disk stays loaded
+  // forever — drift. (Operator-authored files of a retired name are not.)
+  const retiredLeft = findRetiredRuleCopies(
+    absDir,
+    options.retiredRules !== undefined ? { retired: options.retiredRules } : {},
+  ).managed;
+  for (const name of retiredLeft) findings.push({ name, reason: 'retired' });
+
   // Same provenance framing as checkDistributedScriptCurrency: "canonical"
   // means "what THIS RUNNING macf CLI's bundled rules say right now", not a
   // fetch against groundnuty/macf's source-repo HEAD.
@@ -2065,15 +2077,17 @@ export function checkDistributedRuleCurrency(
   }
 
   const staleCount = findings.filter((f) => f.reason === 'stale').length;
-  const missingCount = findings.length - staleCount;
+  const retiredCount = findings.filter((f) => f.reason === 'retired').length;
+  const missingCount = findings.length - staleCount - retiredCount;
   return {
     status: 'WARN',
     checkedCount,
     totalCount: names.length,
     findings,
     detail:
-      `${staleCount} stale, ${missingCount} missing of ${names.length} canonical distributed rule(s) ` +
-      `(canonical ${provenance})`,
+      `${staleCount} stale, ${missingCount} missing of ${names.length} canonical distributed rule(s)` +
+      (retiredCount > 0 ? `, ${retiredCount} retired rule copy(ies) still present` : '') +
+      ` (canonical ${provenance})`,
   };
 }
 
@@ -2843,7 +2857,8 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
   console.log('');
   console.log('Distributed rule currency');
   console.log('──────────────────────────────────────────────────────────────');
-  printRuleCurrencySection(checkDistributedRuleCurrency(projectDir), checkoutCurrency);
+  const ruleCurrencyCheck = checkDistributedRuleCurrency(projectDir);
+  printRuleCurrencySection(ruleCurrencyCheck, checkoutCurrency);
 
   console.log('');
   console.log('Managed file git tracking');
@@ -2870,6 +2885,8 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
       sandboxCheck.status === 'FAIL' ||
       permsCheck.status === 'WARN' ||
       botLoginCheck.status === 'WARN' ||
+      // A retired canonical rule's managed copy still on disk trips the gate alone.
+      ruleCurrencyCheck.findings.some((f) => f.reason === 'retired') ||
       // Its own trigger: an otherwise-compliant workspace with idle compaction on must still be fixed.
       !idleCompactionIsOff(projectDir);
     if (!needsFix) {
@@ -2881,6 +2898,9 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
       console.log('  - permissions.allow/deny floor (installPluginSkillPermissions)');
       console.log('  - PreToolUse/PostToolUse/UserPromptSubmit/PreCompact/SessionStart hooks (installGhTokenHook)');
       console.log('  - sandbox.filesystem.allowRead + sandbox.excludedCommands');
+      for (const f of ruleCurrencyCheck.findings.filter((x) => x.reason === 'retired')) {
+        console.log(`  - remove retired managed rule .claude/rules/${f.name}`);
+      }
       if (botLoginCheck.status === 'WARN') {
         console.log('  - github_app.bot_login in macf-agent.json (resolves the App slug via GET /app)');
       }
@@ -2895,6 +2915,10 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
         installSandboxFdAllowRead(projectDir);
         installSandboxExcludedCommands(projectDir);
         installIdleCompactionOff(projectDir);
+        const retiredRemoved = retireCanonicalRules(projectDir).removed;
+        if (retiredRemoved.length > 0) {
+          console.log(`  Removed retired managed rule(s): ${retiredRemoved.join(', ')}`);
+        }
         if (botLoginCheck.status === 'WARN') {
           try {
             const botLogin = await repairBotLogin(projectDir, config);
@@ -3229,10 +3253,13 @@ function printRuleCurrencySection(check: RuleCurrencyCheckResult, checkoutCurren
   }
   console.log(`  ⚠ ${check.detail}  [WARN]`);
   for (const f of check.findings) {
-    const reasonText = f.reason === 'stale' ? 'stale — differs from canonical' : 'missing — never distributed';
+    const reasonText =
+      f.reason === 'stale' ? 'stale — differs from canonical'
+      : f.reason === 'retired' ? 'retired — canonical no longer ships it, but this managed copy is still loaded (`macf update` or `macf doctor --fix` removes it)'
+      : 'missing — never distributed';
     console.log(`    ✗ ${f.name} — ${reasonText}`);
   }
-  const staleCount = check.findings.filter((f) => f.reason === 'stale').length;
+  const staleCount = check.findings.filter((f) => f.reason === 'stale' || f.reason === 'retired').length;
   printDistributionFixLine('.claude/rules/', checkoutCurrency, staleCount);
 }
 
