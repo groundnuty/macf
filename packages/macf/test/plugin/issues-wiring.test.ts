@@ -97,4 +97,10 @@ describe('macf-plugin-cli issues — reporter-stall sweep wiring (macf#1170)', (
     expect(issuesCase).toContain('MACF_REPORTER_STALL_DAYS');
     expect(issuesCase).toContain('MACF_REPORTER_STALL_LIMIT');
   });
+
+  it("resolves the queue label from the agent's identity, with no code-agent default (#1488)", () => {
+    const issuesCase = issuesCaseSource();
+    expect(issuesCase).toContain('resolveQueueLabel(process.env)');
+    expect(issuesCase).not.toContain("?? 'code-agent'");
+  });
 });
