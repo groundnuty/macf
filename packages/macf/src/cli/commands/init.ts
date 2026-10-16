@@ -1,4 +1,4 @@
-import { recordManagedHashes } from '../managed-hashes.js';
+import { recordManagedHashes, copiedAssetPaths, macfDirPaths, SETTINGS_REL } from '../managed-hashes.js';
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, writeFileSync, readFileSync, existsSync, appendFileSync, chmodSync, copyFileSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -957,7 +957,15 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
 
   // Never idle-compact (CC 2.1.299); enforced, no opt-out. See settings-writer.ts.
   installIdleCompactionOff(absDir);
-  recordManagedHashes(absDir);
+  // Only what this run wrote: a refused rules/scripts copy lists nothing, so
+  // those files keep their earlier hash (or none).
+  recordManagedHashes(absDir, [
+    ...copiedAssetPaths(copyOutcome.rules, copyOutcome.scripts),
+    SETTINGS_REL,
+    ...envFilesResult.written,
+    ...macfDirPaths(['host-prelude.sh']),
+    claudeShPath,
+  ]);
   console.log(`  Sandbox: excludedCommands canonical set installed`);
 
   // Fetch the macf-agent plugin and place it at .macf/plugin/ so claude.sh

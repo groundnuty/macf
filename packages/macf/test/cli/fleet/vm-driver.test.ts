@@ -34,6 +34,9 @@ import {
 import { readLockEntry, type MaintenanceLockConfig } from '../../../src/cli/fleet/maintenance-lock.js';
 import { gatherFleetStatus } from '../../../src/cli/commands/fleet.js';
 import { recordManagedHashes } from '../../../src/cli/managed-hashes.js';
+import { writeEnvFiles } from '../../../src/cli/env-files.js';
+import { writeHostPrelude } from '../../../src/cli/host-prelude.js';
+import { writeClaudeSh } from '../../../src/cli/claude-sh.js';
 import { computeCanonicalRuleFile, copyCanonicalRules } from '../../../src/cli/rules.js';
 import {
   installGhTokenHook,
@@ -1611,7 +1614,7 @@ describe('createVmDriver — classifyDirtyConfig / autoResolveCanonical, real gi
     // What an older macf wrote: different from what the running macf generates.
     const rule = join(repo, '.claude', 'rules', 'pr-discipline.md');
     writeFileSync(rule, readFileSync(rule, 'utf-8').replace(/\n/, '\nOLDER-VERSION-LINE\n'));
-    recordManagedHashes(repo);
+    recordManagedHashes(repo, ['.claude/rules/pr-discipline.md', '.claude/settings.json']);
   }
 
   it('deployed shape: output of an older macf, left uncommitted → NOT objected', async () => {
@@ -1635,6 +1638,41 @@ describe('createVmDriver — classifyDirtyConfig / autoResolveCanonical, real gi
       expect.arrayContaining(['.claude/rules/pr-discipline.md']),
     );
     expect(result.alreadyCanonical).not.toContain('.claude/rules/pr-discipline.md');
+  });
+
+  it('deployed shape: launcher and env files of an older macf are not dirty after a recording update; an operator edit to claude.sh is (#1476)', async () => {
+    deployWithOlderMacf();
+    const config = JSON.parse(readFileSync(join(repo, '.macf', 'macf-agent.json'), 'utf-8'));
+    const envResult = writeEnvFiles(repo, config);
+    const hostPrelude = writeHostPrelude(repo);
+    const claudeSh = writeClaudeSh(repo, config);
+    // The deployed template committed these; macf's later output is what is uncommitted.
+    execFileSync('git', ['add', '-f', '.'], { cwd: repo });
+    execFileSync('git', ['commit', '-m', 'deployed'], { cwd: repo });
+    // What an older macf wrote differs from what the running macf generates.
+    const older = [claudeSh, hostPrelude, ...envResult.written];
+    for (const f of older) writeFileSync(f, readFileSync(f, 'utf-8') + '# older-macf-line\n');
+    recordManagedHashes(repo, older);
+
+    const clean = await driverFor(repo).classifyDirtyConfig('code-agent');
+    expect(clean.genuineDelta).toEqual([]);
+    expect(clean.alreadyCanonical).toEqual(
+      expect.arrayContaining(['claude.sh', '.claude/.macf/env.identity', '.claude/.macf/host-prelude.sh']),
+    );
+
+    writeFileSync(claudeSh, readFileSync(claudeSh, 'utf-8') + '# operator edit\n');
+    const dirty = await driverFor(repo).classifyDirtyConfig('code-agent');
+    expect(dirty.genuineDelta).toContain('claude.sh');
+  });
+
+  it('recording only the written paths keeps an unlisted file\'s earlier hash (#1476)', async () => {
+    deployWithOlderMacf();
+    const rule = join(repo, '.claude', 'rules', 'pr-discipline.md');
+    const recorded = readFileSync(rule, 'utf-8');
+    writeFileSync(rule, recorded + 'OPERATOR EDIT\n');
+    recordManagedHashes(repo, ['.claude/settings.json']);
+    const result = await driverFor(repo).classifyDirtyConfig('code-agent');
+    expect(result.genuineDelta).toContain('.claude/rules/pr-discipline.md');
   });
 
   it('deployed shape with NO record (workspace never updated by a recording macf): an older-output file is objected, as before', async () => {

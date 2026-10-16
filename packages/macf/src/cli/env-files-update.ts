@@ -194,7 +194,7 @@ export function refreshEnvFiles(
  * log appropriately or short-circuit downstream work.
  */
 export type MigrationResult =
-  | { readonly migrated: true }
+  | { readonly migrated: true; readonly written: readonly string[] }
   | { readonly migrated: false; readonly reason: 'already-migrated' | 'no-claude-sh' | string };
 
 /**
@@ -284,9 +284,9 @@ export function migrateMonolithicClaudeSh(
   // outcome anyway — an operator's OTLP endpoint / tmux target / project-
   // rules source surviving a migration is no less correct than a fresh
   // bake, and is what every OTHER call site of writeEnvFiles now does.
-  writeEnvFiles(absDir, config);
+  const envResult = writeEnvFiles(absDir, config);
   writeClaudeSh(absDir, config);
-  return { migrated: true };
+  return { migrated: true, written: [...envResult.written, claudeShPath] };
 }
 
 // ---------------------------------------------------------------------------
