@@ -8,6 +8,7 @@
  * probe issue, apply its label, close it on cleanup); `findRouterRun` is the
  * only read. The token is forwarded as `GH_TOKEN` in the subprocess env.
  */
+import { randomBytes } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
@@ -35,6 +36,9 @@ function errMessage(err: unknown): string {
 export function createProbeIssueCreator(token: string): (repo: string) => Promise<RoutingE2eCreateIssueResult> {
   const env = { ...process.env, GH_TOKEN: token };
   return async (repo: string): Promise<RoutingE2eCreateIssueResult> => {
+    // A per-probe token in the title: the router run's display_title is this title, which is
+    // how the probe tells its own run from a concurrent one.
+    const title = `Routing self-test probe (automated) ${randomBytes(4).toString('hex')}`;
     try {
       const { stdout } = await execFileAsync(
         'gh',
@@ -44,7 +48,7 @@ export function createProbeIssueCreator(token: string): (repo: string) => Promis
           '-X',
           'POST',
           '-f',
-          'title=Routing self-test probe (automated)',
+          `title=${title}`,
           '-f',
           'body=Automated routing capability check. Safe to ignore -- this issue is closed automatically ' +
             'once the check finishes; if you are reading this after it should have closed, the check likely ' +
@@ -55,7 +59,7 @@ export function createProbeIssueCreator(token: string): (repo: string) => Promis
         { encoding: 'utf-8', env, maxBuffer: 1024 * 1024 },
       );
       const parsed = JSON.parse(stdout) as { number: number; url: string };
-      return { ok: true, number: parsed.number, url: parsed.url };
+      return { ok: true, number: parsed.number, url: parsed.url, title };
     } catch (err) {
       return { ok: false, error: errMessage(err) };
     }
@@ -150,6 +154,7 @@ export function createRouterRunFinder(
         readonly status: string;
         readonly created_at: string;
         readonly html_url: string;
+        readonly display_title?: string;
       }[];
       const sinceMs = Date.parse(sinceIso) - RUN_LOOKBACK_BUFFER_MS;
       const candidates = runs
@@ -157,7 +162,7 @@ export function createRouterRunFinder(
         .sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at));
       const run = candidates[0];
       if (!run) return { found: false, conclusion: null, status: null, url: null };
-      return { found: true, id: run.id, conclusion: run.conclusion, status: run.status, url: run.html_url };
+      return { found: true, id: run.id, conclusion: run.conclusion, status: run.status, url: run.html_url, ...(run.display_title !== undefined ? { title: run.display_title } : {}) };
     } catch (err) {
       // Could not read ≠ no run: carry the error so the caller says "unknown".
       return { found: false, conclusion: null, status: null, url: null, error: errMessage(err) };
@@ -242,16 +247,34 @@ export function createRouterRunLister(
         { encoding: 'utf-8', env, maxBuffer: 4 * 1024 * 1024 },
       );
       const runs = JSON.parse(stdout) as readonly {
-        id: number; conclusion: string | null; status: string; created_at: string; html_url: string;
+        id: number; conclusion: string | null; status: string; created_at: string; html_url: string; display_title?: string;
       }[];
       const sinceMs = Date.parse(sinceIso) - RUN_LOOKBACK_BUFFER_MS;
       const listed = runs
         .filter((r) => Date.parse(r.created_at) >= sinceMs)
         .sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at))
-        .map((r) => ({ found: true, id: r.id, conclusion: r.conclusion, status: r.status, url: r.html_url }));
+        .map((r) => ({ found: true, id: r.id, conclusion: r.conclusion, status: r.status, url: r.html_url, ...(r.display_title !== undefined ? { title: r.display_title } : {}) }));
       return { ok: true, runs: listed };
     } catch (err) {
       return { ok: false, error: errMessage(err) };
+    }
+  };
+}
+
+/** Mention mode: the existing issue's title (GET), or undefined when it cannot be read. NEVER throws. */
+export function createIssueTitleReader(token: string): (repo: string, issue: number) => Promise<string | undefined> {
+  const env = { ...process.env, GH_TOKEN: token };
+  return async (repo, issue) => {
+    try {
+      const { stdout } = await execFileAsync('gh', ['api', '--method', 'GET', `repos/${repo}/issues/${String(issue)}`, '--jq', '.title'], {
+        encoding: 'utf-8',
+        env,
+        maxBuffer: 1024 * 1024,
+      });
+      const t = stdout.trim();
+      return t.length > 0 ? t : undefined;
+    } catch {
+      return undefined;
     }
   };
 }

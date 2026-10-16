@@ -458,14 +458,64 @@ describe('runRoutingE2eCore — which router run is the probe\'s (never a guess)
     expect(r.message).toBe("ambiguous: 2 router runs started in the window and the log could not single out the probe's");
   });
 
-  it('two runs where neither names the issue are ambiguous', async () => {
+  it('two untitled runs where neither names the issue are ambiguous', async () => {
     const r = await runRoutingE2eCore(mentionDeps({ 1: 'nothing', 2: 'nothing' }, [run(1), run(2)]), opts);
     expect(r.evidence?.verdict).toBe('unknown');
     expect(r.message).toContain('ambiguous: 2 router runs');
   });
 
-  it('a single candidate is used as-is, even if its log does not name the issue', async () => {
+  it('a single untitled candidate is used as-is (no title to tell it apart)', async () => {
     const r = await runRoutingE2eCore(mentionDeps({ 1: 'Routed mention to science-agent via mTLS POST' }, [run(1)]), opts);
     expect(r.evidence?.verdict).toBe('delivered');
+  });
+
+  const PROBE_TITLE = 'e2e: first cross-agent message (2026-10-16)';
+  const titled = (id: number, title: string): RoutingE2eRouterRun => ({ ...run(id), title });
+  const titledDeps = (logs: Record<number, string>, runs: readonly RoutingE2eRouterRun[]): RoutingE2eDeps => ({
+    ...mentionDeps(logs, runs),
+    readIssueTitle: vi.fn(async () => PROBE_TITLE),
+  });
+
+  it('a SINGLE run triggered by another issue (other display_title) is never taken as the probe\'s (Codex)', async () => {
+    const r = await runRoutingE2eCore(titledDeps({ 1: 'Routed mention to science-agent via mTLS POST' }, [titled(1, 'some other issue')]), opts);
+    expect(r.evidence?.verdict).toBe('no-run');
+  });
+
+  it('an unrelated run completing first does not end the wait: the probe\'s run appearing on a later poll is judged (Codex)', async () => {
+    const listRouterRuns = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true as const, runs: [titled(1, 'some other issue')] })
+      .mockResolvedValue({ ok: true as const, runs: [titled(1, 'some other issue'), titled(2, PROBE_TITLE)] });
+    let clock = 0;
+    const deps = {
+      ...titledDeps({ 1: 'Routed mention to science-agent via mTLS POST', 2: 'Routed mention to science-agent via mTLS POST' }, []),
+      listRouterRuns,
+      maxPolls: 3,
+      pollIntervalMs: 1000,
+      now: () => clock,
+      sleep: async (ms: number) => {
+        clock += ms;
+      },
+    };
+    const r = await runRoutingE2eCore(deps, opts);
+    expect(listRouterRuns.mock.calls.length).toBeGreaterThan(1);
+    expect(r.evidence?.verdict).toBe('delivered');
+    expect(r.routerRun?.id).toBe(2);
+  });
+
+  it('the probe\'s titled self-route run is judged a self-route even though its log names no issue (real shape)', async () => {
+    // Real self-route and failed runs carry no ISSUE_NUMBER (verified on macf-trial, 2026-10-16) —
+    // only display_title ties them to the probe.
+    const r = await runRoutingE2eCore(
+      titledDeps({ 1: 'Routed mention to science-agent via mTLS POST', 2: 'Actor is the same agent, skipping self-routing' }, [titled(1, 'some other issue'), titled(2, PROBE_TITLE)]),
+      opts,
+    );
+    expect(r.evidence?.verdict).toBe('self-route');
+  });
+
+  it('a single run still in progress at the deadline is judged (reported unfinished), not reported missing', async () => {
+    const inProgress: RoutingE2eRouterRun = { found: true, id: 1, conclusion: null, status: 'in_progress', url: 'https://example.test/run/1', title: PROBE_TITLE };
+    const r = await runRoutingE2eCore(titledDeps({}, [inProgress]), opts);
+    expect(r.evidence?.verdict).toBe('unknown');
   });
 });

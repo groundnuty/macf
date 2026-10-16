@@ -31,6 +31,11 @@ describe('evidence functions against real router logs (2026-10-16)', () => {
   it('a real routed line for one recipient is not taken as routed to another', () => {
     expect(findRoutedLine(LABEL_RUN, 'code-agent')).toBeNull();
   });
+  it('a recipient that is a hyphenated prefix of another is not matched by the longer one (Codex)', () => {
+    const other = LABEL_RUN.replace('to science-agent via', 'to science-agent-backup via');
+    expect(findRoutedLine(other, 'science-agent')).toBeNull();
+    expect(findRoutedLine(other, 'science-agent-backup')).toContain('science-agent-backup');
+  });
   it('both real runs name their issue (env block ISSUE_NUMBER), and not a different one', () => {
     expect(logNamesIssue(LABEL_RUN, 3)).toBe(true);
     expect(logNamesIssue(MENTION_RUN, 3)).toBe(true);

@@ -121,6 +121,7 @@ import {
   createIssueCloser,
   createLabelApplier,
   createMentionPoster,
+  createIssueTitleReader,
   createProbeIssueCreator,
   createRouterRunFinder,
   createRouterRunLister,
@@ -184,6 +185,13 @@ export interface RoutingE2eRouterRun {
   readonly conclusion: string | null;
   readonly status: string | null;
   readonly url: string | null;
+  /**
+   * The run's `display_title`. For `issues` and `issue_comment` events GitHub sets
+   * it to the triggering issue's title on EVERY run — including runs that fail
+   * before routing or skip as a self-route, whose logs carry no issue number — so
+   * it is how a run is tied to the probe.
+   */
+  readonly title?: string;
   /** Set when the runs could NOT be listed (found:false then means "unknown", not "none"). */
   readonly error?: string;
 }
@@ -215,7 +223,7 @@ export interface RoutingE2eResult {
 export type RoutingE2eProbeFn = (host: string, port: number) => Promise<HealthResponse | null>;
 
 export type RoutingE2eCreateIssueResult =
-  | { readonly ok: true; readonly number: number; readonly url: string }
+  | { readonly ok: true; readonly number: number; readonly url: string; readonly title?: string }
   | { readonly ok: false; readonly error: string };
 
 export type RoutingE2eLabelResult = { readonly ok: true } | { readonly ok: false; readonly error: string };
@@ -263,6 +271,8 @@ export interface RoutingE2eDeps {
     issue: number,
     botLogin: string,
   ) => Promise<{ readonly ok: true; readonly url: string } | { readonly ok: false; readonly error: string }>;
+  /** Mention mode: the existing issue's title, to tie its router run to the probe (undefined when unreadable). */
+  readonly readIssueTitle?: (repo: string, issue: number) => Promise<string | undefined>;
   readonly maxPolls?: number;
   readonly pollIntervalMs?: number;
   readonly sleep?: (ms: number) => Promise<void>;
@@ -516,7 +526,8 @@ export async function runRoutingE2eCore(
       );
     }
     const posted = await deps.postMention(repo, opts.issue, botLogin);
-    created = posted.ok ? { ok: true, number: opts.issue, url: posted.url } : posted;
+    const title = deps.readIssueTitle ? await deps.readIssueTitle(repo, opts.issue) : undefined;
+    created = posted.ok ? { ok: true, number: opts.issue, url: posted.url, ...(title !== undefined ? { title } : {}) } : posted;
   } else {
     created = await deps.createProbeIssue(repo);
   }
@@ -602,11 +613,27 @@ export async function runRoutingE2eCore(
       if (one.error !== undefined) return { ok: false, error: one.error };
       return { ok: true, runs: one.found ? [one] : [] };
     };
+    const readRunLog = deps.readRunLog;
+    const logCache = new Map<number, TextRead>();
+    const logFor = async (r: RoutingE2eRouterRun): Promise<TextRead | null> => {
+      if (r.id === undefined || r.status !== 'completed') return null;
+      const cached = logCache.get(r.id);
+      if (cached !== undefined) return cached;
+      const read = await readRunLog(repo, r.id);
+      logCache.set(r.id, read);
+      return read;
+    };
     let listing: RoutingE2eRunListing = { ok: true, runs: [] };
     for (let first = true; first || budgetLeft(); first = false) {
       polls++;
       listing = await listRuns();
-      if (listing.ok && listing.runs.length > 0 && listing.runs.every((r) => r.status === 'completed')) break;
+      if (listing.ok && listing.runs.length > 0 && listing.runs.every((r) => r.status === 'completed')) {
+        const seen = [];
+        for (const r of listing.runs) seen.push({ run: r, log: await logFor(r) });
+        // An unrelated run can complete before the probe's own run starts: stop only once a
+        // run naming the probe's issue (or an ambiguity) is in hand.
+        if (selectRun(seen, created.number, created.title).kind !== 'none') break;
+      }
       if (!budgetLeft()) break;
       await sleep(intervalMs);
     }
@@ -633,10 +660,8 @@ export async function runRoutingE2eCore(
     }
     const runs = listing.runs;
     const candidates = [];
-    for (const r of runs) {
-      candidates.push({ run: r, log: r.id !== undefined && r.status === 'completed' ? await deps.readRunLog(repo, r.id) : null });
-    }
-    const picked = selectRun(candidates, created.number);
+    for (const r of runs) candidates.push({ run: r, log: await logFor(r) });
+    const picked = selectRun(candidates, created.number, created.title);
     const run: RoutingE2eRouterRun = picked.kind === 'one' ? picked.run : { found: picked.kind === 'ambiguous', conclusion: null, status: null, url: null };
     const runLog = picked.kind === 'one' ? picked.log : null;
     const recv = deps.readReceiverLog
@@ -855,6 +880,7 @@ async function resolveE2eDepsFromRegistry(
       listRouterRuns: createRouterRunLister(token),
       readRunLog: createRunLogReader(token),
       postMention: createMentionPoster(token),
+      readIssueTitle: createIssueTitleReader(token),
       readReceiverLog: async (label) => {
         // Identity-derived, never scanned: <state>/macf/<project>@<routing label>/channel.log
         // (the routing-table KEY, the same derivation the launcher bakes into MACF_LOG_PATH).

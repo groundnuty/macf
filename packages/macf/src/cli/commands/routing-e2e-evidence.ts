@@ -81,7 +81,7 @@ export function extractErrorLines(log: string): readonly string[] {
 /** The routed line naming the recipient, or null. */
 export function findRoutedLine(log: string, recipient: string): string | null {
   const re = new RegExp(
-    `Routed (?:issue|mention|pr|pull request|review)\\b[^\\n]*?\\bto ${escapeRe(recipient)}\\b[^\\n]*`,
+    `Routed (?:issue|mention|pr|pull request|review)\\b[^\\n]*?\\bto ${escapeRe(recipient)}(?![\\w-])[^\\n]*`,
     'i',
   );
   const m = re.exec(log);
@@ -152,15 +152,26 @@ export type RunSelection<R> =
  * used as-is. Several: only those whose log names the probe's issue; exactly
  * one survivor is used, zero or several is ambiguous — never a guess.
  */
-export function selectRun<R>(
+export function selectRun<R extends { readonly title?: string }>(
   candidates: readonly { readonly run: R; readonly log: TextRead | null }[],
   issue: number,
+  probeTitle?: string,
 ): RunSelection<R> {
-  if (candidates.length === 0) return { kind: 'none' };
-  if (candidates.length === 1 && candidates[0]) return { kind: 'one', ...candidates[0] };
-  const named = candidates.filter((c) => c.log?.kind === 'ok' && logNamesIssue(c.log.text, issue));
+  let pool = candidates;
+  if (probeTitle !== undefined) {
+    // A run's display_title is its triggering issue's title on EVERY run, including ones
+    // that fail before routing or skip as a self-route (their logs name no issue). A
+    // titled run with another title is never the probe's, however few candidates there are.
+    const untitled = candidates.filter((c) => c.run.title === undefined);
+    const mine = candidates.filter((c) => c.run.title === probeTitle);
+    if (untitled.length === 0 && mine.length === 0) return { kind: 'none' };
+    pool = [...mine, ...untitled];
+  }
+  if (pool.length === 0) return { kind: 'none' };
+  if (pool.length === 1 && pool[0]) return { kind: 'one', ...pool[0] };
+  const named = pool.filter((c) => c.log?.kind === 'ok' && logNamesIssue(c.log.text, issue));
   if (named.length === 1 && named[0]) return { kind: 'one', ...named[0] };
-  return { kind: 'ambiguous', count: candidates.length };
+  return { kind: 'ambiguous', count: pool.length };
 }
 
 export function judgeEvidence(i: EvidenceInput): EvidenceVerdictResult {
