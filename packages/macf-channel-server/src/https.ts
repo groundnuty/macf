@@ -312,6 +312,13 @@ export function createHttpsServer(config: {
    */
   readonly agentCard?: unknown;
   /**
+   * Builds the AgentCard from the port the server actually bound. Use this
+   * when the port is assigned at bind time (config port 0), so the card's
+   * advertised URL names the bound port. Built once on first request and
+   * kept for the process lifetime. Takes precedence over `agentCard`.
+   */
+  readonly agentCardFor?: (boundPort: number) => unknown;
+  /**
    * A2A v1.0 inbound task store for `message/send` JSON-RPC handling
    * at `/a2a/v1` (groundnuty/macf#390 Phase 2a). Optional — pre-#390
    * channel-servers skip the route and return 404.
@@ -375,7 +382,7 @@ export function createHttpsServer(config: {
    */
   readonly instanceId?: string;
 }): HttpsServer {
-  const { onNotify, onHealth, onSign, agentCard, taskStore, inbox, logger, recordLedgerEdge, selfAgentName, routingLabel, instanceId } = config;
+  const { onNotify, onHealth, onSign, agentCard: staticAgentCard, agentCardFor, taskStore, inbox, logger, recordLedgerEdge, selfAgentName, routingLabel, instanceId } = config;
 
   const tlsOptions = {
     key: readFileSync(config.agentKeyPath),
@@ -391,6 +398,19 @@ export function createHttpsServer(config: {
   };
 
   let server: NodeHttpsServer | undefined;
+  let builtAgentCard: unknown;
+
+  // The card names the bound port, so it cannot be built before listen when
+  // the port is assigned at bind time. Build on first use, then keep it.
+  function resolveAgentCard(): unknown {
+    if (agentCardFor === undefined) return staticAgentCard;
+    if (builtAgentCard === undefined) {
+      const addr = server?.address();
+      if (addr === null || addr === undefined || typeof addr === 'string') return undefined;
+      builtAgentCard = agentCardFor(addr.port);
+    }
+    return builtAgentCard;
+  }
 
   async function handleRequest(
     req: import('node:http').IncomingMessage,
@@ -453,6 +473,7 @@ export function createHttpsServer(config: {
     // worth tracking — Phase 2+ may add a separate unauthenticated
     // discovery surface if external A2A clients need it.
     if (method === 'GET' && url === '/.well-known/agent-card.json') {
+      const agentCard = resolveAgentCard();
       if (agentCard === undefined) {
         // Channel-server config didn't pass an AgentCard. Return 404
         // (route-not-found path), same as any unhandled URL.
