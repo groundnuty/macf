@@ -21,6 +21,7 @@
  * never `credentials`.
  */
 import { evaluateCallerRoutingForm } from '../bootstrap/router-caller-secrets.js';
+import { runnerInputDrift } from '../bootstrap/control-repo-runner.js';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { execFile } from 'node:child_process';
@@ -28,7 +29,7 @@ import { promisify } from 'node:util';
 import { createInterface } from 'node:readline';
 import { join, resolve as resolvePath } from 'node:path';
 import type { FleetManifest } from '../bootstrap/fleet-manifest.js';
-import { deriveAppHandle, deriveControlRepoName, parseFleetManifest } from '../bootstrap/fleet-manifest.js';
+import { controlRepoSelfHosted, deriveAppHandle, deriveControlRepoName, parseFleetManifest } from '../bootstrap/fleet-manifest.js';
 import type { FleetObserverFn, FleetPlan, FleetPlanFailure, ObservedState, OperatorInteractionBound, Presence, UnimplementedApplyItem } from '../bootstrap/plan.js';
 import { computeInstallScopeCoverage, formatInstallScopeCoverageLines, hasInstallScopeCoverageDrift, installScopeCoverageEntryToJson } from '../bootstrap/install-scope-coverage.js';
 import type { InstallScopeCoverageEntry, InstallScopeCoverageTarget } from '../bootstrap/install-scope-coverage.js';
@@ -1292,17 +1293,23 @@ export function callerSecretRewritesFromObserved(manifest: FleetManifest, observ
   const out: Record<string, boolean> = {};
   for (const agent of manifest.agents) {
     const verdict = evaluateCallerRoutingForm(observed.agents[agent.role]?.callerSecrets, observed.routingSecretRepos?.[agent.repo], selfHosted, observed.orgSecretRepos?.[agent.repo], agent.repo.split('/')[0]);
-    out[agent.role] = verdict.status === 'incomplete' && verdict.callerRewriteFixes;
+    const obs = observed.agents[agent.role];
+    out[agent.role] =
+      (verdict.status === 'incomplete' && verdict.callerRewriteFixes) ||
+      runnerInputDrift(selfHosted, obs?.callerSecrets !== undefined, obs?.callerRunsOn);
   }
   return out;
 }
 
-/** Whether the control repo's router caller must be rewritten (it runs hosted — no runner declared). */
+/** Whether the control repo's router caller must be rewritten (secrets gap, or the runner input drifted from the declaration). */
 export function controlCallerSecretRewriteFromObserved(manifest: FleetManifest, observed: ObservedState): boolean {
   if (observed.controlRepoPresence !== 'present') return false;
   const repo = `${manifest.owner.account}/${deriveControlRepoName(manifest.metadata.name)}`;
-  const v = evaluateCallerRoutingForm(observed.controlRepoCallerSecrets, observed.routingSecretRepos?.[repo], false, observed.orgSecretRepos?.[repo], manifest.owner.account);
-  return v.status === 'incomplete' && v.callerRewriteFixes;
+  const v = evaluateCallerRoutingForm(observed.controlRepoCallerSecrets, observed.routingSecretRepos?.[repo], controlRepoSelfHosted(manifest), observed.orgSecretRepos?.[repo], manifest.owner.account);
+  return (
+    (v.status === 'incomplete' && v.callerRewriteFixes) ||
+    runnerInputDrift(controlRepoSelfHosted(manifest), observed.controlRepoCallerReadable === true, observed.controlRepoRunnerRunsOn)
+  );
 }
 
 /**

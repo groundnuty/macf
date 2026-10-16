@@ -3642,6 +3642,45 @@ agents:
         expect(result.routing['groundnuty/demo-code']?.status).toBe('created');
       });
 
+      // --- groundnuty/macf#1446 — the control repo joins the SAME provisioning
+      // loop + trusted-actors writer, only when the manifest opts it in.
+      for (const declared of [true, false]) {
+        it(`#1446 control repo ${declared ? 'DECLARED self-hosted: is provisioned AND gets MACF_TRUSTED_ACTORS' : 'NOT declared: is never provisioned and gets no trusted-actors write'}`, async () => {
+          const manifestPath = manifestPathIn();
+          const manifest: FleetManifest = {
+            ...manifestWith([CODE_AGENT]),
+            routing: { runner: { runs_on: 'self-hosted', warm: 1 }, ...(declared ? { control_repo_runs_on: 'self-hosted' as const } : {}) },
+          };
+          const provisioned: string[] = [];
+          const written: string[] = [];
+          const base = trustDepsFor({ checkRunnerUsableByRepo: async () => ({ presence: 'present' }) });
+          const deps: FleetApplyDeps = {
+            ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+            trustDeps: {
+              ...base,
+              createRepoVariable: async (repo: string, name: string, value: string) => {
+                if (name === 'MACF_TRUSTED_ACTORS') written.push(repo);
+                return base.createRepoVariable(repo, name, value);
+              },
+            },
+            runnerPlatformEndpoint: 'http://fake-runner-platform:8088',
+            runnerPlatformFetch: (async (_url: string | URL, init?: RequestInit) => {
+              provisioned.push((JSON.parse(String(init?.body)) as { repo: string }).repo);
+              return new Response(JSON.stringify({ ok: true, applied: [] }), { status: 200 });
+            }) as typeof fetch,
+          };
+          await applyFleet(manifest, manifestPath, null, deps);
+          const control = 'groundnuty/demo-fleet-control';
+          if (declared) {
+            expect(provisioned.sort()).toEqual(['groundnuty/demo-code', control].sort());
+            expect(written).toContain(control);
+          } else {
+            expect(provisioned).toEqual(['groundnuty/demo-code']);
+            expect(written).not.toContain(control);
+          }
+        });
+      }
+
       it('DECISIVE run-2: a REUSED runner-ops outcome still POSTs WITH credentials, sourced from the vault-backed resolveKeyPath fallback (groundnuty/macf#943 follow-up — the run-2 credential-less-POST regression)', async () => {
         const manifestPath = manifestPathIn();
         const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };

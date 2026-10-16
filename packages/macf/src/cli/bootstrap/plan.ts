@@ -133,7 +133,8 @@ import { toVariableSegment } from '@groundnuty/macf-core';
 import type { FleetAgent, FleetLock, FleetManifest } from './fleet-manifest.js';
 import { effectiveFleetFingerprints } from './fleet-manifest.js';
 import { secretFingerprint } from './fleet-lock.js';
-import { buildTrustedActorsValue, deriveAppHandle, deriveControlRepoName, routerCarryingRepos } from './fleet-manifest.js';
+import { controlRepoRunnerItem } from './control-repo-runner.js';
+import { buildTrustedActorsValue, controlRepoSelfHosted, deriveAppHandle, deriveControlRepoName, routerCarryingRepos } from './fleet-manifest.js';
 import { formatTable } from '../commands/ps.js';
 import type { VaultAgentObservation, VaultCaObservation, VaultRecipientsObservation, VaultRouterAppObservation, VaultTsOauthObservation } from './vault-read.js';
 import { countVaultAgentPresence, countVaultCaPresence } from './vault-read.js';
@@ -314,6 +315,8 @@ export interface ObservedAgentState {
    * match). See `router-caller-secrets.ts`.
    */
   readonly callerSecrets?: CallerSecrets;
+  /** The installed caller's `runner-runs-on:` value (same single read); `undefined` = unreadable OR no such input. */
+  readonly callerRunsOn?: string;
   /**
    * groundnuty/macf#1425 (silent-fallback-hazards.md Instance 18) — the
    * agent-role KEYS present in this repo's committed
@@ -472,6 +475,13 @@ export interface ObservedState {
   readonly orgSecretRepos?: Readonly<Record<string, RepoSecretNamesObservation>>;
   /** What the CONTROL repo's installed router caller passes under `secrets:` (sibling of `agents[role].callerSecrets`). */
   readonly controlRepoCallerSecrets?: CallerSecrets;
+  /** groundnuty/macf#1446 — control-repo runner observations; present ONLY when the manifest declares `routing.control_repo_runs_on`. */
+  readonly controlRepoRunnerRunsOn?: string;
+  readonly controlRepoCallerReadable?: boolean;
+  readonly controlRepoTrustedActors?: string;
+  readonly controlRepoRunnerRegistered?: Presence;
+  readonly controlRepoRunnerHandover?: string;
+  readonly controlRepoRunnerDetail?: string;
   /**
    * Vault-derived per-project CA key/cert presence (DR-043 Amendment D phase
    * 3) — same undefined-vs-observed convention as {@link ObservedAgentState.vault}.
@@ -1649,8 +1659,18 @@ function routerCallerSecretsItem(
   } else if (verdict.notPassedByCaller.length > 0) {
     parts.push(`the caller (.github/workflows/agent-router.yml) does not pass ${verdict.notPassedByCaller.join(', ')}`);
   }
-  if (verdict.missingFromRepo.length > 0) {
-    parts.push(`the repo has no secret named ${verdict.missingFromRepo.join(', ')}`);
+  const withheld = verdict.orgWithheld ?? [];
+  const trulyMissing = verdict.missingFromRepo.filter((n) => !withheld.includes(n));
+  if (withheld.length > 0) {
+    parts.push(
+      `the org secret${withheld.length > 1 ? 's' : ''} ${withheld.join(', ')} ${withheld.length > 1 ? 'do' : 'does'} not reach ${repo}: organisation secrets are not available to private repositories on the free plan — ` +
+        (withheld.every((n) => n === 'TS_OAUTH_CLIENT_ID' || n === 'TS_OAUTH_SECRET')
+          ? `set ${withheld.length > 1 ? 'them' : 'it'} as repository secrets, or route this repo self-hosted (a self-hosted runner needs no Tailscale pair)`
+          : `set ${withheld.length > 1 ? 'them' : 'it'} as repository secrets — routing self-hosted would not help, since only the Tailscale pair is optional there`),
+    );
+  }
+  if (trulyMissing.length > 0) {
+    parts.push(`the repo has no secret named ${trulyMissing.join(', ')}`);
   }
   return {
     kind: 'router_caller_secrets',
@@ -3075,8 +3095,9 @@ export function computePlan(
   }
 
   // The control repo carries a router too (every agent App is installed
-  // there; its routing table lists the whole fleet), and its caller never
-  // declares a runner — so it runs hosted and needs the Tailscale pair.
+  // there; its routing table lists the whole fleet). Its caller declares a
+  // runner only when the manifest opts in (routing.control_repo_runs_on,
+  // #1446) — otherwise it runs hosted and needs the Tailscale pair.
   if (observed.controlRepoPresence === 'present') {
     const controlRepo = routerCarryingRepos(manifest).at(-1)!;
     items.push(
@@ -3086,9 +3107,23 @@ export function computePlan(
         observed.controlRepoCallerSecrets,
         observed.routingSecretRepos?.[controlRepo],
         observed.orgSecretRepos?.[controlRepo],
-        false,
+        controlRepoSelfHosted(manifest),
       ),
     );
+    // groundnuty/macf#1446 — the control repo's runner class, explicit, only
+    // when the manifest opts it in (no row at all otherwise).
+    if (controlRepoSelfHosted(manifest)) {
+      items.push(
+        controlRepoRunnerItem(fleetName, controlRepo, buildTrustedActorsValue(fleetName, manifest.agents), {
+          callerRunsOn: observed.controlRepoRunnerRunsOn,
+          callerReadable: observed.controlRepoCallerReadable ?? false,
+          trustedActors: observed.controlRepoTrustedActors,
+          runnerPresence: observed.controlRepoRunnerRegistered,
+          runnerHandover: observed.controlRepoRunnerHandover,
+          runnerDetail: observed.controlRepoRunnerDetail,
+        }),
+      );
+    }
   }
 
   items.push(caRegistryItem(seg, observed.caRegistry, observed.vaultCa));

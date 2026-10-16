@@ -4,6 +4,7 @@ import { generateWorkflow } from '../../../src/cli/commands/repo-init.js';
 import { extractCallerSecrets, evaluateCallerRoutingForm } from '../../../src/cli/bootstrap/router-caller-secrets.js';
 import { computePlan, type ObservedState, type PlanItem } from '../../../src/cli/bootstrap/plan.js';
 import type { FleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
+import { classifyOrgSecretReach } from '../../../src/cli/bootstrap/observer.js';
 import { callerSecretRewritesFromObserved, controlCallerSecretRewriteFromObserved } from '../../../src/cli/commands/bootstrap-apply.js';
 
 const FOUR = ['MACF_ROUTING_APP_ID', 'MACF_ROUTING_APP_KEY', 'ROUTING_CLIENT_CERT', 'ROUTING_CLIENT_KEY'];
@@ -38,6 +39,8 @@ function observed(callerYaml: string | undefined, secrets: readonly string[] | '
         app: 'present', appId: '1', install: 'present', installId: '2', repo: 'present', fingerprints: {},
         agentConfigRoles: ['code-agent'],
         callerSecrets: callerYaml === undefined ? undefined : extractCallerSecrets(callerYaml),
+        // Fixtures model a caller that already passes the declared runner class (#1446 drift is tested in control-repo-runner.test.ts).
+        ...(callerYaml === undefined ? {} : { callerRunsOn: 'self-hosted' }),
       },
     },
     caRegistry: 'present',
@@ -225,5 +228,56 @@ describe('evaluateCallerRoutingForm', () => {
       orgSecretRepos: { ...o.orgSecretRepos, 'macf-experiment/demo-control': { status: 'confirmed', names: new Set(TS) } },
     };
     expect(controlCallerSecretRewriteFromObserved(m, c)).toBe(true);
+  });
+});
+
+describe('org secrets reach a repo only if the repo can receive them (#1451)', () => {
+  const REPO = 'groundnuty/demo-code';
+  const caller = generateWorkflow('v3.5.0', V3);
+  function planRow(
+    repoNames: readonly string[],
+    visibility: string,
+    plan: string | undefined,
+    orgNames: readonly string[] = TS,
+  ): { r: PlanItem; o: ObservedState } {
+    const base = observed(caller, repoNames);
+    const o: ObservedState = {
+      ...base,
+      orgSecretRepos: { [REPO]: classifyOrgSecretReach(new Set(orgNames), visibility, plan, REPO) },
+    };
+    return { r: row(computePlan(manifest(false), o).items), o };
+  }
+
+  it('private + free + pair only at org level → update, says the org secret does not reach the repo; no rewrite flagged', () => {
+    const { r, o } = planRow(FOUR, 'private', 'free');
+    expect(r.verb).toBe('update');
+    expect(r.reason).toContain('the org secrets TS_OAUTH_CLIENT_ID, TS_OAUTH_SECRET do not reach groundnuty/demo-code');
+    expect(r.reason).toContain('organisation secrets are not available to private repositories on the free plan');
+    expect(r.reason).toContain('set them as repository secrets, or route this repo self-hosted (a self-hosted runner needs no Tailscale pair)');
+    expect(r.reason).not.toContain('the repo has no secret named');
+    expect(callerSecretRewritesFromObserved(manifest(false), o)).toEqual({ 'code-agent': false });
+  });
+  it('private + free + a NON-Tailscale secret only at org level → the self-hosted remedy is NOT offered', () => {
+    const repo = [...TS, ...FOUR.filter((n) => n !== 'ROUTING_CLIENT_CERT')];
+    const { r } = planRow(repo, 'private', 'free', ['ROUTING_CLIENT_CERT']);
+    expect(r.verb).toBe('update');
+    expect(r.reason).toContain('the org secret ROUTING_CLIENT_CERT does not reach groundnuty/demo-code');
+    expect(r.reason).toContain('routing self-hosted would not help');
+    expect(r.reason).not.toContain('or route this repo self-hosted');
+  });
+  it('private + free + pair at repo level → noop', () => {
+    expect(planRow([...FOUR, ...TS], 'private', 'free').r.verb).toBe('noop');
+  });
+  it('public + free + org-only → noop', () => {
+    expect(planRow(FOUR, 'public', 'free').r.verb).toBe('noop');
+  });
+  it('private + plan absent (App token) → create, LOW CONFIDENCE, never noop', () => {
+    const { r } = planRow(FOUR, 'private', undefined);
+    expect(r.verb).toBe('create');
+    expect(r.reason).toContain('LOW CONFIDENCE');
+    expect(r.reason).toContain('org plan could not be read');
+  });
+  it('private + paid plan (team) + org-only → noop', () => {
+    expect(planRow(FOUR, 'private', 'team').r.verb).toBe('noop');
   });
 });

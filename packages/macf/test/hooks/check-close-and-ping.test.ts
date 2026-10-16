@@ -322,6 +322,83 @@ describe('check-close-and-ping.sh (hook)', () => {
     });
   });
 
+  describe('multi-line commands — target comes from the close line only (#1453)', () => {
+    it('queries the timeline of the issue after `close`, not an earlier #N line', () => {
+      const r = runHook({
+        command: [
+          'gh pr view 1449 --repo groundnuty/macf',
+          'echo "  #1449: merged"',
+          'gh issue close 1448 --repo groundnuty/macf --comment "done"',
+        ].join('\n'),
+        // Only 1448's timeline is stubbed; a lookup of 1449 would hit the stub's no-stub error.
+        stubGh: {
+          'repos/groundnuty/macf/issues/1448/timeline': {
+            xrefs: [{ number: 9, repo: 'groundnuty/macf', state: 'open' }],
+          },
+        },
+      });
+      expect(parseAdditionalContext(r.stdout) ?? '').toContain('#1448');
+    });
+
+    it('a quoted --comment holding a literal newline BEFORE the number still resolves (Codex)', () => {
+      const r = runHook({
+        command: 'gh issue close --comment "done\nverified" 42 --repo o/r',
+        stubGh: { 'repos/o/r/issues/42/timeline': { xrefs: [{ number: 9, repo: 'o/r', state: 'open' }] } },
+      });
+      expect(parseAdditionalContext(r.stdout) ?? '').toContain('#9');
+    });
+
+    it('numbers inside a --comment value are never the target', () => {
+      const r = runHook({
+        command: 'gh issue close 7 --comment "see #1449 and 88" --repo groundnuty/macf',
+        stubGh: { 'repos/groundnuty/macf/issues/7/timeline': { xrefs: [{ number: 9, repo: 'groundnuty/macf', state: 'open' }] } },
+      });
+      expect(parseAdditionalContext(r.stdout) ?? '').toContain('#7');
+    });
+
+    it('stops at `&&`: a later command\'s number and --repo are never read', () => {
+      const r = runHook({
+        command: 'gh issue close 7 --repo groundnuty/macf && gh pr view 99 --repo other/repo',
+        stubGh: { 'repos/groundnuty/macf/issues/7/timeline': { xrefs: [{ number: 9, repo: 'groundnuty/macf', state: 'open' }] } },
+      });
+      expect(parseAdditionalContext(r.stdout) ?? '').toContain('#7');
+    });
+
+    describe('shell-wrapper boundary: the wrapper quote ends the invocation (Codex)', () => {
+      const stub = (n: number): StubMap => ({
+        [`repos/o/r/issues/${n}/timeline`]: { xrefs: [{ number: 9, repo: 'o/r', state: 'open' }] },
+      });
+      it("`bash -c '<close> 42 --repo o/r' && echo done` → 42 in o/r", () => {
+        const r = runHook({
+          command: "bash -c 'gh issue close 42 --repo o/r' && echo done",
+          stubGh: stub(42),
+        });
+        expect(parseAdditionalContext(r.stdout) ?? '').toContain('#42');
+      });
+      it('same with double quotes', () => {
+        const r = runHook({
+          command: 'bash -c "gh issue close 42 --repo o/r" && echo done',
+          stubGh: stub(42),
+        });
+        expect(parseAdditionalContext(r.stdout) ?? '').toContain('#42');
+      });
+      it('`sh -lc "…--comment \\"x && y\\"" ; echo z` → 7', () => {
+        const r = runHook({
+          command: 'sh -lc "gh issue close 7 --repo o/r --comment \\"x && y\\"" ; echo z',
+          stubGh: stub(7),
+        });
+        expect(parseAdditionalContext(r.stdout) ?? '').toContain('#7');
+      });
+      it("a close AFTER an unrelated wrapper (`bash -c 'echo hello' && <close> 42`) is still found (Codex)", () => {
+        const r = runHook({
+          command: "bash -c 'echo hello' && gh issue close 42 --repo o/r",
+          stubGh: stub(42),
+        });
+        expect(parseAdditionalContext(r.stdout) ?? '').toContain('#42');
+      });
+    });
+  });
+
   describe('wrapper / subshell bypass coverage (mirrors check-close-condition.sh)', () => {
     const XREFS = { xrefs: [{ number: 789, repo: 'groundnuty/macf', state: 'open' as const }] };
 

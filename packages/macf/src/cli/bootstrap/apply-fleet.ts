@@ -208,7 +208,7 @@ import { dirname, join } from 'node:path';
 import { caCertFingerprint } from '@groundnuty/macf-core';
 import type { TokenSource } from '@groundnuty/macf-core';
 import type { FleetAgent, FleetLock, FleetLockAgent, FleetManifest } from './fleet-manifest.js';
-import { buildTrustedActorsValue, deriveAppHandle, deriveControlRepoName, effectiveFleetFingerprints } from './fleet-manifest.js';
+import { buildTrustedActorsValue, controlRepoSelfHosted, deriveAppHandle, deriveControlRepoName, effectiveFleetFingerprints } from './fleet-manifest.js';
 import type { AgentApplyDeps, AgentApplyOutcome, InstallRejection } from './apply-agent.js';
 import { applyAgentIdentity, applyIdentity, cleanupScratchPem, writeScratchPem } from './apply-agent.js';
 import type { Presence } from './plan.js';
@@ -2040,6 +2040,12 @@ export async function applyFleet(
   // attempted at all, matching `routing`'s own empty-`{}`-when-not-declared
   // convention (see `FleetApplyResult.runnerProvision`'s doc).
   const runnerProvisionResults: Record<string, RunnerPlatformResult> = {};
+  // groundnuty/macf#1446 — the repos that get a runner + MACF_TRUSTED_ACTORS:
+  // every confirmed agent repo, plus the control repo when (and only when) the
+  // manifest opts it in AND it actually carries the router this run. The SAME
+  // loop and writer agent repos use — no second path. Never in
+  // `justCreatedRepos` (the control repo is made at Step 0.5, long before).
+  const runnerRepos: readonly string[] = controlRepoSelfHosted(manifest) ? routerCarryingRepos : confirmedRepos;
   // A repo this run successfully told the contract to provision — excluded
   // from `justCreatedRepos`'s fast single-check path below (macf#972's own
   // doc predicted this: "at which point a fresh repo's poll becomes
@@ -2106,7 +2112,7 @@ export async function applyFleet(
     }
     const declaredLabels = manifest.routing.runner.labels;
     const warm = manifest.routing.runner.warm;
-    for (const repo of confirmedRepos) {
+    for (const repo of runnerRepos) {
       const result = await provisionRunner(runnerPlatformDeps, {
         repo,
         ...(declaredLabels !== undefined ? { labels: declaredLabels } : {}),
@@ -2869,7 +2875,7 @@ export async function applyFleet(
   // `justProvisionedRepos` parameter, which is correctly left unpassed here
   // (no repo in `nonProvisionedRepos` can ever be a member of that set by
   // construction).
-  const nonProvisionedRepos = confirmedRepos.filter((repo) => !provisionedNowRepos.has(repo));
+  const nonProvisionedRepos = runnerRepos.filter((repo) => !provisionedNowRepos.has(repo));
   const routingRest =
     manifest.routing?.runner !== undefined && manifest.routing.runner.runs_on === 'self-hosted'
       ? await publishTrustedActorsGated(
