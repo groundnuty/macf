@@ -42,17 +42,16 @@
 #      never a hardcoded role list, since fleets choose their own role
 #      names) AND it differs from the acting agent's own routing label.
 #   3. assignee label CONFIRMED naming the ACTING agent itself → BLOCK.
-#      route-by-label "delivers" this to whoever filed it — a no-op — so
-#      a mention is the only real path to anyone else. This is the
-#      failure this hook exists to catch: an issue self-labeled by its
-#      filer got reported as successfully routed (to the filer) while a
-#      blocking design question inside it sat unanswered for several
-#      minutes, because nothing else pointed at the peer who needed to
-#      see it. "Delivered to the person who wrote it" reads identically
-#      to "successfully routed" unless something asserts WHO it reached —
-#      same silent-fallback shape as Instance 12 in this framework's
-#      hazard catalog (a defense that validates a narrower surface than
-#      the rule it enforces).
+#      The router skips a label applied by the agent it names, so the
+#      issue routes to no one. This is the failure this hook exists to
+#      catch: an issue self-labeled by its filer sat unanswered while a
+#      blocking design question inside it waited on a peer who never saw
+#      it. A mention in a NEW issue's body cannot rescue it: the router
+#      runs route-by-mention only for issue_comment, pull_request and
+#      pull_request_review events, never for a new issue's body, so for
+#      the issue-create form cases 3 and 4 block even when the body
+#      carries a mention. (For a PR create a body mention does route, so
+#      there a mention still satisfies the check.)
 #   4. anything else — no labels at all; labels that don't match the
 #      registry; a registry match the hook can't confirm as self or peer
 #      (`$MACF_ROUTING_LABEL` unset) → BLOCK on `gh issue create`; ALLOW on
@@ -155,6 +154,24 @@ fi
 IS_PR_CREATE=false
 if [[ "$COMMAND" =~ gh[[:space:]]+pr[[:space:]]+create ]]; then
   IS_PR_CREATE=true
+fi
+
+# A chained PR create followed by an issue or PR comment must still check
+# the comment segment: the PR-create exemption below covers only the PR
+# create. CHAIN_COMMENT_TAIL holds the command text from the first chained
+# comment onward (empty when there is none). A comment counts only when it
+# starts a segment (command start, or after ; | & or a newline), so prose in
+# a PR body that names the command does not trigger it.
+HAS_ISSUE_CREATE=false
+if [[ "$COMMAND" =~ gh[[:space:]]+issue[[:space:]]+create ]]; then
+  HAS_ISSUE_CREATE=true
+fi
+CHAIN_COMMENT_TAIL=""
+if [[ "$IS_PR_CREATE" == "true" ]] && [[ "$HAS_ISSUE_CREATE" == "false" ]]; then
+  CHAIN_COMMENT_PATTERN='(^|[;|&]|'$'\n'')[[:space:]]*(sudo[[:space:]]+|env[[:space:]]+([A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+)*|[A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+)*gh[[:space:]]+(issue|pr)[[:space:]]+comment([[:space:]]|$)'
+  if [[ "$COMMAND" =~ $CHAIN_COMMENT_PATTERN ]]; then
+    CHAIN_COMMENT_TAIL="${COMMAND#"${COMMAND%%"${BASH_REMATCH[0]}"*}"}"
+  fi
 fi
 
 # Extracts every --label/-l VALUE (comma-split, one wrapping-quote layer
@@ -274,33 +291,54 @@ fi
 # one in cases 3 and 4 (see above); every other subcommand this hook guards
 # (comment) is unchanged — always applies.
 CHECK_A_APPLIES=true
+ISSUE_CREATE_UNROUTED=false
 if [[ "$IS_CLOSE_SUBCOMMAND" == "true" ]]; then
   CHECK_A_APPLIES=false
+elif [[ "$HAS_ISSUE_CREATE" == "true" ]]; then
+  # A new issue routes only by its label (route-by-label); a mention in its
+  # body is never delivered. Unless the label is `backlog` or confirmed for
+  # another agent, the issue reaches no one, with or without a mention.
+  CHECK_A_APPLIES=false
+  if [[ "$CREATE_HAS_BACKLOG_LABEL" != "true" ]] && [[ "$CREATE_CONFIRMED_PEER_LABEL" != "true" ]]; then
+    ISSUE_CREATE_UNROUTED=true
+  fi
 elif [[ "$IS_CREATE_SUBCOMMAND" == "true" ]]; then
+  # PR create only. A PR body mention does route (pull_request event).
   if [[ "$CREATE_HAS_BACKLOG_LABEL" == "true" ]]; then
-    CHECK_A_APPLIES=false  # case 1: backlog — declared, deliberately unrouted
+    CHECK_A_APPLIES=false
   elif [[ "$CREATE_CONFIRMED_PEER_LABEL" == "true" ]]; then
-    CHECK_A_APPLIES=false  # case 2: confirmed routed to a different agent
+    CHECK_A_APPLIES=false
   elif [[ "$CREATE_CONFIRMED_SELF_LABEL" == "true" ]]; then
-    CHECK_A_APPLIES=true   # case 3: confirmed self-label — blocks for BOTH
-                            # issue and PR creates (route-by-label really is
-                            # a no-op either way)
-  elif [[ "$IS_PR_CREATE" == "true" ]]; then
-    # Case 4 does NOT extend to `gh pr create`. A PR isn't ambiguous the
-    # way an issue is: it has no "backlog" concept, and its actual routing
-    # signal is the pull_request_review state-change event
-    # (route-by-pr-review-state) plus a separately-mentioned issue
-    # comment — NOT the PR body (pr-discipline.md). agent-identity.md's
-    # canonical "Finishing Work" flow creates every PR unlabeled with
-    # `--body "Refs #<N>"` and no mention; blocking that here would break
-    # every PR the fleet creates, and the override can't fix it mid-session
-    # (MACF_SKIP_MENTION_CHECK is launch-time-only per this hook's own
-    # message below) — an unrecoverable-until-relaunch failure mode far
-    # worse than the gap this fix closes. So case 4 blocks only
-    # `gh issue create`.
+    CHECK_A_APPLIES=true
+  else
+    # Case 4 does not extend to a PR: an unlabeled `--body "Refs #N"` is
+    # the canonical PR call, its routing signal is the review state, and
+    # blocking it cannot be recovered mid-session.
     CHECK_A_APPLIES=false
   fi
-  # else: case 4 on `gh issue create` — stays true (block)
+  # A chained comment is a separate segment and always needs a mention.
+  if [[ -n "$CHAIN_COMMENT_TAIL" ]]; then
+    CHECK_A_APPLIES=true
+  fi
+fi
+
+if [[ "$ISSUE_CREATE_UNROUTED" == "true" ]]; then
+  if [[ "$CREATE_CONFIRMED_SELF_LABEL" == "true" ]]; then
+    UNROUTED_NOTE="The router skips a label applied by the agent it names, so this issue reaches no one."
+  else
+    UNROUTED_NOTE="A new issue is routed only by its label, and this one has no label for another agent."
+  fi
+  cat >&2 <<ERR
+BLOCKED by MACF mention-routing-hygiene hook: $UNROUTED_NOTE
+A mention in a new issue's body is never delivered, because the router reads mentions only on comments and pull requests.
+
+Create it with a label for the agent who should act, or the "backlog" label
+if it is for later. To ping someone, post a comment with a mention after the
+issue exists.
+
+The override (MACF_SKIP_MENTION_CHECK=1) is operator-only and set at launch.
+ERR
+  exit 2
 fi
 
 # --body-file handling (groundnuty/macf#944).
@@ -642,6 +680,21 @@ AWK_OUTPUT="$(awk -v pat="$HANDLE_PATTERN" '
 OFFENDING="$(grep '^LEAK:' <<<"$AWK_OUTPUT" | sed 's/^LEAK://' || true)"
 ACTIVE_COUNT="$(grep '^ACTIVE_COUNT:' <<<"$AWK_OUTPUT" | sed 's/^ACTIVE_COUNT://' || true)"
 
+# Chained PR create plus comment: only the comment segment's mentions count
+# for Check A (a mention in the PR body does not reach the comment's reader).
+# Skipped in --body-file mode, where LINT_TARGET is file content, not the
+# command text.
+if [[ -n "$CHAIN_COMMENT_TAIL" ]] && [[ "$BODY_FILE_MODE" == "false" ]]; then
+  ACTIVE_COUNT="$(awk -v pat="$HANDLE_PATTERN" '
+    { l = $0; a = 0
+      while (match(l, pat)) {
+        s = a + RSTART; b = (s > 1) ? substr($0, s - 1, 1) : ""; c = substr($0, s + RLENGTH, 1)
+        if (!(b == "`" && c == "`")) n++
+        l = substr(l, RSTART + RLENGTH); a = s + RLENGTH - 1
+      } }
+    END { print n + 0 }' <<<"$CHAIN_COMMENT_TAIL")"
+fi
+
 if [[ -n "$OFFENDING" ]]; then
   cat >&2 <<ERR
 BLOCKED by MACF mention-routing-hygiene hook: this comment/issue/PR body
@@ -699,18 +752,15 @@ fi
 # though the automated guard for it doesn't currently scan shell scripts).
 if [[ "$CHECK_A_APPLIES" == "true" ]] && [[ "$ACTIVE_COUNT" == "0" ]]; then
   CREATE_NOTE=""
-  if [[ "$IS_CREATE_SUBCOMMAND" == "true" ]]; then
-    if [[ "$CREATE_CONFIRMED_SELF_LABEL" == "true" ]]; then
-      CREATE_NOTE="
-This issue or pull request is labeled for you, so routing delivers it to
-you and no one else will see it. Add a mention for whoever should read
-it, or the \"backlog\" label if it's for later."
-    else
-      CREATE_NOTE="
-This issue or pull request has no assignee label, so nothing will route
-it to anyone. Add an assignee label, a mention, or the \"backlog\" label
-if it's deliberately for later."
-    fi
+  if [[ -n "$CHAIN_COMMENT_TAIL" ]]; then
+    CREATE_NOTE="
+The comment later in this command has no mention. Add one for whoever
+should read it, because the PR create does not cover it."
+  elif [[ "$IS_CREATE_SUBCOMMAND" == "true" ]] && [[ "$CREATE_CONFIRMED_SELF_LABEL" == "true" ]]; then
+    CREATE_NOTE="
+The router skips a label applied by the agent it names, so the label on
+this pull request routes it to no one. Add a mention for whoever should
+read it."
   fi
   cat >&2 <<ERR
 BLOCKED by MACF mention-routing-hygiene hook: this comment/issue/PR body has

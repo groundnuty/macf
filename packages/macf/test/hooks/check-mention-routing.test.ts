@@ -772,7 +772,8 @@ describe('check-mention-routing.sh (hook)', () => {
         // else points at anyone who needs to see it.
         const r = runCreate('gh issue create --title "x" --label code-agent --body "no mention here"');
         expect(r.status).toBe(2);
-        expect(r.stderr).toContain('labeled for you');
+        expect(r.stderr).toContain('skips a label applied by the agent it names');
+        expect(r.stderr).not.toContain('routing delivers it to');
         expect(r.stderr).toContain('backlog');
       });
 
@@ -789,9 +790,8 @@ describe('check-mention-routing.sh (hook)', () => {
       it('case 4 — no labels at all, no mention → BLOCKED, message names all three remedies', () => {
         const r = runCreate('gh issue create --title "x" --body "no mention here"');
         expect(r.status).toBe(2);
-        expect(r.stderr).toContain('no assignee label');
-        expect(r.stderr).toContain('assignee label');
-        expect(r.stderr).toMatch(/mention/);
+        expect(r.stderr).toContain('routed only by its label');
+        expect(r.stderr).toContain('never delivered');
         expect(r.stderr).toContain('backlog');
       });
 
@@ -800,7 +800,7 @@ describe('check-mention-routing.sh (hook)', () => {
         // treated as evidence of a confirmed peer-routing decision.
         const r = runCreate('gh issue create --title "x" --label docs --body "no mention here"');
         expect(r.status).toBe(2);
-        expect(r.stderr).toContain('no assignee label');
+        expect(r.stderr).toContain('routed only by its label');
       });
 
       it('case 4 — assignee label present but self-identity unknown (MACF_ROUTING_LABEL unset) → BLOCKED', () => {
@@ -812,9 +812,32 @@ describe('check-mention-routing.sh (hook)', () => {
         expect(r.status).toBe(2);
       });
 
-      it('a mention satisfies Check A even on a self-labeled create (case 3 escape via mention, not backlog)', () => {
+      it('a body mention does NOT rescue a self-labeled issue create (the router never reads a new issue body)', () => {
         const r = runCreate(
           'gh issue create --title "x" --label code-agent --body "$(cat <<EOF\n@macf-science-agent[bot] please advise\nEOF\n)"',
+        );
+        expect(r.status).toBe(2);
+        expect(r.stderr).toContain('skips a label applied by the agent it names');
+      });
+
+      it('a body mention does NOT rescue an unlabeled issue create', () => {
+        const r = runCreate(
+          'gh issue create --title "x" --body "$(cat <<EOF\n@macf-science-agent[bot] please advise\nEOF\n)"',
+        );
+        expect(r.status).toBe(2);
+        expect(r.stderr).toContain('never delivered');
+      });
+
+      it('a peer label plus a body mention still passes', () => {
+        const r = runCreate(
+          'gh issue create --title "x" --label science-agent --body "$(cat <<EOF\n@macf-science-agent[bot] please advise\nEOF\n)"',
+        );
+        expect(r.status).toBe(0);
+      });
+
+      it('a backlog label plus a body mention still passes', () => {
+        const r = runCreate(
+          'gh issue create --title "x" --label backlog --body "$(cat <<EOF\n@macf-science-agent[bot] please advise\nEOF\n)"',
         );
         expect(r.status).toBe(0);
       });
@@ -837,17 +860,17 @@ describe('check-mention-routing.sh (hook)', () => {
         expect(r.stderr).toContain('describing-context');
       });
 
-      it('fires on a describing-leak in a self-labeled create', () => {
+      it('fires on a describing-leak in a self-labeled PR create', () => {
         const r = runCreate(
-          'gh issue create --title "x" --label code-agent --body "$(cat <<EOF\nThe @macf-tester-1-agent[bot] response was clean.\nEOF\n)"',
+          'gh pr create --title "x" --label code-agent --body "$(cat <<EOF\nThe @macf-tester-1-agent[bot] response was clean.\nEOF\n)"',
         );
         expect(r.status).toBe(2);
         expect(r.stderr).toContain('describing-context');
       });
 
-      it('fires on a describing-leak in a create with no labels at all', () => {
+      it('fires on a describing-leak in a PR create with no labels at all', () => {
         const r = runCreate(
-          'gh issue create --title "x" --body "$(cat <<EOF\nThe @macf-tester-1-agent[bot] response was clean.\nEOF\n)"',
+          'gh pr create --title "x" --body "$(cat <<EOF\nThe @macf-tester-1-agent[bot] response was clean.\nEOF\n)"',
         );
         expect(r.status).toBe(2);
         expect(r.stderr).toContain('describing-context');
@@ -858,7 +881,15 @@ describe('check-mention-routing.sh (hook)', () => {
       it('case 3 sister-case: self-labeled `gh pr create`, no mention → BLOCKED', () => {
         const r = runCreate('gh pr create --title "x" --label code-agent --body "Refs #1"');
         expect(r.status).toBe(2);
-        expect(r.stderr).toContain('labeled for you');
+        expect(r.stderr).toContain('skips a label applied by the agent it names');
+        expect(r.stderr).not.toContain('routing delivers it to');
+      });
+
+      it('a self-labeled `gh pr create` WITH a body mention is ALLOWED (a PR body mention routes)', () => {
+        const r = runCreate(
+          'gh pr create --title "x" --label code-agent --body "$(cat <<EOF\n@macf-science-agent[bot] ready\nEOF\n)"',
+        );
+        expect(r.status).toBe(0);
       });
 
       it('the canonical unlabeled `gh pr create --body "Refs #N"` shape (agent-identity.md) stays ALLOWED', () => {
@@ -879,6 +910,36 @@ describe('check-mention-routing.sh (hook)', () => {
 
       it('a peer-labeled `gh pr create` with no mention still ALLOWS (case 2 applies the same to PRs)', () => {
         const r = runCreate('gh pr create --title "x" --label science-agent --body "Refs #1"');
+        expect(r.status).toBe(0);
+      });
+    });
+
+
+    describe('chained `gh pr create` keeps the comment segment checked (groundnuty/macf#1475)', () => {
+      const PR = 'git push -u origin HEAD && gh pr create --title "x" --body "Refs #1"';
+
+      it('a chained comment with no mention is BLOCKED', () => {
+        const r = runCreate(`${PR} && gh issue comment 5 --body "PR is up."`);
+        expect(r.status).toBe(2);
+        expect(r.stderr).toContain('comment later in this command has no mention');
+      });
+
+      it('a mention inside the PR body does not satisfy the chained comment', () => {
+        const r = runCreate(
+          'gh pr create --title "x" --body "$(cat <<EOF\n@macf-science-agent[bot] ready\nEOF\n)" && gh issue comment 5 --body "PR is up."',
+        );
+        expect(r.status).toBe(2);
+      });
+
+      it('a chained comment WITH a mention passes', () => {
+        const r = runCreate(
+          `${PR} && gh issue comment 5 --body "$(cat <<EOF\n@macf-science-agent[bot] PR is ready.\nEOF\n)"`,
+        );
+        expect(r.status).toBe(0);
+      });
+
+      it('a lone unlabeled `gh pr create` is still ALLOWED', () => {
+        const r = runCreate(PR);
         expect(r.status).toBe(0);
       });
     });
@@ -915,11 +976,11 @@ describe('check-mention-routing.sh (hook)', () => {
         expect(r.status).toBe(2);
       });
 
-      it('resolves a readable --body-file for a self-labeled create WITH a mention → ALLOWED', () => {
+      it('a self-labeled issue create WITH a mention in a readable --body-file is still BLOCKED', () => {
         const file = join(dir, 'body.md');
         writeFileSync(file, '@macf-science-agent[bot] please advise\n');
         const r = runCreate(`gh issue create --title "x" --label code-agent --body-file ${file}`);
-        expect(r.status).toBe(0);
+        expect(r.status).toBe(2);
       });
 
       it('resolves a readable --body-file for a backlog-labeled create with zero mentions → ALLOWED', () => {
@@ -954,14 +1015,14 @@ describe('check-mention-routing.sh (hook)', () => {
       // without real shell-quote evaluation. A mention landing in --title
       // therefore mechanically counts, even though GitHub's own mention/
       // notification parsing does not apply to title text.
-      it('a mention ONLY in --title (not in --body) satisfies Check A for a self-labeled create', () => {
+      it('a mention ONLY in --title (not in --body) satisfies Check A for a self-labeled PR create', () => {
         // The title mention must be in the SAME line-start form Check B
         // already requires everywhere else (a mid-line mention right after
         // an opening quote is flagged as a describing-context leak
         // regardless of which flag carries it — see the next describe
         // block). A heredoc-substituted --title puts it at true line-start.
         const r = runCreate(
-          'gh issue create --title "$(cat <<EOF\n@macf-science-agent[bot] please advise\nEOF\n)" --label code-agent --body "no mention in the body"',
+          'gh pr create --title "$(cat <<EOF\n@macf-science-agent[bot] please advise\nEOF\n)" --label code-agent --body "no mention in the body"',
         );
         expect(r.status).toBe(0);
       });
