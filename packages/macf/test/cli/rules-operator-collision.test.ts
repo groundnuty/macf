@@ -3,7 +3,7 @@
  * name is operator-authored — copy keeps it (as retirement already does),
  * warns once, reports it, and `doctor` flags it as a collision, not "missing".
  */
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -98,5 +98,26 @@ describe('doctor output — a collision alone does not end with the update Fix l
   it('a stale finding alongside a collision still prints the Fix line', () => {
     const out = printed([{ name: 'pr-discipline.md', reason: 'operator-authored' }, { name: 'other.md', reason: 'stale' }]);
     expect(out).toContain('Fix: run');
+  });
+});
+
+describe('copyCanonicalRulesDetailed — symlinked destinations', () => {
+  it('never writes through a symlink to an operator file outside the rules dir', () => {
+    const outside = join(root, 'outside-pr-discipline.md');
+    writeFileSync(outside, '# Operator commit rules\n');
+    mkdirSync(join(ws(), '.claude', 'rules'), { recursive: true });
+    symlinkSync(outside, dst('pr-discipline.md'));
+    const warns: string[] = [];
+    const r = copyCanonicalRulesDetailed(ws(), { canonicalDir: canon, warn: (m: string) => { warns.push(m); } });
+    expect(readFileSync(outside, 'utf-8')).toBe('# Operator commit rules\n');
+    expect(r.kept).toContain('pr-discipline.md');
+    expect(warns.join('\n')).toContain('symbolic link');
+  });
+  it('does not create the target of a dangling symlink', () => {
+    const missing = join(root, 'nowhere.md');
+    mkdirSync(join(ws(), '.claude', 'rules'), { recursive: true });
+    symlinkSync(missing, dst('pr-discipline.md'));
+    copyCanonicalRulesDetailed(ws(), { canonicalDir: canon, warn: () => {} });
+    expect(existsSync(missing)).toBe(false);
   });
 });

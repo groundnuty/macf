@@ -158,7 +158,18 @@ export function copyCanonicalRulesDetailed(workspaceDir: string, options: {
     const dst = join(targetDir, entry.name);
     const raw = readFileSync(src, 'utf-8');
     const out = computeCanonicalRuleContent(raw);
-    if (existsSync(dst) && lstatSync(dst).isFile() && isOperatorAuthoredRule(readFileSync(dst, 'utf-8'), out, raw)) {
+    let dstStat: ReturnType<typeof lstatSync> | undefined;
+    try { dstStat = lstatSync(dst); } catch { dstStat = undefined; }
+    // Never write through a symlink: it would overwrite the link's target, possibly outside the workspace.
+    if (dstStat?.isSymbolicLink()) {
+      kept.push(entry.name);
+      warn(
+        `  Warning: .claude/rules/${entry.name} is a symbolic link, so macf leaves it alone rather than ` +
+        'write through it. Replace it with a regular file or delete it, then run `macf update`.',
+      );
+      continue;
+    }
+    if (dstStat?.isFile() && isOperatorAuthoredRule(readFileSync(dst, 'utf-8'), out, raw)) {
       kept.push(entry.name);
       warn(
         `  Warning: .claude/rules/${entry.name} has no macf managed header, so it is operator-authored — ` +
