@@ -4,6 +4,44 @@ All notable changes to the `macf` CLI. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.63] — 2026-10-16
+
+**The first time a fleet's agents were actually up — and the two defects that kept every message
+from arriving.**
+
+### Fixed
+
+- **No generated router could route on a self-hosted fleet** — every generated caller passed only
+  `MACF_ROUTING_BUNDLE`, which `apply` composes only when the vault holds all six routing values
+  (Tailscale pair included), so a self-hosted fleet never had one; the four routing secrets that
+  did exist on each repo never reached the router. Callers now pass the six individual secrets
+  beside the bundle, `apply` rewrites existing callers that don't, and `plan` reports a caller
+  whose routing form is incomplete — on agent repos and on the control repo. Org-level secrets
+  count as present; a `secrets: inherit` that crosses an organisation boundary counts as passing
+  nothing. Measured live on `macf-trial`: plan went from four `update` rows to four no-ops. (#1447)
+- **The tmux submit helper left long prompts unsubmitted on Claude Code 2.1.300, and exited 0** —
+  the Enter sent in the same burst as the text was paste-detected as a newline, so every wake,
+  startup pickup and inject of a long prompt sat in the input box while its caller logged success.
+  The helper now types the text, waits for the pane to settle, sends one Enter and verifies the
+  prompt left the whole input box (wrapped rows included), retrying twice; it exits 3 when it
+  cannot verify and 4 when the prompt is still sitting there, so a failed wake now logs as failed.
+  Only a graceful `/exit` treats "cannot verify" as sent. No new tool dependencies (no `md5sum`).
+  (#1445)
+- **`macf init`/`update` appended a directory ignore over a repo's `dir/*` + negation idiom**,
+  which would have defeated the negation for every new file; `dir/*` and `dir/**` now count as
+  covering `dir/`. (#1436)
+- **A comment that referenced an issue only inside backticks was invisible to close-and-ping** — a
+  new warn-only hook names the backticked reference and says which direction the cross-reference
+  edge lands. (#1431)
+- **`doctor` now names the scripts the tool did not put there**, and when guards are missing on a
+  whole population it classifies the systemic cause (a packaging defect or a deploy-time pin) in
+  words rather than reporting every workspace as individually broken. (#1430)
+
+### Dependencies
+
+- `typescript-eslint` 8.61.0, `@opentelemetry/sdk-trace-base` 2.7.1, `@types/node` 25.9.2,
+  `actions/setup-node` 7.
+
 ## [0.2.62] — 2026-09-03
 
 **Two fixes from the first fleet's first morning.**
