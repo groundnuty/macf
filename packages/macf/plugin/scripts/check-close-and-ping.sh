@@ -198,7 +198,12 @@ if [[ "$MATCH_STR" =~ $WRAP_RE ]] && [[ "$INVOCATION" =~ $WRAP_RE ]]; then
       fi
       WRAP_INNER+="$wc"
     done
-    INVOCATION="$WRAP_INNER"
+    # Only when the close is INSIDE the wrapper's argument: for
+    # `bash -c 'echo hi' && <close> 42` the greedy wrapper match reaches the
+    # later close, and cutting to the wrapper would lose it.
+    if [[ "$WRAP_INNER" =~ gh[[:space:]]+issue[[:space:]]+close([[:space:]]|$) ]]; then
+      INVOCATION="$WRAP_INNER"
+    fi
   fi
 fi
 GH_CLOSE_WORD='gh[[:space:]]+issue[[:space:]]+close([[:space:]]|$)'

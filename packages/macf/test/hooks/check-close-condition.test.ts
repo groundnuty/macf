@@ -395,6 +395,15 @@ describe('check-close-condition.sh (hook)', () => {
         expect(ctx).toContain('#7');
         expect(ctx).toContain(CONDITION_MARKER);
       });
+      it("a close AFTER an unrelated wrapper (`bash -c 'echo hello' && <close> 42`) is still found (Codex)", () => {
+        const r = runHook({
+          command: "bash -c 'echo hello' && gh issue close 42 --repo o/r",
+          stubGh: { 'o/r#42': { body: SECTION_BODY } },
+        });
+        const ctx = parseAdditionalContext(r.stdout) ?? '';
+        expect(ctx).toContain('#42');
+        expect(ctx).toContain(CONDITION_MARKER);
+      });
     });
   });
 

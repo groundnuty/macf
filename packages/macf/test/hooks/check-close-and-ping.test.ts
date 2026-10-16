@@ -389,6 +389,13 @@ describe('check-close-and-ping.sh (hook)', () => {
         });
         expect(parseAdditionalContext(r.stdout) ?? '').toContain('#7');
       });
+      it("a close AFTER an unrelated wrapper (`bash -c 'echo hello' && <close> 42`) is still found (Codex)", () => {
+        const r = runHook({
+          command: "bash -c 'echo hello' && gh issue close 42 --repo o/r",
+          stubGh: stub(42),
+        });
+        expect(parseAdditionalContext(r.stdout) ?? '').toContain('#42');
+      });
     });
   });
 
