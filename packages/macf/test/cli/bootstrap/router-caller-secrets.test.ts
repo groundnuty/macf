@@ -73,6 +73,24 @@ describe('extractCallerSecrets', () => {
     expect(extractCallerSecrets(generateWorkflow('v1'))?.inherit).toBe(true);
     expect(extractCallerSecrets('name: x\n')).toBeUndefined();
   });
+
+  const wrap = (body: string): string => `name: r\njobs:\n  route:\n${body}\n`;
+  it('reads a secrets: block that comes BEFORE uses:', () => {
+    const y = wrap(`    secrets:\n      MACF_ROUTING_BUNDLE: \${{ secrets.MACF_ROUTING_BUNDLE }}\n      ROUTING_CLIENT_CERT: x\n    with:\n      a: b\n    uses: groundnuty/macf-actions/.github/workflows/agent-router.yml@v3.5.0`);
+    expect(extractCallerSecrets(y)).toEqual({ inherit: false, names: ['MACF_ROUTING_BUNDLE', 'ROUTING_CLIENT_CERT'] });
+  });
+  it('reads secrets: inherit before uses:', () => {
+    const y = wrap('    secrets: inherit\n    uses: groundnuty/macf-actions/.github/workflows/agent-router.yml@v3.5.0');
+    expect(extractCallerSecrets(y)).toEqual({ inherit: true, names: [] });
+  });
+  it('never attributes another job\'s secrets to the router job', () => {
+    const before = 'name: r\njobs:\n  other:\n    uses: o/r/.github/workflows/x.yml@v1\n    secrets:\n      OTHER: y\n  route:\n    uses: groundnuty/macf-actions/.github/workflows/agent-router.yml@v3.5.0\n';
+    expect(extractCallerSecrets(before)).toEqual({ inherit: false, names: [] });
+    const after = before + '  later:\n    secrets: inherit\n    uses: o/r/.github/workflows/z.yml@v1\n';
+    expect(extractCallerSecrets(after)).toEqual({ inherit: false, names: [] });
+    const beforeInherit = 'name: r\njobs:\n  other:\n    secrets: inherit\n    uses: o/r/.github/workflows/x.yml@v1\n  route:\n    uses: groundnuty/macf-actions/.github/workflows/agent-router.yml@v3.5.0\n';
+    expect(extractCallerSecrets(beforeInherit)).toEqual({ inherit: false, names: [] });
+  });
 });
 
 describe('router_caller_secrets plan row — decisive pair', () => {
@@ -173,7 +191,39 @@ describe('org-level secrets and the control repo', () => {
 });
 
 describe('evaluateCallerRoutingForm', () => {
-  it('secrets: inherit passes everything the repo holds', () => {
-    expect(evaluateCallerRoutingForm({ inherit: true, names: [] }, { status: 'confirmed', names: new Set(FOUR) }, true).status).toBe('complete');
+  const have = { status: 'confirmed' as const, names: new Set(FOUR) };
+  it('same-owner secrets: inherit passes everything the repo holds', () => {
+    expect(evaluateCallerRoutingForm({ inherit: true, names: [] }, have, true, undefined, 'groundnuty').status).toBe('complete');
+  });
+  it('cross-owner secrets: inherit passes nothing → incomplete, rewrite fixes it', () => {
+    const v = evaluateCallerRoutingForm({ inherit: true, names: [] }, have, true, undefined, 'macf-experiment');
+    expect(v.status).toBe('incomplete');
+    if (v.status === 'incomplete') {
+      expect(v.callerRewriteFixes).toBe(true);
+      expect(v.inheritCrossesOwner).toBe(true);
+    }
+  });
+  it('plan row and rewrite flags name the cross-owner inherit', () => {
+    const m = { ...manifest(true), owner: { account: 'macf-experiment', type: 'org', registry: { type: 'org', org: 'macf-experiment' } }, agents: [{ role: 'code-agent', repo: 'macf-experiment/demo-code', deploy_path: '/x' }] } as unknown as FleetManifest;
+    const base = observed(generateWorkflow('v1'), FOUR);
+    const o: ObservedState = {
+      ...base,
+      orgSecretRepos: { 'macf-experiment/demo-code': { status: 'confirmed', names: new Set() } },
+      routingSecretRepos: { 'macf-experiment/demo-code': { status: 'confirmed', names: new Set(FOUR) } },
+    };
+    const r = row(computePlan(m, o).items);
+    expect(r.verb).toBe('update');
+    expect(r.reason).toContain('secrets: inherit');
+    expect(r.reason).toContain('macf-experiment');
+    expect(r.reason).toContain('apply reconciles the caller');
+    expect(callerSecretRewritesFromObserved(m, o)).toEqual({ 'code-agent': true });
+    const c: ObservedState = {
+      ...o,
+      controlRepoPresence: 'present',
+      controlRepoCallerSecrets: extractCallerSecrets(generateWorkflow('v1')),
+      routingSecretRepos: { ...o.routingSecretRepos, 'macf-experiment/demo-control': { status: 'confirmed', names: new Set(FOUR) } },
+      orgSecretRepos: { ...o.orgSecretRepos, 'macf-experiment/demo-control': { status: 'confirmed', names: new Set(TS) } },
+    };
+    expect(controlCallerSecretRewriteFromObserved(m, c)).toBe(true);
   });
 });

@@ -1290,7 +1290,7 @@ export function callerSecretRewritesFromObserved(manifest: FleetManifest, observ
   const selfHosted = manifest.routing?.runner?.runs_on === 'self-hosted';
   const out: Record<string, boolean> = {};
   for (const agent of manifest.agents) {
-    const verdict = evaluateCallerRoutingForm(observed.agents[agent.role]?.callerSecrets, observed.routingSecretRepos?.[agent.repo], selfHosted, observed.orgSecretRepos?.[agent.repo]);
+    const verdict = evaluateCallerRoutingForm(observed.agents[agent.role]?.callerSecrets, observed.routingSecretRepos?.[agent.repo], selfHosted, observed.orgSecretRepos?.[agent.repo], agent.repo.split('/')[0]);
     out[agent.role] = verdict.status === 'incomplete' && verdict.callerRewriteFixes;
   }
   return out;
@@ -1300,7 +1300,7 @@ export function callerSecretRewritesFromObserved(manifest: FleetManifest, observ
 export function controlCallerSecretRewriteFromObserved(manifest: FleetManifest, observed: ObservedState): boolean {
   if (observed.controlRepoPresence !== 'present') return false;
   const repo = `${manifest.owner.account}/${deriveControlRepoName(manifest.metadata.name)}`;
-  const v = evaluateCallerRoutingForm(observed.controlRepoCallerSecrets, observed.routingSecretRepos?.[repo], false, observed.orgSecretRepos?.[repo]);
+  const v = evaluateCallerRoutingForm(observed.controlRepoCallerSecrets, observed.routingSecretRepos?.[repo], false, observed.orgSecretRepos?.[repo], manifest.owner.account);
   return v.status === 'incomplete' && v.callerRewriteFixes;
 }
 

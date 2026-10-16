@@ -1620,7 +1620,7 @@ function routerCallerSecretsItem(
   orgSecrets: RepoSecretNamesObservation | undefined,
   selfHostedRunner: boolean,
 ): PlanItem {
-  const verdict = evaluateCallerRoutingForm(caller, repoSecrets, selfHostedRunner, orgSecrets);
+  const verdict = evaluateCallerRoutingForm(caller, repoSecrets, selfHostedRunner, orgSecrets, repo.split('/')[0]);
   if (verdict.status === 'unknown') {
     return {
       kind: 'router_caller_secrets',
@@ -1642,7 +1642,9 @@ function routerCallerSecretsItem(
     };
   }
   const parts: string[] = [];
-  if (verdict.notPassedByCaller.length > 0) {
+  if (verdict.inheritCrossesOwner === true) {
+    parts.push(`the caller uses secrets: inherit, which does not cross from ${repo.split('/')[0]} to the router's owner, so it passes no secret`);
+  } else if (verdict.notPassedByCaller.length > 0) {
     parts.push(`the caller (.github/workflows/agent-router.yml) does not pass ${verdict.notPassedByCaller.join(', ')}`);
   }
   if (verdict.missingFromRepo.length > 0) {
