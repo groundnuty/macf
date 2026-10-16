@@ -1149,9 +1149,16 @@ describe('check-mention-routing.sh (hook)', () => {
         ['! gh issue comment 5 --body "done"'],
         ['{ gh issue comment 5 --body "done"; }'],
         ['if ! time gh issue comment 5 --body "done"; then echo no; fi'],
+        ['echo ok && \\\ngh issue comment 5 --body done'],
+        ['echo ok && gh issue comment 5 \\\n  --body done'],
       ])('a comment behind a shell keyword is still checked for a mention (%#)', (command) => {
         const r = runCreate(command);
         expect(r.status).toBe(2);
+      });
+
+      it('a continued line with a mention on the comment passes', () => {
+        const r = runCreate('echo ok && \\\ngh issue comment 5 --body "x\n@macf-science-agent[bot] done"');
+        expect(r.status).toBe(0);
       });
 
       it('a keyword-led comment with a mention is allowed', () => {

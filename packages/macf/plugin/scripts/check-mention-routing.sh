@@ -226,7 +226,11 @@ macf_split_text() {
       i=$((i + 1)); continue
     fi
     if [[ "$q" == "a" || "$q" == "d" ]]; then
-      if [[ "$c" == "\\" ]]; then cur+="$c$nx"; i=$((i + 2)); continue; fi
+      if [[ "$c" == "\\" ]]; then
+        # Inside double quotes a backslash-newline is a line continuation: drop both.
+        if [[ "$q" == "d" && "$nx" == $'\n' ]]; then i=$((i + 2)); continue; fi
+        cur+="$c$nx"; i=$((i + 2)); continue
+      fi
       cur+="$c"
       if [[ "$q" == "a" && "$c" == "'" ]] || [[ "$q" == "d" && "$c" == '"' ]]; then q=""; fi
       i=$((i + 1)); continue
@@ -236,7 +240,10 @@ macf_split_text() {
       '"') q="d"; cur+="$c" ;;
       '$')
         if [[ "$nx" == "'" ]]; then q="a"; cur+="$c$nx"; i=$((i + 1)); else cur+="$c"; fi ;;
-      "\\") cur+="$c$nx"; i=$((i + 1)) ;;
+      "\\")
+        # A backslash-newline is a line continuation, not part of the command: drop both.
+        if [[ "$nx" != $'\n' ]]; then cur+="$c$nx"; fi
+        i=$((i + 1)) ;;
       '#')
         if [[ -z "$cur" || "${cur: -1}" == [[:space:]] ]]; then
           while [[ $i -lt $n && "${s:i:1}" != $'\n' ]]; do i=$((i + 1)); done
