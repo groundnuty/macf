@@ -1867,6 +1867,31 @@ agents:
       ],
     };
 
+    it('the control repo\'s router caller is force-rewritten only when callerSecretRewriteControl is flagged', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT, SCI_AGENT, WRITING_AGENT]);
+      const run = async (flag: boolean): Promise<boolean | undefined> => {
+        let controlForce: boolean | undefined;
+        const repoInitDeps: RepoInitStepDeps = {
+          cloneRepo: async () => {},
+          commitAndPush: async () => 'pushed',
+          repoInit: async (_dir, opts) => {
+            if (opts.repo === 'groundnuty/demo-fleet-control') controlForce = opts.force === true;
+            return { workflow: 'created', config: 'created', labels: { status: 'ok', created: [], existed: [] } };
+          },
+        };
+        const deps: FleetApplyDeps = {
+          ...baseDeps(reusedThreeAgentDeps(), manifestPath, repoInitDeps),
+          observedActionsPins: { agents: {}, controlRepo: 'v3.4.1' },
+          callerSecretRewriteControl: flag,
+        };
+        await applyFleet(manifest, manifestPath, PRIOR_LOCK_THREE_AGENTS, deps);
+        return controlForce;
+      };
+      expect(await run(true)).toBe(true);
+      expect(await run(false)).toBe(false);
+    });
+
     it('DECISIVE — control repo AND every agent repo\'s own repo-init call all receive ALL three declared agents (groundnuty/macf#1425)', async () => {
       const manifestPath = manifestPathIn();
       const manifest = manifestWith([CODE_AGENT, SCI_AGENT, WRITING_AGENT]);

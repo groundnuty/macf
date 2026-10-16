@@ -3014,7 +3014,7 @@ export function computePlan(
   // The control repo carries a router too (every agent App is installed
   // there; its routing table lists the whole fleet), and its caller never
   // declares a runner — so it runs hosted and needs the Tailscale pair.
-  if (observed.controlRepoPresence !== 'absent') {
+  if (observed.controlRepoPresence === 'present') {
     const controlRepo = routerCarryingRepos(manifest).at(-1)!;
     items.push(
       routerCallerSecretsItem(

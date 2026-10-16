@@ -358,7 +358,11 @@ describe('computePlan — all-match observed state → all noops', () => {
       routingSecretRepos: {
         'groundnuty/icsoc-2026-science-agent': { status: 'confirmed', names: new Set(['MACF_ROUTING_APP_ID', 'MACF_ROUTING_APP_KEY', 'ROUTING_CLIENT_CERT', 'ROUTING_CLIENT_KEY']) },
         'groundnuty/icsoc-2026-experiment': { status: 'confirmed', names: new Set(['MACF_ROUTING_APP_ID', 'MACF_ROUTING_APP_KEY', 'ROUTING_CLIENT_CERT', 'ROUTING_CLIENT_KEY']) },
+        'groundnuty/icsoc-2026-control': { status: 'confirmed', names: new Set(['MACF_ROUTING_APP_ID', 'MACF_ROUTING_APP_KEY', 'ROUTING_CLIENT_CERT', 'ROUTING_CLIENT_KEY']) },
       },
+      // Control repo: hosted (no runner declared) → needs the Tailscale pair too, held at ORG level here.
+      orgSecretRepos: { 'groundnuty/icsoc-2026-control': { status: 'confirmed', names: new Set(['TS_OAUTH_CLIENT_ID', 'TS_OAUTH_SECRET']) } },
+      controlRepoCallerSecrets: { inherit: false, names: ['MACF_ROUTING_BUNDLE', 'MACF_ROUTING_APP_ID', 'MACF_ROUTING_APP_KEY', 'ROUTING_CLIENT_CERT', 'ROUTING_CLIENT_KEY', 'TS_OAUTH_CLIENT_ID', 'TS_OAUTH_SECRET'] },
       controlRepoPresence: 'present',
       controlRepoArchived: false,
     };
@@ -371,7 +375,7 @@ describe('computePlan — all-match observed state → all noops', () => {
     // (groundnuty/macf#943; control_repo item absent — not archived) + the
     // fleet-level router_app item (groundnuty/macf#1105, UNCONDITIONAL) + the
     // fleet-level ts_oauth item (groundnuty/macf#1109, UNCONDITIONAL).
-    expect(plan.items).toHaveLength(25);
+    expect(plan.items).toHaveLength(26);
     for (const item of plan.items) {
       // `labels`/`runner_warm` are `'write-always'` (groundnuty/macf#926,
       // was `'create'`): they have NO plan-time observed read at all (see

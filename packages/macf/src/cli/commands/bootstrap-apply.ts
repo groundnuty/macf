@@ -1298,7 +1298,7 @@ export function callerSecretRewritesFromObserved(manifest: FleetManifest, observ
 
 /** Whether the control repo's router caller must be rewritten (it runs hosted — no runner declared). */
 export function controlCallerSecretRewriteFromObserved(manifest: FleetManifest, observed: ObservedState): boolean {
-  if (observed.controlRepoPresence === 'absent') return false;
+  if (observed.controlRepoPresence !== 'present') return false;
   const repo = `${manifest.owner.account}/${deriveControlRepoName(manifest.metadata.name)}`;
   const v = evaluateCallerRoutingForm(observed.controlRepoCallerSecrets, observed.routingSecretRepos?.[repo], false, observed.orgSecretRepos?.[repo]);
   return v.status === 'incomplete' && v.callerRewriteFixes;
