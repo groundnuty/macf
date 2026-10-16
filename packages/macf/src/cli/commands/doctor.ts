@@ -15,7 +15,7 @@
  * for the attribution-trap class this prevents).
  */
 import { execFileSync } from 'node:child_process';
-import { existsSync, readdirSync, readFileSync, statfsSync, statSync } from 'node:fs';
+import { existsSync, lstatSync, readdirSync, readFileSync, statfsSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { createInterface } from 'node:readline';
 import { join, resolve } from 'node:path';
@@ -33,6 +33,7 @@ import {
   computeCanonicalScriptFile,
   findCliPackageRoot,
   listDistributedRuleNames,
+  isOperatorAuthoredRule,
   listDistributedScriptNames,
   findRetiredRuleCopies,
   retireCanonicalRules,
@@ -1972,7 +1973,7 @@ export interface RuleCurrencyFinding {
   readonly name: string;
   /** `stale` — on disk, but content differs from canonical. `missing` —
    *  canonical distributes this name and the workspace has no copy at all. */
-  readonly reason: 'stale' | 'missing' | 'retired';
+  readonly reason: 'stale' | 'missing' | 'retired' | 'operator-authored' | 'symlink';
 }
 
 /**
@@ -2043,14 +2044,24 @@ export function checkDistributedRuleCurrency(
     const canonical = computeCanonicalRuleFile(name, { canonicalDir: rulesDir });
     if (canonical === null) continue; // name came from this same dir — defensive only
     const onDiskPath = join(targetDir, name);
+    // update never writes through a symlink (it would overwrite the target), so it cannot fix one.
+    const isLink = ((): boolean => {
+      try { return lstatSync(onDiskPath).isSymbolicLink(); } catch { return false; }
+    })();
+    if (isLink) {
+      findings.push({ name, reason: 'symlink' });
+      continue;
+    }
     if (!existsSync(onDiskPath)) {
       findings.push({ name, reason: 'missing' });
       continue;
     }
     checkedCount++;
-    if (readFileSync(onDiskPath, 'utf-8') !== canonical) {
-      findings.push({ name, reason: 'stale' });
-    }
+    const onDisk = readFileSync(onDiskPath, 'utf-8');
+    if (onDisk === canonical) continue;
+    // No managed header: operator-authored. update/refresh keep it and --fix
+    // never overwrites it, so report it apart from a stale managed copy.
+    findings.push({ name, reason: isOperatorAuthoredRule(onDisk, canonical, readFileSync(join(rulesDir, name), 'utf-8')) ? 'operator-authored' : 'stale' });
   }
 
   // A retired canonical rule whose managed copy is still on disk stays loaded
@@ -2078,7 +2089,9 @@ export function checkDistributedRuleCurrency(
 
   const staleCount = findings.filter((f) => f.reason === 'stale').length;
   const retiredCount = findings.filter((f) => f.reason === 'retired').length;
-  const missingCount = findings.length - staleCount - retiredCount;
+  const collisionCount = findings.filter((f) => f.reason === 'operator-authored').length;
+  const symlinkCount = findings.filter((f) => f.reason === 'symlink').length;
+  const missingCount = findings.length - staleCount - retiredCount - collisionCount - symlinkCount;
   return {
     status: 'WARN',
     checkedCount,
@@ -2086,6 +2099,8 @@ export function checkDistributedRuleCurrency(
     findings,
     detail:
       `${staleCount} stale, ${missingCount} missing of ${names.length} canonical distributed rule(s)` +
+      (collisionCount > 0 ? `, ${collisionCount} operator-authored file(s) kept under a canonical name` : '') +
+      (symlinkCount > 0 ? `, ${symlinkCount} symbolic link(s) macf will not write through` : '') +
       (retiredCount > 0 ? `, ${retiredCount} retired rule copy(ies) still present` : '') +
       ` (canonical ${provenance})`,
   };
@@ -3238,7 +3253,7 @@ function printStrayScriptsSection(check: StrayScriptCheckResult): void {
 }
 
 /** Print the groundnuty/macf#1360 distributed-rule-currency report section for `check`. */
-function printRuleCurrencySection(check: RuleCurrencyCheckResult, checkoutCurrency: CheckoutCurrencyCheckResult): void {
+export function printRuleCurrencySection(check: RuleCurrencyCheckResult, checkoutCurrency: CheckoutCurrencyCheckResult): void {
   if (check.status === 'INFO') {
     console.log(`  ℹ ${check.detail}  [INFO]`);
     return;
@@ -3256,11 +3271,16 @@ function printRuleCurrencySection(check: RuleCurrencyCheckResult, checkoutCurren
     const reasonText =
       f.reason === 'stale' ? 'stale — differs from canonical'
       : f.reason === 'retired' ? 'retired — canonical no longer ships it, but this managed copy is still loaded (`macf update` or `macf doctor --fix` removes it)'
+      : f.reason === 'symlink' ? 'symbolic link — macf never writes through it; delete it and run `macf update` (or `macf rules refresh --dir .`) to take the canonical rule, or replace it with a regular file to keep your own'
+      : f.reason === 'operator-authored' ? 'collision — no macf managed header, so it is operator-authored and kept; rename it to keep both, or delete it and run `macf update` (or `macf rules refresh --dir .`) to take the canonical rule'
       : 'missing — never distributed';
     console.log(`    ✗ ${f.name} — ${reasonText}`);
   }
   const staleCount = check.findings.filter((f) => f.reason === 'stale' || f.reason === 'retired').length;
-  printDistributionFixLine('.claude/rules/', checkoutCurrency, staleCount);
+  // Collisions and symlinks carry their own remedy; `macf update` keeps them, so the update Fix line would mislead.
+  if (check.findings.some((f) => f.reason !== 'operator-authored' && f.reason !== 'symlink')) {
+    printDistributionFixLine('.claude/rules/', checkoutCurrency, staleCount);
+  }
 }
 
 /**

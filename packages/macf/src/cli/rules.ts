@@ -35,7 +35,7 @@ import { dirname, join, resolve } from 'node:path';
 import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { PACKAGE_VERSION } from '../package-version.js';
 
-const MANAGED_HEADER = [
+export const MANAGED_HEADER = [
   '<!--',
   '  This file is managed by `macf`. Do not edit directly — edits are',
   '  overwritten on the next `macf update`. The canonical source lives at',
@@ -108,7 +108,9 @@ function assertCanonicalSourceDirsExist(dirs: readonly string[]): void {
 
 /**
  * Copy every .md file from the canonical rules dir to <workspace>/.claude/rules/.
- * Existing files are overwritten (the canonical source wins).
+ * Existing macf-managed files are overwritten (the canonical source wins);
+ * existing files without the managed header are kept (see
+ * `copyCanonicalRulesDetailed`).
  *
  * Returns the list of copied filenames (basenames). Throws when the
  * canonical dir doesn't exist — see `assertCanonicalSourceDirsExist` — a
@@ -118,23 +120,69 @@ function assertCanonicalSourceDirsExist(dirs: readonly string[]): void {
 export function copyCanonicalRules(workspaceDir: string, options: {
   readonly canonicalDir?: string;
 } = {}): readonly string[] {
+  return copyCanonicalRulesDetailed(workspaceDir, options).copied;
+}
+
+/**
+ * True when `existing` (a workspace rule file's content) is operator-authored
+ * rather than a macf-managed copy: it lacks the managed header and is not
+ * byte-identical to what macf would write. Same predicate `retireCanonicalRules`
+ * uses, so copy and retirement agree on who owns a file.
+ */
+export function isOperatorAuthoredRule(existing: string, canonicalContent: string, rawSource?: string): boolean {
+  return !beginsWithManagedHeader(existing) && existing !== canonicalContent && existing !== rawSource;
+}
+
+/**
+ * `copyCanonicalRules` plus the names it declined to overwrite: a destination
+ * file with no managed header is operator-authored (e.g. a workspace
+ * template's own `pr-discipline.md`), so it is kept and listed in `kept`.
+ * Warns once per kept file via `options.warn` (default `console.warn`).
+ */
+export function copyCanonicalRulesDetailed(workspaceDir: string, options: {
+  readonly canonicalDir?: string;
+  readonly warn?: (message: string) => void;
+} = {}): { readonly copied: readonly string[]; readonly kept: readonly string[] } {
   const sourceDir = options.canonicalDir ?? canonicalRulesDir();
   assertCanonicalSourceDirsExist([sourceDir]);
+  const warn = options.warn ?? ((m: string) => console.warn(m));
 
   const targetDir = join(resolve(workspaceDir), '.claude', 'rules');
   mkdirSync(targetDir, { recursive: true });
 
   const copied: string[] = [];
+  const kept: string[] = [];
   for (const entry of readdirSync(sourceDir, { withFileTypes: true })) {
     if (!entry.isFile() || !entry.name.endsWith('.md')) continue;
     const src = join(sourceDir, entry.name);
     const dst = join(targetDir, entry.name);
-    const content = readFileSync(src, 'utf-8');
-    const out = computeCanonicalRuleContent(content);
+    const raw = readFileSync(src, 'utf-8');
+    const out = computeCanonicalRuleContent(raw);
+    let dstStat: ReturnType<typeof lstatSync> | undefined;
+    try { dstStat = lstatSync(dst); } catch { dstStat = undefined; }
+    // Never write through a symlink: it would overwrite the link's target, possibly outside the workspace.
+    if (dstStat?.isSymbolicLink()) {
+      kept.push(entry.name);
+      warn(
+        `  Warning: .claude/rules/${entry.name} is a symbolic link, so macf leaves it alone rather than ` +
+        'write through it. Delete it and run `macf update` (or `macf rules refresh --dir .`) to take the ' +
+        'canonical rule, or replace it with a regular file to keep your own.',
+      );
+      continue;
+    }
+    if (dstStat?.isFile() && isOperatorAuthoredRule(readFileSync(dst, 'utf-8'), out, raw)) {
+      kept.push(entry.name);
+      warn(
+        `  Warning: .claude/rules/${entry.name} has no macf managed header, so it is operator-authored — ` +
+        'left in place, not replaced by the canonical rule of the same name. Rename it to keep both, ' +
+        'or delete it and run `macf update` (or `macf rules refresh --dir .`) to take the canonical one.',
+      );
+      continue;
+    }
     writeFileSync(dst, out);
     copied.push(entry.name);
   }
-  return copied;
+  return { copied, kept };
 }
 
 /**
