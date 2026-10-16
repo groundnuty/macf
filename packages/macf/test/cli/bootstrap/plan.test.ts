@@ -116,7 +116,7 @@ describe('computePlan — all-missing manifest (fresh fleet) → all creates', (
     // 'create' branch, same as every other unknown-presence item here
     // (including the two new `agent_config` items — `observed.agents` is
     // `{}`, so `obs?.agentConfigRoles` is `undefined` for both agents).
-    expect(plan.items).toHaveLength(19);
+    expect(plan.items).toHaveLength(21);
     for (const item of plan.items) {
       // `labels` is `'write-always'`, not `'create'` (groundnuty/macf#926) —
       // `labelsItem` has no observed-state input, so it can never carry the
@@ -329,6 +329,7 @@ describe('computePlan — all-match observed state → all noops', () => {
           // fixtures need this too, or the new `agent_config` item would
           // degrade to a low-confidence 'create' and break the noop claim.
           agentConfigRoles: ['science-agent', 'code-agent'],
+          callerSecrets: { inherit: false, names: ['MACF_ROUTING_BUNDLE', 'MACF_ROUTING_APP_ID', 'MACF_ROUTING_APP_KEY', 'ROUTING_CLIENT_CERT', 'ROUTING_CLIENT_KEY'] },
         },
         'code-agent': {
           app: 'present',
@@ -338,6 +339,7 @@ describe('computePlan — all-match observed state → all noops', () => {
           repo: 'present',
           fingerprints: { app_private_key: 'sha256:bbb' },
           agentConfigRoles: ['science-agent', 'code-agent'],
+          callerSecrets: { inherit: false, names: ['MACF_ROUTING_BUNDLE', 'MACF_ROUTING_APP_ID', 'MACF_ROUTING_APP_KEY', 'ROUTING_CLIENT_CERT', 'ROUTING_CLIENT_KEY'] },
         },
       },
       caRegistry: 'present',
@@ -353,6 +355,10 @@ describe('computePlan — all-match observed state → all noops', () => {
         'groundnuty/icsoc-2026-science-agent': 'present',
         'groundnuty/icsoc-2026-experiment': 'present',
       },
+      routingSecretRepos: {
+        'groundnuty/icsoc-2026-science-agent': { status: 'confirmed', names: new Set(['MACF_ROUTING_APP_ID', 'MACF_ROUTING_APP_KEY', 'ROUTING_CLIENT_CERT', 'ROUTING_CLIENT_KEY']) },
+        'groundnuty/icsoc-2026-experiment': { status: 'confirmed', names: new Set(['MACF_ROUTING_APP_ID', 'MACF_ROUTING_APP_KEY', 'ROUTING_CLIENT_CERT', 'ROUTING_CLIENT_KEY']) },
+      },
       controlRepoPresence: 'present',
       controlRepoArchived: false,
     };
@@ -365,7 +371,7 @@ describe('computePlan — all-match observed state → all noops', () => {
     // (groundnuty/macf#943; control_repo item absent — not archived) + the
     // fleet-level router_app item (groundnuty/macf#1105, UNCONDITIONAL) + the
     // fleet-level ts_oauth item (groundnuty/macf#1109, UNCONDITIONAL).
-    expect(plan.items).toHaveLength(23);
+    expect(plan.items).toHaveLength(25);
     for (const item of plan.items) {
       // `labels`/`runner_warm` are `'write-always'` (groundnuty/macf#926,
       // was `'create'`): they have NO plan-time observed read at all (see
@@ -1379,12 +1385,12 @@ describe('computePlan — deterministic ordering', () => {
     // UNCONDITIONAL), before any per-agent item. `agent_config`
     // (groundnuty/macf#1425) is pushed right after `labels` — the SAME
     // per-agent loop iteration, same order `computePlan` pushes them in.
-    expect(kinds.slice(0, 15)).toEqual([
+    expect(kinds.slice(0, 17)).toEqual([
       'runner_ops',
       'router_app',
       'ts_oauth',
-      'app', 'repo', 'install', 'secret_fingerprint', 'labels', 'agent_config', // science-agent
-      'app', 'repo', 'install', 'secret_fingerprint', 'labels', 'agent_config', // code-agent
+      'app', 'repo', 'install', 'secret_fingerprint', 'labels', 'agent_config', 'router_caller_secrets', // science-agent
+      'app', 'repo', 'install', 'secret_fingerprint', 'labels', 'agent_config', 'router_caller_secrets', // code-agent
     ]);
   });
 
@@ -1594,7 +1600,7 @@ describe('summarizePlan', () => {
     // var, so the `'orphan'` branch is never reached either — 0, not for
     // row-4's not-in-the-lock reason, but because there is nothing observed
     // to call superseded.
-    expect(summary).toEqual({ creates: 16, updates: 1, noops: 2, extras: 0, writeAlways: 4, deletes: 0, orphans: 0 });
+    expect(summary).toEqual({ creates: 18, updates: 1, noops: 2, extras: 0, writeAlways: 4, deletes: 0, orphans: 0 });
   });
 });
 

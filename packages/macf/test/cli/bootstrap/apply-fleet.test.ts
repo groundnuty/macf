@@ -7186,6 +7186,38 @@ agents:
       expect(codeResult?.status).not.toBe(sciResult?.status);
     });
 
+    it('a bundle-only router caller is REWRITTEN (repoInit force) even when its pin already matches — and NOT when no rewrite is flagged', async () => {
+      const manifestPath = manifestPathIn();
+      const manifest = manifestWith([CODE_AGENT]);
+      const priorLock: FleetLock = {
+        schema_version: 1,
+        fleet: 'demo-fleet',
+        agents: [{ role: 'code-agent', app_id: 'app-code-agent', install_id: 'install-1' }],
+      };
+      const forces: boolean[] = [];
+      const repoInitDeps: RepoInitStepDeps = {
+        ...NOOP_REPO_INIT,
+        repoInit: (async (_dir: string, opts: { force?: boolean }) => {
+          forces.push(opts.force === true);
+          return { workflow: 'created', config: 'created', labels: { status: 'ok', created: [], existed: [] } };
+        }) as unknown as RepoInitStepDeps['repoInit'],
+      };
+      const run = async (callerSecretRewrites: Record<string, boolean>): Promise<void> => {
+        const deps: FleetApplyDeps = {
+          ...baseDeps(agentDepsFor('code-agent', 'reused', 'app-code-agent', 'install-1'), manifestPath, repoInitDeps),
+          // pin already matches the declared 'v3.4.1' — pin reconcile alone would NOT force.
+          observedActionsPins: { agents: { 'code-agent': 'v3.4.1' }, controlRepo: 'v3.4.1' },
+          callerSecretRewrites,
+        };
+        await applyFleet(manifest, manifestPath, priorLock, deps);
+      };
+      await run({ 'code-agent': true });
+      expect(forces).toContain(true);
+      forces.length = 0;
+      await run({ 'code-agent': false });
+      expect(forces).not.toContain(true);
+    });
+
     it('absent versions.actions (versions: not declared at all): NO action is recorded — attempted:false, results empty — the same no-opinion gate the version(macf) phase already uses', async () => {
       const manifestPath = manifestPathIn();
       const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), versions: undefined };
