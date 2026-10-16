@@ -96,6 +96,15 @@ describe('checkMacfIgnores', () => {
     expect(r.findings).toContain('.claude/.macf/env.github');
   });
 
+  it('a tracked env file other than env.github is reported, even with the full block present', () => {
+    writeFileSync(join(dir, '.claude', '.macf', 'env.certs'), 'export MACF_AGENT_KEY=x');
+    updateGitignore(dir);
+    execFileSync('git', ['add', '-f', '.claude/.macf/env.certs'], { cwd: dir });
+    const r = checkMacfIgnores(dir);
+    expect(r.status).toBe('WARN');
+    expect(r.tracked).toContain('.claude/.macf/env.certs');
+  });
+
   it('reports a "!" re-include when the block exists but the path is still not ignored', () => {
     updateGitignore(dir);
     writeFileSync(join(dir, '.gitignore'), readFileSync(join(dir, '.gitignore'), 'utf-8') + '!.claude/.macf/\n');

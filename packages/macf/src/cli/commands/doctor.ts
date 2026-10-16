@@ -2577,7 +2577,18 @@ export interface MacfIgnoreCheckResult {
   readonly detail: string;
 }
 
-const MACF_IGNORE_PROBES = ['.macf/certs', '.claude/.macf/env.github'] as const;
+/** The macf paths that must never be committed: the certs dir and every env file present. */
+function macfIgnoreProbes(absDir: string): readonly string[] {
+  const envDir = join(absDir, '.claude', '.macf');
+  const envFiles = ((): string[] => {
+    try {
+      return readdirSync(envDir).filter((n) => n.startsWith('env.')).sort().map((n) => `.claude/.macf/${n}`);
+    } catch {
+      return [];
+    }
+  })();
+  return ['.macf/certs', ...envFiles];
+}
 
 function isTracked(absDir: string, rel: string): boolean {
   const out = execFileSync('git', ['ls-files', '--', rel], { cwd: absDir, encoding: 'utf-8' });
@@ -2585,9 +2596,11 @@ function isTracked(absDir: string, rel: string): boolean {
 }
 
 function hasMacfBlock(absDir: string): boolean {
-  let content = '';
-  try { content = readFileSync(join(absDir, '.gitignore'), 'utf-8'); } catch { return false; }
-  return missingMacfGitignoreEntries(content).length === 0;
+  try {
+    return missingMacfGitignoreEntries(readFileSync(join(absDir, '.gitignore'), 'utf-8')).length === 0;
+  } catch {
+    return false;
+  }
 }
 
 export function checkMacfIgnores(workspaceDir: string): MacfIgnoreCheckResult {
@@ -2595,7 +2608,7 @@ export function checkMacfIgnores(workspaceDir: string): MacfIgnoreCheckResult {
   const unignored: string[] = [];
   const tracked: string[] = [];
   let probed = 0;
-  for (const rel of MACF_IGNORE_PROBES) {
+  for (const rel of macfIgnoreProbes(absDir)) {
     if (!existsSync(join(absDir, rel))) continue;
     probed += 1;
     // Tracked first: ignoring a directory does not untrack files already committed under it.
