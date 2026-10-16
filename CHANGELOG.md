@@ -4,6 +4,13 @@ All notable changes to the `macf` CLI. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.69] — 2026-10-16
+
+### Fixed
+
+- **The tmux wake no longer blocks the channel server.** The wake ran its send script with `spawnSync` (10 s timeout), freezing the event loop for the whole send-and-verify. During that time the pending `/notify` response, `/health`, other deliveries and the MCP connection all waited, so `macf fleet doctor --inject` reported a delivered probe as a timeout. The wake now runs asynchronously and serialised per pane, `/notify` answers once the message is pushed to the MCP channel, and a spawn that throws (for example on a NUL in the prompt) is logged as a failed wake instead of crashing the server. (#1494)
+- **Telemetry reports the running macf version.** `MACF_VERSION` was written as a literal into the operator-managed `env.telemetry`, which `macf update` never rewrites, so `service.version` stayed at the first-deployed release. `env.identity` now resolves it at launch from `.macf/macf-agent.json`, and `macf update` removes the stale generated line while leaving the rest of `env.telemetry` untouched. The channel server reports its own package version. (#1495)
+
 ## [0.2.68] — 2026-10-16
 
 ### Fixed
