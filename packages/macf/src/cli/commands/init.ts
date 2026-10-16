@@ -1294,6 +1294,34 @@ async function initLocalModeCertsAndRegistry(
 const MACF_GITIGNORE_ENTRIES = ['.macf/', '.claude/rules/', '.claude/scripts/'] as const;
 
 /**
+ * The macf `.gitignore` entries `content` does not already cover (line-exact; `dir/*` and
+ * `dir/**` count as covering `dir/`). Shared by `updateGitignore` and `doctor`, so doctor
+ * reports exactly what `--fix` would add.
+ */
+export function missingMacfGitignoreEntries(content: string): readonly string[] {
+  const presentLines = new Set(
+    content.split('\n').map((line) => line.trim()).filter((line) => line.length > 0),
+  );
+  // macf#1434: `dir/*` (or `dir/**`) is a DIFFERENT SPELLING of the same
+  // coverage as `dir/`, not a narrower one — git's own docs: "It is not
+  // possible to re-include a file if a parent directory of that file is
+  // excluded." A workspace already ignoring `.claude/scripts/*` (the
+  // substrate idiom, paired with a `!.claude/scripts/<file>` negation to
+  // preserve one operator-authored script) has already achieved
+  // directory-wide coverage; appending the plain `dir/` line on top adds
+  // nothing to what's ignored but silently defeats every future
+  // negation under that directory, because a `!`-re-include can't pierce
+  // a parent-directory exclusion. So a `dir/*`/`dir/**` line must count
+  // as already covering `dir/` for THIS entry only — still line-exact
+  // (no substring match), and still scoped to the one directory being
+  // checked, so `.claude/rules/project/*` does not count as coverage for
+  // the unrelated `.claude/rules/` entry.
+  const isCovered = (entry: string): boolean =>
+    presentLines.has(entry) || presentLines.has(`${entry}*`) || presentLines.has(`${entry}**`);
+return MACF_GITIGNORE_ENTRIES.filter((entry) => !isCovered(entry));
+}
+
+/**
  * Idempotently ensures `MACF_GITIGNORE_ENTRIES` are present in the
  * workspace's `.gitignore`. Append-only: existing bytes (operator lines,
  * ordering, trailing-newline state) are never rewritten — a missing entry
@@ -1320,26 +1348,7 @@ export function updateGitignore(projectDir: string): readonly string[] {
     // this function's problem to parse — it just won't count as a match,
     // which means the canonical entry gets appended again (idempotent
     // no-op in gitignore semantics, never a correctness issue).
-    const presentLines = new Set(
-      content.split('\n').map((line) => line.trim()).filter((line) => line.length > 0),
-    );
-    // macf#1434: `dir/*` (or `dir/**`) is a DIFFERENT SPELLING of the same
-    // coverage as `dir/`, not a narrower one — git's own docs: "It is not
-    // possible to re-include a file if a parent directory of that file is
-    // excluded." A workspace already ignoring `.claude/scripts/*` (the
-    // substrate idiom, paired with a `!.claude/scripts/<file>` negation to
-    // preserve one operator-authored script) has already achieved
-    // directory-wide coverage; appending the plain `dir/` line on top adds
-    // nothing to what's ignored but silently defeats every future
-    // negation under that directory, because a `!`-re-include can't pierce
-    // a parent-directory exclusion. So a `dir/*`/`dir/**` line must count
-    // as already covering `dir/` for THIS entry only — still line-exact
-    // (no substring match), and still scoped to the one directory being
-    // checked, so `.claude/rules/project/*` does not count as coverage for
-    // the unrelated `.claude/rules/` entry.
-    const isCovered = (entry: string): boolean =>
-      presentLines.has(entry) || presentLines.has(`${entry}*`) || presentLines.has(`${entry}**`);
-    const missing = MACF_GITIGNORE_ENTRIES.filter((entry) => !isCovered(entry));
+    const missing = missingMacfGitignoreEntries(content);
     if (missing.length > 0) {
       appendFileSync(gitignorePath, `\n# MACF agent data\n${missing.join('\n')}\n`);
     }

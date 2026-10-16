@@ -20,7 +20,7 @@ import { tmpdir } from 'node:os';
 import { createInterface } from 'node:readline';
 import { join, resolve } from 'node:path';
 import { fromVariableSegment, proxyAwareFetch } from '@groundnuty/macf-core';
-import { updateGitignore } from './init.js';
+import { missingMacfGitignoreEntries, updateGitignore } from './init.js';
 import { readAgentConfig, resolveCanonicalBranch, tokenSourceFromConfig, writeAgentConfig } from '../config.js';
 import type { MacfAgentConfig } from '../config.js';
 import { defaultProcReader, readPkgVersionFs, scanMacfProcesses } from '../proc-scan.js';
@@ -2585,11 +2585,9 @@ function isTracked(absDir: string, rel: string): boolean {
 }
 
 function hasMacfBlock(absDir: string): boolean {
-  try {
-    return /^\/?\.macf(\/(\*{1,2})?)?\s*$/m.test(readFileSync(join(absDir, '.gitignore'), 'utf-8'));
-  } catch {
-    return false;
-  }
+  let content = '';
+  try { content = readFileSync(join(absDir, '.gitignore'), 'utf-8'); } catch { return false; }
+  return missingMacfGitignoreEntries(content).length === 0;
 }
 
 export function checkMacfIgnores(workspaceDir: string): MacfIgnoreCheckResult {
@@ -2633,7 +2631,7 @@ export function checkMacfIgnores(workspaceDir: string): MacfIgnoreCheckResult {
         `${p} is tracked by git, so ignore rules do not apply to it. Remove it from the index with git rm --cached ${p} and commit; if that commit was ever pushed, treat the key or token in it as exposed and rotate it.`,
     ),
     ...reincluded.map(
-      (p) => `${p} is still not ignored after the macf block was added; a "!" line in .gitignore re-includes it. Remove that line.`,
+      (p) => `${p} is still not ignored although .gitignore has the macf entries; a later rule, such as a "!" line, re-includes it. Remove that rule.`,
     ),
   ];
   if (messages.length > 0) {

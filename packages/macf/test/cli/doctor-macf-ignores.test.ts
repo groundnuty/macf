@@ -88,6 +88,14 @@ describe('checkMacfIgnores', () => {
     expect(r.tracked).toContain('.macf/certs');
   });
 
+  it('an anchored /.macf/ alone is missing coverage, not a re-include, so --fix applies', () => {
+    writeFileSync(join(dir, '.gitignore'), '/.macf/\n');
+    const r = checkMacfIgnores(dir);
+    expect(r.status).toBe('WARN');
+    expect(r.reincluded).toEqual([]);
+    expect(r.findings).toContain('.claude/.macf/env.github');
+  });
+
   it('reports a "!" re-include when the block exists but the path is still not ignored', () => {
     updateGitignore(dir);
     writeFileSync(join(dir, '.gitignore'), readFileSync(join(dir, '.gitignore'), 'utf-8') + '!.claude/.macf/\n');
@@ -95,7 +103,7 @@ describe('checkMacfIgnores', () => {
     expect(r.status).toBe('WARN');
     expect(r.reincluded).toEqual(['.claude/.macf/env.github']);
     expect(r.detail).toContain(
-      '.claude/.macf/env.github is still not ignored after the macf block was added; a "!" line in .gitignore re-includes it. Remove that line.',
+      '.claude/.macf/env.github is still not ignored although .gitignore has the macf entries; a later rule, such as a "!" line, re-includes it. Remove that rule.',
     );
   });
 
