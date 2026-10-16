@@ -666,6 +666,7 @@ function mkRolled(over: Partial<FleetRollResult> = {}): FleetRollResult {
     branchSkipped: 0,
     stalePinSkipped: 0,
     notYetServingSkipped: 0,
+    stuckAtLaunchPromptSkipped: 0,
     ...over,
   };
 }
@@ -719,6 +720,10 @@ describe('fleetUpgradeExitCode / isMixedVersionRoll (macf#1146) — pure decisio
     expect(rollLeftAgentBehind(mkRolled({ stalePinSkipped: 1 }))).toBe(true);
     expect(isMixedVersionRoll(report)).toBe(true);
     expect(fleetUpgradeExitCode(report)).toBe(2);
+  });
+
+  it('stuckAtLaunchPromptSkipped > 0, not halted → left behind (MIXED, macf#1478)', () => {
+    expect(rollLeftAgentBehind(mkRolled({ stuckAtLaunchPromptSkipped: 1 }))).toBe(true);
   });
 
   it('notYetServingSkipped > 0, not halted → 2 (MIXED)', () => {

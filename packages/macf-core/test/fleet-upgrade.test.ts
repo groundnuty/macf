@@ -169,6 +169,7 @@ function makeDriver(opts: {
    * explicitly configure a pin.
    */
   launchPin?: (agent: string) => string | null;
+  pane?: (agent: string) => string | null;
   /**
    * Per-agent inspected-workspace path (macf#1101) — omitted by default
    * (mirrors a driver that doesn't implement the OPTIONAL verb at all), so
@@ -236,7 +237,7 @@ function makeDriver(opts: {
     autoResolveCanonical: async (agent, files) => {
       calls.autoResolveCanonical.push({ agent, files });
     },
-    capturePane: async () => null,
+    capturePane: async (agent) => (opts.pane ? opts.pane(agent) : null),
     upgrade: async (agent) => {
       calls.upgrade.push(agent);
       calls.order.push(`upgrade:${agent}`);
@@ -1015,6 +1016,138 @@ describe('rollFleet', () => {
     // the lock in place; it is never released on a halted roll.
     expect(calls.stopHeartbeat).toEqual(['a1']);
     expect(calls.releaseLock).toEqual([]);
+  });
+
+  describe('stuck at a launch prompt (macf#1478)', () => {
+    const DEV_PANE = 'WARNING\n❯ 1. I am using this for local development\n  2. Exit\n';
+
+    const twoWithInstances = planFleetUpgrade(
+      [mkWs('a1', 'g', '0.2.40'), mkWs('a2', 'g', '0.2.40')],
+      mkState([
+        ['a1', '0.2.40', true, 'inst-a1-old'],
+        ['a2', '0.2.40', true, 'inst-a2-old'],
+      ]),
+      '0.2.41',
+    );
+    const expectSkippedAndContinued = (
+      res: Awaited<ReturnType<typeof rollFleet>>,
+      calls: { readonly upgrade: readonly string[] },
+    ): void => {
+      expect(res.halted).toBe(false);
+      expect(res.stuckAtLaunchPromptSkipped).toBe(1);
+      expect(res.notYetServingSkipped).toBe(0);
+      expect(calls.upgrade).toEqual(['a1', 'a2']); // a2 still rolls
+      expect(res.results[0]).toMatchObject({
+        agent: 'a1',
+        outcome: 'stuck-at-launch-prompt-skipped',
+        reason: 'stuck-at-launch-prompt',
+      });
+      expect(res.results[0]!.detail).toContain("a1's pane");
+      // The operator-facing remedy: real tmux session, exact command, operator answers.
+      expect(res.results[0]!.detail).toContain('tmux session g@a1');
+      expect(res.results[0]!.detail).toContain('macf fleet upgrade --execute');
+      expect(res.results[0]!.detail).toContain('same --target');
+      expect(res.results[0]!.detail).toContain('operator answers it by hand');
+      expect(res.results[0]!.detail).not.toContain('CONFIRMED');
+      expect(res.results[1]).toMatchObject({ agent: 'a2', outcome: 'upgraded' });
+    };
+
+    it('wrong-version with a known launch prompt on the pane → stuck-at-launch-prompt-skipped, NOT halted, a2 rolls', async () => {
+      const { driver, calls } = makeDriver({
+        state: mkState([]),
+        workspaces: [],
+        launchPin: (agent) => (agent === 'a1' ? '0.2.41' : null),
+        pane: (agent) => (agent === 'a1' ? DEV_PANE : null),
+      });
+      const { verifyGreen } = makeVerify({
+        a1: { ok: false, reason: 'wrong-version', lastVersion: '0.2.40' },
+      });
+      const events: UpgradeEvent[] = [];
+      const res = await rollFleet(twoBehind, { targetVersion: '0.2.41', verifyTimeoutMs: 1000 }, {
+        driver,
+        verifyGreen,
+        ...noWait,
+        onEvent: (ev) => events.push(ev),
+      });
+      expectSkippedAndContinued(res, calls);
+      expect(res.results[0]!.detail).toContain('dev-channels');
+      expect(events).toContainEqual({ kind: 'stuck-at-launch-prompt-skip', agent: 'a1' });
+      expect(events.some((e) => e.kind === 'halt')).toBe(false);
+    });
+
+    it('DECISIVE: same non-null instance_id before/after + a prompt on the pane → stuck-at-launch-prompt-skipped, not not-yet-serving', async () => {
+      const { driver, calls } = makeDriver({
+        state: mkState([]),
+        workspaces: [],
+        pane: (agent) => (agent === 'a1' ? DEV_PANE : null),
+      });
+      const { verifyGreen } = makeVerify({
+        a1: { ok: false, reason: 'wrong-version', lastVersion: '0.2.40', lastInstanceId: 'inst-a1-old' },
+      });
+      const res = await rollFleet(twoWithInstances, { targetVersion: '0.2.41', verifyTimeoutMs: 1000 }, {
+        driver,
+        verifyGreen,
+        ...noWait,
+      });
+      expectSkippedAndContinued(res, calls);
+    });
+
+    it('same instance_id and NO prompt on the pane → still not-yet-serving-skipped', async () => {
+      const { driver, calls } = makeDriver({
+        state: mkState([]),
+        workspaces: [],
+        pane: () => '❯ queued message in the input box\n',
+      });
+      const { verifyGreen } = makeVerify({
+        a1: { ok: false, reason: 'wrong-version', lastVersion: '0.2.40', lastInstanceId: 'inst-a1-old' },
+      });
+      const res = await rollFleet(twoWithInstances, { targetVersion: '0.2.41', verifyTimeoutMs: 1000 }, {
+        driver,
+        verifyGreen,
+        ...noWait,
+      });
+      expect(res.halted).toBe(false);
+      expect(calls.upgrade).toEqual(['a1', 'a2']);
+      expect(res.notYetServingSkipped).toBe(1);
+      expect(res.stuckAtLaunchPromptSkipped).toBe(0);
+      expect(res.results[0]).toMatchObject({ outcome: 'not-yet-serving-skipped', reason: 'not-yet-serving' });
+    });
+
+    it('wrong-version with a NEW instance_id and a prompt → stuck-at-launch-prompt-skipped', async () => {
+      const { driver, calls } = makeDriver({
+        state: mkState([]),
+        workspaces: [],
+        launchPin: (agent) => (agent === 'a1' ? '0.2.41' : null),
+        pane: (agent) => (agent === 'a1' ? DEV_PANE : null),
+      });
+      const { verifyGreen } = makeVerify({
+        a1: { ok: false, reason: 'wrong-version', lastVersion: '0.2.40', lastInstanceId: 'inst-a1-NEW' },
+      });
+      const res = await rollFleet(twoWithInstances, { targetVersion: '0.2.41', verifyTimeoutMs: 1000 }, {
+        driver,
+        verifyGreen,
+        ...noWait,
+      });
+      expectSkippedAndContinued(res, calls);
+    });
+
+    it('a pane with no prompt keeps the bad-release classification', async () => {
+      const { driver } = makeDriver({
+        state: mkState([]),
+        workspaces: [],
+        launchPin: (agent) => (agent === 'a1' ? '0.2.41' : null),
+        pane: () => '❯ queued message in the input box\n',
+      });
+      const { verifyGreen } = makeVerify({
+        a1: { ok: false, reason: 'wrong-version', lastVersion: '0.2.40' },
+      });
+      const res = await rollFleet(twoBehind, { targetVersion: '0.2.41', verifyTimeoutMs: 1000 }, {
+        driver,
+        verifyGreen,
+        ...noWait,
+      });
+      expect(res.results[0]).toMatchObject({ outcome: 'halted', reason: 'bad-release' });
+    });
   });
 
   describe('launch-pin discrimination (macf#899)', () => {

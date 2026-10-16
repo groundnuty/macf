@@ -1223,8 +1223,10 @@ describe('macf-prompt-watcher.sh — retry path shares the pre-Enter guard with 
         // The static pane never clears (stub tmux never reacts to sends),
         // so the watcher retries once (2 ordinal sends) and, because the
         // frame still matches BOTH times, sends Enter both times too.
-        expect(ordinalSends).toBe(2);
-        expect(enterSends).toBe(2);
+        // macf#1478: the watcher now re-arms up to REARM_MAX (3) attempts in
+        // total while the prompt keeps coming back, instead of one retry.
+        expect(ordinalSends).toBe(3);
+        expect(enterSends).toBe(3);
       } finally {
         rmSync(stateDir, { recursive: true, force: true });
         rmSync(workDir, { recursive: true, force: true });
@@ -1402,4 +1404,129 @@ describe('macf-prompt-watcher.sh — own-output strip survives line-wrapping (ma
       expect(line).not.toMatch(/\[(y\/N|Y\/n|y\/n)\]/);
     }
   }, 15_000);
+});
+
+/**
+ * groundnuty/macf#1478 — a "cleared" verdict needs the signature to stay
+ * absent for a settle window, and an allowlisted entry whose signature comes
+ * back is re-armed (bounded), never reclassified as UNKNOWN.
+ *
+ * The stub pane is scripted by the number of `1` sends so far: before any
+ * send it shows the prompt; after send N (N < `clearsAfterSend`) it shows the
+ * prompt ABSENT for the first `blinkCaptures` captures (a transient redraw)
+ * and the prompt again after that; from send `clearsAfterSend` on it is gone.
+ */
+function makeBlinkingStubTmuxDir(
+  dir0: string,
+  promptFrame: string,
+  clearsAfterSend: number,
+  blinkCaptures: number,
+): string {
+  const dir = mkdtempSync(join(tmpdir(), 'macf-prompt-watcher-tmux-blink-'));
+  const promptFile = join(dir, 'prompt.txt');
+  const sendsFile = join(dir0, 'sends.log');
+  const capFile = join(dir0, 'caps-since-send');
+  writeFileSync(promptFile, promptFrame);
+  writeFileSync(capFile, '0');
+  const shim = `#!/usr/bin/env bash
+set -euo pipefail
+cmd="\${1:-}"
+case "$cmd" in
+  capture-pane)
+    n=0; [ -f "${sendsFile}" ] && n=$(grep -c -- '-- 1$' "${sendsFile}" || true)
+    c=$(cat "${capFile}"); echo $((c + 1)) > "${capFile}"
+    if [ "$n" -ge ${clearsAfterSend} ]; then echo "Welcome to Claude Code"; exit 0; fi
+    if [ "$n" -ge 1 ] && [ "$c" -lt ${blinkCaptures} ]; then echo "Welcome to Claude Code"; exit 0; fi
+    cat "${promptFile}"
+    ;;
+  send-keys)
+    echo "SEND: $*" >> "${sendsFile}"
+    echo 0 > "${capFile}"
+    ;;
+  *) exit 0 ;;
+esac
+`;
+  writeFileSync(join(dir, 'tmux'), shim);
+  chmodSync(join(dir, 'tmux'), 0o755);
+  return dir;
+}
+
+const DEV_CHANNELS_FRAME =
+  'WARNING: Loading development channels\n❯ 1. I am using this for local development\n  2. Exit\n';
+
+function runRearmWatcher(opts: {
+  readonly frame: string;
+  readonly clearsAfterSend: number;
+  readonly blinkCaptures: number;
+  readonly rearmMax?: number;
+}): { sends: number; log: string; stderr: string; status: number | null } {
+  const stateDir = mkdtempSync(join(tmpdir(), 'macf-prompt-watcher-state-'));
+  const workDir = mkdtempSync(join(tmpdir(), 'macf-prompt-watcher-work-'));
+  const tmuxDir = makeBlinkingStubTmuxDir(workDir, opts.frame, opts.clearsAfterSend, opts.blinkCaptures);
+  const configDir = join(workDir, '.macf');
+  const configPath = join(configDir, 'prompt-responses.json');
+  try {
+    mkdirSync(configDir, { recursive: true });
+    writeFileSync(configPath, MINIMAL_CONFIG);
+    const res = spawnSync('bash', [WATCHER_SCRIPT, '%99'], {
+      encoding: 'utf-8',
+      env: {
+        PATH: `${tmuxDir}:${process.env['PATH'] ?? ''}`,
+        MACF_PROMPT_RESPONSES_PATH: configPath,
+        MACF_LOG_PATH: join(stateDir, 'channel.log'),
+        MACF_PROMPT_WATCH_WINDOW_SECS: '8',
+        MACF_PROMPT_WATCH_INTERVAL_SECS: '1',
+        MACF_PROMPT_WATCH_TOTAL_CAP_SECS: '8',
+        MACF_PROMPT_SETTLE_SECS: '2',
+        ...(opts.rearmMax ? { MACF_PROMPT_REARM_MAX: String(opts.rearmMax) } : {}),
+      },
+    });
+    const sendsFile = join(workDir, 'sends.log');
+    const sends = existsSync(sendsFile)
+      ? (readFileSync(sendsFile, 'utf-8').match(/-- 1$/gm) ?? []).length
+      : 0;
+    const logFile = join(stateDir, 'prompt-watcher.log');
+    return {
+      sends,
+      log: existsSync(logFile) ? readFileSync(logFile, 'utf-8') : '',
+      stderr: res.stderr,
+      status: res.status,
+    };
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(workDir, { recursive: true, force: true });
+    rmSync(tmuxDir, { recursive: true, force: true });
+  }
+}
+
+describe('macf-prompt-watcher.sh — outcome check + re-arm (macf#1478)', () => {
+  it('DECISIVE: a prompt that survives the first "1" (transient redraw) is answered again and the second send takes', () => {
+    const r = runRearmWatcher({ frame: DEV_CHANNELS_FRAME, clearsAfterSend: 2, blinkCaptures: 2 });
+    expect(r.status).toBe(0);
+    // Old code: judged cleared on the blink, spent max_fires:1, then called
+    // the returning prompt UNKNOWN and sent nothing more (1 send).
+    expect(r.sends).toBe(2);
+    expect(r.log).toContain('the answer did not take');
+    expect(r.log).toContain('cleared and stayed clear');
+    expect(r.log + r.stderr).not.toContain('UNKNOWN');
+  }, 20_000);
+
+  it('a prompt that never takes is re-sent a bounded number of times, then reported as not taking — never UNKNOWN', () => {
+    const r = runRearmWatcher({ frame: DEV_CHANNELS_FRAME, clearsAfterSend: 99, blinkCaptures: 0, rearmMax: 3 });
+    expect(r.status).toBe(0);
+    expect(r.sends).toBe(3);
+    expect(r.stderr).toContain('is still on screen after 3 answers');
+    expect(r.log + r.stderr).not.toContain('UNKNOWN');
+  }, 20_000);
+
+  it('Inv 1: a frame that matches no allowlisted entry is still alerted and never answered', () => {
+    const r = runRearmWatcher({
+      frame: 'Something else?\n❯ 1. Do the unlisted thing\n  2. No\n',
+      clearsAfterSend: 99,
+      blinkCaptures: 0,
+    });
+    expect(r.status).toBe(0);
+    expect(r.sends).toBe(0);
+    expect(r.stderr).toContain('UNKNOWN prompt-like frame');
+  }, 20_000);
 });

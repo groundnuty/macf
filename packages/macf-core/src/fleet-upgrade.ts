@@ -87,6 +87,7 @@
 import { compareSemver } from './semver.js';
 import type { FleetDriver, FleetState } from './fleet-driver.js';
 import type { WorkspaceRecord } from './discovery.js';
+import { PROMPT_RESPONSES_SEED, looksPromptLike } from './prompt-responses.js';
 import type { VerifyGreenOptions, VerifyGreenResult } from './verify-green.js';
 
 /**
@@ -193,6 +194,7 @@ export type RollOutcome =
   | 'branch-skipped'
   | 'stale-pin-skipped'
   | 'not-yet-serving-skipped'
+  | 'stuck-at-launch-prompt-skipped'
   | 'halted';
 
 /**
@@ -260,8 +262,27 @@ export type RollOutcome =
  *                             older/mixed-version fleet without that field
  *                             falls straight through to the `bad-release` /
  *                             `stale-pin` pin-check below, UNCHANGED.
+ * - `stuck-at-launch-prompt` — (macf#1478, NEW) the relaunched agent's pane shows
+ *                             a launch prompt that is still waiting for an
+ *                             answer (a known launch ceremony, Claude Code's
+ *                             trust dialog, or an unrecognised numbered menu /
+ *                             `(y/n)` frame). The pane is positive evidence of
+ *                             WHY the target version never confirmed, so the
+ *                             halt names that cause — never a bad release.
+ *                             NOT terminal, like `not-yet-serving` (the same
+ *                             situation, named precisely);
+ *                             `outcome: 'stuck-at-launch-prompt-skipped'` —
+ *                             `rollFleet` skips this ONE agent and CONTINUES.
+ *                             Remedy: clear the prompt in the named pane, then
+ *                             re-run. Checked FIRST, before every other
+ *                             classification.
  */
-export type HaltReason = 'bad-release' | 'relaunch-unconfirmed' | 'stale-pin' | 'not-yet-serving';
+export type HaltReason =
+  | 'bad-release'
+  | 'relaunch-unconfirmed'
+  | 'stale-pin'
+  | 'not-yet-serving'
+  | 'stuck-at-launch-prompt';
 
 /** The per-agent EXECUTE result. `detail` carries a human-readable summary. */
 export interface AgentRollResult {
@@ -270,7 +291,8 @@ export interface AgentRollResult {
   /**
    * Set when `outcome === 'halted'` OR `outcome === 'stale-pin-skipped'`
    * (macf#899 added the latter) OR `outcome === 'not-yet-serving-skipped'`
-   * (NEW, follow-up to macf#899) — see `HaltReason`.
+   * (NEW, follow-up to macf#899) OR `outcome === 'stuck-at-launch-prompt-skipped'`
+   * (macf#1478) — see `HaltReason`.
    */
   readonly reason?: HaltReason;
   readonly detail?: string;
@@ -461,6 +483,12 @@ export interface FleetRollResult {
    * anything about its launch pin.
    */
   readonly notYetServingSkipped: number;
+  /**
+   * Count of agents skipped because their pane shows a launch prompt still
+   * waiting for an answer (`reason: 'stuck-at-launch-prompt'`, macf#1478) —
+   * POST-flight and safe to continue past, like `notYetServingSkipped`.
+   */
+  readonly stuckAtLaunchPromptSkipped: number;
 }
 
 /** Progress events for CLI rendering (the RESULT objects are what tests assert on). */
@@ -547,6 +575,8 @@ export type UpgradeEvent =
    * the launch pin (which is never even consulted on this path).
    */
   | { readonly kind: 'not-yet-serving-skip'; readonly agent: string; readonly instanceId: string }
+  /** macf#1478 — the agent's pane waits at a launch prompt; skipped (NOT a halt) and the roll continues. */
+  | { readonly kind: 'stuck-at-launch-prompt-skip'; readonly agent: string }
   /**
    * DR-043 §D6 write-back (macf#907) — `deps.recordDeployedVersion` (the
    * confirmed-green `fleet.lock` write) rejected. NON-FATAL: `outcome` for
@@ -684,7 +714,42 @@ type HaltClassification =
   | { readonly reason: 'relaunch-unconfirmed'; readonly detail: string }
   | { readonly reason: 'bad-release'; readonly detail: string; readonly pin: string | null }
   | { readonly reason: 'stale-pin'; readonly detail: string; readonly pin: string }
-  | { readonly reason: 'not-yet-serving'; readonly detail: string; readonly instanceId: string };
+  | { readonly reason: 'not-yet-serving'; readonly detail: string; readonly instanceId: string }
+  | { readonly reason: 'stuck-at-launch-prompt'; readonly detail: string };
+
+/**
+ * Name the launch prompt a pane is sitting at, or `null` when none shows
+ * (macf#1478). Matches the seeded launch ceremonies, Claude Code's trust
+ * dialog, and any numbered-menu / `(y/n)` frame (`looksPromptLike`).
+ * Pure.
+ */
+export function detectLaunchPrompt(pane: string | null): string | null {
+  if (!pane) return null;
+  for (const entry of PROMPT_RESPONSES_SEED.entries) {
+    if (entry.frame_contains.every((needle) => pane.includes(needle))) return entry.name;
+  }
+  if (/do you trust/i.test(pane)) return 'trust-dialog';
+  return looksPromptLike(pane) ? 'unrecognised-prompt' : null;
+}
+
+/** Read the pane and classify it; a failed read is "no evidence", never a throw. */
+async function stuckAtPrompt(agent: string, fleet: string, driver: FleetDriver): Promise<HaltClassification | null> {
+  let prompt: string | null;
+  try {
+    prompt = detectLaunchPrompt(await driver.capturePane(agent));
+  } catch {
+    return null;
+  }
+  if (prompt === null) return null;
+  return {
+    reason: 'stuck-at-launch-prompt',
+    detail:
+      `stuck-at-launch-prompt: ${agent}'s pane shows a prompt waiting for an answer (${prompt}), ` +
+      `so the relaunched agent did not reach the target version. The operator answers it by ` +
+      `hand in tmux session ${fleet}@${agent}, then re-runs the same macf fleet upgrade ` +
+      `--execute command with the same --target. Skipped; the roll continues with the other agents.`,
+  };
+}
 
 /**
  * Classify a failed verify-green against the agent's PRE-upgrade running
@@ -767,6 +832,7 @@ async function classifyHalt(
   oldInstanceId: string | null,
   targetVersion: string,
   agent: string,
+  fleet: string,
   driver: FleetDriver,
 ): Promise<HaltClassification> {
   const base = `verify-green ${green.reason} (last=${green.lastVersion ?? 'down'})`;
@@ -775,6 +841,12 @@ async function classifyHalt(
     green.lastVersion !== null &&
     oldVersion !== null &&
     compareSemver(green.lastVersion, oldVersion) === 0;
+
+  // macf#1478 — a prompt on the pane is positive evidence of WHY the relaunch
+  // stalled, so it is checked before every other classification, including
+  // the same-instance early return below.
+  const stuck = await stuckAtPrompt(agent, fleet, driver);
+  if (stuck) return stuck;
 
   if (!confirmedOldVersion) {
     return { reason: 'relaunch-unconfirmed', detail: `relaunch-unconfirmed: ${base}` };
@@ -989,6 +1061,7 @@ export async function rollFleet(
   let branchSkipped = 0;
   let stalePinSkipped = 0;
   let notYetServingSkipped = 0;
+  let stuckAtLaunchPromptSkipped = 0;
 
   for (const plan of plans) {
     if (plan.disposition !== 'behind') continue;
@@ -1141,9 +1214,28 @@ export async function rollFleet(
       plan.runningInstanceId,
       opts.targetVersion,
       agent,
+      plan.fleet,
       deps.driver,
     );
     const { reason, detail } = classification;
+
+    if (reason === 'stuck-at-launch-prompt') {
+      // macf#1478 — same posture as `not-yet-serving`: the pane names the
+      // cause, one stuck relaunch endangers no other agent, so skip and
+      // CONTINUE. The lock stays (agent not confirmed clean); only the
+      // heartbeat stops.
+      stuckAtLaunchPromptSkipped += 1;
+      results.push({
+        agent,
+        outcome: 'stuck-at-launch-prompt-skipped',
+        reason,
+        detail,
+        ...(autoResolvedFiles ? { autoResolvedFiles } : {}),
+      });
+      deps.onEvent?.({ kind: 'stuck-at-launch-prompt-skip', agent });
+      stopHeartbeat();
+      continue;
+    }
 
     if (reason === 'not-yet-serving') {
       // NEW (follow-up to macf#899) — SAFE TO CONTINUE despite the agent
@@ -1219,6 +1311,7 @@ export async function rollFleet(
       branchSkipped,
       stalePinSkipped,
       notYetServingSkipped,
+      stuckAtLaunchPromptSkipped,
     };
   }
 
@@ -1232,6 +1325,7 @@ export async function rollFleet(
     branchSkipped,
     stalePinSkipped,
     notYetServingSkipped,
+    stuckAtLaunchPromptSkipped,
   };
 }
 
