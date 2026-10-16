@@ -8,9 +8,18 @@
  * probe issue, apply its label, close it on cleanup); `findRouterRun` is the
  * only read. The token is forwarded as `GH_TOKEN` in the subprocess env.
  */
+import { randomBytes } from 'node:crypto';
 import { execFile } from 'node:child_process';
+import { readFile } from 'node:fs/promises';
+import { readdirSync, readFileSync } from 'node:fs';
+import type { WorkspaceRecord } from '@groundnuty/macf-core';
+import { discoverWorkspaces } from '../discovery.js';
+import { readAgentConfig } from '../config.js';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { promisify } from 'node:util';
-import type { RoutingE2eCreateIssueResult, RoutingE2eLabelResult, RoutingE2eRouterRun } from './routing-e2e.js';
+import type { TextRead } from './routing-e2e-evidence.js';
+import type { RoutingE2eCreateIssueResult, RoutingE2eLabelResult, RoutingE2eRouterRun, RoutingE2eRunListing } from './routing-e2e.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -31,6 +40,9 @@ function errMessage(err: unknown): string {
 export function createProbeIssueCreator(token: string): (repo: string) => Promise<RoutingE2eCreateIssueResult> {
   const env = { ...process.env, GH_TOKEN: token };
   return async (repo: string): Promise<RoutingE2eCreateIssueResult> => {
+    // A per-probe token in the title: the router run's display_title is this title, which is
+    // how the probe tells its own run from a concurrent one.
+    const title = `Routing self-test probe (automated) ${randomBytes(4).toString('hex')}`;
     try {
       const { stdout } = await execFileAsync(
         'gh',
@@ -40,7 +52,7 @@ export function createProbeIssueCreator(token: string): (repo: string) => Promis
           '-X',
           'POST',
           '-f',
-          'title=Routing self-test probe (automated)',
+          `title=${title}`,
           '-f',
           'body=Automated routing capability check. Safe to ignore -- this issue is closed automatically ' +
             'once the check finishes; if you are reading this after it should have closed, the check likely ' +
@@ -51,7 +63,7 @@ export function createProbeIssueCreator(token: string): (repo: string) => Promis
         { encoding: 'utf-8', env, maxBuffer: 1024 * 1024 },
       );
       const parsed = JSON.parse(stdout) as { number: number; url: string };
-      return { ok: true, number: parsed.number, url: parsed.url };
+      return { ok: true, number: parsed.number, url: parsed.url, title };
     } catch (err) {
       return { ok: false, error: errMessage(err) };
     }
@@ -115,22 +127,24 @@ export function createIssueCloser(token: string): (repo: string, issueNumber: nu
  * event's own `cleanup-labels` run (a DIFFERENT job, gated on `action ==
  * 'closed'`, never re-notifies — verified against the live workflow source)
  * can never be mistaken for the one the label triggered. NEVER throws;
- * degrades to `found: false` on any read failure (repo has no
+ * a read failure returns `found: false` WITH `error` set (repo has no
  * `agent-router.yml`, auth failure, network error).
  */
 export function createRouterRunFinder(
   token: string,
-): (repo: string, sinceIso: string) => Promise<RoutingE2eRouterRun> {
+): (repo: string, sinceIso: string, event?: 'issues' | 'issue_comment') => Promise<RoutingE2eRouterRun> {
   const env = { ...process.env, GH_TOKEN: token };
-  return async (repo: string, sinceIso: string): Promise<RoutingE2eRouterRun> => {
+  return async (repo: string, sinceIso: string, event: 'issues' | 'issue_comment' = 'issues'): Promise<RoutingE2eRouterRun> => {
     try {
       const { stdout } = await execFileAsync(
         'gh',
         [
           'api',
+          '--method',
+          'GET',
           `repos/${repo}/actions/workflows/agent-router.yml/runs`,
           '-f',
-          'event=issues',
+          `event=${event}`,
           '-f',
           'per_page=10',
           '--jq',
@@ -139,10 +153,12 @@ export function createRouterRunFinder(
         { encoding: 'utf-8', env, maxBuffer: 4 * 1024 * 1024 },
       );
       const runs = JSON.parse(stdout) as readonly {
+        readonly id: number;
         readonly conclusion: string | null;
         readonly status: string;
         readonly created_at: string;
         readonly html_url: string;
+        readonly display_title?: string;
       }[];
       const sinceMs = Date.parse(sinceIso) - RUN_LOOKBACK_BUFFER_MS;
       const candidates = runs
@@ -150,9 +166,178 @@ export function createRouterRunFinder(
         .sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at));
       const run = candidates[0];
       if (!run) return { found: false, conclusion: null, status: null, url: null };
-      return { found: true, conclusion: run.conclusion, status: run.status, url: run.html_url };
+      return { found: true, id: run.id, conclusion: run.conclusion, status: run.status, url: run.html_url, ...(run.display_title !== undefined ? { title: run.display_title } : {}) };
+    } catch (err) {
+      // Could not read ≠ no run: carry the error so the caller says "unknown".
+      return { found: false, conclusion: null, status: null, url: null, error: errMessage(err) };
+    }
+  };
+}
+
+/**
+ * Post ONE clearly labelled comment mentioning the recipient's bot on an
+ * existing issue. Never edits or deletes anything. NEVER throws.
+ */
+export function createMentionPoster(
+  token: string,
+): (repo: string, issue: number, botLogin: string) => Promise<{ ok: true; url: string } | { ok: false; error: string }> {
+  const env = { ...process.env, GH_TOKEN: token };
+  return async (repo, issue, botLogin) => {
+    try {
+      const { stdout } = await execFileAsync(
+        'gh',
+        [
+          'api', `repos/${repo}/issues/${String(issue)}/comments`, '-X', 'POST',
+          '-f', `body=@${botLogin}[bot] Automated routing probe. Safe to ignore; nothing needs doing.`,
+          '--jq', '.html_url',
+        ],
+        { encoding: 'utf-8', env, maxBuffer: 1024 * 1024 },
+      );
+      return { ok: true, url: stdout.trim() };
+    } catch (err) {
+      return { ok: false, error: errMessage(err) };
+    }
+  };
+}
+
+/** The router run's log, read by run id. NEVER throws. */
+export function createRunLogReader(token: string): (repo: string, runId: number) => Promise<TextRead> {
+  const env = { ...process.env, GH_TOKEN: token };
+  return async (repo, runId) => {
+    try {
+      const { stdout } = await execFileAsync('gh', ['run', 'view', String(runId), '--repo', repo, '--log'], {
+        encoding: 'utf-8', env, maxBuffer: 32 * 1024 * 1024,
+      });
+      return { kind: 'ok', text: stdout };
+    } catch (err) {
+      return { kind: 'error', error: errMessage(err) };
+    }
+  };
+}
+
+/**
+ * `<state>/macf/<project>@<agent_name>/channel.log` — the SAME expression the
+ * launcher bakes into MACF_LOG_PATH (`env-files.ts`). Keyed on `agent_name`,
+ * NOT the routing label (they differ on the substrate: science is
+ * agent_name `macf-science-agent`, label `science-agent`).
+ */
+export function receiverLogPathFor(project: string, agentName: string): string {
+  const state = process.env['XDG_STATE_HOME'] || join(homedir(), '.local', 'state');
+  return join(state, 'macf', `${project}@${agentName}`, 'channel.log');
+}
+
+export interface ReceiverLogSeams {
+  readonly discover: () => readonly WorkspaceRecord[];
+  readonly readConfig: (workspaceDir: string) => { readonly agent_name: string } | null;
+  /** Literal `export MACF_LOG_PATH=<path>` from the workspace's `.claude/.macf/env.*`, or null. */
+  readonly readEnvLogPath: (workspaceDir: string) => string | null;
+}
+
+/** A literal (no `$`) MACF_LOG_PATH export from env.* files; last file (sorted) wins. */
+export function readEnvLogPathFromDir(workspaceDir: string): string | null {
+  const dir = join(workspaceDir, '.claude', '.macf');
+  let names: string[];
+  try {
+    names = readdirSync(dir).filter((n) => n.startsWith('env.')).sort();
+  } catch {
+    return null;
+  }
+  let found: string | null = null;
+  for (const n of names) {
+    let text: string;
+    try {
+      text = readFileSync(join(dir, n), 'utf-8');
     } catch {
-      return { found: false, conclusion: null, status: null, url: null };
+      continue;
+    }
+    for (const line of text.split('\n')) {
+      const m = /^\s*export\s+MACF_LOG_PATH=(?:"([^"]*)"|'([^']*)'|(\S+))\s*$/.exec(line);
+      const v = m ? (m[1] ?? m[2] ?? m[3]) : undefined;
+      if (v && !v.includes('$')) found = v;
+    }
+  }
+  return found;
+}
+
+/**
+ * Resolve the recipient's log path from its identity ON THIS HOST: the local
+ * workspace whose config declares `project` + routing label `label`. Its
+ * configured MACF_LOG_PATH wins; else derived from its `agent_name`. No such
+ * workspace → null ("not verifiable from this host"); never a label-keyed guess.
+ */
+export function resolveReceiverLogPath(
+  project: string,
+  label: string,
+  projectDir: string,
+  seams?: ReceiverLogSeams,
+): string | null {
+  const s: ReceiverLogSeams = seams ?? {
+    discover: () => discoverWorkspaces({ cwd: projectDir }),
+    readConfig: (d) => readAgentConfig(d),
+    readEnvLogPath: readEnvLogPathFromDir,
+  };
+  const rec = s.discover().find((r) => r.project === project && r.agent === label);
+  if (!rec) return null;
+  const fromEnv = s.readEnvLogPath(rec.workspace);
+  if (fromEnv) return fromEnv;
+  const cfg = s.readConfig(rec.workspace);
+  return cfg ? receiverLogPathFor(project, cfg.agent_name) : null;
+}
+
+export async function readLocalLog(path: string): Promise<TextRead> {
+  try {
+    return { kind: 'ok', text: await readFile(path, 'utf-8') };
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { kind: 'absent' };
+    return { kind: 'error', error: errMessage(err) };
+  }
+}
+
+/**
+ * EVERY router run for `event` created no earlier than 5 s before `sinceIso`,
+ * oldest first (the finder above returns only the first). Used to disambiguate
+ * concurrent runs by their logs. NEVER throws; a read failure is `{ ok: false }`, never `[]`.
+ */
+export function createRouterRunLister(
+  token: string,
+): (repo: string, sinceIso: string, event: 'issues' | 'issue_comment') => Promise<RoutingE2eRunListing> {
+  const env = { ...process.env, GH_TOKEN: token };
+  return async (repo, sinceIso, event) => {
+    try {
+      const { stdout } = await execFileAsync(
+        'gh',
+        ['api', '--method', 'GET', `repos/${repo}/actions/workflows/agent-router.yml/runs`, '-f', `event=${event}`, '-f', 'per_page=20', '--jq', '.workflow_runs'],
+        { encoding: 'utf-8', env, maxBuffer: 4 * 1024 * 1024 },
+      );
+      const runs = JSON.parse(stdout) as readonly {
+        id: number; conclusion: string | null; status: string; created_at: string; html_url: string; display_title?: string;
+      }[];
+      const sinceMs = Date.parse(sinceIso) - RUN_LOOKBACK_BUFFER_MS;
+      const listed = runs
+        .filter((r) => Date.parse(r.created_at) >= sinceMs)
+        .sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at))
+        .map((r) => ({ found: true, id: r.id, conclusion: r.conclusion, status: r.status, url: r.html_url, ...(r.display_title !== undefined ? { title: r.display_title } : {}) }));
+      return { ok: true, runs: listed };
+    } catch (err) {
+      return { ok: false, error: errMessage(err) };
+    }
+  };
+}
+
+/** Mention mode: the existing issue's title (GET), or undefined when it cannot be read. NEVER throws. */
+export function createIssueTitleReader(token: string): (repo: string, issue: number) => Promise<string | undefined> {
+  const env = { ...process.env, GH_TOKEN: token };
+  return async (repo, issue) => {
+    try {
+      const { stdout } = await execFileAsync('gh', ['api', '--method', 'GET', `repos/${repo}/issues/${String(issue)}`, '--jq', '.title'], {
+        encoding: 'utf-8',
+        env,
+        maxBuffer: 1024 * 1024,
+      });
+      const t = stdout.trim();
+      return t.length > 0 ? t : undefined;
+    } catch {
+      return undefined;
     }
   };
 }
