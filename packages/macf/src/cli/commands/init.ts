@@ -16,7 +16,7 @@ import { copyCanonicalAssetsGuarded } from '../canonical-overwrite-guard.js';
 import { seedProjectRulesDir } from '../project-rules.js';
 import { reportSeedPromptResponses, seedPromptResponsesConfig } from '../prompt-responses.js';
 import { reportSeedStallSignatures, seedStallSignaturesConfig } from '../stall-signatures.js';
-import { installGhTokenHook, installStartupPickupHook, installPluginSkillPermissions, installSandboxFdAllowRead, installSandboxExcludedCommands } from '../settings-writer.js';
+import { installGhTokenHook, installStartupPickupHook, installPluginSkillPermissions, installSandboxFdAllowRead, installSandboxExcludedCommands, installIdleCompactionOff } from '../settings-writer.js';
 import { deriveBotLogin, fetchAppSlug } from './doctor.js';
 import { fetchPluginToWorkspace, copyLocalPluginToWorkspace, stripPluginMcpServers, linkPluginCliDist } from '../plugin-fetcher.js';
 import { writeMcpJsonChannelServer } from '../mcp-json.js';
@@ -953,6 +953,9 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
   // authored entries are preserved; opt-out via
   // MACF_SANDBOX_EXCLUDED_COMMANDS_SKIP=1. See macf#211.
   installSandboxExcludedCommands(absDir);
+
+  // Never idle-compact (CC 2.1.299); enforced, no opt-out. See settings-writer.ts.
+  installIdleCompactionOff(absDir);
   console.log(`  Sandbox: excludedCommands canonical set installed`);
 
   // Fetch the macf-agent plugin and place it at .macf/plugin/ so claude.sh

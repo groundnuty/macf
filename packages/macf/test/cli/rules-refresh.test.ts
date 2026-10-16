@@ -233,4 +233,17 @@ describe('canonical-overwrite guard integration (groundnuty/macf#1401, extending
     rmSync(fakeRoot, { recursive: true, force: true });
     rmSync(remote, { recursive: true, force: true });
   });
+
+  it('turns idle compaction off through the shared writer (true -> false, other keys kept)', () => {
+    mkdirSync(join(tmpRoot, '.claude'), { recursive: true });
+    writeFileSync(
+      join(tmpRoot, '.claude', 'settings.json'),
+      JSON.stringify({ idleCompaction: true, operatorKey: 'keep' }),
+    );
+    rulesRefresh(tmpRoot);
+    const out = JSON.parse(readFileSync(join(tmpRoot, '.claude', 'settings.json'), 'utf-8')) as Record<string, unknown>;
+    expect(out['idleCompaction']).toBe(false);
+    expect(out['operatorKey']).toBe('keep');
+  });
+
 });

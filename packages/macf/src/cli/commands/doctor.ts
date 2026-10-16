@@ -44,6 +44,7 @@ import {
   installStartupPickupHook,
   installPluginSkillPermissions,
   installSandboxExcludedCommands,
+  installIdleCompactionOff,
   installSandboxFdAllowRead,
   MACF_LEGACY_DENY_WRITE_PATTERNS,
   SANDBOX_FD_READ_PATTERN,
@@ -2870,6 +2871,7 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
         installStartupPickupHook(projectDir);
         installSandboxFdAllowRead(projectDir);
         installSandboxExcludedCommands(projectDir);
+        installIdleCompactionOff(projectDir);
         if (botLoginCheck.status === 'WARN') {
           try {
             const botLogin = await repairBotLogin(projectDir, config);

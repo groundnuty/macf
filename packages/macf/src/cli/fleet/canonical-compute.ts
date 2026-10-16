@@ -75,6 +75,7 @@ import {
   applyPluginSkillPermissionsTransform,
   applySandboxFdAllowReadTransform,
   applySandboxExcludedCommandsTransform,
+  applyIdleCompactionOffTransform,
   type Settings,
 } from '../settings-writer.js';
 
@@ -209,6 +210,7 @@ function applyAllSettingsTransforms(settings: Settings, workspaceDir: string): S
   out = applyPluginSkillPermissionsTransform(out);
   out = applySandboxFdAllowReadTransform(out);
   out = applySandboxExcludedCommandsTransform(out);
+  out = applyIdleCompactionOffTransform(out);
   return out;
 }
 

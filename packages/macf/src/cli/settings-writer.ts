@@ -1069,6 +1069,37 @@ export function installSandboxExcludedCommands(workspaceDir: string): void {
 }
 
 /**
+ * Idle compaction is OFF in every MACF workspace — enforced, not defaulted.
+ *
+ * Claude Code 2.1.299 added idle compaction: "a 200K+ token conversation left
+ * idle for about 54 minutes is compacted before its one-hour prompt cache
+ * expires", and "`"idleCompaction": false` in settings.json turns it off.
+ * Both need v2.1.290 or later". Fleet agents sit idle for long stretches
+ * waiting for routed work, so they would compact on their own and lose
+ * context. Operator directive: never idle-compact, in any MACF workspace.
+ *
+ * Unlike the `excludedCommands` merge there is deliberately NO opt-out env
+ * var, and an existing `true` (or any non-`false` value) is overwritten.
+ * Every other key is preserved untouched.
+ */
+export function applyIdleCompactionOffTransform(settings: Settings): Settings {
+  if (settings['idleCompaction'] === false) return settings;
+  return { ...settings, idleCompaction: false };
+}
+
+export function installIdleCompactionOff(workspaceDir: string): void {
+  const absDir = resolve(workspaceDir);
+  const claudeDir = join(absDir, '.claude');
+  const path = join(claudeDir, 'settings.json');
+
+  mkdirSync(claudeDir, { recursive: true });
+
+  const settings = readSettings(path);
+  if (settings['idleCompaction'] === false) return; // idempotent: no write
+  writeFileSync(path, JSON.stringify(applyIdleCompactionOffTransform(settings), null, 2) + '\n');
+}
+
+/**
  * Read `.claude/settings.json`'s `sandbox.excludedCommands` array as
  * a list of strings. Returns an empty array if the file doesn't
  * exist or the nested shape is absent/alien. Mirrors
