@@ -42,6 +42,7 @@ import { existsSync, readFileSync, accessSync, constants as fsConstants } from '
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { MacfError } from '@groundnuty/macf-core';
+import { PACKAGE_VERSION } from '../../package-version.js';
 import { readAgentConfig } from '../config.js';
 import { shellQuote } from '../fleet/launch-command.js';
 import { resolveWorkspaceDir, formatWorkspaceDirConflictWarning } from '../workspace-dir.js';
@@ -72,8 +73,12 @@ export function watchdogMarker(project: string): string {
 /** Coarse default cadence (DR-006 §A.4 heartbeat cadence). */
 export const DEFAULT_SCHEDULE = '*/10 * * * *';
 
-/** The command string the cron invokes (DR-037: the cron consumer of reconcile). */
-export const RECONCILE_INVOCATION = 'macf fleet reconcile';
+/**
+ * The subcommand the cron invokes (DR-037: the cron consumer of reconcile). It
+ * runs after the absolute `macf` path, because cron's PATH does not include npm's
+ * global bin.
+ */
+export const RECONCILE_ARGS = 'fleet reconcile';
 
 /** Default host-prelude path, relative to the workspace (DR-029/#599 generator). */
 const HOST_PRELUDE_REL = join('.claude', '.macf', 'host-prelude.sh');
@@ -104,6 +109,10 @@ export interface FleetInstallCronDeps {
   readonly crontabAvailable: () => boolean;
   /** App creds from `<workspace>/.claude/settings.local.json` `.env`, or null. */
   readonly readAppCreds: () => AppCreds | null;
+  /** Absolute path of the first `macf` on the installing shell's PATH, or null. */
+  readonly resolveMacf: () => string | null;
+  /** `<path> --version` of that binary (semver part), or null when it cannot be read. */
+  readonly macfVersion: (path: string) => string | null;
   /** True iff the token-mint helper exists + is executable at `path`. */
   readonly helperExists: (path: string) => boolean;
   /** Interactive y/N confirm (default No). */
@@ -118,6 +127,8 @@ export interface FleetInstallCronDeps {
 export interface RunFleetInstallCronOptions {
   /** The workspace's `macf-agent.json` `project`; scopes the crontab marker. */
   readonly project: string;
+  /** The running CLI's version; the `macf` baked into the line must match it. */
+  readonly cliVersion: string;
   /** Absolute workspace dir (holds `claude.sh`, `.claude/scripts`, `settings.local.json`). */
   readonly workspaceDir: string;
   /** Cron schedule expression. */
@@ -219,6 +230,8 @@ export function buildTokenPrefix(args: {
 /** All resolved pieces of a cron line (pure input to `buildCronLine`). */
 export interface CronLineParts {
   readonly schedule: string;
+  /** Absolute path of the `macf` binary the cron runs. */
+  readonly macfPath: string;
   readonly preludePath: string;
   readonly tokenPrefix: string;
   readonly reconcileFlags: readonly string[];
@@ -228,14 +241,14 @@ export interface CronLineParts {
 
 /**
  * Assemble the full crontab line:
- *   `<schedule> [ -f <prelude> ] && . <prelude>; <token>macf fleet reconcile --dir <workspace> <flags> >> <log> 2>&1 <marker>`
+ *   `<schedule> [ -f <prelude> ] && . <prelude>; <token><absolute macf> fleet reconcile --dir <workspace> <flags> >> <log> 2>&1 <marker>`
  * Every path is a quoted shell word.
  */
 export function buildCronLine(parts: CronLineParts): string {
   const prelude = `[ -f ${shellQuote(parts.preludePath)} ] && . ${shellQuote(parts.preludePath)}; `;
   const flags = parts.reconcileFlags.length > 0 ? ` ${parts.reconcileFlags.join(' ')}` : '';
   const cmd =
-    `${prelude}${parts.tokenPrefix}${RECONCILE_INVOCATION}${flags} ` +
+    `${prelude}${parts.tokenPrefix}${shellQuote(parts.macfPath)} ${RECONCILE_ARGS}${flags} ` +
     `>> ${shellQuote(parts.logPath)} 2>&1`;
   return `${parts.schedule} ${cmd} ${parts.marker}`;
 }
@@ -349,6 +362,12 @@ export async function runFleetInstallCron(
   const preludePath = opts.prelude ?? join(opts.workspaceDir, HOST_PRELUDE_REL);
   const logPath = opts.log ?? join(homedirOf(deps, opts), WATCHDOG_LOG_REL);
 
+  const macf = checkMacfBinary(opts.cliVersion, deps);
+  if (!macf.ok) {
+    deps.warn(`macf fleet install-cron: ${macf.message}`);
+    return 2;
+  }
+
   const token = buildTokenPrefix({
     noToken: opts.noToken,
     workspaceDir: opts.workspaceDir,
@@ -367,6 +386,7 @@ export async function runFleetInstallCron(
 
   const line = buildCronLine({
     schedule: opts.schedule,
+    macfPath: macf.path,
     preludePath,
     tokenPrefix: token.prefix,
     reconcileFlags,
@@ -395,6 +415,33 @@ export async function runFleetInstallCron(
   );
   deps.log('Verify: crontab -l | grep macf-watchdog');
   return 0;
+}
+
+/** Resolve the `macf` cron will run; refuse when absent or a different version. */
+export function checkMacfBinary(
+  cliVersion: string,
+  deps: Pick<FleetInstallCronDeps, 'resolveMacf' | 'macfVersion'>,
+): { readonly ok: true; readonly path: string } | { readonly ok: false; readonly message: string } {
+  const fix = `npm install -g @groundnuty/macf@${cliVersion}`;
+  const path = deps.resolveMacf();
+  if (!path) {
+    return {
+      ok: false,
+      message:
+        `no \`macf\` found on PATH. The cron line runs an absolute \`macf\` at this CLI's ` +
+        `version (${cliVersion}); install one with: ${fix}`,
+    };
+  }
+  const found = deps.macfVersion(path);
+  if (found !== cliVersion) {
+    return {
+      ok: false,
+      message:
+        `${path} reports version ${found ?? 'unknown'} but this CLI is ${cliVersion}. ` +
+        `Cron must run the same version; install it with: ${fix}`,
+    };
+  }
+  return { ok: true, path };
 }
 
 /** Human-readable install mode for the confirmation/summary lines. */
@@ -446,6 +493,18 @@ export function createRealDeps(workspaceDir: string): FleetInstallCronDeps {
       }
     },
     readAppCreds: () => readAppCredsFromSettings(workspaceDir),
+    resolveMacf: () => resolveOnPath('macf'),
+    macfVersion: (path: string) => {
+      try {
+        const out = execFileSync(path, ['--version'], {
+          encoding: 'utf-8',
+          stdio: ['ignore', 'pipe', 'ignore'],
+        }).trim();
+        return out.split('+')[0] || null;
+      } catch {
+        return null;
+      }
+    },
     helperExists: (path: string) => {
       try {
         accessSync(path, fsConstants.X_OK);
@@ -458,6 +517,21 @@ export function createRealDeps(workspaceDir: string): FleetInstallCronDeps {
     log: (msg: string) => console.log(msg),
     warn: (msg: string) => console.error(msg),
   };
+}
+
+/** First executable `name` on `$PATH`, as an absolute path (like `command -v`). */
+function resolveOnPath(name: string): string | null {
+  for (const dir of (process.env['PATH'] ?? '').split(':')) {
+    if (!dir || !dir.startsWith('/')) continue;
+    const candidate = join(dir, name);
+    try {
+      accessSync(candidate, fsConstants.X_OK);
+      return candidate;
+    } catch {
+      // not here — keep looking
+    }
+  }
+  return null;
 }
 
 /** Read `.env.{APP_ID,INSTALL_ID,KEY_PATH}` from the workspace's settings.local.json. */
@@ -537,6 +611,7 @@ export async function runFleetInstallCronCommand(
   return runFleetInstallCron(
     {
       project,
+      cliVersion: PACKAGE_VERSION,
       workspaceDir,
       schedule: cliOpts.schedule?.trim() || DEFAULT_SCHEDULE,
       execute: Boolean(cliOpts.execute),

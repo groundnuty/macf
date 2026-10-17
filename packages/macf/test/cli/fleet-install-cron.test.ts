@@ -22,6 +22,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { PACKAGE_VERSION } from '../../src/package-version.js';
 import {
   buildReconcileFlags,
   buildTokenPrefix,
@@ -34,7 +35,8 @@ import {
   WATCHDOG_MARKER,
   watchdogMarker,
   DEFAULT_SCHEDULE,
-  RECONCILE_INVOCATION,
+  RECONCILE_ARGS,
+  checkMacfBinary,
   type FleetInstallCronDeps,
   type RunFleetInstallCronOptions,
   type AppCreds,
@@ -62,7 +64,11 @@ vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:child_process')>();
   return {
     ...actual,
-    execFileSync: vi.fn((cmd: string, args?: readonly string[]) => {
+    execFileSync: vi.fn((cmd: string, args?: readonly string[], opts?: object) => {
+      // `<macf> --version` runs for real, against the stub binaries these tests plant.
+      if (args?.length === 1 && args[0] === '--version') {
+        return actual.execFileSync(cmd, [...args], opts as never);
+      }
       if (cmd === 'command' && args?.[0] === '-v' && args?.[1] === 'crontab') {
         return Buffer.from('/usr/bin/crontab\n');
       }
@@ -93,6 +99,8 @@ function fakeDeps(overrides: Partial<FleetInstallCronDeps> = {}): {
     },
     crontabAvailable: () => true,
     readAppCreds: () => FULL_CREDS,
+    resolveMacf: () => MACF_BIN,
+    macfVersion: () => CLI_VER,
     helperExists: () => true,
     confirm: async () => true,
     log: (msg: string) => rec.logs.push(msg),
@@ -103,10 +111,14 @@ function fakeDeps(overrides: Partial<FleetInstallCronDeps> = {}): {
 }
 
 const MARKER = watchdogMarker('proj');
+const MACF_BIN = '/opt/npm/bin/macf';
+const CLI_VER = '1.2.3';
+const INVOKE = `'${MACF_BIN}' ${RECONCILE_ARGS}`;
 
 function baseOpts(over: Partial<RunFleetInstallCronOptions> = {}): RunFleetInstallCronOptions {
   return {
     project: 'proj',
+    cliVersion: CLI_VER,
     workspaceDir: WS,
     schedule: DEFAULT_SCHEDULE,
     execute: false,
@@ -230,6 +242,7 @@ describe('buildTokenPrefix', () => {
 describe('buildCronLine', () => {
   const parts = {
     schedule: DEFAULT_SCHEDULE,
+    macfPath: MACF_BIN,
     preludePath: '/ws/.claude/.macf/host-prelude.sh',
     tokenPrefix: 'GH_TOKEN=$(x) || exit 1; export GH_TOKEN; ',
     reconcileFlags: [] as readonly string[],
@@ -242,7 +255,7 @@ describe('buildCronLine', () => {
     expect(line.startsWith(`${DEFAULT_SCHEDULE} `)).toBe(true);
     expect(line).toContain("[ -f '/ws/.claude/.macf/host-prelude.sh' ] && . '/ws/.claude/.macf/host-prelude.sh';");
     expect(line).toContain('GH_TOKEN=$(x) || exit 1; export GH_TOKEN;');
-    expect(line).toContain(RECONCILE_INVOCATION);
+    expect(line).toContain(INVOKE);
     expect(line).toContain("'/home/agent/.macf/watchdog.log' 2>&1");
     expect(line.endsWith(MARKER)).toBe(true);
   });
@@ -254,14 +267,14 @@ describe('buildCronLine', () => {
 
   it('execute line carries --execute right after the invocation', () => {
     const line = buildCronLine({ ...parts, reconcileFlags: ['--execute'] });
-    expect(line).toContain(`${RECONCILE_INVOCATION} --execute >> `);
+    expect(line).toContain(`${INVOKE} --execute >> `);
   });
 
   it('line built from real flags carries --dir for a plain path', () => {
     const reconcileFlags = buildReconcileFlags({
       workspaceDir: '/ws', withRouting: false, execute: false, allowRestart: false,
     });
-    expect(buildCronLine({ ...parts, reconcileFlags })).toContain(`${RECONCILE_INVOCATION} --dir '/ws' >> `);
+    expect(buildCronLine({ ...parts, reconcileFlags })).toContain(`${INVOKE} --dir '/ws' >> `);
   });
 
   it('quotes a workspace path containing a space and a single quote', () => {
@@ -271,26 +284,24 @@ describe('buildCronLine', () => {
     expect(buildCronLine({ ...parts, reconcileFlags })).toContain(`--dir '/my ws/it'\\''s'`);
   });
 
-  it('the built reconcile command, run from a directory outside the workspace, gets --dir', async () => {
+  it('the built reconcile command, run from a directory outside the workspace, gets --dir under a minimal env -i PATH', async () => {
     const ws = "/my ws/it's";
     const reconcileFlags = buildReconcileFlags({
       workspaceDir: ws, withRouting: false, execute: true, allowRestart: false,
     });
-    const line = buildCronLine({ ...parts, tokenPrefix: '', preludePath: '/nonexistent/prelude.sh', logPath: '/dev/null', reconcileFlags });
+    const root = mkdtempSync(join(tmpdir(), 'cron-exec-'));
+    const line = buildCronLine({ ...parts, macfPath: join(root, 'bin', 'macf'), tokenPrefix: '', preludePath: '/nonexistent/prelude.sh', logPath: '/dev/null', reconcileFlags });
     // Everything after the schedule, minus the marker comment.
     const cmd = line.slice(parts.schedule.length + 1, line.length - parts.marker.length - 1);
-    const root = mkdtempSync(join(tmpdir(), 'cron-exec-'));
     try {
       const bin = join(root, 'bin');
       const cwd = join(root, 'elsewhere');
       const out = join(root, 'argv.txt');
       mkdirSync(bin); mkdirSync(cwd);
-      writeFileSync(join(bin, 'macf'), '#!/bin/sh\n{ pwd; for a in "$@"; do printf "%s\\n" "$a"; done; } > "$STUB_OUT"\n', { mode: 0o755 });
+      writeFileSync(join(bin, 'macf'), `#!/bin/sh\n{ pwd; for a in "$@"; do printf "%s\\n" "$a"; done; } > '${out}'\n`, { mode: 0o755 });
       writeFileSync(join(root, 'cron.sh'), cmd + '\n');
       const real = await vi.importActual<typeof import('node:child_process')>('node:child_process');
-      real.execFileSync('/bin/sh', [join(root, 'cron.sh')], {
-        cwd, env: { PATH: `${bin}:${process.env['PATH'] ?? ''}`, STUB_OUT: out },
-      });
+      real.execFileSync('/usr/bin/env', ['-i', `HOME=${root}`, 'PATH=/usr/bin:/bin', '/bin/sh', join(root, 'cron.sh')], { cwd });
       const lines = readFileSync(out, 'utf-8').trimEnd().split('\n');
       expect(lines[0]).toBe(realpathSync(cwd));
       expect(lines.slice(1)).toEqual(['fleet', 'reconcile', '--dir', ws, '--execute']);
@@ -339,7 +350,7 @@ describe('runFleetInstallCron — install', () => {
     expect(rec.writes).toHaveLength(1);
     const written = rec.writes[0]!;
     expect(written).toContain(MARKER);
-    expect(written).toContain(RECONCILE_INVOCATION);
+    expect(written).toContain(INVOKE);
     expect(written).not.toContain('--execute');
     // token-mint baked (full creds available)
     expect(written).toContain('GH_TOKEN=$(');
@@ -421,6 +432,59 @@ describe('runFleetInstallCron — uninstall', () => {
     const code = await runFleetInstallCron(baseOpts({ uninstall: true, yes: false }), deps);
     expect(code).toBe(0);
     expect(rec.writes).toHaveLength(0);
+  });
+});
+
+describe('absolute macf path', () => {
+  const fix = `npm install -g @groundnuty/macf@${CLI_VER}`;
+
+  it('the installed line contains the resolved absolute path, not a bare macf', async () => {
+    const { deps, rec } = fakeDeps({ resolveMacf: () => '/home/u/.npm-global/bin/macf' });
+    expect(await runFleetInstallCron(baseOpts(), deps)).toBe(0);
+    expect(rec.writes[0]!).toContain("'/home/u/.npm-global/bin/macf' fleet reconcile");
+    expect(rec.writes[0]!).not.toMatch(/[; ]macf fleet reconcile/);
+  });
+
+  it('no macf on PATH → exit 2 with the install command, no write', async () => {
+    const { deps, rec } = fakeDeps({ resolveMacf: () => null });
+    expect(await runFleetInstallCron(baseOpts(), deps)).toBe(2);
+    expect(rec.writes).toHaveLength(0);
+    expect(rec.warns.join('\n')).toContain(fix);
+  });
+
+  it('version mismatch → exit 2 naming both versions and the install command', async () => {
+    const { deps, rec } = fakeDeps({ macfVersion: () => '0.9.0' });
+    expect(await runFleetInstallCron(baseOpts(), deps)).toBe(2);
+    expect(rec.writes).toHaveLength(0);
+    const w = rec.warns.join('\n');
+    expect(w).toContain('0.9.0');
+    expect(w).toContain(CLI_VER);
+    expect(w).toContain(fix);
+  });
+
+  it('an unreadable --version is a refusal too', () => {
+    const r = checkMacfBinary(CLI_VER, { resolveMacf: () => MACF_BIN, macfVersion: () => null });
+    expect(r.ok).toBe(false);
+  });
+
+  it('--print applies the same checks, and prints the resolved line when good', async () => {
+    const bad = fakeDeps({ resolveMacf: () => null });
+    expect(await runFleetInstallCron(baseOpts({ print: true }), bad.deps)).toBe(2);
+    expect(bad.rec.logs).toHaveLength(0);
+    const mismatch = fakeDeps({ macfVersion: () => '0.9.0' });
+    expect(await runFleetInstallCron(baseOpts({ print: true }), mismatch.deps)).toBe(2);
+    const good = fakeDeps();
+    expect(await runFleetInstallCron(baseOpts({ print: true }), good.deps)).toBe(0);
+    expect(good.rec.logs.join('\n')).toContain(INVOKE);
+  });
+
+  it('--uninstall needs no macf binary', async () => {
+    const { deps, rec } = fakeDeps({
+      resolveMacf: () => null,
+      readCrontab: () => `*/10 * * * * x ${MARKER}\n@daily y`,
+    });
+    expect(await runFleetInstallCron(baseOpts({ uninstall: true }), deps)).toBe(0);
+    expect(rec.writes[0]!).toBe('@daily y\n');
   });
 });
 
@@ -506,16 +570,24 @@ describe('per-project marker', () => {
 
 describe('runFleetInstallCronCommand — --dir vs ambient MACF_WORKSPACE_DIR (macf#1123)', () => {
   const ORIGINAL_ENV = process.env['MACF_WORKSPACE_DIR'];
+  const ORIGINAL_PATH = process.env['PATH'];
+  let stubDir = '';
   let logSpy: ReturnType<typeof vi.spyOn>;
   let errSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
+    // A stub `macf` at this CLI's version, so the real deps resolve a matching binary.
+    stubDir = mkdtempSync(join(tmpdir(), 'macf-stub-'));
+    writeFileSync(join(stubDir, 'macf'), `#!/bin/sh\necho ${PACKAGE_VERSION}\n`, { mode: 0o755 });
+    process.env['PATH'] = `${stubDir}:${ORIGINAL_PATH ?? ''}`;
     logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
   });
   afterEach(() => {
     logSpy.mockRestore();
     errSpy.mockRestore();
+    process.env['PATH'] = ORIGINAL_PATH;
+    rmSync(stubDir, { recursive: true, force: true });
     if (ORIGINAL_ENV === undefined) delete process.env['MACF_WORKSPACE_DIR'];
     else process.env['MACF_WORKSPACE_DIR'] = ORIGINAL_ENV;
   });
