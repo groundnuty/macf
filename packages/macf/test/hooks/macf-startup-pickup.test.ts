@@ -352,7 +352,7 @@ describe('macf-startup-pickup.sh (SessionStart hook, groundnuty/macf#768)', () =
     // and a genuine startup must be UNCHANGED (covered by every other
     // describe block in this file, none of which override `source` — they
     // all still send the default 'startup').
-    for (const source of ['compact', 'resume', 'clear', 'fork']) {
+    for (const source of ['compact', 'clear', 'fork']) {
       it(`source: '${source}' → does NOT inject (fails CLOSED, not the pre-#930 fire-on-everything behavior)`, () => {
         const r = runHook({
           pluginOutput: PENDING_OUTPUT,
@@ -365,6 +365,18 @@ describe('macf-startup-pickup.sh (SessionStart hook, groundnuty/macf#768)', () =
         expect(r.submitInvocation).toBeNull();
       });
     }
+
+    it("source: 'resume' → injects (claude.sh relaunches with `claude -c`, so every relaunch is a resume)", () => {
+      const r = runHook({
+        pluginOutput: PENDING_OUTPUT,
+        pluginOnelineOutput: '#1: fix the thing; #2: write the docs',
+        env: { MACF_AGENT_ROLE: 'code-agent' },
+        source: 'resume',
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain('pending issue(s):');
+      expect(r.submitInvocation).not.toBeNull();
+    });
 
     it("an unrecognised source ('wat') → does NOT inject (fail-closed on ambiguity, not just the 4 known non-startup values)", () => {
       const r = runHook({

@@ -52,17 +52,18 @@
 # NOT instant by design as of groundnuty/macf#802 — see below.
 #
 # TRIGGER + SUBAGENT GATE (groundnuty/macf#930): the pickup nudge is
-# appropriate ONLY for a genuine fresh client start. Pre-#930 this hook was
-# registered matcher-less (fires on every SessionStart source) and never
-# read its own payload, so it ALSO fired on `compact` / `resume` / `clear` /
-# `fork` (competing with in-flight work right after the agent lost context
+# appropriate only for a session that starts a client: `startup`, or `resume`
+# from a `claude -c` relaunch. Pre-#930 this hook was registered matcher-less
+# (fires on every SessionStart source) and never read its own payload, so it
+# ALSO fired on `compact` / `clear` / `fork` (competing with in-flight work
+# right after the agent lost context
 # to compaction — the worst time to spend it re-injecting a queue prompt)
 # and reached at least one MACF-orchestrated worker/subagent session
 # (operator-witnessed live, groundnuty/macf#930 comments), which cannot
 # distinguish an ambient framework injection from a genuine task from its
 # principal. Independent, deliberately non-bypassable checks below:
-#   - `source` must be exactly `startup` (registration also carries
-#     `matcher: "startup"` as defense-in-depth, but the script-side check is
+#   - `source` must be exactly `startup` or `resume` (registration also
+#     carries `matcher: "startup|resume"` as defense-in-depth, but the script-side check is
 #     the one that actually gates the payload — Claude Code evaluates a
 #     `matcher` before invoking the command at all, which makes a matcher
 #     alone unobservable/untestable from inside the script, and this script
@@ -72,6 +73,12 @@
 #     plus a captured payload example, corroborated internally by this
 #     repo's own DR-034 `SessionStart(source=compact)` usage — not
 #     assumed from memory.
+#     `resume` is accepted because `claude.sh` relaunches with `claude -c`,
+#     so every relaunch (fleet upgrade, restart-self, the operator) is
+#     `source=resume`; accepting it picks up work routed while the agent was
+#     down. `compact`, `clear` and
+#     `fork` stay excluded: they are mid-session context events, where
+#     re-injecting a queue prompt competes with in-flight work.
 #   - `agent_id` must be absent — Claude Code documents `agent_id` as
 #     present "ONLY when the hook fires inside a subagent", the precise
 #     signal (deliberately NOT `agent_type` too — see the inline comment at
@@ -269,19 +276,19 @@ fi
 # 3. Trigger + subagent gate (groundnuty/macf#930) — see the file header
 #    "TRIGGER + SUBAGENT GATE" section for the full rationale + citations.
 #    Read now (not drained/ignored, pre-#930 behavior) because this is the
-#    place that can actually be tested: the `matcher: "startup"` on this
-#    hook's registration (settings-writer.ts / hooks.json) is
+#    place that can actually be tested: the `matcher: "startup|resume"` on this
+#    hook's registration (settings-writer.ts, in settings.json) is
 #    defense-in-depth, but Claude Code evaluates matchers before invoking
 #    the command at all, so a matcher alone is unobservable/untestable from
 #    inside the script — this script-side check is what a test actually
 #    drives.
 INPUT_JSON="$(cat 2>/dev/null || echo '')"
 SESSION_SOURCE="$(printf '%s' "$INPUT_JSON" | sed -n 's/.*"source":"\([^"]*\)".*/\1/p' 2>/dev/null || true)"
-# Fail CLOSED on anything but an exact "startup" match — absent, malformed,
-# or any of resume/clear/compact/fork all take this exit. No override: this
-# is a correctness gate (matching Claude Code's own definition of "a client
-# actually started"), not an optional feature toggle.
-[[ "$SESSION_SOURCE" == "startup" ]] || exit 0
+# Fail CLOSED on anything but an exact "startup" or "resume" match — absent,
+# malformed, or any of clear/compact/fork all take this exit. No override:
+# this is a correctness gate (a client actually started or was relaunched
+# via `claude -c`), not an optional feature toggle.
+[[ "$SESSION_SOURCE" == "startup" || "$SESSION_SOURCE" == "resume" ]] || exit 0
 
 # Best-effort subagent no-op — see the file header for why this does NOT
 # fully cover the operator-witnessed incident. Checked AFTER the source

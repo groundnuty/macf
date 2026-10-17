@@ -37,6 +37,7 @@ import {
   MACF_TURN_RECEIPT_HOOK_COMMAND,
   MACF_CHANNELS_HOOK_COMMAND,
   MACF_STARTUP_PICKUP_HOOK_COMMAND,
+  MACF_STARTUP_PICKUP_HOOK_MATCHER,
   ROLE_FLOOR_ALLOW,
   ROLE_FLOOR_DENY,
 } from './settings-writer.js';
@@ -77,12 +78,12 @@ export const ROLE_FLOOR_HOOKS: readonly ExpectedHook[] = [
   // this expected-settings entry — see `startupPickupAutoResumesByDefault`
   // below for the policy the script's runtime check mirrors.
   //
-  // `matcher: 'startup'` (groundnuty/macf#930) mirrors what
+  // `matcher: 'startup|resume'` (groundnuty/macf#930) mirrors what
   // `applyStartupPickupHookTransform` actually writes — defense-in-depth
   // only; `doctor.ts`'s `hookFindings` compares command presence, not
   // matcher equality, so this field is documentation-accuracy, not a
   // functional drift check.
-  { event: 'SessionStart', matcher: 'startup', command: MACF_STARTUP_PICKUP_HOOK_COMMAND, required: false },
+  { event: 'SessionStart', matcher: MACF_STARTUP_PICKUP_HOOK_MATCHER, command: MACF_STARTUP_PICKUP_HOOK_COMMAND, required: false },
 ];
 
 /** Per-role additions beyond the floor (DR-028 §Decision 1, Per-role deltas). */
