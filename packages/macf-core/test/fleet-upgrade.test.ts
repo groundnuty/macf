@@ -6,6 +6,7 @@
  * `fleet/upgrade.sh` guard cases (behind-selected / at-target-skipped / busy-skip
  * / verify-green-before-next / HALT-the-roll).
  */
+import { readFileSync } from 'node:fs';
 import { describe, it, expect } from 'vitest';
 import {
   planFleetUpgrade,
@@ -15,6 +16,9 @@ import {
   buildConfigDirtyMessage,
   buildBranchSkipMessage,
   describeInspectedWorkspace,
+  detectLaunchPrompt,
+  isPaneReady,
+  isWatcherAnsweredPrompt,
   type FleetDriver,
   type FleetState,
   type WorkspaceRecord,
@@ -207,6 +211,7 @@ function makeDriver(opts: {
       calls.discover += 1;
       return opts.workspaces;
     },
+    isRunning: async () => true,
     isBusy: async (agent) => {
       const idx = perAgent.get(agent) ?? 0;
       perAgent.set(agent, idx + 1);
@@ -342,6 +347,7 @@ function makeTransactionalDriver(opts: {
       calls.discover += 1;
       return opts.workspaces;
     },
+    isRunning: async () => true,
     isBusy: async (agent) => {
       calls.isBusy.push(agent);
       return false;
@@ -1912,5 +1918,29 @@ describe('upgradeFleets', () => {
     expect(report.halted).toBe(false);
     expect(report.fleets[0]).toMatchObject({ fleet: 'fleet-1', skipped: 'driver-unresolved' });
     expect(calls.upgrade).toEqual(['b']); // fleet-2 still rolled
+  });
+});
+
+describe('isPaneReady', () => {
+  const fx = (n: string) => readFileSync(new URL(`./fixtures/${n}`, import.meta.url), 'utf8');
+  it('is true for the live ready pane', () => {
+    expect(isPaneReady(fx('live-ready-pane.txt'))).toBe(true);
+  });
+  it('is false for the live trust pane', () => {
+    expect(isPaneReady(fx('live-trust-pane.txt'))).toBe(false);
+  });
+  it('is false for a pane before Claude Code has drawn', () => {
+    expect(isPaneReady(fx('pre-start-pane.txt'))).toBe(false);
+  });
+});
+
+describe('detectLaunchPrompt', () => {
+  it('names the live Claude Code trust dialog', () => {
+    const pane = readFileSync(new URL('./fixtures/live-trust-pane.txt', import.meta.url), 'utf8');
+    expect(detectLaunchPrompt(pane)).toBe('trust-dialog');
+  });
+  it('separates watcher-answered prompts from the rest', () => {
+    expect(isWatcherAnsweredPrompt('dev-channels')).toBe(true);
+    expect(isWatcherAnsweredPrompt('trust-dialog')).toBe(false);
   });
 });

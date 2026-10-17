@@ -18,6 +18,8 @@
  *   - dry-run plans-without-acting; --execute acts
  */
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { PROMPT_RESPONSES_SEED } from '../src/prompt-responses.js';
 import {
   reconcileFleet,
   resolveReconcileConfig,
@@ -37,6 +39,8 @@ import {
   type ReconcileHeartbeat,
   type ReconcileStateStore,
   type WorkspaceRecord,
+  FleetLaunchBlockedError,
+  FleetLaunchFailedError,
 } from '../src/index.js';
 
 // --- fixtures ---------------------------------------------------------------
@@ -80,23 +84,44 @@ interface DriverCalls {
 interface FakeDriverOpts {
   readonly probe: FleetState | (() => Promise<FleetState>);
   readonly busy?: ReadonlySet<string>;
+  /** Agents with no live session. Default: a registered agent runs, an unregistered one does not. */
+  readonly notRunning?: ReadonlySet<string>;
+  /** Unregistered agents that nevertheless have a live session (starting, or stuck at a prompt). */
+  readonly runningUnregistered?: ReadonlySet<string>;
+  /** Make `launch` throw this for the named agent. */
+  readonly launchThrows?: ReadonlyMap<string, Error>;
   readonly workspaces?: readonly WorkspaceRecord[];
+  /** Pane text per agent for `capturePane`; absent = no evidence (null). */
+  readonly panes?: ReadonlyMap<string, string>;
 }
 
 function fakeDriver(o: FakeDriverOpts): { driver: FleetDriver; calls: DriverCalls } {
   const calls: DriverCalls = { launched: [], injected: [], restarted: [], busyChecks: [] };
   const busy = o.busy ?? new Set<string>();
+  const notRunning = o.notRunning ?? new Set<string>();
+  let last: FleetState | null = null;
+  const probe = typeof o.probe === 'function' ? o.probe : async () => o.probe as FleetState;
   const driver: FleetDriver = {
-    probe: typeof o.probe === 'function' ? o.probe : async () => o.probe,
+    probe: async () => (last = await probe()),
     discoverWorkspaces: () => o.workspaces ?? [],
     isBusy: async (agent: string) => {
       calls.busyChecks.push(agent);
       return busy.has(agent);
     },
+    isRunning: async (agent: string) => {
+      if (notRunning.has(agent)) return false;
+      if (o.runningUnregistered?.has(agent)) return true;
+      return last?.agents.some((a) => a.name === agent) ?? false;
+    },
+    capturePane: async (agent: string) => o.panes?.get(agent) ?? null,
     upgrade: async () => {},
     restart: async (agent: string) => void calls.restarted.push(agent),
     inject: async (agent: string, text: string) => void calls.injected.push({ agent, text }),
-    launch: async (agent: string) => void calls.launched.push(agent),
+    launch: async (agent: string) => {
+      calls.launched.push(agent);
+      const err = o.launchThrows?.get(agent);
+      if (err) throw err;
+    },
   };
   return { driver, calls };
 }
@@ -278,6 +303,82 @@ describe('reconcileFleet — exit-code intent (B.1/B.2)', () => {
     const r = await reconcileFleet(oneAbsent, h.deps, cfg({ execute: true }));
     expect(decisionOf(r.rows, 'code-agent')).toBe('LAUNCH');
     expect(h.calls.launched).toEqual(['code-agent']);
+  });
+});
+
+// --- a registered agent with no live session is not running -----------------
+
+describe('reconcileFleet — stale registration (deaf + not running)', () => {
+  const one: readonly DesiredAgent[] = [{ agent: 'code-agent', workspace: '/w/macf' }];
+  const deafDown = { probe: fleet(agentState('code-agent', false)), notRunning: new Set(['code-agent']) };
+
+  it('deaf + not running + last-exit absent → LAUNCH, not an inject', async () => {
+    const h = harness(deafDown);
+    const r = await reconcileFleet(one, h.deps, cfg({ execute: true }));
+    expect(decisionOf(r.rows, 'code-agent')).toBe('LAUNCH');
+    expect(r.rows[0]!.detail).toContain('registered but not running here');
+    expect(h.calls.launched).toEqual(['code-agent']);
+    expect(h.calls.injected).toEqual([]);
+  });
+
+  it('deaf + not running + last-exit 0 → SKIP', async () => {
+    const h = harness(deafDown, { 'code-agent': { lastExit: 0 } });
+    const r = await reconcileFleet(one, h.deps, cfg({ execute: true }));
+    expect(decisionOf(r.rows, 'code-agent')).toBe('SKIP');
+    expect(h.calls.launched).toEqual([]);
+  });
+
+  it('deaf + running → HEAL (ladder unchanged)', async () => {
+    const h = harness({ probe: fleet(agentState('code-agent', false)) });
+    const r = await reconcileFleet(one, h.deps, cfg({ execute: true }));
+    expect(decisionOf(r.rows, 'code-agent')).toBe('HEAL');
+    expect(h.calls.launched).toEqual([]);
+    expect(h.calls.injected).toHaveLength(1);
+  });
+
+  it('the dry-run plan is honest: LAUNCH, and nothing acted on', async () => {
+    const h = harness(deafDown);
+    const r = await reconcileFleet(one, h.deps, cfg());
+    expect(decisionOf(r.rows, 'code-agent')).toBe('LAUNCH');
+    expect(h.calls.launched).toEqual([]);
+  });
+});
+
+// --- a launch that fails is reported, never swallowed -----------------------
+
+describe('reconcileFleet — launch outcome', () => {
+  const one: readonly DesiredAgent[] = [{ agent: 'code-agent', workspace: '/w/macf' }];
+
+  it('launch that never came up → FAILED row with the reason, rc 3', async () => {
+    const h = harness({
+      probe: fleet(),
+      launchThrows: new Map([['code-agent', new FleetLaunchFailedError('tmux session macf@code-agent did not appear')]]),
+    });
+    const r = await reconcileFleet(one, h.deps, cfg({ execute: true }));
+    expect(decisionOf(r.rows, 'code-agent')).toBe('FAILED');
+    expect(r.rows[0]!.detail).toContain('did not appear');
+    expect(r.rc).toBe(3);
+  });
+
+  it('launch blocked at a prompt → BLOCKED naming the session, alert raised, rc 3', async () => {
+    const h = harness({
+      probe: fleet(),
+      launchThrows: new Map([['code-agent', new FleetLaunchBlockedError('macf@code-agent', 'trust-dialog')]]),
+    });
+    const r = await reconcileFleet(one, h.deps, cfg({ execute: true }));
+    expect(decisionOf(r.rows, 'code-agent')).toBe('BLOCKED');
+    expect(r.rows[0]!.detail).toContain('macf@code-agent');
+    expect(h.alerts).toHaveLength(1);
+    expect(h.alerts[0]!.reason).toBe(r.rows[0]!.detail);
+    expect(h.alerts[0]!.reason).not.toContain('launch blocked');
+    expect(r.rc).toBe(3);
+  });
+
+  it('dry-run raises no alert and reports no failure', async () => {
+    const h = harness({ probe: fleet() });
+    const r = await reconcileFleet(one, h.deps, cfg());
+    expect(h.alerts).toEqual([]);
+    expect(r.rc).toBe(1);
   });
 });
 
@@ -481,5 +582,138 @@ describe('reconcileFleet — Tier-3 alert dedup', () => {
     await reconcileFleet([{ agent: 'devops-agent', workspace: '/w/devops' }], h.deps, cfg({ execute: true }));
     expect(h.alerts).toEqual([]);
     expect(h.logs.some((l) => l.includes('already open (dedup)'))).toBe(true);
+  });
+});
+
+// --- the heal ladder never types into a pane waiting for the operator ---------
+
+describe('reconcileFleet — prompt guard before heal', () => {
+  const oneDeaf: readonly DesiredAgent[] = [{ agent: 'devops-agent', workspace: '/w/devops' }];
+  const fx = (n: string) => readFileSync(new URL(`./fixtures/${n}`, import.meta.url), 'utf8');
+  const paneFor = (text: string) => new Map([['devops-agent', text]]);
+  const deafProbe = () => fleet(agentState('devops-agent', false));
+
+  it('trust dialog → BLOCKED, no inject, no restart, alert, rc 3', async () => {
+    const h = harness({ probe: deafProbe(), panes: paneFor(fx('live-trust-pane.txt')) });
+    const r = await reconcileFleet(oneDeaf, h.deps, cfg({ execute: true, allowRestart: true }));
+    expect(decisionOf(r.rows, 'devops-agent')).toBe('BLOCKED');
+    expect(r.rows[0]!.detail).toMatch(/^waiting at a prompt \(.+\) in its tmux session; answer it there$/);
+    expect(h.alerts[0]!.reason).toBe(r.rows[0]!.detail);
+    expect(h.logs.some((l) => l.includes('a launch failed or an agent is waiting at a prompt; see the FAILED and BLOCKED rows above.'))).toBe(true);
+    expect(r.rc).toBe(3);
+    expect(h.calls.injected).toEqual([]);
+    expect(h.calls.restarted).toEqual([]);
+    expect(h.alerts).toHaveLength(1);
+    expect(h.storeCalls.writes.every((w) => w.state.deafSweeps === 0)).toBe(true);
+  });
+
+  it('an unregistered agent whose session is alive at the trust dialog is BLOCKED, never launched again', async () => {
+    const h = harness({ probe: fleet(), runningUnregistered: new Set(['devops-agent']), panes: paneFor(fx('live-trust-pane.txt')) });
+    const r = await reconcileFleet(oneDeaf, h.deps, cfg({ execute: true }));
+    expect(decisionOf(r.rows, 'devops-agent')).toBe('BLOCKED');
+    expect(h.calls.launched).toEqual([]);
+    expect(h.calls.injected).toEqual([]);
+  });
+
+  it('an unregistered agent with a live session and no prompt gets the heal ladder, not a second launch', async () => {
+    const h = harness({ probe: fleet(), runningUnregistered: new Set(['devops-agent']) });
+    const r = await reconcileFleet(oneDeaf, h.deps, cfg({ execute: true }));
+    expect(decisionOf(r.rows, 'devops-agent')).toBe('HEAL');
+    expect(r.rows[0]!.detail).toContain('session running but not registered');
+    expect(h.calls.launched).toEqual([]);
+  });
+
+  it('names the real tmux session when discovery knows the project', async () => {
+    const ws = { agent: 'devops-agent', workspace: '/w/devops', registry: 'o/r', project: 'macf' } as unknown as WorkspaceRecord;
+    const h = harness({ probe: deafProbe(), panes: paneFor(fx('live-trust-pane.txt')), workspaces: [ws] });
+    const r = await reconcileFleet(oneDeaf, h.deps, cfg());
+    expect(r.rows[0]!.detail).toContain('in tmux session macf@devops-agent; answer it there');
+  });
+
+  it('picks the desired workspace when two projects share the routing label', async () => {
+    const other = { agent: 'devops-agent', workspace: '/w/other', registry: 'o/r', project: 'other' } as unknown as WorkspaceRecord;
+    const mine = { agent: 'devops-agent', workspace: '/w/devops', registry: 'o/r', project: 'macf' } as unknown as WorkspaceRecord;
+    const h = harness({ probe: deafProbe(), panes: paneFor(fx('live-trust-pane.txt')), workspaces: [other, mine] });
+    const r = await reconcileFleet(oneDeaf, h.deps, cfg());
+    expect(r.rows[0]!.detail).toContain('in tmux session macf@devops-agent;');
+  });
+
+  it('does not guess between two same-label projects when neither is the desired workspace', async () => {
+    const a = { agent: 'devops-agent', workspace: '/w/a', registry: 'o/r', project: 'a' } as unknown as WorkspaceRecord;
+    const b = { agent: 'devops-agent', workspace: '/w/b', registry: 'o/r', project: 'b' } as unknown as WorkspaceRecord;
+    const h = harness({ probe: deafProbe(), panes: paneFor(fx('live-trust-pane.txt')), workspaces: [a, b] });
+    const r = await reconcileFleet(oneDeaf, h.deps, cfg());
+    expect(r.rows[0]!.detail).toContain('in its tmux session;');
+  });
+
+  it('says "its tmux session" rather than guess when the project is unknown', async () => {
+    const h = harness({ probe: deafProbe(), panes: paneFor(fx('live-trust-pane.txt')) });
+    const r = await reconcileFleet(oneDeaf, h.deps, cfg());
+    expect(r.rows[0]!.detail).toContain('in its tmux session; answer it there');
+    expect(r.rows[0]!.detail).not.toContain('tmux session devops-agent');
+  });
+
+  it('dry-run shows BLOCKED and raises no alert', async () => {
+    const h = harness({ probe: deafProbe(), panes: paneFor(fx('live-trust-pane.txt')) });
+    const r = await reconcileFleet(oneDeaf, h.deps, cfg());
+    expect(decisionOf(r.rows, 'devops-agent')).toBe('BLOCKED');
+    expect(h.alerts).toEqual([]);
+  });
+
+  it('live permission prompt → BLOCKED, no inject', async () => {
+    const h = harness({ probe: deafProbe(), panes: paneFor(fx('live-devops-permission-pane.txt')) });
+    const r = await reconcileFleet(oneDeaf, h.deps, cfg({ execute: true }));
+    expect(decisionOf(r.rows, 'devops-agent')).toBe('BLOCKED');
+    expect(h.calls.injected).toEqual([]);
+  });
+
+  it('watcher-answered prompt → no action, no alert, no deaf sweep counted', async () => {
+    const entry = PROMPT_RESPONSES_SEED.entries[0]!;
+    const h = harness({ probe: deafProbe(), panes: paneFor(entry.frame_contains.join('\n')) });
+    const r = await reconcileFleet(oneDeaf, h.deps, cfg({ execute: true, allowRestart: true }));
+    expect(r.rc).toBe(0);
+    expect(h.calls.injected).toEqual([]);
+    expect(h.calls.restarted).toEqual([]);
+    expect(h.alerts).toEqual([]);
+    // Only the grace counter is recorded; no deaf sweep is counted.
+    expect(h.storeCalls.writes.map((w) => [w.agent, w.state.watcherPromptSweeps, w.state.deafSweeps])).toEqual([['devops-agent', 1, 0]]);
+    expect(r.rows[0]!.detail).toMatch(/^waiting at a prompt \(.+\) that the prompt watcher answers; left alone this sweep$/);
+    expect(h.logs.filter((l) => l.includes('prompt watcher'))).toHaveLength(1);
+  });
+
+  it('a watcher-answered prompt still showing a sweep later → BLOCKED, alert, rc 3, nothing typed', async () => {
+    const entry = PROMPT_RESPONSES_SEED.entries[0]!;
+    const h = harness({ probe: deafProbe(), panes: paneFor(entry.frame_contains.join('\n')) }, { 'devops-agent': { watcherPromptSweeps: 1 } });
+    const r = await reconcileFleet(oneDeaf, h.deps, cfg({ execute: true, allowRestart: true }));
+    expect(decisionOf(r.rows, 'devops-agent')).toBe('BLOCKED');
+    expect(r.rows[0]!.detail).toContain('which the prompt watcher did not clear since the last sweep');
+    expect(r.rc).toBe(3);
+    expect(h.alerts).toHaveLength(1);
+    expect(h.calls.injected).toEqual([]);
+    expect(h.calls.restarted).toEqual([]);
+  });
+
+  it('a cleared pane resets the watcher grace counter, and the heal ladder keeps the reset', async () => {
+    const h = harness({ probe: deafProbe(), panes: paneFor(fx('live-ready-pane.txt')) }, { 'devops-agent': { watcherPromptSweeps: 1 } });
+    await reconcileFleet(oneDeaf, h.deps, cfg({ execute: true }));
+    const last = h.storeCalls.writes.filter((w) => w.agent === 'devops-agent').at(-1)!;
+    expect(last.state.watcherPromptSweeps).toBe(0);
+    expect(last.state.deafSweeps).toBe(1);
+  });
+
+  it('no prompt → Tier-1 inject as before', async () => {
+    const h = harness({ probe: deafProbe(), panes: paneFor(fx('live-ready-pane.txt')) });
+    await reconcileFleet(oneDeaf, h.deps, cfg({ execute: true }));
+    expect(h.calls.injected).toHaveLength(1);
+  });
+
+  it('sweep-2 escalation with a trust pane → no restart', async () => {
+    const h = harness(
+      { probe: deafProbe(), panes: paneFor(fx('live-trust-pane.txt')) },
+      { 'devops-agent': { deafSweeps: 1 } },
+    );
+    await reconcileFleet(oneDeaf, h.deps, cfg({ execute: true, allowRestart: true }));
+    expect(h.calls.restarted).toEqual([]);
+    expect(h.calls.injected).toEqual([]);
   });
 });

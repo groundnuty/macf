@@ -9,6 +9,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { FleetLaunchFailedError } from '@groundnuty/macf-core';
 import type { FleetDriver, ReconcileResult, WorkspaceRecord } from '@groundnuty/macf-core';
 import { resolveWorkspaceDir } from '../../src/cli/workspace-dir.js';
 import {
@@ -88,6 +89,8 @@ function stubDriver(workspaces: readonly WorkspaceRecord[]): FleetDriver {
     probe: async () => ({ agents: [] }),
     discoverWorkspaces: () => workspaces,
     isBusy: async () => false,
+    // Nothing is registered (probe above), so nothing has a live session either.
+    isRunning: async () => false,
     upgrade: async () => {},
     restart: async () => {},
     inject: async () => {},
@@ -137,7 +140,14 @@ describe('createFsStateStore', () => {
       alertOpen: false,
       lastExit: null,
       paused: false,
+      watcherPromptSweeps: 0,
     });
+  });
+
+  it('persists the watcher-prompt grace counter across sweeps (write → read)', () => {
+    const store = createFsStateStore(dirs());
+    store.write('code-agent', { ...store.read('code-agent'), watcherPromptSweeps: 1 });
+    expect(createFsStateStore(dirs()).read('code-agent').watcherPromptSweeps).toBe(1);
   });
 
   it('round-trips persisted escalation state (write → read)', () => {
@@ -247,6 +257,45 @@ describe('runFleetReconcileCommand — --dir vs ambient MACF_WORKSPACE_DIR (macf
     delete process.env['MACF_WORKSPACE_DIR'];
     await runFleetReconcileCommand('/auto-discovered', { execute: false });
     expect(vi.mocked(createVmDriverFromConfig).mock.calls[0]?.[0]).toBe('/auto-discovered');
+  });
+});
+
+// --- a failed launch fails the run ------------------------------------------
+
+describe('runFleetReconcileCommand — a launch that never comes up', () => {
+  it('exits 3, and --json carries the FAILED row', async () => {
+    const manifest = join(root, 'desired.yaml');
+    writeFileSync(manifest, 'agents:\n  - agent: code-agent\n    workspace: /w/macf\n');
+    const driver = {
+      ...stubDriver(WS),
+      launch: async () => {
+        throw new FleetLaunchFailedError('tmux session macf@code-agent did not appear within 30s');
+      },
+    };
+    vi.mocked(createVmDriverFromConfig).mockReset();
+    vi.mocked(createVmDriverFromConfig).mockResolvedValue(driver);
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      const rc = await runFleetReconcileCommand('/p', {
+        execute: true,
+        json: true,
+        manifest,
+        stateDir: join(root, 's'),
+        lastExitDir: join(root, 'l'),
+        pausedDir: join(root, 'p'),
+        heartbeatFile: join(root, 'hb'),
+      });
+      expect(rc).toBe(3);
+      const out = JSON.parse(String(logSpy.mock.calls.at(-1)![0])) as {
+        rc: number;
+        agents: { decision: string; detail: string }[];
+      };
+      expect(out.rc).toBe(3);
+      expect(out.agents[0]!.decision).toBe('FAILED');
+      expect(out.agents[0]!.detail).toContain('did not appear');
+    } finally {
+      logSpy.mockRestore();
+    }
   });
 });
 

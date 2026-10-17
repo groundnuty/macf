@@ -728,8 +728,35 @@ export function detectLaunchPrompt(pane: string | null): string | null {
   for (const entry of PROMPT_RESPONSES_SEED.entries) {
     if (entry.frame_contains.every((needle) => pane.includes(needle))) return entry.name;
   }
-  if (/do you trust/i.test(pane)) return 'trust-dialog';
+  if (/Yes, I trust this folder|one you trust\?|do you trust/i.test(pane)) return 'trust-dialog';
   return looksPromptLike(pane) ? 'unrecognised-prompt' : null;
+}
+
+// A run of ten box-drawing dashes, matched as a fixed string (never a quantified multibyte glyph).
+const PANE_READY_SEP_MARK = '\u2500'.repeat(10);
+const PANE_READY_INPUT_RE = /^\s*\u276f/;
+
+/**
+ * True when the frame shows Claude Code's own input box: a separator line, then within six
+ * lines (before another separator) a line starting with the prompt glyph. Port of `_pane_ready`
+ * in macf-startup-pickup.sh. Pure.
+ */
+export function isPaneReady(frame: string | null): boolean {
+  if (!frame) return false;
+  const lines = frame.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    if (!lines[i]!.includes(PANE_READY_SEP_MARK)) continue;
+    for (let j = i + 1; j < lines.length && j <= i + 6; j++) {
+      if (lines[j]!.includes(PANE_READY_SEP_MARK)) break;
+      if (PANE_READY_INPUT_RE.test(lines[j]!)) return true;
+    }
+  }
+  return false;
+}
+
+/** True when the prompt watcher answers this prompt itself, so it may clear without an operator. */
+export function isWatcherAnsweredPrompt(name: string): boolean {
+  return PROMPT_RESPONSES_SEED.entries.some((entry) => entry.name === name);
 }
 
 /** Read the pane and classify it; a failed read is "no evidence", never a throw. */

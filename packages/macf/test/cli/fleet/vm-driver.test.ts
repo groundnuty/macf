@@ -17,7 +17,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { FleetDriverError, planFleetUpgrade } from '@groundnuty/macf-core';
+import { FleetDriverError, FleetLaunchBlockedError, FleetLaunchFailedError, planFleetUpgrade } from '@groundnuty/macf-core';
 import type { AgentInfo, HealthResponse, WorkspaceRecord } from '@groundnuty/macf-core';
 import {
   createVmDriver,
@@ -96,11 +96,16 @@ interface Recorder {
   readonly spawnEnvs: (NodeJS.ProcessEnv | undefined)[];
 }
 
+/** A real ready Claude Code pane: the only frame a launch verifies OK on. */
+const READY_PANE = readFileSync(new URL('./fixtures/live-ready-pane.txt', import.meta.url), 'utf8');
+
 /** Per-call capturePane return values (drained in order; repeats last). */
 interface SeamOverrides {
   readonly workspaces?: readonly WorkspaceRecord[];
   readonly config?: (dir: string) => WorkspaceIdentity | null;
   readonly liveSessions?: ReadonlySet<string>;
+  /** `tmux new-session` execs succeed but no session ever appears. */
+  readonly launchFails?: boolean;
   readonly paneReads?: readonly (string | null)[];
   readonly peers?: readonly { readonly name: string; readonly info: AgentInfo }[];
   readonly health?: (host: string, port: number) => Promise<HealthResponse | null>;
@@ -129,7 +134,7 @@ function fakeSeams(o: SeamOverrides = {}): { seams: VmDriverSeams; rec: Recorder
     spawnEnvs: [],
   };
   const paneQueue = [...(o.paneReads ?? [])];
-  const live = o.liveSessions ?? new Set<string>();
+  const live = new Set<string>(o.liveSessions ?? []);
   const dirtyWorkspaces = o.configDirtyWorkspaces ?? new Set<string>();
   const seams: VmDriverSeams = {
     listPeers: async () => o.peers ?? [],
@@ -153,6 +158,7 @@ function fakeSeams(o: SeamOverrides = {}): { seams: VmDriverSeams; rec: Recorder
     exec: (bin, args, cwd, env) => {
       rec.execs.push({ bin, args, cwd });
       rec.execEnvs.push(env);
+      if (bin === 'tmux' && args[0] === 'new-session' && !o.launchFails) live.add(args[3]!);
     },
     spawnDetached: (bin, args, cwd, env) => {
       rec.spawns.push({ bin, args, cwd });
@@ -173,6 +179,22 @@ function fakeSeams(o: SeamOverrides = {}): { seams: VmDriverSeams; rec: Recorder
 }
 
 const OPTS = { workspaceDir: '/w/macf', project: 'macf', busyWindowMs: 1500 };
+const LAUNCH_ARGS_CODE = [
+  'new-session', '-d', '-s', 'macf@code-agent', '-c', '/w/macf',
+  "exec env -u MACF_WORKSPACE_DIR -u MACF_PROJECT -u MACF_ROUTING_LABEL -u MACF_AGENT_NAME -u CLAUDE_PROJECT_DIR MACF_NO_TMUX_WRAP=1 '/w/macf'/claude.sh",
+];
+
+// --- isRunning --------------------------------------------------------------
+
+describe('isRunning', () => {
+  it('is true only when the derived tmux session exists', async () => {
+    const { seams } = fakeSeams({ liveSessions: new Set(['macf@code-agent']) });
+    const d = createVmDriver(OPTS, seams);
+    expect(await d.isRunning('code-agent')).toBe(true);
+    expect(await d.isRunning('science-agent')).toBe(false);
+    expect(await d.isRunning('ghost')).toBe(false);
+  });
+});
 
 // --- resolveTarget ----------------------------------------------------------
 
@@ -887,10 +909,10 @@ describe('restart', () => {
   });
 
   it('cold-launches when the agent is dead (restart == launch)', async () => {
-    const { seams, rec } = fakeSeams({ liveSessions: new Set() });
+    const { seams, rec } = fakeSeams({ liveSessions: new Set(), paneReads: [READY_PANE] });
     await createVmDriver(OPTS, seams).restart('code-agent');
-    expect(rec.execs).toEqual([]);
-    expect(rec.spawns).toEqual([{ bin: '/w/macf/claude.sh', args: [], cwd: '/w/macf' }]);
+    expect(rec.execs).toEqual([{ bin: 'tmux', args: LAUNCH_ARGS_CODE, cwd: '/w/macf' }]);
+    expect(rec.spawns).toEqual([]);
   });
 
   it('threads leaveConfigUncommitted through as --leave-config-uncommitted (macf#725)', async () => {
@@ -950,16 +972,20 @@ describe('inject', () => {
 // --- launch -----------------------------------------------------------------
 
 describe('launch', () => {
-  it('spawns the workspace launcher detached', async () => {
-    const { seams, rec } = fakeSeams();
+  it('creates a detached tmux session running claude.sh, and never spawns claude.sh itself', async () => {
+    const { seams, rec } = fakeSeams({ paneReads: [READY_PANE] });
     await createVmDriver(OPTS, seams).launch('science-agent');
-    expect(rec.spawns).toEqual([{ bin: '/w/science/claude.sh', args: [], cwd: '/w/science' }]);
-  });
-
-  it('honours a custom launcher basename', async () => {
-    const { seams, rec } = fakeSeams();
-    await createVmDriver({ ...OPTS, launcher: 'run.sh' }, seams).launch('code-agent');
-    expect(rec.spawns[0]!.bin).toBe('/w/macf/run.sh');
+    expect(rec.execs).toEqual([
+      {
+        bin: 'tmux',
+        args: [
+          'new-session', '-d', '-s', 'macf@science-agent', '-c', '/w/science',
+          "exec env -u MACF_WORKSPACE_DIR -u MACF_PROJECT -u MACF_ROUTING_LABEL -u MACF_AGENT_NAME -u CLAUDE_PROJECT_DIR MACF_NO_TMUX_WRAP=1 '/w/science'/claude.sh",
+        ],
+        cwd: '/w/science',
+      },
+    ]);
+    expect(rec.spawns).toEqual([]);
   });
 
   it('throws FleetDriverError for an unknown agent', async () => {
@@ -967,6 +993,91 @@ describe('launch', () => {
     await expect(createVmDriver(OPTS, seams).launch('ghost')).rejects.toBeInstanceOf(
       FleetDriverError,
     );
+  });
+
+  it('throws, and starts nothing, when the session name cannot be derived', async () => {
+    const { seams, rec } = fakeSeams({ config: () => ({ routingLabel: 'code-agent' }) });
+    await expect(createVmDriver(OPTS, seams).launch('code-agent')).rejects.toBeInstanceOf(
+      FleetDriverError,
+    );
+    expect(rec.execs).toEqual([]);
+    expect(rec.spawns).toEqual([]);
+  });
+
+  it('fails loudly when the session never appears', async () => {
+    const { seams, rec } = fakeSeams({ launchFails: true });
+    const err = await createVmDriver({ ...OPTS, launchTimeoutMs: 3000, launchPollMs: 1000 }, seams)
+      .launch('code-agent')
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(FleetLaunchFailedError);
+    expect((err as Error).message).toContain('macf@code-agent');
+    expect(rec.sleeps).toEqual([1000, 1000, 1000]);
+  });
+
+  const fx = (n: string) => readFileSync(new URL(`./fixtures/${n}`, import.meta.url), 'utf8');
+  const READY = READY_PANE;
+  const PRE_START = fx('pre-start-pane.txt');
+
+  it('succeeds at once when the first read is the ready pane', async () => {
+    const { seams, rec } = fakeSeams({ paneReads: [READY] });
+    await createVmDriver({ ...OPTS, launchPromptWindowMs: 5000 }, seams).launch('code-agent');
+    expect(rec.captured).toHaveLength(1);
+    expect(rec.submits).toEqual([]);
+  });
+
+  it('waits through a pre-start pane, then succeeds on the ready pane', async () => {
+    const { seams, rec } = fakeSeams({ paneReads: [PRE_START, PRE_START, READY] });
+    await createVmDriver({ ...OPTS, launchPromptWindowMs: 5000, launchPollMs: 1000 }, seams).launch('code-agent');
+    expect(rec.captured).toHaveLength(3);
+  });
+
+  it('reports BLOCKED when the trust dialog follows a pre-start pane', async () => {
+    const { seams } = fakeSeams({ paneReads: [PRE_START, fx('live-trust-pane.txt')] });
+    const err = await createVmDriver({ ...OPTS, launchPromptWindowMs: 5000, launchPollMs: 1000 }, seams)
+      .launch('code-agent')
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(FleetLaunchBlockedError);
+    expect((err as FleetLaunchBlockedError).prompt).toBe('trust-dialog');
+  });
+
+  it('fails loudly when the pane never reaches the input prompt', async () => {
+    const { seams } = fakeSeams();
+    seams.capturePane = () => PRE_START;
+    const err = await createVmDriver({ ...OPTS, launchPromptWindowMs: 3000, launchPollMs: 1000 }, seams)
+      .launch('code-agent')
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(FleetLaunchFailedError);
+    expect((err as Error).message).toContain("tmux session macf@code-agent did not reach Claude Code's input prompt within 3s; attach to it to see why");
+  });
+
+  it('waits out a prompt the watcher answers, then succeeds once it clears', async () => {
+    const seed = 'I am using this for local development';
+    const { seams, rec } = fakeSeams({ paneReads: [seed, seed, READY] });
+    await createVmDriver({ ...OPTS, launchPromptWindowMs: 5000, launchPollMs: 1000 }, seams).launch('code-agent');
+    expect(rec.sleeps).toEqual([1000, 1000]);
+    expect(rec.submits).toEqual([]);
+  });
+
+  it('reports BLOCKED when a watcher prompt is still showing at the end of the window', async () => {
+    const seed = 'I am using this for local development';
+    const { seams } = fakeSeams({ paneReads: [seed] });
+    seams.capturePane = () => seed;
+    const err = await createVmDriver({ ...OPTS, launchPromptWindowMs: 3000, launchPollMs: 1000 }, seams)
+      .launch('code-agent')
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(FleetLaunchBlockedError);
+    expect((err as Error).message).toContain('which the prompt watcher did not clear');
+  });
+
+  it('reports BLOCKED at the real trust dialog on the first read, and answers nothing', async () => {
+    const pane = readFileSync(new URL('./fixtures/live-trust-pane.txt', import.meta.url), 'utf8');
+    const { seams, rec } = fakeSeams({ paneReads: [pane] });
+    const err = await createVmDriver(OPTS, seams).launch('code-agent').catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(FleetLaunchBlockedError);
+    expect((err as FleetLaunchBlockedError).session).toBe('macf@code-agent');
+    expect((err as FleetLaunchBlockedError).prompt).toBe('trust-dialog');
+    expect(rec.captured).toHaveLength(1);
+    expect(rec.submits).toEqual([]);
   });
 });
 
@@ -1053,20 +1164,20 @@ describe('orchestrator-identity-env scrub on exec/spawnDetached (macf#763)', () 
   });
 
   it('restart (session dead → cold-start launch): the spawnDetached child env carries NONE of the orchestrator identity', async () => {
-    const { seams, rec } = fakeSeams({ liveSessions: new Set() });
+    const { seams, rec } = fakeSeams({ liveSessions: new Set(), paneReads: [READY_PANE] });
     await createVmDriver(OPTS, seams).restart('science-agent');
-    expect(rec.spawnEnvs).toHaveLength(1);
-    const env = rec.spawnEnvs[0]!;
+    expect(rec.execEnvs).toHaveLength(1);
+    const env = rec.execEnvs[0]!;
     for (const key of ORCHESTRATOR_IDENTITY_ENV_KEYS) {
       expect(env[key]).toBeUndefined();
     }
   });
 
   it('launch: the spawnDetached child env carries NONE of the orchestrator identity', async () => {
-    const { seams, rec } = fakeSeams();
+    const { seams, rec } = fakeSeams({ paneReads: [READY_PANE] });
     await createVmDriver(OPTS, seams).launch('science-agent');
-    expect(rec.spawnEnvs).toHaveLength(1);
-    const env = rec.spawnEnvs[0]!;
+    expect(rec.execEnvs).toHaveLength(1);
+    const env = rec.execEnvs[0]!;
     for (const key of ORCHESTRATOR_IDENTITY_ENV_KEYS) {
       expect(env[key]).toBeUndefined();
     }

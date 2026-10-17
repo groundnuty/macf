@@ -105,6 +105,13 @@ export interface FleetDriver {
   readonly isBusy: (agent: string) => Promise<boolean>;
 
   /**
+   * `true` when the agent has a live runtime here (VM: its tmux session exists).
+   * A registry entry alone does not mean running — it survives an unclean
+   * reboot. Read-only. `false` when the agent cannot be resolved.
+   */
+  readonly isRunning: (agent: string) => Promise<boolean>;
+
+  /**
    * The pre-flight config-dirty predicate (macf#722 Fix B) — `true` when the
    * agent's workspace has UNCOMMITTED changes on the roll's touched-config
    * surface (the macf#725 UNION: the macf-update overwrite set ∪ the
@@ -365,5 +372,25 @@ export class FleetDriverError extends MacfError {
   constructor(message: string) {
     super('FLEET_DRIVER_ERROR', message);
     this.name = 'FleetDriverError';
+  }
+}
+
+/** `launch` started the agent but it never came up (no session appeared). */
+export class FleetLaunchFailedError extends FleetDriverError {
+  constructor(message: string) {
+    super(message);
+    this.name = 'FleetLaunchFailedError';
+  }
+}
+
+/** `launch` started the agent but its pane waits at a prompt nothing will answer. */
+export class FleetLaunchBlockedError extends FleetDriverError {
+  readonly session: string;
+  readonly prompt: string;
+  constructor(session: string, prompt: string) {
+    super(`blocked at a prompt (${prompt}); attach to tmux session ${session} and answer it`);
+    this.name = 'FleetLaunchBlockedError';
+    this.session = session;
+    this.prompt = prompt;
   }
 }

@@ -6,6 +6,9 @@
  * store + a clock, so NOTHING runtime-specific (`/proc`, tmux, `capture-pane`,
  * the K8s API) leaks above this line.
  *
+ * "Not running" means absent from the registry, or registered but with no live
+ * runtime (`driver.isRunning`) — a registry entry survives an unclean reboot.
+ *
  * The model is Kubernetes-on-a-VM: reconcile ACTUAL (`driver.probe()` +
  * `driver.discoverWorkspaces()`) toward the operator-owned DESIRED set:
  *   - desired & not-running       → LAUNCH   (cold-start / reboot-recovery)
@@ -33,7 +36,8 @@
  * — the report is built + printed and NOTHING is acted on or persisted unless
  * `execute` is set.
  */
-import type { FleetDriver, FleetState } from './fleet-driver.js';
+import { FleetLaunchBlockedError, type FleetDriver, type FleetState } from './fleet-driver.js';
+import { detectLaunchPrompt, isWatcherAnsweredPrompt } from './fleet-upgrade.js';
 
 /** One agent the operator declares SHOULD run on this host (DR-006 §A.2). */
 export interface DesiredAgent {
@@ -43,8 +47,8 @@ export interface DesiredAgent {
   readonly workspace: string;
 }
 
-/** The four reconcile verdicts (the report's DECISION column). */
-export type ReconcileDecision = 'OK' | 'LAUNCH' | 'SKIP' | 'HEAL';
+/** The reconcile verdicts (FAILED/BLOCKED: a launch that never came up / stopped at a prompt) (the report's DECISION column). */
+export type ReconcileDecision = 'OK' | 'LAUNCH' | 'SKIP' | 'HEAL' | 'FAILED' | 'BLOCKED';
 
 /**
  * Per-agent state that persists ACROSS sweeps (the cron's cross-sweep memory).
@@ -63,6 +67,8 @@ export interface ReconcileAgentState {
   readonly lastExit: number | null;
   /** Explicit operator `paused` sentinel → desired-down. */
   readonly paused: boolean;
+  /** Consecutive sweeps that found a prompt the prompt watcher should answer still showing. */
+  readonly watcherPromptSweeps?: number;
 }
 
 /** The zero state for an agent with no persisted history. */
@@ -73,6 +79,7 @@ export const EMPTY_RECONCILE_STATE: ReconcileAgentState = {
   alertOpen: false,
   lastExit: null,
   paused: false,
+  watcherPromptSweeps: 0,
 };
 
 /**
@@ -177,6 +184,7 @@ export interface ReconcileRow {
  *   - 0 = every desired agent OK / down (no action)
  *   - 1 = action(s) taken or needed
  *   - 2 = precondition/probe failure (bad manifest, probe threw)
+ *   - 3 = a launch failed, or an agent is waiting at a prompt only the operator can answer
  */
 export interface ReconcileResult {
   readonly rc: number;
@@ -286,8 +294,11 @@ export async function reconcileFleet(
     const row = await reconcileAgent(d, state, fleet, deps, config, launchCount);
     deps.log(reportRow(row.row));
     rows.push(row.row);
-    if (row.row.decision === 'LAUNCH') launchCount += 1;
-    if (row.acted) rc = 1;
+    if (row.row.decision === 'LAUNCH' || row.row.decision === 'FAILED' || row.row.decision === 'BLOCKED') {
+      launchCount += 1;
+    }
+    if (row.acted) rc = Math.max(rc, 1);
+    if (row.row.decision === 'FAILED' || row.row.decision === 'BLOCKED') rc = 3;
   }
 
   deps.log('');
@@ -299,7 +310,9 @@ export async function reconcileFleet(
   deps.log(
     rc === 0
       ? `reconcile [${mode}, restart:${restart}]: all desired agents OK / down — no action.`
-      : `reconcile [${mode}, restart:${restart}]: action(s) taken or needed above.`,
+      : rc === 3
+        ? `reconcile [${mode}, restart:${restart}]: a launch failed or an agent is waiting at a prompt; see the FAILED and BLOCKED rows above.`
+        : `reconcile [${mode}, restart:${restart}]: action(s) taken or needed above.`,
   );
 
   return { rc, rows };
@@ -323,7 +336,15 @@ async function reconcileAgent(
 
   const actual = classifyReachability(fleet, agent);
 
-  if (actual === 'absent') {
+  if (actual === 'reachable') {
+    if (config.execute) deps.store.reset(agent);
+    return { row: mkRow(agent, 'OK', 'reachable + accepting'), acted: false };
+  }
+
+  // Whether the agent runs is the host's fact (a live session), not the
+  // registry's: a registration can outlive a reboot, and a starting or stuck
+  // agent has a session before it registers.
+  if (!(await deps.driver.isRunning(agent))) {
     // exit-code intent: not running + last-exit==0 (operator typed /exit) → desired-down.
     if (state.lastExit === 0) {
       return {
@@ -331,34 +352,102 @@ async function reconcileAgent(
         acted: false,
       };
     }
-    await doLaunch(d, deps, config, launchCount);
-    return {
-      row: mkRow(agent, 'LAUNCH', `not running, last-exit!=0/absent → cold-start (ws: ${d.workspace})`),
-      acted: true,
-    };
+    const detail = actual === 'deaf'
+      ? `registered but not running here (stale registration, e.g. after a reboot) → cold-start (ws: ${d.workspace})`
+      : `not running, last-exit!=0/absent → cold-start (ws: ${d.workspace})`;
+    return launchRow(d, detail, deps, config, launchCount);
   }
 
-  if (actual === 'reachable') {
-    if (config.execute) deps.store.reset(agent);
-    return { row: mkRow(agent, 'OK', 'reachable + accepting'), acted: false };
-  }
-
-  // deaf → HEAL ladder.
-  await healAgent(d, state, deps, config);
-  return { row: mkRow(agent, 'HEAL', 'registered but channel DOWN (deaf) → ladder'), acted: true };
+  // Running but not reachable → HEAL ladder, unless the pane waits for an
+  // answer the ladder must never type. A second instance is never launched.
+  const guard = await promptGuard(d, state, deps, config);
+  if (guard.waiting) return guard.waiting;
+  // The ladder writes on top of the guard's state, so a counter reset survives.
+  await healAgent(d, guard.state, deps, config);
+  const detail = actual === 'deaf'
+    ? 'registered but channel DOWN (deaf) → ladder'
+    : 'session running but not registered (channel server down or not yet up) → ladder';
+  return { row: mkRow(agent, 'HEAL', detail), acted: true };
 }
 
-/** Cold-start a desired-but-down agent, STAGGERED so N dead agents don't thundering-herd. */
-async function doLaunch(
+/**
+ * Read the pane before any heal action. A prompt only the operator can answer is a BLOCKED
+ * row (no inject, no restart); one the prompt watcher answers is left alone this sweep.
+ * A failed read is no evidence, and the ladder runs as usual.
+ */
+async function promptGuard(
   d: DesiredAgent,
+  state: ReconcileAgentState,
+  deps: ReconcileDeps,
+  config: ReconcileConfig,
+): Promise<{
+  readonly waiting: { readonly row: ReconcileRow; readonly acted: boolean } | null;
+  readonly state: ReconcileAgentState;
+}> {
+  const agent = d.agent;
+  const seenBefore = state.watcherPromptSweeps ?? 0;
+  let prompt: string | null;
+  try {
+    prompt = detectLaunchPrompt(await deps.driver.capturePane(agent));
+  } catch {
+    return { waiting: null, state };
+  }
+  if (prompt === null) {
+    if (seenBefore === 0) return { waiting: null, state };
+    const cleared = { ...state, watcherPromptSweeps: 0 };
+    if (config.execute) deps.store.write(agent, cleared);
+    return { waiting: null, state: cleared };
+  }
+  if (isWatcherAnsweredPrompt(prompt)) {
+    // The watcher answers within seconds, so one sweep of grace is enough. A
+    // prompt still showing a whole sweep later means the watcher is off, has no
+    // config, or gave up: report it instead of skipping it forever.
+    if (seenBefore === 0) {
+      if (config.execute) deps.store.write(agent, { ...state, watcherPromptSweeps: 1 });
+      const detail = `waiting at a prompt (${prompt}) that the prompt watcher answers; left alone this sweep`;
+      return { waiting: { row: mkRow(agent, 'SKIP', detail), acted: false }, state };
+    }
+    prompt = `${prompt}, which the prompt watcher did not clear since the last sweep`;
+  }
+  // Name the session the operator attaches to (`<project>@<routing-label>`)
+  // when this host's discovery knows the project; never guess it.
+  // Two projects may share a routing label: prefer the desired workspace, and
+  // accept a label-only match only when it is unambiguous.
+  const records = deps.driver.discoverWorkspaces().filter((w) => w.agent === agent);
+  const project = (records.find((w) => w.workspace === d.workspace) ?? (records.length === 1 ? records[0] : undefined))?.project;
+  const where = project ? `tmux session ${project}@${agent}` : 'its tmux session';
+  const detail = `waiting at a prompt (${prompt}) in ${where}; answer it there`;
+  await raiseAlert(agent, detail, deps, config);
+  return { waiting: { row: mkRow(agent, 'BLOCKED', detail), acted: true }, state };
+}
+
+/**
+ * Cold-start a desired-but-down agent, STAGGERED so N dead agents don't
+ * thundering-herd. A launch that never came up is a FAILED row; one stuck at a
+ * prompt is a BLOCKED row plus a Tier-3 alert. Nothing answers the prompt.
+ */
+async function launchRow(
+  d: DesiredAgent,
+  detail: string,
   deps: ReconcileDeps,
   config: ReconcileConfig,
   launchCount: number,
-): Promise<void> {
-  if (!config.execute) return;
+): Promise<{ readonly row: ReconcileRow; readonly acted: boolean }> {
+  const agent = d.agent;
+  if (!config.execute) return { row: mkRow(agent, 'LAUNCH', detail), acted: true };
   // Space every launch after the first by the stagger window.
   if (launchCount > 0) await deps.sleep(config.launchStaggerMs);
-  await deps.driver.launch(d.agent);
+  try {
+    await deps.driver.launch(agent);
+  } catch (err) {
+    if (err instanceof FleetLaunchBlockedError) {
+      await raiseAlert(agent, err.message, deps, config);
+      return { row: mkRow(agent, 'BLOCKED', err.message), acted: true };
+    }
+    const why = err instanceof Error ? err.message : String(err);
+    return { row: mkRow(agent, 'FAILED', `launch failed: ${why}`), acted: true };
+  }
+  return { row: mkRow(agent, 'LAUNCH', detail), acted: true };
 }
 
 /**
@@ -454,8 +543,11 @@ async function raiseAlert(
     deps.log(`    [skip] Tier-3 alert for ${agent} already open (dedup)`);
     return;
   }
+  if (!config.execute) {
+    deps.log(`    (dry-run) would raise a Tier-3 alert for ${agent} (${reason})`);
+    return;
+  }
   deps.log(`    Tier-3 alert for ${agent} (${reason})`);
-  if (!config.execute) return;
   await deps.alert(agent, reason);
   const fresh = deps.store.read(agent);
   deps.store.write(agent, { ...fresh, alertOpen: true });

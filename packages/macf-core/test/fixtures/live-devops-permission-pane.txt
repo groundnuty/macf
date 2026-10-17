@@ -1,0 +1,10 @@
+ 73  `project-conventions.md`) stay tracked and survive a clone — they are this
+     workspace's own output, not
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Do you want to make this edit to CLAUDE.md?
+ ❯ 1. Yes
+   2. Yes, and allow Claude to edit files in this project's .claude folder for
+      this session
+   3. No
+
+ Esc to cancel · Tab to amend

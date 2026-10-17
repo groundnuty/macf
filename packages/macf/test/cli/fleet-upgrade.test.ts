@@ -98,6 +98,7 @@ function makeDriver(
       mkState(agents.map((a) => [a.name, flip && restarted.has(a.name) ? opts.target : opts.base])),
     discoverWorkspaces: () => workspaces,
     isBusy: opts.isBusy ?? (async () => false),
+    isRunning: async () => true,
     isConfigDirty: async () => false,
     listDirtyConfig: async () => [],
     currentBranch: async () => 'main',
@@ -354,6 +355,7 @@ describe('runFleetUpgrade', () => {
       },
       discoverWorkspaces: () => [mkWs('a', 'fleet-1', '0.2.40')],
       isBusy: async () => false,
+      isRunning: async () => true,
       isConfigDirty: async () => false,
       listDirtyConfig: async () => [],
       currentBranch: async () => 'main',
@@ -477,6 +479,7 @@ describe('runFleetUpgrade', () => {
           mkState(own.map((m) => [m.agent, restarted.has(m.agent) ? opts.target : opts.base])),
         discoverWorkspaces: () => members, // full host scan — filtering is the CALLER's job (macf-core's upgradeFleets)
         isBusy: async () => false,
+        isRunning: async () => true,
         isConfigDirty: async () => false,
         listDirtyConfig: async () => [],
         currentBranch: async () => 'main',
@@ -766,6 +769,7 @@ describe('runFleetUpgrade — the decisive pair (macf#1146): mixed vs. fully-gre
       base: '0.2.40',
       target: '0.2.41',
       isBusy: async () => true,
+      isRunning: async () => true,
     });
     const { deps, lines } = makeDeps({
       discover: () => workspaces,
