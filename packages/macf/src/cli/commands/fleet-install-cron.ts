@@ -12,7 +12,11 @@
  * reconciler IS the reboot-recovery + one-command launch-all. claude.sh-on-launch
  * can't install it (on cold-boot nothing launches to install it).
  *
- * The generated cron line, in order:
+ * The crontab line only runs a per-fleet script, `~/.macf/cron/<owner>__<project>.sh`
+ * (Ubuntu's cron caps a command at 1000 characters, so the PATH and the paths below
+ * cannot live on the line):
+ *   <schedule> /bin/sh '<script>' >> '<log>' 2>&1 <marker>
+ * The script holds, in order:
  *   0. sets PATH to the installing shell's PATH (cron's PATH is /usr/bin:/bin, which
  *      finds neither `node` for the `macf` shebang nor `claude` in the tmux session
  *      reconcile launches);
@@ -41,8 +45,17 @@
  *       macf-devops-toolkit DR-006 §A.4.
  */
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync, accessSync, constants as fsConstants } from 'node:fs';
-import { join } from 'node:path';
+import {
+  existsSync,
+  readFileSync,
+  accessSync,
+  mkdirSync,
+  writeFileSync,
+  renameSync,
+  rmSync,
+  constants as fsConstants,
+} from 'node:fs';
+import { dirname, join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { MacfError } from '@groundnuty/macf-core';
 import { PACKAGE_VERSION } from '../../package-version.js';
@@ -88,6 +101,12 @@ export const RECONCILE_ARGS = 'fleet reconcile';
 /** Default host-prelude path, relative to the workspace (DR-029/#599 generator). */
 const HOST_PRELUDE_REL = join('.claude', '.macf', 'host-prelude.sh');
 
+/** Per-fleet scripts live here, relative to `$HOME`. */
+const CRON_SCRIPT_DIR_REL = join('.macf', 'cron');
+
+/** Refuse a crontab line longer than this; Vixie cron caps a command at 1000. */
+export const MAX_CRON_LINE = 900;
+
 /** Default watchdog log path, relative to `$HOME` (host-global; DR-006 §A.4). */
 const WATCHDOG_LOG_REL = join('.macf', 'watchdog.log');
 
@@ -124,6 +143,12 @@ export interface FleetInstallCronDeps {
   readonly helperExists: (path: string) => boolean;
   /** Interactive y/N confirm (default No). */
   readonly confirm: (question: string) => Promise<boolean>;
+  /** Directory holding the per-fleet scripts (default `$HOME/.macf/cron`). */
+  readonly scriptDir: () => string;
+  /** Write `content` to `path` atomically, mode 0700, creating its dir 0700. Throws on failure. */
+  readonly writeScript: (path: string, content: string) => void;
+  /** Delete the script at `path`; true iff it existed. */
+  readonly removeScript: (path: string) => boolean;
   /** Info line to stdout. */
   readonly log: (msg: string) => void;
   /** Warning line to stderr. */
@@ -240,30 +265,54 @@ export function buildTokenPrefix(args: {
 /** All resolved pieces of a cron line (pure input to `buildCronLine`). */
 export interface CronLineParts {
   readonly schedule: string;
-  /** Absolute path of the `macf` binary the cron runs. */
-  readonly macfPath: string;
-  /** The installing shell's PATH, set at the start of the line. */
-  readonly installPath: string;
-  readonly preludePath: string;
-  readonly tokenPrefix: string;
-  readonly reconcileFlags: readonly string[];
+  /** Absolute path of the per-fleet script the line runs. */
+  readonly scriptPath: string;
   readonly logPath: string;
   readonly marker: string;
 }
 
+/** Everything the per-fleet script holds (pure input to `buildCronScript`). */
+export interface CronScriptParts {
+  /** Absolute path of the `macf` binary the script runs. */
+  readonly macfPath: string;
+  /** The installing shell's PATH, set at the start of the script. */
+  readonly installPath: string;
+  readonly preludePath: string;
+  readonly tokenPrefix: string;
+  readonly reconcileFlags: readonly string[];
+  readonly marker: string;
+}
+
 /**
- * Assemble the full crontab line:
- *   `<schedule> PATH='<path>'; export PATH; [ -f <prelude> ] && . <prelude>; <token><absolute macf> fleet reconcile --dir <workspace> <flags> >> <log> 2>&1 <marker>`
+ * The crontab line:
+ *   `<schedule> /bin/sh '<script>' >> '<log>' 2>&1 <marker>`
  * Every path is a quoted shell word.
  */
 export function buildCronLine(parts: CronLineParts): string {
-  const prelude = `[ -f ${shellQuote(parts.preludePath)} ] && . ${shellQuote(parts.preludePath)}; `;
-  const flags = parts.reconcileFlags.length > 0 ? ` ${parts.reconcileFlags.join(' ')}` : '';
-  const pathSet = `PATH=${shellQuote(parts.installPath)}; export PATH; `;
-  const cmd =
-    `${pathSet}${prelude}${parts.tokenPrefix}${shellQuote(parts.macfPath)} ${RECONCILE_ARGS}${flags} ` +
-    `>> ${shellQuote(parts.logPath)} 2>&1`;
+  const cmd = `/bin/sh ${shellQuote(parts.scriptPath)} >> ${shellQuote(parts.logPath)} 2>&1`;
   return `${parts.schedule} ${cmd} ${parts.marker}`;
+}
+
+/** The per-fleet script: PATH, prelude, token mint, then exec the reconcile. */
+export function buildCronScript(parts: CronScriptParts): string {
+  const prelude = shellQuote(parts.preludePath);
+  const flags = parts.reconcileFlags.length > 0 ? ` ${parts.reconcileFlags.join(' ')}` : '';
+  return [
+    '#!/bin/sh',
+    `${parts.marker} — generated by \`macf fleet install-cron\`; re-run it to change this file.`,
+    `PATH=${shellQuote(parts.installPath)}; export PATH`,
+    `[ -f ${prelude} ] && . ${prelude}`,
+    // The token prefix ends in `; ` and is empty with --no-token.
+    ...(parts.tokenPrefix.trim() ? [parts.tokenPrefix.trim()] : []),
+    `exec ${shellQuote(parts.macfPath)} ${RECONCILE_ARGS}${flags}`,
+    '',
+  ].join('\n');
+}
+
+/** This fleet's script path under `dir`: `<owner>__<project>.sh`, unsafe characters made `_`. */
+export function cronScriptPath(dir: string, owner: string, project: string): string {
+  const safe = (v: string): string => v.replace(/[^A-Za-z0-9._-]/g, '_');
+  return join(dir, `${safe(owner)}__${safe(project)}.sh`);
 }
 
 /**
@@ -364,12 +413,18 @@ export async function runFleetInstallCron(
       .split('\n')
       .some((l) => isOwnedLine(l, marker, opts.workspaceDir));
     const next = computeUninstalledCrontab(existing, marker, opts.workspaceDir);
+    const scriptPath = cronScriptPath(deps.scriptDir(), opts.owner, opts.project);
     if (!hadLine) {
-      deps.log('No macf-watchdog cron line found — nothing to remove.');
+      const removed = !opts.print && deps.removeScript(scriptPath);
+      deps.log(
+        removed
+          ? `No macf-watchdog cron line found; removed ${scriptPath}.`
+          : 'No macf-watchdog cron line found — nothing to remove.',
+      );
       return 0;
     }
     if (opts.print) {
-      deps.log('Would remove the macf-watchdog cron line; resulting crontab:');
+      deps.log(`Would remove the macf-watchdog cron line and ${scriptPath}; resulting crontab:`);
       deps.log(next.length > 0 ? next.trimEnd() : '(empty)');
       return 0;
     }
@@ -378,7 +433,8 @@ export async function runFleetInstallCron(
       return 0;
     }
     deps.writeCrontab(next);
-    deps.log('Removed macf-watchdog cron line.');
+    deps.removeScript(scriptPath);
+    deps.log('Removed macf-watchdog cron line and script.');
     return 0;
   }
 
@@ -409,20 +465,16 @@ export async function runFleetInstallCron(
   });
   if (token.warning) deps.warn(`WARN: ${token.warning}`);
 
+  // Only the crontab line is subject to cron's `%` rule; the script is read by sh.
+  const scriptPath = cronScriptPath(deps.scriptDir(), opts.owner, opts.project);
   const percent = findPercentValue([
-    ['PATH', installPath],
-    ['workspace', opts.workspaceDir],
-    ['manifest', opts.manifest],
+    ['script', scriptPath],
     ['log', logPath],
-    ['prelude', preludePath],
-    ['token helper', token.prefix],
-    ['macf', macf.path],
   ]);
   if (percent) {
     deps.warn(
       `macf fleet install-cron: cannot install: ${percent} contains "%", which cron treats as ` +
-        'the end of the command. Use a path without "%" (or pass --log / --manifest / --prelude ' +
-        'pointing elsewhere).',
+        'the end of the command. Use a path without "%" (for the log, pass --log pointing elsewhere).',
     );
     return 2;
   }
@@ -435,14 +487,24 @@ export async function runFleetInstallCron(
     allowRestart: opts.allowRestart,
   });
 
-  const line = buildCronLine({
-    schedule: opts.schedule,
+  const line = buildCronLine({ schedule: opts.schedule, scriptPath, logPath, marker });
+  if (line.length > MAX_CRON_LINE) {
+    const [name, value] =
+      scriptPath.length >= logPath.length ? (['script path', scriptPath] as const) : (['log path', logPath] as const);
+    deps.warn(
+      `macf fleet install-cron: the crontab line is ${line.length} characters; cron caps a command ` +
+        `at 1000 and this limit is ${MAX_CRON_LINE}. The longest value is the ${name} (${value.length} ` +
+        'characters); use a shorter one (for the log, pass --log).',
+    );
+    return 2;
+  }
+
+  const script = buildCronScript({
     macfPath: macf.path,
     installPath,
     preludePath,
     tokenPrefix: token.prefix,
     reconcileFlags,
-    logPath,
     marker,
   });
 
@@ -450,20 +512,26 @@ export async function runFleetInstallCron(
 
   if (opts.print) {
     deps.log(line);
+    deps.log(`Script ${scriptPath}:`);
+    deps.log(script.trimEnd());
     return 0;
   }
 
   deps.log(`Planned macf-watchdog cron line [${mode}]:`);
   deps.log(`  ${line}`);
+  deps.log(`Script ${scriptPath}:`);
+  deps.log(script.trimEnd());
   if (!opts.yes && !(await deps.confirm('Install this cron line?'))) {
     deps.log('Aborted — crontab unchanged.');
     return 0;
   }
 
+  // Script first: a crontab line must never point at a script that is not there.
+  deps.writeScript(scriptPath, script);
   const next = computeInstalledCrontab(existing, line, marker, opts.workspaceDir);
   deps.writeCrontab(next);
   deps.log(
-    `Installed macf-watchdog cron [${mode}], schedule '${opts.schedule}', log ${logPath}.`,
+    `Installed macf-watchdog cron [${mode}], schedule '${opts.schedule}', script ${scriptPath}, log ${logPath}.`,
   );
   deps.log('Verify: crontab -l | grep macf-watchdog');
   return 0;
@@ -574,6 +642,24 @@ export function createRealDeps(workspaceDir: string): FleetInstallCronDeps {
       }
     },
     confirm: (question: string) => promptYesNo(question),
+    scriptDir: () => join(process.env['HOME'] ?? '~', CRON_SCRIPT_DIR_REL),
+    writeScript: (path: string, content: string) => {
+      const dir = dirname(path);
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+      const tmp = `${path}.${process.pid}.tmp`;
+      try {
+        writeFileSync(tmp, content, { mode: 0o700 });
+        renameSync(tmp, path);
+      } catch (err) {
+        rmSync(tmp, { force: true });
+        throw new FleetInstallCronError(`failed to write ${path}: ${(err as Error).message}`);
+      }
+    },
+    removeScript: (path: string) => {
+      if (!existsSync(path)) return false;
+      rmSync(path, { force: true });
+      return true;
+    },
     log: (msg: string) => console.log(msg),
     warn: (msg: string) => console.error(msg),
   };

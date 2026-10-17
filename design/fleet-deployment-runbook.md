@@ -1326,12 +1326,15 @@ that periodically runs `fleet reconcile`. Flags: `--schedule <cron>`,
 `--allow-restart`, `--with-routing` (a no-op), `--manifest <path>`, `--no-token`
 (don't bake a `GH_TOKEN` mint into the cron line), `--uninstall`, `--print`
 (preview without touching crontab), `--prelude <path>`, `--log <path>`,
-`--yes`, `--dir <path>`. The line sets the installing shell's `PATH`, runs the
-absolute path of the global `macf`, and passes `--dir <workspace>`. It carries the
+`--yes`, `--dir <path>`. The line runs a per-fleet script,
+`~/.macf/cron/<owner>__<project>.sh`, which holds the PATH, the token mint and the
+reconcile command, because Ubuntu's cron caps a command at 1000 characters. The script
+sets the installing shell's `PATH`, runs the
+absolute path of the global `macf`, and passes `--dir <workspace>`. The line carries the
 marker `# macf-watchdog (DR-006) [fleet=<owner>/<project>]`, and install and
 uninstall touch only that fleet's line. It refuses (exit 2) if no `macf` is on
 PATH, if that `macf` is not the version of the CLI you are running (#1508), if
-PATH is empty, or if any value baked into the line contains `%`. There is no
+PATH is empty, or if the log or script path on the line contains `%`, or if the line passes 900 characters. There is no
 `@reboot` line, so recovery after a reboot waits for the first tick.
 
 **`macf fleet reconcile`** [`--help`] — the desired-state watchdog: probes
