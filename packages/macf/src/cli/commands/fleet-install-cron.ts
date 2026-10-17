@@ -42,6 +42,7 @@ import { existsSync, readFileSync, accessSync, constants as fsConstants } from '
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { MacfError } from '@groundnuty/macf-core';
+import { readAgentConfig } from '../config.js';
 import { shellQuote } from '../fleet/launch-command.js';
 import { resolveWorkspaceDir, formatWorkspaceDirConflictWarning } from '../workspace-dir.js';
 
@@ -53,8 +54,20 @@ export class FleetInstallCronError extends MacfError {
   }
 }
 
-/** The stable marker that guards idempotency — a re-run strips lines carrying it. */
+/**
+ * The bare marker older installs wrote (one global string, shared with other
+ * tools' watchdog lines). Kept only to recognise legacy lines; new lines carry
+ * `watchdogMarker(project)`.
+ */
 export const WATCHDOG_MARKER = '# macf-watchdog (DR-006)';
+
+/**
+ * This project's marker. The brackets stop `project=foo` matching inside
+ * `project=foobar`; lines are matched by ENDING with it.
+ */
+export function watchdogMarker(project: string): string {
+  return `${WATCHDOG_MARKER} [project=${project}]`;
+}
 
 /** Coarse default cadence (DR-006 §A.4 heartbeat cadence). */
 export const DEFAULT_SCHEDULE = '*/10 * * * *';
@@ -103,6 +116,8 @@ export interface FleetInstallCronDeps {
 
 /** Already-resolved orchestrator input (env/config resolution done upstream). */
 export interface RunFleetInstallCronOptions {
+  /** The workspace's `macf-agent.json` `project`; scopes the crontab marker. */
+  readonly project: string;
   /** Absolute workspace dir (holds `claude.sh`, `.claude/scripts`, `settings.local.json`). */
   readonly workspaceDir: string;
   /** Cron schedule expression. */
@@ -225,27 +240,66 @@ export function buildCronLine(parts: CronLineParts): string {
   return `${parts.schedule} ${cmd} ${parts.marker}`;
 }
 
-/** Split a crontab into lines, dropping the marker line(s) and any blank lines. */
-export function stripMarkerLines(existing: string, marker: string): readonly string[] {
-  return existing
-    .split('\n')
-    .filter((line) => !line.includes(marker) && line.trim() !== '');
+/** A line is this fleet's if it ends with its marker, or is a legacy line naming its workspace. */
+function isOwnedLine(line: string, marker: string, workspaceDir: string): boolean {
+  const t = line.trimEnd();
+  if (t.endsWith(marker)) return true;
+  return t.endsWith(WATCHDOG_MARKER) && line.includes(`${workspaceDir}/`);
 }
 
-/** The crontab after installing `newLine` (idempotent: strips any prior marker line). */
+/** Legacy bare-marker lines that do NOT belong to this workspace (left untouched). */
+export function foreignLegacyLines(existing: string, workspaceDir: string): readonly string[] {
+  return existing
+    .split('\n')
+    .filter((l) => l.trimEnd().endsWith(WATCHDOG_MARKER) && !l.includes(`${workspaceDir}/`));
+}
+
+/** Split a crontab into lines, dropping THIS fleet's line(s) and any blank lines. */
+export function stripMarkerLines(
+  existing: string,
+  marker: string,
+  workspaceDir: string,
+): readonly string[] {
+  return existing
+    .split('\n')
+    .filter((line) => !isOwnedLine(line, marker, workspaceDir) && line.trim() !== '');
+}
+
+/** The crontab after installing `newLine` (idempotent: strips this fleet's prior line). */
 export function computeInstalledCrontab(
   existing: string,
   newLine: string,
   marker: string,
+  workspaceDir: string,
 ): string {
-  const kept = stripMarkerLines(existing, marker);
+  const kept = stripMarkerLines(existing, marker, workspaceDir);
   return [...kept, newLine].join('\n') + '\n';
 }
 
-/** The crontab after removing the marker line(s); '' when nothing else remains. */
-export function computeUninstalledCrontab(existing: string, marker: string): string {
-  const kept = stripMarkerLines(existing, marker);
+/** The crontab after removing this fleet's line(s); '' when nothing else remains. */
+export function computeUninstalledCrontab(
+  existing: string,
+  marker: string,
+  workspaceDir: string,
+): string {
+  const kept = stripMarkerLines(existing, marker, workspaceDir);
   return kept.length > 0 ? kept.join('\n') + '\n' : '';
+}
+
+/** One notice naming a legacy line we left alone (cut to ~100 chars). */
+function noticeForeignLegacy(
+  existing: string,
+  workspaceDir: string,
+  warn: (msg: string) => void,
+): void {
+  const foreign = foreignLegacyLines(existing, workspaceDir);
+  if (foreign.length === 0) return;
+  const first = foreign[0]!.trim();
+  const shown = first.length > 100 ? `${first.slice(0, 100)}…` : first;
+  const more = foreign.length > 1 ? ` (+${foreign.length - 1} more)` : '';
+  warn(
+    `NOTE: left a crontab line in place because it does not belong to this fleet${more}: ${shown}`,
+  );
 }
 
 // --- Orchestrator (pure control flow over injected deps) ---
@@ -264,11 +318,15 @@ export async function runFleetInstallCron(
   }
 
   const existing = deps.readCrontab() ?? '';
+  const marker = watchdogMarker(opts.project);
+  noticeForeignLegacy(existing, opts.workspaceDir, deps.warn);
 
   // --- Uninstall path ---
   if (opts.uninstall) {
-    const hadLine = existing.split('\n').some((l) => l.includes(WATCHDOG_MARKER));
-    const next = computeUninstalledCrontab(existing, WATCHDOG_MARKER);
+    const hadLine = existing
+      .split('\n')
+      .some((l) => isOwnedLine(l, marker, opts.workspaceDir));
+    const next = computeUninstalledCrontab(existing, marker, opts.workspaceDir);
     if (!hadLine) {
       deps.log('No macf-watchdog cron line found — nothing to remove.');
       return 0;
@@ -313,7 +371,7 @@ export async function runFleetInstallCron(
     tokenPrefix: token.prefix,
     reconcileFlags,
     logPath,
-    marker: WATCHDOG_MARKER,
+    marker,
   });
 
   const mode = describeMode(opts);
@@ -330,7 +388,7 @@ export async function runFleetInstallCron(
     return 0;
   }
 
-  const next = computeInstalledCrontab(existing, line, WATCHDOG_MARKER);
+  const next = computeInstalledCrontab(existing, line, marker, opts.workspaceDir);
   deps.writeCrontab(next);
   deps.log(
     `Installed macf-watchdog cron [${mode}], schedule '${opts.schedule}', log ${logPath}.`,
@@ -466,9 +524,19 @@ export async function runFleetInstallCronCommand(
   if (conflictWarning) console.error(conflictWarning);
   const workspaceDir = resolved.workspaceDir;
 
+  const project = readAgentConfig(workspaceDir)?.project;
+  if (!project) {
+    console.error(
+      `macf fleet install-cron: no project found in ${workspaceDir}/.macf/macf-agent.json ` +
+        '(run `macf init` first). The cron marker is per project, so it cannot be installed.',
+    );
+    return 2;
+  }
+
   const deps = createRealDeps(workspaceDir);
   return runFleetInstallCron(
     {
+      project,
       workspaceDir,
       schedule: cliOpts.schedule?.trim() || DEFAULT_SCHEDULE,
       execute: Boolean(cliOpts.execute),

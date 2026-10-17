@@ -32,6 +32,7 @@ import {
   runFleetInstallCron,
   runFleetInstallCronCommand,
   WATCHDOG_MARKER,
+  watchdogMarker,
   DEFAULT_SCHEDULE,
   RECONCILE_INVOCATION,
   type FleetInstallCronDeps,
@@ -49,6 +50,14 @@ import {
 // — `@groundnuty/macf-core`'s `token.ts` imports `execFile` from this same
 // module, and a from-scratch mock factory drops it, breaking unrelated tests
 // transitively importing macf-core in this same file/worker.
+const configMock = vi.hoisted(() => ({
+  readAgentConfig: vi.fn((_dir: string): { project: string } | null => ({ project: 'proj' })),
+}));
+vi.mock('../../src/cli/config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/cli/config.js')>()),
+  readAgentConfig: configMock.readAgentConfig,
+}));
+
 vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:child_process')>();
   return {
@@ -93,8 +102,11 @@ function fakeDeps(overrides: Partial<FleetInstallCronDeps> = {}): {
   return { deps, rec };
 }
 
+const MARKER = watchdogMarker('proj');
+
 function baseOpts(over: Partial<RunFleetInstallCronOptions> = {}): RunFleetInstallCronOptions {
   return {
+    project: 'proj',
     workspaceDir: WS,
     schedule: DEFAULT_SCHEDULE,
     execute: false,
@@ -222,7 +234,7 @@ describe('buildCronLine', () => {
     tokenPrefix: 'GH_TOKEN=$(x) || exit 1; export GH_TOKEN; ',
     reconcileFlags: [] as readonly string[],
     logPath: '/home/agent/.macf/watchdog.log',
-    marker: WATCHDOG_MARKER,
+    marker: MARKER,
   };
 
   it('assembles schedule + prelude + token + reconcile + log + marker', () => {
@@ -232,7 +244,7 @@ describe('buildCronLine', () => {
     expect(line).toContain('GH_TOKEN=$(x) || exit 1; export GH_TOKEN;');
     expect(line).toContain(RECONCILE_INVOCATION);
     expect(line).toContain("'/home/agent/.macf/watchdog.log' 2>&1");
-    expect(line.endsWith(WATCHDOG_MARKER)).toBe(true);
+    expect(line.endsWith(MARKER)).toBe(true);
   });
 
   it('report-only line carries no --execute', () => {
@@ -290,32 +302,32 @@ describe('buildCronLine', () => {
 
 describe('crontab compute helpers', () => {
   it('stripMarkerLines drops the marker line + blanks, keeps the rest', () => {
-    const existing = ['@daily /usr/bin/backup', '', `*/5 * * * * old ${WATCHDOG_MARKER}`, '0 3 * * * cleanup'].join('\n');
-    expect(stripMarkerLines(existing, WATCHDOG_MARKER)).toEqual([
+    const existing = ['@daily /usr/bin/backup', '', `*/5 * * * * old ${MARKER}`, '0 3 * * * cleanup'].join('\n');
+    expect(stripMarkerLines(existing, MARKER, WS)).toEqual([
       '@daily /usr/bin/backup',
       '0 3 * * * cleanup',
     ]);
   });
 
   it('computeInstalledCrontab is idempotent — replaces a prior marker line', () => {
-    const existing = ['@daily /usr/bin/backup', `*/10 * * * * PRIOR ${WATCHDOG_MARKER}`].join('\n');
-    const newLine = `${DEFAULT_SCHEDULE} NEW ${WATCHDOG_MARKER}`;
-    const out = computeInstalledCrontab(existing, newLine, WATCHDOG_MARKER);
+    const existing = ['@daily /usr/bin/backup', `*/10 * * * * PRIOR ${MARKER}`].join('\n');
+    const newLine = `${DEFAULT_SCHEDULE} NEW ${MARKER}`;
+    const out = computeInstalledCrontab(existing, newLine, MARKER, WS);
     // Exactly one macf-watchdog line, and it's the new one.
-    expect(out.split('\n').filter((l) => l.includes(WATCHDOG_MARKER))).toEqual([newLine]);
+    expect(out.split('\n').filter((l) => l.includes(MARKER))).toEqual([newLine]);
     expect(out).toContain('@daily /usr/bin/backup');
     expect(out).not.toContain('PRIOR');
   });
 
   it('computeUninstalledCrontab removes only the marker line', () => {
-    const existing = ['@daily /usr/bin/backup', `*/10 * * * * x ${WATCHDOG_MARKER}`].join('\n');
-    const out = computeUninstalledCrontab(existing, WATCHDOG_MARKER);
+    const existing = ['@daily /usr/bin/backup', `*/10 * * * * x ${MARKER}`].join('\n');
+    const out = computeUninstalledCrontab(existing, MARKER, WS);
     expect(out).toBe('@daily /usr/bin/backup\n');
   });
 
   it('computeUninstalledCrontab yields empty string when nothing else remains', () => {
-    const existing = `*/10 * * * * x ${WATCHDOG_MARKER}`;
-    expect(computeUninstalledCrontab(existing, WATCHDOG_MARKER)).toBe('');
+    const existing = `*/10 * * * * x ${MARKER}`;
+    expect(computeUninstalledCrontab(existing, MARKER, WS)).toBe('');
   });
 });
 
@@ -326,7 +338,7 @@ describe('runFleetInstallCron — install', () => {
     expect(code).toBe(0);
     expect(rec.writes).toHaveLength(1);
     const written = rec.writes[0]!;
-    expect(written).toContain(WATCHDOG_MARKER);
+    expect(written).toContain(MARKER);
     expect(written).toContain(RECONCILE_INVOCATION);
     expect(written).not.toContain('--execute');
     // token-mint baked (full creds available)
@@ -340,11 +352,11 @@ describe('runFleetInstallCron — install', () => {
   });
 
   it('is idempotent — re-run over an existing marker line replaces, not duplicates', async () => {
-    const existing = `*/10 * * * * OLD ${WATCHDOG_MARKER}`;
+    const existing = `*/10 * * * * OLD ${MARKER}`;
     const { deps, rec } = fakeDeps({ readCrontab: () => existing });
     await runFleetInstallCron(baseOpts(), deps);
     const written = rec.writes[0]!;
-    expect(written.split('\n').filter((l) => l.includes(WATCHDOG_MARKER))).toHaveLength(1);
+    expect(written.split('\n').filter((l) => l.includes(MARKER))).toHaveLength(1);
     expect(written).not.toContain('OLD');
   });
 
@@ -361,7 +373,7 @@ describe('runFleetInstallCron — install', () => {
     const code = await runFleetInstallCron(baseOpts({ print: true }), deps);
     expect(code).toBe(0);
     expect(rec.writes).toHaveLength(0);
-    expect(rec.logs.some((l) => l.includes(WATCHDOG_MARKER))).toBe(true);
+    expect(rec.logs.some((l) => l.includes(MARKER))).toBe(true);
   });
 
   it('warns + bakes no token when creds are missing', async () => {
@@ -388,7 +400,7 @@ describe('runFleetInstallCron — install', () => {
 
 describe('runFleetInstallCron — uninstall', () => {
   it('removes only the macf-watchdog line, preserves the rest', async () => {
-    const existing = ['@daily /usr/bin/backup', `*/10 * * * * x ${WATCHDOG_MARKER}`].join('\n');
+    const existing = ['@daily /usr/bin/backup', `*/10 * * * * x ${MARKER}`].join('\n');
     const { deps, rec } = fakeDeps({ readCrontab: () => existing });
     const code = await runFleetInstallCron(baseOpts({ uninstall: true }), deps);
     expect(code).toBe(0);
@@ -404,11 +416,91 @@ describe('runFleetInstallCron — uninstall', () => {
   });
 
   it('declined uninstall confirmation → no write', async () => {
-    const existing = `*/10 * * * * x ${WATCHDOG_MARKER}`;
+    const existing = `*/10 * * * * x ${MARKER}`;
     const { deps, rec } = fakeDeps({ readCrontab: () => existing, confirm: async () => false });
     const code = await runFleetInstallCron(baseOpts({ uninstall: true, yes: false }), deps);
     expect(code).toBe(0);
     expect(rec.writes).toHaveLength(0);
+  });
+});
+
+describe('per-project marker', () => {
+  const A = watchdogMarker('A');
+  const lineB = `*/10 * * * * run-b ${watchdogMarker('B')}`;
+  const legacyOther = `*/10 * * * * cd /other/ws && reconcile.sh ${WATCHDOG_MARKER}`;
+  const legacyMine = `*/10 * * * * '${WS}/.claude/scripts/macf-gh-token.sh' x ${WATCHDOG_MARKER}`;
+  const crontab = (...ls: string[]) => ls.join('\n');
+  const optsA = (over: Partial<RunFleetInstallCronOptions> = {}) => baseOpts({ project: 'A', ...over });
+
+  it('marker is bracketed per project', () => {
+    expect(A).toBe(`${WATCHDOG_MARKER} [project=A]`);
+  });
+
+  it('install for A keeps B line and an unrelated legacy line byte-identical, and notes the legacy one', async () => {
+    const { deps, rec } = fakeDeps({ readCrontab: () => crontab('@daily x', lineB, legacyOther) });
+    await runFleetInstallCron(optsA(), deps);
+    const lines = rec.writes[0]!.split('\n');
+    expect(lines).toContain(lineB);
+    expect(lines).toContain(legacyOther);
+    expect(lines.filter((l) => l.endsWith(A))).toHaveLength(1);
+    expect(rec.warns.filter((w) => w.includes('does not belong to this fleet'))).toHaveLength(1);
+    expect(rec.warns.join('\n')).toContain('/other/ws');
+  });
+
+  it('the notice cuts a long line to about 100 chars', async () => {
+    const long = `*/10 * * * * ${'x'.repeat(300)} ${WATCHDOG_MARKER}`;
+    const { deps, rec } = fakeDeps({ readCrontab: () => long });
+    await runFleetInstallCron(optsA(), deps);
+    const note = rec.warns.find((w) => w.includes('does not belong'))!;
+    expect(note.length).toBeLessThan(220);
+    expect(note).not.toContain('x'.repeat(150));
+  });
+
+  it('re-install for A replaces A line: exactly one', async () => {
+    const first = fakeDeps();
+    await runFleetInstallCron(optsA(), first.deps);
+    const second = fakeDeps({ readCrontab: () => first.rec.writes[0]! });
+    await runFleetInstallCron(optsA({ schedule: '*/5 * * * *' }), second.deps);
+    const mine = second.rec.writes[0]!.split('\n').filter((l) => l.endsWith(A));
+    expect(mine).toHaveLength(1);
+    expect(mine[0]!.startsWith('*/5 * * * * ')).toBe(true);
+  });
+
+  it('a legacy line containing A workspace path is replaced', async () => {
+    const { deps, rec } = fakeDeps({ readCrontab: () => crontab(legacyMine, lineB) });
+    await runFleetInstallCron(optsA(), deps);
+    const out = rec.writes[0]!;
+    expect(out).not.toContain(legacyMine);
+    expect(out).toContain(lineB);
+    expect(rec.warns.filter((w) => w.includes('does not belong'))).toHaveLength(0);
+  });
+
+  it('a workspace path that is a prefix of another does not claim its legacy line', () => {
+    const other = `*/10 * * * * '${WS}-2/.claude/scripts/h.sh' ${WATCHDOG_MARKER}`;
+    expect(stripMarkerLines(other, A, WS)).toEqual([other]);
+  });
+
+  it('--uninstall for A removes only A line', async () => {
+    const lineA = `*/10 * * * * run-a ${A}`;
+    const { deps, rec } = fakeDeps({ readCrontab: () => crontab('@daily x', lineA, lineB, legacyOther) });
+    await runFleetInstallCron(optsA({ uninstall: true }), deps);
+    expect(rec.writes[0]!).toBe(crontab('@daily x', lineB, legacyOther) + '\n');
+  });
+
+  it('--uninstall with only foreign lines writes nothing', async () => {
+    const { deps, rec } = fakeDeps({ readCrontab: () => crontab(lineB, legacyOther) });
+    await runFleetInstallCron(optsA({ uninstall: true }), deps);
+    expect(rec.writes).toHaveLength(0);
+  });
+
+  it('project=foo does not touch project=foobar', async () => {
+    const foobar = `*/10 * * * * run ${watchdogMarker('foobar')}`;
+    const { deps, rec } = fakeDeps({ readCrontab: () => foobar });
+    await runFleetInstallCron(baseOpts({ project: 'foo' }), deps);
+    expect(rec.writes[0]!.split('\n')).toContain(foobar);
+    const un = fakeDeps({ readCrontab: () => foobar });
+    await runFleetInstallCron(baseOpts({ project: 'foo', uninstall: true }), un.deps);
+    expect(un.rec.writes).toHaveLength(0);
   });
 });
 
@@ -474,5 +566,12 @@ describe('runFleetInstallCronCommand — --dir vs ambient MACF_WORKSPACE_DIR (ma
     expect(code).toBe(0);
     const printed = logSpy.mock.calls.map((c) => String(c[0])).join('\n');
     expect(printed).toContain('/auto-discovered/.claude/.macf/host-prelude.sh');
+  });
+
+  it('no project in macf-agent.json → exit 2, no output line', async () => {
+    configMock.readAgentConfig.mockReturnValueOnce(null);
+    const code = await runFleetInstallCronCommand('/target-b', { print: true, token: false });
+    expect(code).toBe(2);
+    expect(logSpy).not.toHaveBeenCalled();
   });
 });
