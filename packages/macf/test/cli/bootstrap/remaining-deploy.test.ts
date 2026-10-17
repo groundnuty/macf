@@ -107,9 +107,11 @@ describe('computeRemainingDeploy', () => {
     for (const step of report.steps) {
       expect(step.command).not.toContain('--vault');
     }
-    expect(report.vaultLocationNote).toContain('demo-fleet-control');
-    expect(report.vaultLocationNote).toContain('--vault');
-    expect(report.vaultLocationNote).toContain('git pull');
+    expect(report.vaultLocationNote).toContain('fleet.yaml and secrets/vault.age');
+    expect(report.vaultLocationNote).toContain('<dir>/fleet.yaml');
+    expect(report.vaultLocationNote).toContain("--identity-key <that host's age key>");
+    // The old guidance told the operator to clone the private control repo on the agent host.
+    expect(report.vaultLocationNote).not.toMatch(/clone it first|local clone of|git pull|pass --vault/i);
   });
 
   it('resolves deploy_path the SAME way commands/fleet-deploy.ts resolves it (path.resolve, cwd-relative)', () => {
@@ -185,11 +187,11 @@ describe('formatRemainingDeployLines', () => {
           command: `macf fleet deploy --agent code-agent -f /fake/fleet/fleet.yaml --identity-key ${DEPLOY_IDENTITY_KEY_PLACEHOLDER}`,
         },
       ],
-      vaultLocationNote: 'clone groundnuty/demo-fleet-control first, or pass --vault explicitly.',
+      vaultLocationNote: 'On the host that will run it, put copies of fleet.yaml and secrets/vault.age side by side.',
     });
     const text = lines.join('\n');
-    expect(text).toContain('clone groundnuty/demo-fleet-control first');
+    expect(text).toContain('On the host that will run it');
     // The note appears before the per-agent bullet.
-    expect(text.indexOf('clone groundnuty/demo-fleet-control')).toBeLessThan(text.indexOf('code-agent: NOT DEPLOYED'));
+    expect(text.indexOf('On the host that will run it')).toBeLessThan(text.indexOf('code-agent: NOT DEPLOYED'));
   });
 });

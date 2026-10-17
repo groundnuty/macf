@@ -400,10 +400,11 @@ export const RUNNER_TOKEN_ENV_VAR = 'MACF_BOOTSTRAP_RUNNER_TOKEN';
  */
 export function noRunnerTokenReason(): string {
   return (
-    'manifest declares routing.runner (runs_on: "self-hosted") but no runner registration token was ' +
-    'supplied, so apply will not wait for new runners to come up. It checks each repo once: a repo whose ' +
-    'runner is already visible gets MACF_TRUSTED_ACTORS, and one whose runner is not visible yet does not, ' +
-    'and cannot route until a re-run writes it. To have this run wait up to 10 minutes instead, supply ' +
+    'manifest declares routing.runner (runs_on: "self-hosted") and no runner registration token was ' +
+    'supplied. That is fine when the runner platform is configured: apply waits up to 10 minutes for each ' +
+    'runner it requests from the platform this run. For a repo whose runner apply did not request, it checks ' +
+    'once instead of waiting, and a repo whose runner is not visible yet gets no MACF_TRUSTED_ACTORS and ' +
+    'cannot route until a re-run writes it. To have apply wait for those too, supply ' +
     `${RUNNER_TOKEN_FLAG} <token> (or the ${RUNNER_TOKEN_ENV_VAR} env var). Get a token with: ` +
     'gh api -X POST /orgs/<org>/actions/runners/registration-token --jq .token'
   );
