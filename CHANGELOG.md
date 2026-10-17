@@ -4,6 +4,12 @@ All notable changes to the `macf` CLI. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.72] — 2026-10-17
+
+### Fixed
+
+- **0.2.71 republished.** npm accepted `@groundnuty/macf-core@0.2.71` but never made it available, so `@groundnuty/macf@0.2.71` cannot be installed: it depends on that exact version. 0.2.72 carries the same changes as 0.2.71; use it instead.
+
 ## [0.2.71] — 2026-10-17
 
 ### Fixed
