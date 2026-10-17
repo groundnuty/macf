@@ -577,9 +577,10 @@ export function generateWorkflow(
     '  gate:',
     // groundnuty/macf#1497: the gate runs on the runner the caller declares, so
     // a self-hosted fleet spends no metered hosted job per event. Same
-    // capability condition as the `runner-runs-on:` input below.
+    // capability condition as the `runner-runs-on:` input below. A fork PR
+    // stays hosted, as the router's own pick-runner does (macf-actions v3.6.2).
     gateSelfHosted
-      ? '    runs-on: [self-hosted, macf-vm]'
+      ? "    runs-on: ${{ github.event.pull_request.head.repo.fork == true && 'ubuntu-latest' || fromJSON('[\"self-hosted\",\"macf-vm\"]') }}"
       : '    runs-on: ubuntu-latest',
     '    permissions:',
     '      actions: read',

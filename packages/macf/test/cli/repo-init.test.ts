@@ -269,8 +269,12 @@ describe('macf#980 — pull_request synchronize/ready_for_review recovery routin
       return parsed.jobs['gate']['runs-on'];
     }
 
-    it('declared self-hosted: the gate runs on the self-hosted runner labels', () => {
-      expect(gateRunsOn('v3.6.1', 'self-hosted')).toEqual(['self-hosted', 'macf-vm']);
+    it('declared self-hosted: the gate runs on the self-hosted runner labels, except for a fork PR', () => {
+      const runsOn = gateRunsOn('v3.6.1', 'self-hosted');
+      expect(runsOn).toBe(
+        "${{ github.event.pull_request.head.repo.fork == true && 'ubuntu-latest' || fromJSON('[\"self-hosted\",\"macf-vm\"]') }}",
+      );
+      expect(String(runsOn)).toContain('fork == true');
     });
 
     it('undeclared or hosted: the gate stays on ubuntu-latest', () => {
