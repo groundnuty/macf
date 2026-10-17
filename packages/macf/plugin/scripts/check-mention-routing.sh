@@ -1042,6 +1042,34 @@ AWK_OUTPUT="$(awk -v pat="$HANDLE_PATTERN" '
 OFFENDING="$(grep '^LEAK:' <<<"$AWK_OUTPUT" | sed 's/^LEAK://' || true)"
 ACTIVE_COUNT="$(grep '^ACTIVE_COUNT:' <<<"$AWK_OUTPUT" | sed 's/^ACTIVE_COUNT://' || true)"
 
+# Human mentions: a line-start @<login> (no [bot]) addresses a person; GitHub
+# notifies them directly, so it satisfies Check A. A line-start @<login> that
+# starts with "${MACF_PROJECT}-" is a fleet agent missing its [bot] suffix.
+HUMAN_OUT="$(awk -v proj="${MACF_PROJECT:-}" '
+  {
+    line = $0
+    sub(/^[[:space:]>]*([0-9]+\.[[:space:]]+|[-*][[:space:]]+)?/, "", line)
+    if (match(line, /^@[A-Za-z0-9][A-Za-z0-9-]*/)) {
+      login = substr(line, 2, RLENGTH - 1)
+      rest = substr(line, RLENGTH + 1, 1)
+      if (rest == "[" || rest == "_") next
+      if (proj != "" && index(login, proj "-") == 1) print "TYPO:" login
+      else print "HUMAN:" login
+    }
+  }
+' <<<"$LINT_TARGET")"
+FLEET_TYPO="$(grep -m1 '^TYPO:' <<<"$HUMAN_OUT" | sed 's/^TYPO://' || true)"
+if [[ -n "$(grep '^HUMAN:' <<<"$HUMAN_OUT" || true)" ]]; then
+  ACTIVE_COUNT=$(( ACTIVE_COUNT + 1 ))
+fi
+
+if [[ -n "$FLEET_TYPO" ]]; then
+  cat >&2 <<ERR
+BLOCKED by MACF mention-routing-hygiene hook: "@$FLEET_TYPO" looks like one of this fleet's agents but has no [bot] suffix, so it reaches no agent. Write @$FLEET_TYPO[bot] to reach the agent.
+ERR
+  exit 2
+fi
+
 if [[ -n "$OFFENDING" ]]; then
   cat >&2 <<ERR
 BLOCKED by MACF mention-routing-hygiene hook: this comment/issue/PR body
@@ -1121,6 +1149,8 @@ Fix: add an addressing mention naming the recipient:
 Examples (where <recipient> is the issue reporter, PR reviewer, etc.):
   @macf-science-agent[bot] PR #N ready for review.
   @macf-code-agent[bot] LGTM, you can merge.
+
+To address a person rather than an agent, start a line with their GitHub login: @<login> <your message>
 
 Override (ONLY for legitimate no-recipient cases — rare; status posts
 on self-filed-self-closed issues, or test-orchestration scratch comments)
