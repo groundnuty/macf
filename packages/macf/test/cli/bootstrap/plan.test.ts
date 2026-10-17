@@ -3757,7 +3757,11 @@ describe('metered routing line (macf#1497)', () => {
     const repos = routerCarryingRepos(manifest);
     expect(out).toHaveLength(repos.length);
     for (const repo of repos) expect(out.some((l) => l.startsWith(`${repo}: routing runs on GitHub-hosted runners`))).toBe(true);
-    expect(out[0]).toContain('declare routing.runner.runs_on: self-hosted (agent repos) or routing.control_repo_runs_on: self-hosted (control repo)');
+    const control = repos.at(-1)!;
+    const agentLine = out.find((l) => !l.startsWith(`${control}: `))!;
+    const controlLine = out.find((l) => l.startsWith(`${control}: `))!;
+    expect(agentLine).toContain('To move it, set routing.runner.runs_on: self-hosted and re-run apply.');
+    expect(controlLine).toContain('To move it, set routing.runner.runs_on and routing.control_repo_runs_on to self-hosted, then re-run apply.');
   });
 
   it('self-hosted agents with a hosted control repo (the macf-trial shape) report only the control repo', () => {

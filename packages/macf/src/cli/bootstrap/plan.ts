@@ -814,7 +814,7 @@ export interface FleetPlan {
    */
   readonly runnerDeclarationMismatches: readonly RunnerDeclarationFinding[];
   /** groundnuty/macf#1497 — router-carrying repos whose routing runs on GitHub-hosted (metered) runners. Informational; never affects the exit code. */
-  readonly meteredRoutingRepos: readonly string[];
+  readonly meteredRoutingRepos: readonly MeteredRoutingRepo[];
   /**
    * groundnuty/macf#1336 — zero-to-N per-secret findings, one per routing
    * secret genuinely SPLIT across the fleet's agent repos (present on some,
@@ -3472,18 +3472,32 @@ export function computePlan(
  * `self-hosted`, plus the control repo unless `routing.control_repo_runs_on`
  * is. Derived from the manifest alone (what the generator will emit).
  */
-function computeMeteredRoutingRepos(manifest: FleetManifest): readonly string[] {
+/** A router-carrying repo whose routing runs on GitHub-hosted runners, and which kind it is. */
+export interface MeteredRoutingRepo {
+  readonly repo: string;
+  readonly kind: 'agent' | 'control';
+}
+
+function computeMeteredRoutingRepos(manifest: FleetManifest): readonly MeteredRoutingRepo[] {
   const repos = routerCarryingRepos(manifest);
   const controlRepo = repos.at(-1);
   const agentsSelfHosted = manifest.routing?.runner?.runs_on === 'self-hosted';
-  return [...new Set(repos)].filter((repo) => (repo === controlRepo ? !controlRepoSelfHosted(manifest) : !agentsSelfHosted));
+  return [...new Set(repos)]
+    .map((repo): MeteredRoutingRepo => ({ repo, kind: repo === controlRepo ? 'control' : 'agent' }))
+    .filter((r) => (r.kind === 'control' ? !controlRepoSelfHosted(manifest) : !agentsSelfHosted));
 }
 
-/** groundnuty/macf#1497 — one informational line per repo that routes on metered GitHub-hosted runners. */
-export function formatMeteredRoutingLines(repos: readonly string[]): readonly string[] {
-  return repos.map(
-    (repo) =>
-      `${repo}: routing runs on GitHub-hosted runners, which bill per minute on a private repo. To move it, declare routing.runner.runs_on: self-hosted (agent repos) or routing.control_repo_runs_on: self-hosted (control repo) and provision a runner.`,
+/**
+ * groundnuty/macf#1497 — one informational line per repo that routes on
+ * metered GitHub-hosted runners, with the remedy for that repo's kind. The
+ * control repo's field is refused unless the agent repos' is also set.
+ */
+export function formatMeteredRoutingLines(repos: readonly MeteredRoutingRepo[]): readonly string[] {
+  return repos.map(({ repo, kind }) =>
+    `${repo}: routing runs on GitHub-hosted runners, which bill per minute on a private repo. ` +
+    (kind === 'control'
+      ? 'To move it, set routing.runner.runs_on and routing.control_repo_runs_on to self-hosted, then re-run apply.'
+      : 'To move it, set routing.runner.runs_on: self-hosted and re-run apply.'),
   );
 }
 
