@@ -102,6 +102,7 @@ function fakeDeps(overrides: Partial<FleetInstallCronDeps> = {}): {
     },
     crontabAvailable: () => true,
     readAppCreds: () => FULL_CREDS,
+    installPath: () => INSTALL_PATH,
     resolveMacf: () => MACF_BIN,
     macfVersion: () => CLI_VER,
     helperExists: () => true,
@@ -115,6 +116,7 @@ function fakeDeps(overrides: Partial<FleetInstallCronDeps> = {}): {
 
 const MARKER = watchdogMarker('acme', 'proj');
 const MACF_BIN = '/opt/npm/bin/macf';
+const INSTALL_PATH = "/opt/npm/bin:/home/u/.local/bin:/usr/bin";
 const CLI_VER = '1.2.3';
 const INVOKE = `'${MACF_BIN}' ${RECONCILE_ARGS}`;
 
@@ -247,6 +249,7 @@ describe('buildCronLine', () => {
   const parts = {
     schedule: DEFAULT_SCHEDULE,
     macfPath: MACF_BIN,
+    installPath: INSTALL_PATH,
     preludePath: '/ws/.claude/.macf/host-prelude.sh',
     tokenPrefix: 'GH_TOKEN=$(x) || exit 1; export GH_TOKEN; ',
     reconcileFlags: [] as readonly string[],
@@ -262,6 +265,11 @@ describe('buildCronLine', () => {
     expect(line).toContain(INVOKE);
     expect(line).toContain("'/home/agent/.macf/watchdog.log' 2>&1");
     expect(line.endsWith(MARKER)).toBe(true);
+  });
+
+  it('the line starts with the installing PATH, before the prelude', () => {
+    const line = buildCronLine(parts);
+    expect(line.startsWith(`${DEFAULT_SCHEDULE} PATH='${INSTALL_PATH}'; export PATH; [ -f `)).toBe(true);
   });
 
   it('report-only line carries no --execute', () => {
@@ -294,15 +302,18 @@ describe('buildCronLine', () => {
       workspaceDir: ws, withRouting: false, execute: true, allowRestart: false,
     });
     const root = mkdtempSync(join(tmpdir(), 'cron-exec-'));
-    const line = buildCronLine({ ...parts, macfPath: join(root, 'bin', 'macf'), tokenPrefix: '', preludePath: '/nonexistent/prelude.sh', logPath: '/dev/null', reconcileFlags });
+    const tools = join(root, 'tools');
+    const line = buildCronLine({ ...parts, installPath: `${tools}:/usr/bin:/bin`, macfPath: join(root, 'bin', 'macf'), tokenPrefix: '', preludePath: '/nonexistent/prelude.sh', logPath: '/dev/null', reconcileFlags });
     // Everything after the schedule, minus the marker comment.
     const cmd = line.slice(parts.schedule.length + 1, line.length - parts.marker.length - 1);
     try {
       const bin = join(root, 'bin');
       const cwd = join(root, 'elsewhere');
       const out = join(root, 'argv.txt');
-      mkdirSync(bin); mkdirSync(cwd);
-      writeFileSync(join(bin, 'macf'), `#!/bin/sh\n{ pwd; for a in "$@"; do printf "%s\\n" "$a"; done; } > '${out}'\n`, { mode: 0o755 });
+      mkdirSync(bin); mkdirSync(cwd); mkdirSync(tools);
+      // `fakenode` is on the installing PATH only, as node is under npm's bin.
+      writeFileSync(join(tools, 'fakenode'), '#!/bin/sh\nexec /bin/sh "$@"\n', { mode: 0o755 });
+      writeFileSync(join(bin, 'macf'), `#!/usr/bin/env fakenode\n{ pwd; for a in "$@"; do printf "%s\\n" "$a"; done; } > '${out}'\n`, { mode: 0o755 });
       writeFileSync(join(root, 'cron.sh'), cmd + '\n');
       const real = await vi.importActual<typeof import('node:child_process')>('node:child_process');
       real.execFileSync('/usr/bin/env', ['-i', `HOME=${root}`, 'PATH=/usr/bin:/bin', '/bin/sh', join(root, 'cron.sh')], { cwd });
@@ -312,6 +323,37 @@ describe('buildCronLine', () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe('installing PATH', () => {
+  it('install bakes the installing PATH into the written line', async () => {
+    const { deps, rec } = fakeDeps();
+    await runFleetInstallCron(baseOpts(), deps);
+    expect(rec.writes[0]!).toContain(`PATH='${INSTALL_PATH}'; export PATH; `);
+  });
+
+  it('--print shows the PATH', async () => {
+    const { deps, rec } = fakeDeps();
+    await runFleetInstallCron(baseOpts({ print: true }), deps);
+    expect(rec.logs.join('\n')).toContain(`PATH='${INSTALL_PATH}'; export PATH; `);
+  });
+
+  it('an empty PATH → exit 2, no write', async () => {
+    for (const empty of ['', '  ', null]) {
+      const { deps, rec } = fakeDeps({ installPath: () => empty });
+      expect(await runFleetInstallCron(baseOpts(), deps)).toBe(2);
+      expect(rec.writes).toHaveLength(0);
+    }
+  });
+
+  it('--uninstall needs no PATH', async () => {
+    const { deps, rec } = fakeDeps({
+      installPath: () => null,
+      readCrontab: () => `*/10 * * * * x ${MARKER}`,
+    });
+    expect(await runFleetInstallCron(baseOpts({ uninstall: true }), deps)).toBe(0);
+    expect(rec.writes).toHaveLength(1);
   });
 });
 
@@ -578,6 +620,25 @@ describe('per-project marker', () => {
     for (const other of ['/srv/fleet/other', '/backup/srv/fleet']) {
       expect(stripMarkerLines(legacy(other), A, '/srv/fleet')).toEqual([legacy(other)]);
     }
+  });
+
+  it('a legacy --no-token line naming the workspace host-prelude is claimed and replaced', async () => {
+    const prelude = `${WS}/.claude/.macf/host-prelude.sh`;
+    const old = `*/10 * * * * [ -f ${prelude} ] && . ${prelude}; macf fleet reconcile ${WATCHDOG_MARKER}`;
+    const { deps, rec } = fakeDeps({ readCrontab: () => crontab(old, lineB) });
+    await runFleetInstallCron(optsA(), deps);
+    const out = rec.writes[0]!;
+    expect(out).not.toContain(old);
+    expect(out).toContain(lineB);
+    expect(rec.warns.filter((w) => w.includes('does not belong'))).toHaveLength(0);
+    const un = fakeDeps({ readCrontab: () => crontab(old) });
+    await runFleetInstallCron(optsA({ uninstall: true }), un.deps);
+    expect(un.rec.writes[0]!).toBe('');
+  });
+
+  it('a legacy line naming a different prelude path stays foreign', () => {
+    const other = `*/10 * * * * [ -f '/backup${WS}/.claude/.macf/host-prelude.sh' ] && x ${WATCHDOG_MARKER}`;
+    expect(stripMarkerLines(other, A, WS)).toEqual([other]);
   });
 
   it('project=foo does not touch project=foobar', async () => {

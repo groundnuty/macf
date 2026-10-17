@@ -13,6 +13,9 @@
  * can't install it (on cold-boot nothing launches to install it).
  *
  * The generated cron line, in order:
+ *   0. sets PATH to the installing shell's PATH (cron's PATH is /usr/bin:/bin, which
+ *      finds neither `node` for the `macf` shebang nor `claude` in the tmux session
+ *      reconcile launches);
  *   1. sources the host-prelude IF present (cron's bare env lacks the toolchain —
  *      the CLI / tmux / gh; DR-029/#599 host-prelude generator, DR-031 bootstrap);
  *   2. mints a FRESH `GH_TOKEN` fail-loud (cron has no ambient token; the watchdog's
@@ -111,6 +114,8 @@ export interface FleetInstallCronDeps {
   readonly crontabAvailable: () => boolean;
   /** App creds from `<workspace>/.claude/settings.local.json` `.env`, or null. */
   readonly readAppCreds: () => AppCreds | null;
+  /** The installing shell's PATH, baked into the line; null or empty when unset. */
+  readonly installPath: () => string | null;
   /** Absolute path of the first `macf` on the installing shell's PATH, or null. */
   readonly resolveMacf: () => string | null;
   /** `<path> --version` of that binary (semver part), or null when it cannot be read. */
@@ -236,6 +241,8 @@ export interface CronLineParts {
   readonly schedule: string;
   /** Absolute path of the `macf` binary the cron runs. */
   readonly macfPath: string;
+  /** The installing shell's PATH, set at the start of the line. */
+  readonly installPath: string;
   readonly preludePath: string;
   readonly tokenPrefix: string;
   readonly reconcileFlags: readonly string[];
@@ -245,22 +252,28 @@ export interface CronLineParts {
 
 /**
  * Assemble the full crontab line:
- *   `<schedule> [ -f <prelude> ] && . <prelude>; <token><absolute macf> fleet reconcile --dir <workspace> <flags> >> <log> 2>&1 <marker>`
+ *   `<schedule> PATH='<path>'; export PATH; [ -f <prelude> ] && . <prelude>; <token><absolute macf> fleet reconcile --dir <workspace> <flags> >> <log> 2>&1 <marker>`
  * Every path is a quoted shell word.
  */
 export function buildCronLine(parts: CronLineParts): string {
   const prelude = `[ -f ${shellQuote(parts.preludePath)} ] && . ${shellQuote(parts.preludePath)}; `;
   const flags = parts.reconcileFlags.length > 0 ? ` ${parts.reconcileFlags.join(' ')}` : '';
+  const pathSet = `PATH=${shellQuote(parts.installPath)}; export PATH; `;
   const cmd =
-    `${prelude}${parts.tokenPrefix}${shellQuote(parts.macfPath)} ${RECONCILE_ARGS}${flags} ` +
+    `${pathSet}${prelude}${parts.tokenPrefix}${shellQuote(parts.macfPath)} ${RECONCILE_ARGS}${flags} ` +
     `>> ${shellQuote(parts.logPath)} 2>&1`;
   return `${parts.schedule} ${cmd} ${parts.marker}`;
 }
 
-/** True iff `line` holds this workspace's complete token-helper argument (path-boundary exact). */
+/**
+ * True iff `line` holds one of this workspace's own paths as a complete argument:
+ * the token helper, or the default host-prelude (a `--no-token` line has only that).
+ */
 function namesWorkspaceHelper(line: string, workspaceDir: string): boolean {
-  const helper = join(workspaceDir, TOKEN_HELPER_REL).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return new RegExp(`(?:^|[\\s'"]|\\$\\()${helper}(?=[\\s'"]|$)`).test(line);
+  return [TOKEN_HELPER_REL, HOST_PRELUDE_REL].some((rel) => {
+    const path = join(workspaceDir, rel).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`(?:^|[\\s'"]|\\$\\()${path}(?=[\\s'";\\]]|$)`).test(line);
+  });
 }
 
 /** A line is this fleet's if it ends with its marker, or is a legacy line naming its workspace. */
@@ -378,6 +391,15 @@ export async function runFleetInstallCron(
     return 2;
   }
 
+  const installPath = deps.installPath()?.trim();
+  if (!installPath) {
+    deps.warn(
+      'macf fleet install-cron: PATH is empty here. The cron line sets the installing ' +
+        "shell's PATH; run this from a shell with PATH set.",
+    );
+    return 2;
+  }
+
   const token = buildTokenPrefix({
     noToken: opts.noToken,
     workspaceDir: opts.workspaceDir,
@@ -397,6 +419,7 @@ export async function runFleetInstallCron(
   const line = buildCronLine({
     schedule: opts.schedule,
     macfPath: macf.path,
+    installPath,
     preludePath,
     tokenPrefix: token.prefix,
     reconcileFlags,
@@ -503,6 +526,7 @@ export function createRealDeps(workspaceDir: string): FleetInstallCronDeps {
       }
     },
     readAppCreds: () => readAppCredsFromSettings(workspaceDir),
+    installPath: () => process.env['PATH'] ?? null,
     resolveMacf: () => resolveOnPath('macf'),
     macfVersion: (path: string) => {
       try {
