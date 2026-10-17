@@ -595,6 +595,20 @@ describe('reconcileFleet — prompt guard before heal', () => {
     expect(h.storeCalls.writes.every((w) => w.state.deafSweeps === 0)).toBe(true);
   });
 
+  it('names the real tmux session when discovery knows the project', async () => {
+    const ws = { agent: 'devops-agent', workspace: '/w/devops', registry: 'o/r', project: 'macf' } as unknown as WorkspaceRecord;
+    const h = harness({ probe: deafProbe(), panes: paneFor(fx('live-trust-pane.txt')), workspaces: [ws] });
+    const r = await reconcileFleet(oneDeaf, h.deps, cfg());
+    expect(r.rows[0]!.detail).toContain('in tmux session macf@devops-agent; answer it there');
+  });
+
+  it('says "its tmux session" rather than guess when the project is unknown', async () => {
+    const h = harness({ probe: deafProbe(), panes: paneFor(fx('live-trust-pane.txt')) });
+    const r = await reconcileFleet(oneDeaf, h.deps, cfg());
+    expect(r.rows[0]!.detail).toContain('in its tmux session; answer it there');
+    expect(r.rows[0]!.detail).not.toContain('tmux session devops-agent');
+  });
+
   it('dry-run shows BLOCKED and raises no alert', async () => {
     const h = harness({ probe: deafProbe(), panes: paneFor(fx('live-trust-pane.txt')) });
     const r = await reconcileFleet(oneDeaf, h.deps, cfg());

@@ -383,7 +383,11 @@ async function promptGuard(
     deps.log(`    ${agent} ${detail}`);
     return { row: mkRow(agent, 'SKIP', detail), acted: false };
   }
-  const detail = `${agent} is waiting at a prompt (${prompt}) in tmux session ${agent}; answer it there`;
+  // Name the session the operator attaches to (`<project>@<routing-label>`)
+  // when this host's discovery knows the project; never guess it.
+  const project = deps.driver.discoverWorkspaces().find((w) => w.agent === agent)?.project;
+  const where = project ? `tmux session ${project}@${agent}` : 'its tmux session';
+  const detail = `${agent} is waiting at a prompt (${prompt}) in ${where}; answer it there`;
   await raiseAlert(agent, `waiting at a prompt (${prompt}); answer it in the pane`, deps, config);
   return { row: mkRow(agent, 'BLOCKED', detail), acted: true };
 }
