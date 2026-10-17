@@ -6,6 +6,7 @@
  * `fleet/upgrade.sh` guard cases (behind-selected / at-target-skipped / busy-skip
  * / verify-green-before-next / HALT-the-roll).
  */
+import { readFileSync } from 'node:fs';
 import { describe, it, expect } from 'vitest';
 import {
   planFleetUpgrade,
@@ -15,6 +16,8 @@ import {
   buildConfigDirtyMessage,
   buildBranchSkipMessage,
   describeInspectedWorkspace,
+  detectLaunchPrompt,
+  isWatcherAnsweredPrompt,
   type FleetDriver,
   type FleetState,
   type WorkspaceRecord,
@@ -1914,5 +1917,16 @@ describe('upgradeFleets', () => {
     expect(report.halted).toBe(false);
     expect(report.fleets[0]).toMatchObject({ fleet: 'fleet-1', skipped: 'driver-unresolved' });
     expect(calls.upgrade).toEqual(['b']); // fleet-2 still rolled
+  });
+});
+
+describe('detectLaunchPrompt', () => {
+  it('names the live Claude Code trust dialog', () => {
+    const pane = readFileSync(new URL('./fixtures/live-trust-pane.txt', import.meta.url), 'utf8');
+    expect(detectLaunchPrompt(pane)).toBe('trust-dialog');
+  });
+  it('separates watcher-answered prompts from the rest', () => {
+    expect(isWatcherAnsweredPrompt('dev-channels')).toBe(true);
+    expect(isWatcherAnsweredPrompt('trust-dialog')).toBe(false);
   });
 });

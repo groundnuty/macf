@@ -438,7 +438,7 @@ fleet
     'Tier-3 gh-issue alert); desired-down (paused sentinel OR last-exit==0 /exit) → SKIP. ' +
     'Guards: aliveness-gate (NEVER restart a busy agent), EXPONENTIAL restart-backoff + ' +
     'stuck-in-backoff escalation (never restart-storm), launch-stagger (space cold-starts), ' +
-    'and a self-heartbeat. DRY-RUN BY DEFAULT — logs decisions, acts on nothing; pass ' +
+    'and a self-heartbeat. Exit codes: 0 nothing to do, 1 acted or action needed, 2 setup or probe error, 3 a launch failed or is blocked at a prompt. DRY-RUN BY DEFAULT — logs decisions, acts on nothing; pass ' +
     '--execute to act. The cron consumer is `macf fleet install-cron`.',
   )
   .option('--execute', 'ACTUALLY act (launch/inject/restart/alert/heartbeat). Default: dry-run.', false)

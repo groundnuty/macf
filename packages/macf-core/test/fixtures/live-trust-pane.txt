@@ -1,0 +1,14 @@
+Warning: Your devbox environment may be out of date. Run `refresh-global` or `eval "$(devbox global shellenv --preserve-path-stack -r)" && hash -r` to update it.
+Starting writing-agent (writing-agent)...
+────────────────────────────────────────────────────────────────────────────────
+ Accessing workspace:
+ /Users/orzech/Dropbox/home/repos/macf-trial/trial-writing-agent
+ Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source project, or work from your team). If not, take a moment to review what's in this folder first.
+ Claude Code'll be able to read, edit, and execute files here.
+ ⚠ This folder pre-approves 38 tool permissions in .claude/settings.json:
+   Bash, Write, Edit, WebFetch, WebSearch, mcp__macf-agent__notify_peer, mcp__macf-agent__checkpoint_to_memory, NotebookEdit, and 29 more
+ These will apply without asking. Only proceed if you trust this configuration.
+ Security guide
+ ❯ No, exit
+   Yes, I trust this folder
+ Enter to confirm · Esc to cancel

@@ -1011,23 +1011,39 @@ describe('launch', () => {
     expect(rec.sleeps).toEqual([1000, 1000, 1000]);
   });
 
-  it('succeeds when the pane shows no prompt after the settle', async () => {
+  it('succeeds when the pane shows no prompt', async () => {
     const { seams, rec } = fakeSeams({ paneReads: ['Claude Code v2 — ready'] });
-    await createVmDriver({ ...OPTS, launchSettleMs: 5000 }, seams).launch('code-agent');
-    expect(rec.sleeps).toEqual([5000]);
+    await createVmDriver({ ...OPTS, launchPromptWindowMs: 5000 }, seams).launch('code-agent');
     expect(rec.submits).toEqual([]);
   });
 
-  it('reports BLOCKED at the trust dialog, naming the session, and answers nothing', async () => {
-    const pane = [
-      'Is this a project you created or one you trust?',
-      '❯ 1. Yes, I trust this folder',
-      '  2. No, exit',
-    ].join('\n');
+  it('waits out a prompt the watcher answers, then succeeds once it clears', async () => {
+    const seed = 'I am using this for local development';
+    const { seams, rec } = fakeSeams({ paneReads: [seed, seed, 'Claude Code v2 — ready'] });
+    await createVmDriver({ ...OPTS, launchPromptWindowMs: 5000, launchPollMs: 1000 }, seams).launch('code-agent');
+    expect(rec.sleeps).toEqual([1000, 1000]);
+    expect(rec.submits).toEqual([]);
+  });
+
+  it('reports BLOCKED when a watcher prompt is still showing at the end of the window', async () => {
+    const seed = 'I am using this for local development';
+    const { seams } = fakeSeams({ paneReads: [seed] });
+    seams.capturePane = () => seed;
+    const err = await createVmDriver({ ...OPTS, launchPromptWindowMs: 3000, launchPollMs: 1000 }, seams)
+      .launch('code-agent')
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(FleetLaunchBlockedError);
+    expect((err as Error).message).toContain('prompt watcher did not clear');
+  });
+
+  it('reports BLOCKED at the real trust dialog on the first read, and answers nothing', async () => {
+    const pane = readFileSync(new URL('./fixtures/live-trust-pane.txt', import.meta.url), 'utf8');
     const { seams, rec } = fakeSeams({ paneReads: [pane] });
     const err = await createVmDriver(OPTS, seams).launch('code-agent').catch((e: unknown) => e);
     expect(err).toBeInstanceOf(FleetLaunchBlockedError);
     expect((err as FleetLaunchBlockedError).session).toBe('macf@code-agent');
+    expect((err as FleetLaunchBlockedError).prompt).toBe('trust-dialog');
+    expect(rec.captured).toHaveLength(1);
     expect(rec.submits).toEqual([]);
   });
 });

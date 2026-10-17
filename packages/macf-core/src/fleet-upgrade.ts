@@ -728,8 +728,13 @@ export function detectLaunchPrompt(pane: string | null): string | null {
   for (const entry of PROMPT_RESPONSES_SEED.entries) {
     if (entry.frame_contains.every((needle) => pane.includes(needle))) return entry.name;
   }
-  if (/do you trust/i.test(pane)) return 'trust-dialog';
+  if (/Yes, I trust this folder|one you trust\?|do you trust/i.test(pane)) return 'trust-dialog';
   return looksPromptLike(pane) ? 'unrecognised-prompt' : null;
+}
+
+/** True when the prompt watcher answers this prompt itself, so it may clear without an operator. */
+export function isWatcherAnsweredPrompt(name: string): boolean {
+  return PROMPT_RESPONSES_SEED.entries.some((entry) => entry.name === name);
 }
 
 /** Read the pane and classify it; a failed read is "no evidence", never a throw. */

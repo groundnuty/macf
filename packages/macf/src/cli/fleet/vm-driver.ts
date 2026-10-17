@@ -26,6 +26,7 @@ import {
   FleetLaunchBlockedError,
   FleetLaunchFailedError,
   detectLaunchPrompt,
+  isWatcherAnsweredPrompt,
   ROLL_TOUCHED_CONFIG_PATTERNS,
   createRegistryFromConfig,
   fromVariableSegment,
@@ -241,8 +242,8 @@ export interface VmDriverOptions {
   readonly launchTimeoutMs?: number;
   /** Poll interval while waiting for the session (default 1 s). */
   readonly launchPollMs?: number;
-  /** Settle before reading the pane for an unanswered prompt (default 15 s). */
-  readonly launchSettleMs?: number;
+  /** How long to poll the pane for a prompt the watcher has not cleared (default 60 s). */
+  readonly launchPromptWindowMs?: number;
   /**
    * Maintenance-lock config (DR-040 Decision 4, macf#752) — defaults to
    * env-resolved (`resolveMaintenanceLockConfig()`) so production honors the
@@ -351,7 +352,7 @@ export const ORCHESTRATOR_IDENTITY_ENV_KEYS = [
 
 const DEFAULT_LAUNCH_TIMEOUT_MS = 30_000;
 const DEFAULT_LAUNCH_POLL_MS = 1_000;
-const DEFAULT_LAUNCH_SETTLE_MS = 15_000;
+const DEFAULT_LAUNCH_PROMPT_WINDOW_MS = 60_000;
 
 /**
  * Build the child env for a target-workspace `macf` subcommand invoked via
@@ -615,11 +616,20 @@ export function createVmDriver(opts: VmDriverOptions, seams: VmDriverSeams): Fle
       await seams.sleep(pollMs);
       waited += pollMs;
     }
-    // The prompt watcher answers the dev-channels prompt; the trust dialog and
-    // anything unknown stay on the pane. Read it only after the watcher's turn.
-    await seams.sleep(opts.launchSettleMs ?? DEFAULT_LAUNCH_SETTLE_MS);
-    const prompt = detectLaunchPrompt(seams.capturePane(session));
-    if (prompt !== null) throw new FleetLaunchBlockedError(session, prompt);
+    // The watcher answers its own prompts; anything else on the pane waits for an operator.
+    const windowMs = opts.launchPromptWindowMs ?? DEFAULT_LAUNCH_PROMPT_WINDOW_MS;
+    let elapsed = 0;
+    let prompt = detectLaunchPrompt(seams.capturePane(session));
+    for (;;) {
+      if (prompt === null) return;
+      if (!isWatcherAnsweredPrompt(prompt)) throw new FleetLaunchBlockedError(session, prompt);
+      if (elapsed >= windowMs) {
+        throw new FleetLaunchBlockedError(session, `${prompt}; the prompt watcher did not clear it`);
+      }
+      await seams.sleep(pollMs);
+      elapsed += pollMs;
+      prompt = detectLaunchPrompt(seams.capturePane(session));
+    }
   }
 
   async function restart(agent: string, restartOpts?: { readonly leaveConfigUncommitted?: boolean }): Promise<void> {
