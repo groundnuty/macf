@@ -115,6 +115,7 @@ function makeSingleAgentDriver(opts: {
     probe,
     discoverWorkspaces: () => [mkWs('code-agent', opts.base)],
     isBusy: async () => opts.busy ?? false,
+    isRunning: async () => true,
     isConfigDirty: async () => opts.configDirty ?? false,
     listDirtyConfig: async () => (opts.configDirty ? ['claude.sh'] : []),
     currentBranch: async () => 'main',

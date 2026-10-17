@@ -207,6 +207,7 @@ function makeDriver(opts: {
       calls.discover += 1;
       return opts.workspaces;
     },
+    isRunning: async () => true,
     isBusy: async (agent) => {
       const idx = perAgent.get(agent) ?? 0;
       perAgent.set(agent, idx + 1);
@@ -342,6 +343,7 @@ function makeTransactionalDriver(opts: {
       calls.discover += 1;
       return opts.workspaces;
     },
+    isRunning: async () => true,
     isBusy: async (agent) => {
       calls.isBusy.push(agent);
       return false;

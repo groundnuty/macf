@@ -37,6 +37,8 @@ import {
   type ReconcileHeartbeat,
   type ReconcileStateStore,
   type WorkspaceRecord,
+  FleetLaunchBlockedError,
+  FleetLaunchFailedError,
 } from '../src/index.js';
 
 // --- fixtures ---------------------------------------------------------------
@@ -80,12 +82,17 @@ interface DriverCalls {
 interface FakeDriverOpts {
   readonly probe: FleetState | (() => Promise<FleetState>);
   readonly busy?: ReadonlySet<string>;
+  /** Agents with no live session (registered or not). Default: all running. */
+  readonly notRunning?: ReadonlySet<string>;
+  /** Make `launch` throw this for the named agent. */
+  readonly launchThrows?: ReadonlyMap<string, Error>;
   readonly workspaces?: readonly WorkspaceRecord[];
 }
 
 function fakeDriver(o: FakeDriverOpts): { driver: FleetDriver; calls: DriverCalls } {
   const calls: DriverCalls = { launched: [], injected: [], restarted: [], busyChecks: [] };
   const busy = o.busy ?? new Set<string>();
+  const notRunning = o.notRunning ?? new Set<string>();
   const driver: FleetDriver = {
     probe: typeof o.probe === 'function' ? o.probe : async () => o.probe,
     discoverWorkspaces: () => o.workspaces ?? [],
@@ -93,10 +100,15 @@ function fakeDriver(o: FakeDriverOpts): { driver: FleetDriver; calls: DriverCall
       calls.busyChecks.push(agent);
       return busy.has(agent);
     },
+    isRunning: async (agent: string) => !notRunning.has(agent),
     upgrade: async () => {},
     restart: async (agent: string) => void calls.restarted.push(agent),
     inject: async (agent: string, text: string) => void calls.injected.push({ agent, text }),
-    launch: async (agent: string) => void calls.launched.push(agent),
+    launch: async (agent: string) => {
+      calls.launched.push(agent);
+      const err = o.launchThrows?.get(agent);
+      if (err) throw err;
+    },
   };
   return { driver, calls };
 }
@@ -278,6 +290,80 @@ describe('reconcileFleet — exit-code intent (B.1/B.2)', () => {
     const r = await reconcileFleet(oneAbsent, h.deps, cfg({ execute: true }));
     expect(decisionOf(r.rows, 'code-agent')).toBe('LAUNCH');
     expect(h.calls.launched).toEqual(['code-agent']);
+  });
+});
+
+// --- a registered agent with no live session is not running -----------------
+
+describe('reconcileFleet — stale registration (deaf + not running)', () => {
+  const one: readonly DesiredAgent[] = [{ agent: 'code-agent', workspace: '/w/macf' }];
+  const deafDown = { probe: fleet(agentState('code-agent', false)), notRunning: new Set(['code-agent']) };
+
+  it('deaf + not running + last-exit absent → LAUNCH, not an inject', async () => {
+    const h = harness(deafDown);
+    const r = await reconcileFleet(one, h.deps, cfg({ execute: true }));
+    expect(decisionOf(r.rows, 'code-agent')).toBe('LAUNCH');
+    expect(r.rows[0]!.detail).toContain('registered but not running here');
+    expect(h.calls.launched).toEqual(['code-agent']);
+    expect(h.calls.injected).toEqual([]);
+  });
+
+  it('deaf + not running + last-exit 0 → SKIP', async () => {
+    const h = harness(deafDown, { 'code-agent': { lastExit: 0 } });
+    const r = await reconcileFleet(one, h.deps, cfg({ execute: true }));
+    expect(decisionOf(r.rows, 'code-agent')).toBe('SKIP');
+    expect(h.calls.launched).toEqual([]);
+  });
+
+  it('deaf + running → HEAL (ladder unchanged)', async () => {
+    const h = harness({ probe: fleet(agentState('code-agent', false)) });
+    const r = await reconcileFleet(one, h.deps, cfg({ execute: true }));
+    expect(decisionOf(r.rows, 'code-agent')).toBe('HEAL');
+    expect(h.calls.launched).toEqual([]);
+    expect(h.calls.injected).toHaveLength(1);
+  });
+
+  it('the dry-run plan is honest: LAUNCH, and nothing acted on', async () => {
+    const h = harness(deafDown);
+    const r = await reconcileFleet(one, h.deps, cfg());
+    expect(decisionOf(r.rows, 'code-agent')).toBe('LAUNCH');
+    expect(h.calls.launched).toEqual([]);
+  });
+});
+
+// --- a launch that fails is reported, never swallowed -----------------------
+
+describe('reconcileFleet — launch outcome', () => {
+  const one: readonly DesiredAgent[] = [{ agent: 'code-agent', workspace: '/w/macf' }];
+
+  it('launch that never came up → FAILED row with the reason, rc 3', async () => {
+    const h = harness({
+      probe: fleet(),
+      launchThrows: new Map([['code-agent', new FleetLaunchFailedError('tmux session macf@code-agent did not appear')]]),
+    });
+    const r = await reconcileFleet(one, h.deps, cfg({ execute: true }));
+    expect(decisionOf(r.rows, 'code-agent')).toBe('FAILED');
+    expect(r.rows[0]!.detail).toContain('did not appear');
+    expect(r.rc).toBe(3);
+  });
+
+  it('launch blocked at a prompt → BLOCKED naming the session, alert raised, rc 3', async () => {
+    const h = harness({
+      probe: fleet(),
+      launchThrows: new Map([['code-agent', new FleetLaunchBlockedError('macf@code-agent', 'trust-dialog')]]),
+    });
+    const r = await reconcileFleet(one, h.deps, cfg({ execute: true }));
+    expect(decisionOf(r.rows, 'code-agent')).toBe('BLOCKED');
+    expect(r.rows[0]!.detail).toContain('macf@code-agent');
+    expect(h.alerts).toHaveLength(1);
+    expect(r.rc).toBe(3);
+  });
+
+  it('dry-run raises no alert and reports no failure', async () => {
+    const h = harness({ probe: fleet() });
+    const r = await reconcileFleet(one, h.deps, cfg());
+    expect(h.alerts).toEqual([]);
+    expect(r.rc).toBe(1);
   });
 });
 

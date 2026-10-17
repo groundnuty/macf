@@ -433,7 +433,7 @@ fleet
     'The desired-state reconciler, porting devops-toolkit\'s fleet/reconcile.sh. ' +
     'Probes ACTUAL state (fleet /health) and drives it toward the ' +
     'operator-owned DESIRED set (a desired-agents.yaml manifest if present, else the ' +
-    "host's discovered workspaces): desired-and-down → LAUNCH; desired-and-deaf → HEAL " +
+    "host's discovered workspaces): desired-and-down (not registered, or registered with no live session) → LAUNCH, verified (a launch that never comes up → FAILED, one stopped at a prompt → BLOCKED, exit 3); desired-and-deaf with a live session → HEAL " +
     'via the tiered ladder (Tier-1 gated inject → Tier-2 graceful-restart [--allow-restart] → ' +
     'Tier-3 gh-issue alert); desired-down (paused sentinel OR last-exit==0 /exit) → SKIP. ' +
     'Guards: aliveness-gate (NEVER restart a busy agent), EXPONENTIAL restart-backoff + ' +

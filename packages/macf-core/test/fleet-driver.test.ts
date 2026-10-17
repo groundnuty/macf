@@ -39,6 +39,7 @@ describe('FleetDriver structural contract', () => {
         calls.push(`isBusy:${a}`);
         return false;
       },
+      isRunning: async () => true,
       upgrade: async (a) => void calls.push(`upgrade:${a}`),
       restart: async (a) => void calls.push(`restart:${a}`),
       inject: async (a, t) => void calls.push(`inject:${a}:${t}`),

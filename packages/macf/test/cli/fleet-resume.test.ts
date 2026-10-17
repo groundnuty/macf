@@ -86,6 +86,7 @@ function build(
   const driver: FleetDriver = {
     probe: async (): Promise<FleetState> => ({ agents: [] }),
     discoverWorkspaces: () => records,
+    isRunning: async () => true,
     isBusy: async (agent: string): Promise<boolean> => {
       const n = rec.isBusyCalls.get(agent) ?? 0;
       rec.isBusyCalls.set(agent, n + 1);

@@ -30,6 +30,7 @@ import { spawn, execFileSync } from 'node:child_process';
 import { writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { ROLL_TOUCHED_CONFIG_PATTERNS } from '@groundnuty/macf-core';
+import { launchInnerCommand } from '../fleet/launch-command.js';
 import { readAgentConfig, resolveCanonicalBranch, agentConfigPath } from '../config.js';
 import {
   backupSessionTranscript,
@@ -378,7 +379,7 @@ export function buildRelauncherScript(args: {
     '# runs it is already inside the fresh session, so $TMUX being set there is',
     '# the CORRECT signal, not a leftover artifact.',
     'exec tmux new-session -d -s "$SESSION" -c "$WORKSPACE" \\',
-    '  "MACF_NO_TMUX_WRAP=1 exec \\"$WORKSPACE/claude.sh\\""',
+    `  "${launchInnerCommand('$WORKSPACE').replace(/"/g, '\\"')}"`,
     '',
   ].join('\n');
 }

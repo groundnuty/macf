@@ -4,7 +4,7 @@
  * Implements the runtime-agnostic `FleetDriver` contract with VM primitives —
  * the registry `/health` probe, the `.macf/`-marker workspace scan, tmux
  * `capture-pane` / `send-keys`, `macf update`, `macf restart-self`, and the
- * `./claude.sh` cold-start. **Nothing VM-specific leaks above the interface**
+ * detached-tmux cold-start. **Nothing VM-specific leaks above the interface**
  * (that's the DR-037 hard rule — the macOS variant + K8s driver drop in later by
  * swapping the driver, never the decision layer).
  *
@@ -23,6 +23,9 @@ import { execFileSync, spawn } from 'node:child_process';
 import { join } from 'node:path';
 import {
   FleetDriverError,
+  FleetLaunchBlockedError,
+  FleetLaunchFailedError,
+  detectLaunchPrompt,
   ROLL_TOUCHED_CONFIG_PATTERNS,
   createRegistryFromConfig,
   fromVariableSegment,
@@ -46,6 +49,7 @@ import {
 } from '../config.js';
 import { createClientFromConfig } from '../registry-helper.js';
 import { discoverWorkspaces } from '../discovery.js';
+import { buildTmuxLaunchArgs } from './launch-command.js';
 import { gatherFleetStatus, type FleetProbeFn } from '../commands/fleet.js';
 import { classifyDirtyFile } from './canonical-compute.js';
 import { readMcpJsonChannelServerVersion } from '../mcp-json.js';
@@ -233,8 +237,12 @@ export interface VmDriverOptions {
   readonly busyWindowMs?: number;
   /** The `macf` binary name/path (default `'macf'`, resolved on PATH). */
   readonly macfBin?: string;
-  /** The launcher basename spawned by `launch` (default `'claude.sh'`). */
-  readonly launcher?: string;
+  /** How long `launch` waits for the new tmux session to appear (default 30 s). */
+  readonly launchTimeoutMs?: number;
+  /** Poll interval while waiting for the session (default 1 s). */
+  readonly launchPollMs?: number;
+  /** Settle before reading the pane for an unanswered prompt (default 15 s). */
+  readonly launchSettleMs?: number;
   /**
    * Maintenance-lock config (DR-040 Decision 4, macf#752) — defaults to
    * env-resolved (`resolveMaintenanceLockConfig()`) so production honors the
@@ -340,6 +348,10 @@ export const ORCHESTRATOR_IDENTITY_ENV_KEYS = [
   'MACF_AGENT_NAME',
   'CLAUDE_PROJECT_DIR',
 ] as const;
+
+const DEFAULT_LAUNCH_TIMEOUT_MS = 30_000;
+const DEFAULT_LAUNCH_POLL_MS = 1_000;
+const DEFAULT_LAUNCH_SETTLE_MS = 15_000;
 
 /**
  * Build the child env for a target-workspace `macf` subcommand invoked via
@@ -575,14 +587,39 @@ export function createVmDriver(opts: VmDriverOptions, seams: VmDriverSeams): Fle
     seams.exec(macfBin, ['update', '--yes'], target.workspace, childEnvForTarget());
   }
 
+  async function isRunning(agent: string): Promise<boolean> {
+    const target = resolveTarget(seams, agent, opts.project);
+    return Boolean(target?.session && seams.hasSession(target.session));
+  }
+
   async function launch(agent: string): Promise<void> {
-    const target = requireTarget(agent);
-    const launcher = join(target.workspace, opts.launcher ?? 'claude.sh');
-    // macf#763: same scrub as `upgrade`/`restart` — `claude.sh` itself
-    // re-sources the target's own env files, but scrub here too for
-    // uniformity/defense-in-depth (the detached child briefly runs with the
-    // orchestrator's env before claude.sh re-execs).
-    seams.spawnDetached(launcher, [], target.workspace, childEnvForTarget());
+    const { target, session } = requireSession(agent);
+    // The detached session is created here, not by claude.sh's own self-wrap,
+    // which needs a terminal. The scrubbed env keeps the orchestrator's
+    // identity out of the child (macf#763).
+    seams.exec('tmux', buildTmuxLaunchArgs(session, target.workspace), target.workspace, childEnvForTarget());
+    await verifyLaunch(agent, session);
+  }
+
+  /** Never report a launch unverified: the session must appear, and not stop at a prompt. */
+  async function verifyLaunch(agent: string, session: string): Promise<void> {
+    const timeoutMs = opts.launchTimeoutMs ?? DEFAULT_LAUNCH_TIMEOUT_MS;
+    const pollMs = opts.launchPollMs ?? DEFAULT_LAUNCH_POLL_MS;
+    let waited = 0;
+    while (!seams.hasSession(session)) {
+      if (waited >= timeoutMs) {
+        throw new FleetLaunchFailedError(
+          `tmux session ${session} did not appear within ${Math.round(timeoutMs / 1000)}s of launching ${agent}`,
+        );
+      }
+      await seams.sleep(pollMs);
+      waited += pollMs;
+    }
+    // The prompt watcher answers the dev-channels prompt; the trust dialog and
+    // anything unknown stay on the pane. Read it only after the watcher's turn.
+    await seams.sleep(opts.launchSettleMs ?? DEFAULT_LAUNCH_SETTLE_MS);
+    const prompt = detectLaunchPrompt(seams.capturePane(session));
+    if (prompt !== null) throw new FleetLaunchBlockedError(session, prompt);
   }
 
   async function restart(agent: string, restartOpts?: { readonly leaveConfigUncommitted?: boolean }): Promise<void> {
@@ -652,6 +689,7 @@ export function createVmDriver(opts: VmDriverOptions, seams: VmDriverSeams): Fle
     probe,
     discoverWorkspaces: () => seams.discover(),
     isBusy,
+    isRunning,
     isConfigDirty,
     listDirtyConfig,
     currentBranch,
