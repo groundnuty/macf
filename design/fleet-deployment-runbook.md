@@ -260,51 +260,14 @@ registered). Treat all six as independent facts; a summary line claiming
 
 ## 4a. Adding an agent to an already-provisioned fleet
 
-> ### ⚠️ KNOWN GAP — the new agent cannot route to its predecessors until you fix one variable by hand
->
-> **Adding an agent leaves it trusted only on its own repo.** `apply` writes
-> `MACF_TRUSTED_ACTORS` **only when the variable is absent** (create-only), so the
-> new agent's repo gets the full actor list while every pre-existing repo keeps
-> its old, shorter one. The result is a **one-directional routing break**: the new
-> agent can be routed *to*, and cannot route *out*.
->
-> **Measured on `macf-trial` after a 2→3 scale-up (2026-08-27):**
->
-> ```
-> trial-code-agent      2 actors — the new agent ABSENT
-> trial-science-agent   2 actors — the new agent ABSENT
-> trial-writing-agent   3 actors — the new agent PRESENT
-> ```
->
-> **`macf bootstrap plan` detects this and says so**, reporting an `update` whose
-> reason reads *"NOT IMPLEMENTED BY APPLY … create-only … does NOT overwrite a
-> PRESENT-but-diverging value."* **So the plan is honest and the fleet is broken;
-> nothing is silently wrong, but nothing fixes it either.**
->
-> **What to do after step 2 completes, for EVERY pre-existing agent repo:**
->
-> ```sh
-> # 1. What does the manifest declare? (one <fleet>-<role>-agent[bot] per agent)
-> grep -E '^  - role:' fleet.yaml
->
-> # 2. What does each repo actually trust?
-> for r in <repo-1> <repo-2> ...; do
->   printf '%s: ' "$r"
->   gh api "repos/<owner>/$r/actions/variables/MACF_TRUSTED_ACTORS" --jq .value
-> done
->
-> # 3. Set any repo whose list is short to the FULL space-separated set
-> gh variable set MACF_TRUSTED_ACTORS --repo <owner>/<repo> \
->   --body "<fleet>-code-agent[bot] <fleet>-science-agent[bot] <fleet>-<new-role>-agent[bot]"
-> ```
->
-> **Verify with `macf bootstrap plan`: it should report `0 update`.** While it
-> still reports one, the break is live.
->
-> **Tracked as `groundnuty/macf#1319`**, which makes `apply` reconcile the
-> variable as a confirmed `update` rather than skipping it. **This section loses
-> this box when that lands** — check whether `#1319` is closed before following
-> the manual steps.
+> **`MACF_TRUSTED_ACTORS` follows the manifest.** On every repo the value is the
+> fleet's agent bots (`<fleet>-<role>-agent[bot]`) followed by any logins in
+> `routing.runner.trusted_actors`. `apply` reconciles it: where a repo holds a
+> different value, `plan` reports an `update` and `apply` rewrites it after one
+> confirmation (`--yes` confirms), so adding an agent widens every existing repo
+> in the same run (`reconcileTrustedActors`, `apply-routing.ts`; macf#1319). A
+> login added by hand outside the manifest is removed by the next `apply`; to keep
+> one, list it under `routing.runner.trusted_actors`.
 
 **A different happy path from §1–§4 — those provision a fleet from nothing;
 this scales one that already routes.** Everything below only applies once a
@@ -450,7 +413,7 @@ gh api /repos/<owner>/<new-agent-repo>/actions/runners --jq '.total_count'
 
 # 3. Routing is live for the new repo.
 gh variable get MACF_TRUSTED_ACTORS --repo <owner>/<new-agent-repo>
-# expect: non-empty, includes the new agent's bot login + the owner account login
+# expect: non-empty, lists every agent bot login plus any routing.runner.trusted_actors
 
 # 4. The control repo's label queue has the new role.
 gh label list --repo <owner>/<fleet>-control --json name --jq '.[].name'
@@ -612,20 +575,21 @@ silently-dropped typo.
 | `apiVersion` | required | — | must be the literal `macf/v0` |
 | `kind` | required | — | must be the literal `Fleet` |
 | `metadata.name` | required | — | lowercase kebab-case, must start with an alnum (`^[a-z0-9][a-z0-9-]*$`). Propagates into the derived control-repo name (`<name>-control`), every App handle (`<name>-<role>`), and the registry variable segment. |
-| `versions.macf` / `versions.actions` | optional (whole `versions:` block) | omitted → no GitOps steering target; `apply` doesn't reconcile version drift for either plane | §D6/Amendment L: `versions.macf` is reconciled by `macf fleet upgrade` under a verify-green gate; `versions.actions` is reconciled by `macf repo-init` re-pinning the router workflow. `apply` **names the remedy and refuses to run it itself** — a version mismatch is Confirm-then-update, never silent auto-roll. |
+| `versions.macf` / `versions.actions` | optional (whole `versions:` block) | omitted → no GitOps steering target; `apply` doesn't reconcile version drift for either plane | §D6/Amendment L: `versions.macf` is reconciled by `macf fleet upgrade` under a verify-green gate. `apply` force-rewrites a diverging `agent-router.yml` pin itself (`apply-repo-init.ts`), and its version phase runs the `fleet upgrade` roll, only over workspaces on the host running `apply` (`apply-version.ts`; §7.8). |
 | `owner.account` | required | — | the GitHub org or user login that owns the fleet |
 | `owner.type` | required | — | `user` \| `org` — shapes the manifest-form URL and interacts with the router-App scope derivation (§6.5) |
 | `owner.registry` | required | — | see §6.2 |
 | `network.advertise_host` | required | — | the tailnet hostname other agents use to reach this fleet's channel servers; consumed by `macf fleet deploy` (`advertiseHost`) |
 | `transport.age_recipients` | required (array; `.min(0)`, **not** `.min(1)`) | `[]` is the create-path REFUSAL trigger, never "skip minting" — see §1 | operator-supplied public keys only, never a private key, never tool-minted (Amendment C) |
-| `transport.tailscale_oauth_required` | optional | `false` | declares that this fleet's router needs `TS_OAUTH_CLIENT_ID`/`TS_OAUTH_SECRET`; when `true` and the vault doesn't hold them, `apply` refuses **before gate 1** rather than spend a click on a fleet that can't route (§7.4) |
-| `transport.router_app_scope` | optional | `'shared'` | `'shared'` (one router App per **owner scope**, reused across every fleet on that account) vs `'per-fleet'` (a dedicated router App for this fleet alone) — see §6.5, §7.3 |
+| `transport.tailscale_oauth_required` | optional | `false` | declares that this fleet's router needs `TS_OAUTH_CLIENT_ID`/`TS_OAUTH_SECRET`; when `true` and none of the flags, env, the secrets file or the vault supplies the pair, `apply` refuses **before gate 1** rather than spend a click on a fleet that can't route (§7.4) |
+| `transport.router_app_scope` | optional | `'shared'` | `'shared'` (one router App per **owner scope**, reused across every fleet on that account) vs `'per-fleet'` (a dedicated router App for this fleet alone). For a new fleet in an org that already hosts a fleet, `'per-fleet'` is the path that works without copying another fleet's router credentials — see §6.5, §7.3 |
+| `transport.age_recipients_narrowing_override` | optional | omitted | a non-empty string that acknowledges removing a recipient from an existing vault's `age_recipients`; without it `apply` refuses to narrow the set (`bootstrap-apply.ts`, `apply-fleet.ts`) |
 | `transport.router_app_origin_fleet` | optional | omitted | provenance-only: names which fleet's vault this fleet's copy of a shared router credential came from. Purely a marker — declaring it changes no behavior; see §7.3 |
 | `transport.runner_platform_endpoint` | optional | omitted | the LOWEST-precedence, narrowest tier of the runner-platform endpoint resolution — an escape hatch for a fleet that genuinely needs a different runner-provisioning platform than its scope's shared one, not the intended common path. A VARIABLE, never a secret — safe to commit to `fleet.yaml`. See §1 + §6.5 (groundnuty/macf#1211) |
 | `defaults.role_template` | required | — | the GitHub template repo new agent repos are cloned from |
-| `defaults.app_manifest` | required | — | **accepted by the schema but UNCONSUMED anywhere downstream today** (verified: zero non-schema, non-fixture references in source). Every real fleet uses the literal `dr-019` by convention; the DR-019 permission set is hardcoded in `app-manifest.ts` regardless of what this field says. Write `dr-019`; nothing currently reads it. |
+| `defaults.app_manifest` | optional | — | **accepted by the schema but UNCONSUMED anywhere downstream today** (verified: zero non-schema, non-fixture references in source). Every real fleet uses the literal `dr-019` by convention; the DR-019 permission set is hardcoded in `app-manifest.ts` regardless of what this field says. Write `dr-019`; nothing currently reads it. |
 | `agents[]` | required, `.min(1)` | — | see §6.3 |
-| `routing.runner` | optional (whole `routing:` block) | **omitted → `MACF_TRUSTED_ACTORS` is never written, at all** | §7.1 — this is the trap. See §6.5 for the sub-fields. |
+| `routing.runner` | optional (whole `routing:` block) | **omitted → routing runs on GitHub-hosted runners and `MACF_TRUSTED_ACTORS` is never written** | §7.1; `plan` prints a per-repo line saying so. See §6.5 for the sub-fields. |
 | `collaborators[]` | optional | omitted → no cross-fleet federation | DR-036/DR-041 cross-fleet guest trust. **Parsed but not reconciled** by `apply` today (day-2, per DR-043's use-case catalog) |
 | `shared` | optional | omitted | `.strict()`, requires **both** `routing_app` and `ts_oauth` together. **Currently unconsumed** anywhere in the codebase — `transport.router_app_scope` is the field that actually carries the shared-vs-per-fleet choice (§6.5); this field predates that decision and is not wired to anything |
 | `trust.ca` / `trust.federated_cas[]` | **removed** (groundnuty/macf#1201) | — | these two parsed but were never read by anything — the sharpest of the schema's inert fields, since their own doc comment described a CA-plan gating relationship that never existed. **A `fleet.yaml` that still declares a `trust:` section gets a targeted refusal at parse time**, naming the field and telling the operator to remove it — not a bare `.strict()` "unrecognized key." Fleet-level CA/federation trust is still an open design (`#810`); it is not re-added here ahead of that design's enforcement. A fleet gets its own CA unconditionally either way — nothing about CA provisioning depended on this section. |
@@ -650,7 +614,7 @@ control repo (`<fleet>-control`) — never `{ type: org, ... }`.**
 | Field | Required? | Default | Notes |
 |---|---|---|---|
 | `role` | required | — | the **bare** role (`code-agent`, not `<fleet>-code-agent`) — the App handle is *derived* as `<fleet-name>-<role>`, never declared. Writing the already-prefixed form is a parse-time rejection (the #791 double-prefix trap). Lowercase kebab, no leading/trailing/double dashes; must be unique across `agents[]`. |
-| `profile` | required | — | **accepted by the schema but currently UNCONSUMED anywhere in `apply`/`deploy`.** Real fixtures show it is not a function of `role` (`science-agent` → `research`, but also `runner-ops` → `code` in one worked example) — write something meaningful for a human reader; nothing downstream reads it today. |
+| `profile` | optional | — | **accepted by the schema but currently UNCONSUMED anywhere in `apply`/`deploy`.** Real fixtures show it is not a function of `role` (`science-agent` → `research`, but also `runner-ops` → `code` in one worked example) — write something meaningful for a human reader; nothing downstream reads it today. |
 | `repo` | required | — | `owner/repo`; must be unique across `agents[]` |
 | `deploy_path` | required | — | a **filesystem path on whatever host runs `apply`/`fleet deploy`** — there is no field naming *which* host, so this is implicitly local (DR-037 Amendment D) |
 | `provenance` | optional | omitted (behaves as `'template'`) | `'template'` (default — clone `repo` from `role_template`) or `'mirror'` (an existing dir, e.g. an Overleaf-backed paper repo, that `apply` remote-adds + pushes to instead of cloning) |
@@ -679,17 +643,22 @@ routing:
 | `runs_on` | required (once `routing:` is present) | — | the **only** value that means anything today is the literal `self-hosted`. **Omitting the whole `routing:` block is silently different from declaring it with any other value** — see §7.1. |
 | `labels` | optional | omitted → the convention `[self-hosted, macf-vm]` applies uncross-checked | when given, this is a **cross-check** against what `macf-actions`' router actually emits on its self-hosted branch (`ROUTER_EMITTED_LABELS`, hardcoded to `['self-hosted', 'macf-vm']`) — a superset check, not the value that decides runner usability. Declaring a label set that DOESN'T carry both router-emitted labels is a **parse-time rejection**, not a runtime surprise (macf#934). |
 | `warm` | optional | `1` | DR-009 §7.4: "latency above all; `warm: 1` is mandatory, not a default to tune." `0` is meaningful only for a fleet explicitly declared dormant. |
+| `trusted_actors` | optional | omitted → agent bots only | GitHub logins (humans, or extra bots) appended after the fleet's own agent bots in `MACF_TRUSTED_ACTORS` (0.2.74); the trusted-actors reconcile keeps them. An actor not listed is refused at `pick-runner` on a repo whose caller declares `runner-runs-on: self-hosted`. |
 
 **Two independent mechanisms both gate on this block, and satisfying one
 does not satisfy the other (§7.1's "silent cost" made concrete):**
 
 1. **`MACF_TRUSTED_ACTORS`** — the trust-allowlist variable `pick-runner`
-   reads to decide `ubuntu-latest` vs `[self-hosted, macf-vm]`. Written
-   **only after** `apply` confirms a usable runner exists (register-before-
-   route, DR-043 Amendment H.1) — gated by `--runner-token`
-   (§7's flag reference) deciding whether `apply` even *attempts* detection.
-2. **The runner-provisioning contract** (its endpoint resolved per §1's
-   flag/env → scope-variable → manifest → none chain, DR-043 Amendment I,
+   reads. Written **only after** `apply` confirms a usable runner exists
+   (register-before-route, DR-043 Amendment H.1). Without `--runner-token`,
+   `apply` checks once per repo and writes the variable wherever a runner is
+   already visible; the token only adds a wait of up to 10 minutes for a runner
+   to appear (`apply-routing.ts`; #1195). Under `macf-actions` v3.6.2, a caller
+   that declares `runner-runs-on: self-hosted` never falls back to a hosted
+   runner: with no runner its jobs queue, and an unlisted actor is refused at
+   `pick-runner`.
+2. **The runner-provisioning contract** (its endpoint resolved per §6.6's
+   six-tier chain, DR-043 Amendment I,
    groundnuty/macf#1211) — a separate, non-fatal call `apply` makes to
    actually create/update a runner pod for this repo, independent of the
    token above. If NOTHING in that chain resolves, `plan` says so before you
@@ -755,7 +724,7 @@ and plan reports them as withheld.
 | `MACF_BOOTSTRAP_TS_OAUTH_CLIENT_ID` | `bootstrap apply` | Fallback for `--ts-oauth-client-id`. CLI flag wins on conflict. |
 | `MACF_BOOTSTRAP_TS_OAUTH_SECRET` | `bootstrap apply` | Fallback for `--ts-oauth-secret`. CLI flag wins on conflict. |
 | `MACF_BOOTSTRAP_VAULT_VERSION` (`=1`) | `bootstrap apply`, `vault-write.ts` | Changes an existing `secrets/vault.age` from fail-loud-on-clobber to version-aside-and-write (a timestamped sibling file, never an in-place overwrite). Default: fail loud. |
-| `MACF_RUNNER_PLATFORM_ENDPOINT` | `apply-fleet.ts`'s runner-provisioning call, `macf bootstrap plan` (Amendment I, groundnuty/macf#1211) | The `groundnuty/runner-platform` tailnet HTTP endpoint — the TOP (env) tier of a four-tier resolution: this env var → the fleet's `owner.registry` scope's shared Actions variable of the SAME name (the normal case — see §1) → `transport.runner_platform_endpoint` in `fleet.yaml` → unconfigured. Has **no baked-in default** (unlike `api.github.com`) since it names one operator's private tailnet address — every tier can be absent; nothing is ever guessed. Nothing resolved → every provision call reports `'not-configured'`, non-fatally, and `plan` names the gap before you approve `apply`. |
+| `MACF_RUNNER_PLATFORM_ENDPOINT` | `apply-fleet.ts`'s runner-provisioning call, `macf bootstrap plan` (Amendment I, groundnuty/macf#1211) | The `groundnuty/runner-platform` tailnet HTTP endpoint — the env tier of a six-tier resolution (`runner-platform.ts:331-347`): explicit flag → this env var → the operator secrets file, fleet then scope (`--secrets-file`, `--scope-secrets-file`) → the `owner.registry` scope's Actions variable of the SAME name, read from the registry repo's variable endpoint (for `registry: type: repo`, the control repo) → `transport.runner_platform_endpoint` in `fleet.yaml` → unconfigured. For a new fleet the secrets file is the simplest source, because the control repo does not exist before the first `apply`. Has **no baked-in default** (unlike `api.github.com`) since it names one operator's private tailnet address — every tier can be absent; nothing is ever guessed. Nothing resolved → every provision call reports `'not-configured'`, non-fatally, and `plan` names the gap before you approve `apply`. |
 | `MACF_RECOVERY_DIR` | `vault-write.ts` | Overrides where per-agent recovery artifacts (Amendment B — the durable-before-gate-2 credential copy) are written. Default derives from `XDG_CONFIG_HOME`/home dir. |
 | `MACF_I_UNDERSTAND_THIS_DELETES_REPOSITORIES` (`=1`) | `fleet destroy` | One of three required acknowledgments for the terminal teardown rung (§9). Deliberately not a flag alone — friction is the design intent. |
 
@@ -779,15 +748,16 @@ changes what the command does, not merely a documentation nicety:
 
 | Command(s) | Constraint | What happens if you violate it |
 |---|---|---|
-| `bootstrap plan`, `bootstrap status`, `bootstrap apply`, `bootstrap manifest scaffold`, `fleet deploy` | `--vault <path>` and `--identity-key <path>` are **together-or-neither** | Enforced (`checkVaultFlagsComplete` / the same check inlined for `fleet deploy`): giving exactly one without the other is a refusal, not a silent degrade to the vault-free default — this is deliberate: a half-given pair usually means the operator forgot the second flag, not that they intended vault-free operation. |
+| `bootstrap plan`, `bootstrap status`, `bootstrap apply`, `bootstrap manifest scaffold` | `--vault <path>` and `--identity-key <path>` are **together-or-neither** | Enforced (`checkVaultFlagsComplete`): giving exactly one without the other is a refusal, not a silent degrade to the vault-free default — this is deliberate: a half-given pair usually means the operator forgot the second flag, not that they intended vault-free operation. |
+| `fleet deploy` | `--identity-key <path>` is **required**; `--vault <path>` is optional | `--vault` defaults to `<fleet.yaml dir>/secrets/vault.age`; `--identity-key` alone is accepted (`commands/fleet-deploy.ts`). |
 | `fleet destroy` | `--age-identity <path>` is **required when** `--shred-age-key` is given (not required otherwise) | `--shred-age-key` alone doesn't refuse at the flag level, but the shred step has nothing to act on without a path — always pass both together. |
 | `fleet destroy` | `--destroy-repositories`, the interactive fleet-name confirmation, **and** `MACF_I_UNDERSTAND_THIS_DELETES_REPOSITORIES=1` are **all three required** | Missing any one refuses the run — none of the three is optional or implied by either of the others (§9). |
-| `bootstrap apply` | `--runner-token <token>` (or `MACF_BOOTSTRAP_RUNNER_TOKEN`) is **required when** the manifest declares `routing.runner.runs_on: self-hosted` | A manifest-conditioned requirement, not a flag-to-flag one: the flag is optional on a fleet with no self-hosted runner declared. When it declares self-hosted and the flag is missing, `apply` prints a warning before gate 1 (same timing as before) but **no longer aborts the run** — every OTHER leg (routing secrets, CA, repo-init, vault composition) still proceeds; only the `MACF_TRUSTED_ACTORS` write itself is withheld, and the run still exits non-zero overall (groundnuty/macf#1209; §7.1, §6.5). |
-| `bootstrap apply` | `--ts-oauth-client-id` and `--ts-oauth-secret` are **mutually required** — supplying one without the other is refused before the manifest is even parsed. Both are **required when** the manifest declares `transport.tailscale_oauth_required: true` and no vault supplies the pair. |
+| `bootstrap apply` | `--runner-token <token>` (or `MACF_BOOTSTRAP_RUNNER_TOKEN`) is **advised when** the manifest declares `routing.runner.runs_on: self-hosted` | Not required: without it `apply` prints a warning before gate 1 and every leg still runs. Each repo is checked once and `MACF_TRUSTED_ACTORS` is written where a runner is visible; the token only adds a wait of up to 10 minutes. The run exits 1 only if a trusted-actors leg failed, or no repo was confirmed at all (§6.5, §7.1). |
+| `bootstrap apply` | `--ts-oauth-client-id` and `--ts-oauth-secret` are **mutually required** — supplying one without the other is refused before the manifest is even parsed. Both are **required when** the manifest declares `transport.tailscale_oauth_required: true` and neither env, the secrets file nor the vault supplies the pair. |
 | `bootstrap manifest scaffold` | `--owner`, `--fleet`, and at least one `--agent role=owner/repo` are all `requiredOption`s; `--vault`/`--identity-key` follow the same together-or-neither rule as the row above | The three required options have no defaults at all (commander refuses to run without them); the vault pair is optional but paired. |
 
 No other command in `packages/macf/src/cli/index.ts`'s `bootstrap`/`fleet`
-families was found to have a cross-flag requirement beyond these five rows
+families was found to have a cross-flag requirement beyond these rows
 — every other flag on every other command is independently optional.
 
 ---
@@ -817,7 +787,7 @@ Each of these was live-observed this month provisioning real fleets in the
 produces a specific, named outcome; the point of this section is knowing
 what that outcome means before you see it.
 
-### 7.1 A fleet with no `routing:` block declared — routing silently never works
+### 7.1 A fleet with no `routing:` block declared — routing runs hosted
 
 **What you did:** omitted `routing:` entirely (or declared it with a
 `runs_on` value other than the literal `self-hosted`).
@@ -825,8 +795,9 @@ what that outcome means before you see it.
 **What happens:** `apply-fleet.ts` gates the entire `MACF_TRUSTED_ACTORS`
 write on `manifest.routing?.runner !== undefined &&
 manifest.routing.runner.runs_on === 'self-hosted'`. When that's false, the
-write is skipped — **not reported as skipped, not warned about, nothing
-prints**. The run otherwise looks completely clean.
+write is skipped, and routing runs on GitHub-hosted runners. `plan`
+prints a per-repo line saying so, with a billing note and the
+`routing.runner.runs_on: self-hosted` remedy (`plan.ts`; #1497).
 
 **Why this is worse than it sounds for this framework specifically.**
 DR-043 Amendment H frames the failure mode as *"silent cost"* — routing
@@ -843,13 +814,8 @@ tailnet join. So for the standard MACF deployment, the hosted fallback isn't
 merely a cost — it is a runner class that **cannot reach the private
 endpoint the routed job needs to deliver to.**
 
-**Live-reproduced:** `macf-trial`'s `fleet.yaml` has no `routing:` key at
-all. `gh variable list --repo macf-experiment/trial-code-agent` shows no
-`MACF_TRUSTED_ACTORS` entry, confirmed against a live read while writing
-this runbook.
-
-**Fix:** declare the `routing.runner` block from §6.5, supply
-`--runner-token`, re-run `apply`.
+**Fix:** declare the `routing.runner` block from §6.5 (`macf-trial` does), then
+re-run `apply`; `--runner-token` only adds a wait for a runner to appear.
 
 ### 7.2 An install scoped to "All repositories" — refused
 
@@ -911,28 +877,21 @@ is a manual, interim one:
    vault check now succeeds and the shared credential is reused with zero
    new App creation.
 
-**Or**, if you'd rather not share routing infrastructure across fleets at
-all: set `transport.router_app_scope: per-fleet` in the manifest before the
-first `apply` for this fleet, and it mints its own dedicated router App
-(2 extra clicks, permanently isolated).
-
-**Live-reproduced:** `macf-experiment` org's installation list carries
-exactly one router App (`macf-experiment-router`), shared by the
-`macf-experiment` fleet that created it first. `macf-trial` — a second
-fleet in the same org, default `'shared'` scope, no
-`router_app_origin_fleet` declared — has no router App of its own, no
-`scope_credentials` marker in its `fleet.lock`, and (confirmed live)
-`MACF_ROUTING_APP_ID`/`MACF_ROUTING_APP_KEY` absent from every one of its
-repos.
+**Or**, set `transport.router_app_scope: per-fleet` in the manifest before the
+first `apply` for this fleet. It mints its own dedicated router App, at a cost
+of two more browser clicks, and is permanently isolated. For a new fleet in an
+org that already has `<owner>-router`, this is the supported path.
 
 ### 7.4 Tailscale OAuth declared but absent — refused before gate 1
 
 **What you did:** set `transport.tailscale_oauth_required: true` without
-first putting `TS_OAUTH_CLIENT_ID`/`TS_OAUTH_SECRET` into the vault.
+supplying `TS_OAUTH_CLIENT_ID`/`TS_OAUTH_SECRET` — by flags
+(`--ts-oauth-client-id`/`--ts-oauth-secret`), env, the secrets file, or the
+vault.
 
-**What happens:** `checkTailscaleOauthPreflight` reads the vault (needs
-`--vault`/`--identity-key`) before any consent gate opens, and refuses
-outright if the declared requirement isn't satisfiable — same posture as
+**What happens:** `checkTailscaleOauthPreflight` runs before any consent gate
+opens (the vault is read only when `--vault`/`--identity-key` are given), and
+refuses outright if the declared requirement isn't satisfiable — same posture as
 the age-recipient refusal in §1: a declared intent the tool cannot honor is
 refused, never silently skipped and never silently proceeded-with.
 
@@ -949,12 +908,13 @@ never gates whether a PRESENT vault value gets used."* Concretely:
   by hand, or inherited from an earlier run) **→** still published — the
   flag never suppresses a value that's already there.
 - **left at the default `false`, vault absent it →** an honest `'skipped'`
-  leg, not `'failed'` — no refusal, but routing still won't work. §4 row 4
-  is exactly this case, live-reproduced on `macf-trial`.
+  leg, not `'failed'` — no refusal, but a hosted-runner route still won't work.
 
-`agent-router.yml` needs this pair **unconditionally** to route, regardless
-of what the manifest declares — the flag is purely about how the tool talks
-to you about a gap, never about whether the gap matters.
+The pair is needed only by routing jobs that run on GitHub-hosted runners
+(`macf-actions` v3.6.2; a self-hosted pick skips the tailnet join). Those are
+the control repo, unless `routing.control_repo_runs_on: self-hosted`, plus every
+repo of a fleet without `routing.runner`. The flag is purely about how the tool
+talks to you about a gap, never about whether the gap matters.
 
 ### 7.5 A registry pointed at `{ type: org }` — refused
 
@@ -966,8 +926,8 @@ ever fix it. Use `{ type: repo, ... }` for an org-owned fleet instead.
 ### 7.6 A resumed gate — App exists, install still incomplete
 
 **What you did:** a previous `apply` run created an App for some role (gate
-1 succeeded — the App and its private key are already durable in the vault
-per Amendment B), but the install never completed — you cancelled (§7.7),
+1 succeeded — the App and its private key are already durable in the per-agent
+recovery artifact `~/.config/macf/recovery/<fleet>/<role>.age`, per Amendment B), but the install never completed — you cancelled (§7.7),
 the process died, or you just haven't clicked Install yet.
 
 **What happens on the next `apply`:** the confirm-before-create guard finds
@@ -993,8 +953,9 @@ gate-2 install page instead of completing the install.
 **What happens:** the wait for **that one identity** ends immediately —
 nothing else in the run is affected. The App created at gate 1 (if this run
 just created it) and its credential remain exactly as durable as they were
-the moment before you cancelled (Amendment B: the vault write happens before
-gate 2 even opens). That role's outcome for this run is reported as
+the moment before you cancelled (Amendment B: the recovery artifact
+`~/.config/macf/recovery/<fleet>/<role>.age` is written before gate 2 even
+opens; the vault is written once per run, later). That role's outcome for this run is reported as
 `failed`, `cancelled: true`, with the message: *"cancelled by the operator
 … re-run apply whenever you want to finish this identity; nothing else in
 the fleet is affected by cancelling one."* Re-running `apply` later produces
@@ -1056,8 +1017,8 @@ something tries to actually read the registry through it.
 | Code | Meaning |
 |---|---|
 | **0** | Every hard-failure predicate is false, **and** the version-reconcile phase (if attempted) left nobody behind. |
-| **1** | A **hard failure** needing operator attention: the control repo couldn't be provisioned or synced, any agent identity needs attention (`failed`/`drift`/`skipped-unverified`), the runner-ops or router App needs attention, the vault write failed, any CA leg failed, any of the six routing-secret legs `failed` (not merely `skipped`), or the version-reconcile phase **halted** (a confirmed-or-unconfirmable bad release). Checked first — a halt always reports `1` even if something else in the same run is *also* merely partial. |
-| **2** | **Not** a hard failure, but the run is unfinished: the version-reconcile phase left at least one discovered fleet member un-rolled (busy / config-dirty / off-branch / stale-pin / not-yet-serving), or a repo's `MACF_TRUSTED_ACTORS` leg ended `pending` because its runner is not visible yet (the summary prints a `Not finished:` line naming the repos). Distinguishes "this needs a look, but nothing is broken" from a genuine `1`. |
+| **1** | A **hard failure** needing operator attention: the control repo couldn't be provisioned or synced, any agent identity needs attention (`failed`/`drift`/`skipped-unverified`), the runner-ops or router App needs attention, the vault write failed, any CA leg failed, any of the six routing-secret legs `failed` (not merely `skipped`), a `MACF_TRUSTED_ACTORS` leg or the routing bundle `failed`, any routing-client leg failed, the control repo is missing labels it needs to route, an `actions_pin` that `could-not-attempt` (e.g. a re-run without the vault flags while `versions:` is declared), any deploy-phase `failed`, or the version-reconcile phase **halted** (a confirmed-or-unconfirmable bad release). Checked first — a halt always reports `1` even if something else in the same run is *also* merely partial. |
+| **2** | **Not** a hard failure, but the run is unfinished: the version-reconcile phase left at least one discovered fleet member un-rolled (busy / config-dirty / off-branch / stale-pin / not-yet-serving), the control repo's labels are usable but not all confirmed yet, or a repo's `MACF_TRUSTED_ACTORS` leg ended `pending` because its runner is not visible yet (the summary prints a `Not finished:` line naming the repos). Distinguishes "this needs a look, but nothing is broken" from a genuine `1`. |
 
 ### `macf fleet upgrade --execute`
 
@@ -1068,6 +1029,13 @@ green; **1** at least one fleet **halted** (a bad release — checked first);
 roll). A caller doing the common `[ $? -ne 0 ]` check now correctly sees
 non-zero for a mixed roll too (this was the exact gap `2` was added to
 close).
+
+### `macf fleet reconcile`
+
+**0** nothing to do; **1** an action was taken or is needed (a first cold start
+is `1`); **2** a setup or probe error (bad manifest, probe threw); **3** a launch
+failed, or an agent waits at a prompt only the operator can answer
+(`macf-core/src/fleet-reconcile.ts`).
 
 ### `--dry-run` and read-only commands (`plan`, `status`, `manifest scaffold`)
 
@@ -1138,14 +1106,21 @@ declared role against the discovered workspace routing label).
 **`macf fleet install-cron`** [`--help`] — installs a host crontab entry
 that periodically runs `fleet reconcile`. Flags: `--schedule <cron>`,
 `--execute` (installs an ACTING line; default is report-only),
-`--allow-restart`, `--with-routing`, `--manifest <path>`, `--no-token`
+`--allow-restart`, `--with-routing` (a no-op), `--manifest <path>`, `--no-token`
 (don't bake a `GH_TOKEN` mint into the cron line), `--uninstall`, `--print`
 (preview without touching crontab), `--prelude <path>`, `--log <path>`,
-`--yes`, `--dir <path>`.
+`--yes`, `--dir <path>`. The line passes `--dir <workspace>` and carries a
+per-project marker, `# macf-watchdog (DR-006) [project=<project>]`; install and
+uninstall touch only that project's line and leave another fleet's watchdog line
+alone. There is no `@reboot` line, so recovery after a reboot waits for the first
+tick. The line runs the `macf` on PATH, so install the fleet's version globally
+on that host (#1508).
 
 **`macf fleet reconcile`** [`--help`] — the desired-state watchdog: probes
 actual `/health` against a desired set and launches/heals/skips accordingly.
-Dry-run by default. Flags: `--execute`, `--allow-restart` (enables Tier-2
+Dry-run by default. Exit `0` nothing to do, `1` acted or action needed, `2`
+setup or probe error, `3` a launch failed or an agent waits at an operator-only
+prompt (§8). Flags: `--execute`, `--allow-restart` (enables Tier-2
 graceful-restart), `--with-routing`, `--manifest <path>`, `--state-dir
 <dir>`, `--last-exit-dir <dir>`, `--paused-dir <dir>`, `--heartbeat-file
 <path>`, `--json`, `--dir <path>`.
@@ -1156,11 +1131,12 @@ default. Flags: `--execute`, `--dir <path>`.
 
 **`macf fleet upgrade`** [`--help`] — the rolling framework-version upgrade
 described in §8's exit-code table. Flags: `--target <version>` (default:
-npm-latest of `@groundnuty/macf`), `--fleet <names>` / `--registry <ids>`
+npm-latest of `@groundnuty/macf`; each agent's step runs `macf update --yes` through the
+`macf` on PATH, which pins npm-latest, so upgrade to the latest release), `--fleet <names>` / `--registry <ids>`
 (comma-lists, same selector space — `--registry` is the historical name),
 `--execute`, `--wait` (poll for idle instead of skipping a busy agent),
-`--verify-timeout <sec>` (default 120), `--force` (bypass the config-dirty
-pre-flight gate — the agent's own dirt still isn't stashed), `--dir <path>`,
+`--verify-timeout <sec>` (default 120), `--force` (bypass the branch and config-dirty
+pre-flight gates — the agent's own dirt still isn't stashed), `--dir <path>`,
 `-f, --file <path>` (a confirmed verify-green then records `deployed_version`
 into that fleet's `fleet.lock`; omitted = unchanged).
 
