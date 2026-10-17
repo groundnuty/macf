@@ -384,7 +384,7 @@ describe('noUsableRunnerWithoutTokenReason (groundnuty/macf#1195)', () => {
     expect(reason).toContain(RUNNER_TOKEN_FLAG);
     expect(reason).toContain(RUNNER_TOKEN_ENV_VAR);
     expect(reason).toContain('gh api -X POST /orgs/<org>/actions/runners/registration-token --jq .token');
-    expect(reason).toContain('billed on private repos');
+    expect(reason).toContain('never fall back to a GitHub-hosted one');
   });
 
   it('distinguishes unknown / just-created / ordinary-absent with three different cause sentences', () => {
