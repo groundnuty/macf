@@ -53,7 +53,10 @@ import {
 // module, and a from-scratch mock factory drops it, breaking unrelated tests
 // transitively importing macf-core in this same file/worker.
 const configMock = vi.hoisted(() => ({
-  readAgentConfig: vi.fn((_dir: string): { project: string } | null => ({ project: 'proj' })),
+  readAgentConfig: vi.fn((_dir: string): { project: string; registry: unknown } | null => ({
+    project: 'proj',
+    registry: { type: 'org', org: 'acme' },
+  })),
 }));
 vi.mock('../../src/cli/config.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/cli/config.js')>()),
@@ -110,7 +113,7 @@ function fakeDeps(overrides: Partial<FleetInstallCronDeps> = {}): {
   return { deps, rec };
 }
 
-const MARKER = watchdogMarker('proj');
+const MARKER = watchdogMarker('acme', 'proj');
 const MACF_BIN = '/opt/npm/bin/macf';
 const CLI_VER = '1.2.3';
 const INVOKE = `'${MACF_BIN}' ${RECONCILE_ARGS}`;
@@ -118,6 +121,7 @@ const INVOKE = `'${MACF_BIN}' ${RECONCILE_ARGS}`;
 function baseOpts(over: Partial<RunFleetInstallCronOptions> = {}): RunFleetInstallCronOptions {
   return {
     project: 'proj',
+    owner: 'acme',
     cliVersion: CLI_VER,
     workspaceDir: WS,
     schedule: DEFAULT_SCHEDULE,
@@ -489,15 +493,15 @@ describe('absolute macf path', () => {
 });
 
 describe('per-project marker', () => {
-  const A = watchdogMarker('A');
-  const lineB = `*/10 * * * * run-b ${watchdogMarker('B')}`;
+  const A = watchdogMarker('acme', 'A');
+  const lineB = `*/10 * * * * run-b ${watchdogMarker('acme', 'B')}`;
   const legacyOther = `*/10 * * * * cd /other/ws && reconcile.sh ${WATCHDOG_MARKER}`;
   const legacyMine = `*/10 * * * * '${WS}/.claude/scripts/macf-gh-token.sh' x ${WATCHDOG_MARKER}`;
   const crontab = (...ls: string[]) => ls.join('\n');
   const optsA = (over: Partial<RunFleetInstallCronOptions> = {}) => baseOpts({ project: 'A', ...over });
 
   it('marker is bracketed per project', () => {
-    expect(A).toBe(`${WATCHDOG_MARKER} [project=A]`);
+    expect(A).toBe(`${WATCHDOG_MARKER} [fleet=acme/A]`);
   });
 
   it('install for A keeps B line and an unrelated legacy line byte-identical, and notes the legacy one', async () => {
@@ -557,8 +561,27 @@ describe('per-project marker', () => {
     expect(rec.writes).toHaveLength(0);
   });
 
+  it('same project, different owners: A never touches the B line', async () => {
+    const lineOther = `*/10 * * * * run ${watchdogMarker('ownerB', 'proj')}`;
+    const mine = baseOpts({ owner: 'ownerA' });
+    const inst = fakeDeps({ readCrontab: () => lineOther });
+    await runFleetInstallCron(mine, inst.deps);
+    expect(inst.rec.writes[0]!.split('\n')).toContain(lineOther);
+    const un = fakeDeps({ readCrontab: () => lineOther });
+    await runFleetInstallCron({ ...mine, uninstall: true }, un.deps);
+    expect(un.rec.writes).toHaveLength(0);
+  });
+
+  it('legacy lines match at the path boundary', () => {
+    const legacy = (dir: string) => `*/10 * * * * '${dir}/.claude/scripts/macf-gh-token.sh' x ${WATCHDOG_MARKER}`;
+    expect(stripMarkerLines(legacy('/srv/fleet'), A, '/srv/fleet')).toEqual([]);
+    for (const other of ['/srv/fleet/other', '/backup/srv/fleet']) {
+      expect(stripMarkerLines(legacy(other), A, '/srv/fleet')).toEqual([legacy(other)]);
+    }
+  });
+
   it('project=foo does not touch project=foobar', async () => {
-    const foobar = `*/10 * * * * run ${watchdogMarker('foobar')}`;
+    const foobar = `*/10 * * * * run ${watchdogMarker('acme', 'foobar')}`;
     const { deps, rec } = fakeDeps({ readCrontab: () => foobar });
     await runFleetInstallCron(baseOpts({ project: 'foo' }), deps);
     expect(rec.writes[0]!.split('\n')).toContain(foobar);
@@ -638,6 +661,13 @@ describe('runFleetInstallCronCommand — --dir vs ambient MACF_WORKSPACE_DIR (ma
     expect(code).toBe(0);
     const printed = logSpy.mock.calls.map((c) => String(c[0])).join('\n');
     expect(printed).toContain('/auto-discovered/.claude/.macf/host-prelude.sh');
+  });
+
+  it('no derivable owner → exit 2, no output line', async () => {
+    configMock.readAgentConfig.mockReturnValueOnce({ project: 'proj', registry: { type: 'local' } });
+    const code = await runFleetInstallCronCommand('/target-b', { print: true, token: false });
+    expect(code).toBe(2);
+    expect(logSpy).not.toHaveBeenCalled();
   });
 
   it('no project in macf-agent.json → exit 2, no output line', async () => {

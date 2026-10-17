@@ -43,7 +43,7 @@ import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { MacfError } from '@groundnuty/macf-core';
 import { PACKAGE_VERSION } from '../../package-version.js';
-import { readAgentConfig } from '../config.js';
+import { readAgentConfig, ownerAccountFromRegistry } from '../config.js';
 import { shellQuote } from '../fleet/launch-command.js';
 import { resolveWorkspaceDir, formatWorkspaceDirConflictWarning } from '../workspace-dir.js';
 
@@ -58,16 +58,18 @@ export class FleetInstallCronError extends MacfError {
 /**
  * The bare marker older installs wrote (one global string, shared with other
  * tools' watchdog lines). Kept only to recognise legacy lines; new lines carry
- * `watchdogMarker(project)`.
+ * `watchdogMarker(owner, project)`.
  */
 export const WATCHDOG_MARKER = '# macf-watchdog (DR-006)';
 
 /**
- * This project's marker. The brackets stop `project=foo` matching inside
- * `project=foobar`; lines are matched by ENDING with it.
+ * This fleet's marker, `# macf-watchdog (DR-006) [fleet=<owner>/<project>]`. Two
+ * owners can run a fleet of the same project name on one host, so it names both.
+ * The brackets stop one name matching inside a longer one; lines are matched by
+ * ENDING with it.
  */
-export function watchdogMarker(project: string): string {
-  return `${WATCHDOG_MARKER} [project=${project}]`;
+export function watchdogMarker(owner: string, project: string): string {
+  return `${WATCHDOG_MARKER} [fleet=${owner}/${project}]`;
 }
 
 /** Coarse default cadence (DR-006 §A.4 heartbeat cadence). */
@@ -127,6 +129,8 @@ export interface FleetInstallCronDeps {
 export interface RunFleetInstallCronOptions {
   /** The workspace's `macf-agent.json` `project`; scopes the crontab marker. */
   readonly project: string;
+  /** The GitHub owner of the fleet's registry; scopes the crontab marker. */
+  readonly owner: string;
   /** The running CLI's version; the `macf` baked into the line must match it. */
   readonly cliVersion: string;
   /** Absolute workspace dir (holds `claude.sh`, `.claude/scripts`, `settings.local.json`). */
@@ -253,18 +257,24 @@ export function buildCronLine(parts: CronLineParts): string {
   return `${parts.schedule} ${cmd} ${parts.marker}`;
 }
 
+/** True iff `line` holds this workspace's complete token-helper argument (path-boundary exact). */
+function namesWorkspaceHelper(line: string, workspaceDir: string): boolean {
+  const helper = join(workspaceDir, TOKEN_HELPER_REL).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(?:^|[\\s'"]|\\$\\()${helper}(?=[\\s'"]|$)`).test(line);
+}
+
 /** A line is this fleet's if it ends with its marker, or is a legacy line naming its workspace. */
 function isOwnedLine(line: string, marker: string, workspaceDir: string): boolean {
   const t = line.trimEnd();
   if (t.endsWith(marker)) return true;
-  return t.endsWith(WATCHDOG_MARKER) && line.includes(`${workspaceDir}/`);
+  return t.endsWith(WATCHDOG_MARKER) && namesWorkspaceHelper(line, workspaceDir);
 }
 
 /** Legacy bare-marker lines that do NOT belong to this workspace (left untouched). */
 export function foreignLegacyLines(existing: string, workspaceDir: string): readonly string[] {
   return existing
     .split('\n')
-    .filter((l) => l.trimEnd().endsWith(WATCHDOG_MARKER) && !l.includes(`${workspaceDir}/`));
+    .filter((l) => l.trimEnd().endsWith(WATCHDOG_MARKER) && !namesWorkspaceHelper(l, workspaceDir));
 }
 
 /** Split a crontab into lines, dropping THIS fleet's line(s) and any blank lines. */
@@ -331,7 +341,7 @@ export async function runFleetInstallCron(
   }
 
   const existing = deps.readCrontab() ?? '';
-  const marker = watchdogMarker(opts.project);
+  const marker = watchdogMarker(opts.owner, opts.project);
   noticeForeignLegacy(existing, opts.workspaceDir, deps.warn);
 
   // --- Uninstall path ---
@@ -598,11 +608,23 @@ export async function runFleetInstallCronCommand(
   if (conflictWarning) console.error(conflictWarning);
   const workspaceDir = resolved.workspaceDir;
 
-  const project = readAgentConfig(workspaceDir)?.project;
-  if (!project) {
+  const config = readAgentConfig(workspaceDir);
+  const project = config?.project;
+  if (!config || !project) {
     console.error(
       `macf fleet install-cron: no project found in ${workspaceDir}/.macf/macf-agent.json ` +
         '(run `macf init` first). The cron marker is per project, so it cannot be installed.',
+    );
+    return 2;
+  }
+
+  let owner: string;
+  try {
+    owner = ownerAccountFromRegistry(config.registry);
+  } catch {
+    console.error(
+      `macf fleet install-cron: no registry owner derivable from ${workspaceDir}/.macf/macf-agent.json ` +
+        '(`registry` must be org, profile or repo). The cron marker names the owner, so it cannot be installed.',
     );
     return 2;
   }
@@ -611,6 +633,7 @@ export async function runFleetInstallCronCommand(
   return runFleetInstallCron(
     {
       project,
+      owner,
       cliVersion: PACKAGE_VERSION,
       workspaceDir,
       schedule: cliOpts.schedule?.trim() || DEFAULT_SCHEDULE,
