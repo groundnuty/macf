@@ -2481,8 +2481,10 @@ function runnerClassReason(
   const detailSuffix = detail !== undefined ? ` ${detail}` : '';
   const handoverSuffix = handover !== undefined ? ` ${handover}` : '';
   return (
-    `Runner class: github-hosted (billed on private repos) — ${cause} yet; MACF_TRUSTED_ACTORS will NOT be ` +
-    `written by apply until one is (register-before-route).${detailSuffix}${handoverSuffix}${RUNNER_TOKEN_PLAN_NOTE}` +
+    `Runner class: self-hosted, no runner yet — ${cause} yet. apply requests one from the runner platform ` +
+    'when MACF_RUNNER_PLATFORM_ENDPOINT resolves, and writes MACF_TRUSTED_ACTORS only once it is visible ' +
+    "(register-before-route); until then this repo's routing jobs wait for a runner and never fall back to " +
+    `a GitHub-hosted one.${detailSuffix}${handoverSuffix}${RUNNER_TOKEN_PLAN_NOTE}` +
     RUNNER_REQUIRED_FAILURE_PLAN_NOTE
   );
 }

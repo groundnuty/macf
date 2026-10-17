@@ -446,6 +446,17 @@ describe('computePlan — a version/config mismatch → update + confirm_require
     expect(itemFor(match.items, 'routing', 'routing:icsoc-2026:runner')?.verb).toBe('noop');
   });
 
+  it('no self-hosted runner-class reason claims a hosted fallback, whatever the registration state', () => {
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
+    for (const runnerRegistered of ['absent', 'unknown', undefined, 'present'] as const) {
+      const plan = computePlan(manifest, { ...EMPTY_OBSERVED, routingRunnerRegistered: runnerRegistered });
+      const reason = itemFor(plan.items, 'routing', 'routing:icsoc-2026:runner')?.reason ?? '';
+      expect(reason).not.toContain('ubuntu-latest');
+      expect(reason).not.toContain('github-hosted (billed');
+      expect(reason).toContain('Runner class: self-hosted');
+    }
+  });
+
   it('does not flag update when the observed value already matches', () => {
     const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
     const observed: ObservedState = {
@@ -481,29 +492,29 @@ describe('computePlan — a version/config mismatch → update + confirm_require
     expect(routing?.reason).not.toMatch(/billed on private repos/);
   });
 
-  it('names "github-hosted (billed on private repos)" when no runner is confirmed registered — even though runs_on declares self-hosted', () => {
+  it('names "self-hosted, no runner yet" when no runner is confirmed registered — even though runs_on declares self-hosted', () => {
     const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
     const observed: ObservedState = { ...EMPTY_OBSERVED, routingRunnerRegistered: 'absent' };
     const plan = computePlan(manifest, observed);
     const routing = itemFor(plan.items, 'routing', 'routing:icsoc-2026:runner');
-    expect(routing?.reason).toMatch(/Runner class: github-hosted \(billed on private repos\)/);
+    expect(routing?.reason).toMatch(/Runner class: self-hosted, no runner yet/);
     expect(routing?.reason).toMatch(/no self-hosted runner is confirmed registered/);
   });
 
-  it('names "github-hosted (billed on private repos)" when registration is UNKNOWN — never overclaims confidence', () => {
+  it('names "self-hosted, no runner yet" when registration is UNKNOWN — never overclaims confidence', () => {
     const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
     const observed: ObservedState = { ...EMPTY_OBSERVED, routingRunnerRegistered: 'unknown' };
     const plan = computePlan(manifest, observed);
     const routing = itemFor(plan.items, 'routing', 'routing:icsoc-2026:runner');
-    expect(routing?.reason).toMatch(/Runner class: github-hosted \(billed on private repos\)/);
+    expect(routing?.reason).toMatch(/Runner class: self-hosted, no runner yet/);
     expect(routing?.reason).toMatch(/could not be confirmed/);
   });
 
-  it('names "github-hosted (billed on private repos)" when registration was never checked (undefined) — the pre-macf#922 default', () => {
+  it('names "self-hosted, no runner yet" when registration was never checked (undefined) — the pre-macf#922 default', () => {
     const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
     const plan = computePlan(manifest, EMPTY_OBSERVED);
     const routing = itemFor(plan.items, 'routing', 'routing:icsoc-2026:runner');
-    expect(routing?.reason).toMatch(/Runner class: github-hosted \(billed on private repos\)/);
+    expect(routing?.reason).toMatch(/Runner class: self-hosted, no runner yet/);
   });
 
   // --- macf#924 — org-admin handover surfaces in the plan's runner-class line ---
@@ -522,7 +533,7 @@ describe('computePlan — a version/config mismatch → update + confirm_require
     const plan = computePlan(manifest, observed);
     const routing = itemFor(plan.items, 'routing', 'routing:icsoc-2026:runner');
     // Original wording is preserved verbatim (strict extension, not a rewrite).
-    expect(routing?.reason).toMatch(/Runner class: github-hosted \(billed on private repos\)/);
+    expect(routing?.reason).toMatch(/Runner class: self-hosted, no runner yet/);
     expect(routing?.reason).toMatch(/no self-hosted runner is confirmed registered/);
     // The handover is appended.
     expect(routing?.reason).toContain('an org admin must add this repo at');
@@ -647,7 +658,7 @@ describe('computePlan — a version/config mismatch → update + confirm_require
     const plan = computePlan(manifest, observed);
     const routing = itemFor(plan.items, 'routing', 'routing:icsoc-2026:runner');
     // Original wording is preserved verbatim (strict extension, not a rewrite).
-    expect(routing?.reason).toMatch(/Runner class: github-hosted \(billed on private repos\)/);
+    expect(routing?.reason).toMatch(/Runner class: self-hosted, no runner yet/);
     expect(routing?.reason).toMatch(/no self-hosted runner is confirmed registered/);
     // The detail is appended, naming the missing label and what was found.
     expect(routing?.reason).toContain('not carrying required label(s) "macf-vm"');
