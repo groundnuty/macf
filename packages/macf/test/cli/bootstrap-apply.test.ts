@@ -4182,10 +4182,8 @@ describe('runBootstrapApply — remaining-deploy honest completion (macf#1014)',
     expect(out).toContain(`macf fleet deploy --agent code-agent -f ${file} --identity-key PATH_TO_YOUR_AGE_IDENTITY_KEY`);
     expect(out).toContain(`macf fleet deploy --agent science-agent -f ${file} --identity-key PATH_TO_YOUR_AGE_IDENTITY_KEY`);
     // The --vault-omitted precondition note (review finding): the operator
-    // must know the constructed commands' default --vault resolution only
-    // works from a local clone of the fleet's OWN control repo.
-    expect(out).toContain('demo-fleet-control');
-    expect(out).toContain('git pull');
+    // must be told how to place fleet.yaml and the vault on another host.
+    expect(out).toContain('fleet.yaml and secrets/vault.age');
   });
 
   it('groundnuty/macf#1212 — the real runBootstrapApply entrypoint (not just the pure formatApplyResult unit) prints "confirm the fleet is green" BEFORE the per-agent deploy commands, echoing the SAME -f path apply itself was invoked with', async () => {
@@ -4821,12 +4819,16 @@ describe('formatApplyResult / fleetApplyResultToJson / applyExitCode (pure)', ()
     expect(src).toContain('commandFor: (role: string) => otherHostDeployCommand(controlRepoFullName(manifest), role),');
   });
 
-  it("the other-host command names a control-repo clone, never this host's own paths", () => {
+  it("the other-host command says to copy fleet.yaml and secrets/vault.age, not to clone", () => {
     const cmd = otherHostDeployCommand('macf-experiment/macf-trial-control', 'code-agent');
     expect(cmd).toBe(
-      'On the host that will run it, clone macf-experiment/macf-trial-control, then run: '
-        + 'macf fleet deploy --agent code-agent -f <clone>/fleet.yaml --identity-key PATH_TO_YOUR_AGE_IDENTITY_KEY',
+      "On the host that will run it, put copies of the control repo's fleet.yaml and "
+        + 'secrets/vault.age side by side as DIR/fleet.yaml and DIR/secrets/vault.age '
+        + '(for example with scp from a clone on this machine), then run: '
+        + "macf fleet deploy --agent code-agent -f DIR/fleet.yaml --identity-key PATH_TO_YOUR_AGE_IDENTITY_KEY",
     );
+    expect(cmd).toContain('fleet.yaml and secrets/vault.age');
+    expect(cmd).not.toContain('clone macf-experiment/macf-trial-control');
     expect(cmd).not.toContain('--vault');
   });
 

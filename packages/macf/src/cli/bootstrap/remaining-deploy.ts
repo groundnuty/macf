@@ -45,24 +45,14 @@
  * signal is satisfied on EVERY host, so "not deployed" can only ever mean
  * "not deployed here"; it must never read as "not deployed anywhere."
  *
- * **The `--vault` precondition (review finding, macf#1014).** When `apply`
- * itself was NOT given `--vault` (the common first-provision case — writing
- * a fresh vault needs only the recipients' PUBLIC keys, never a private
- * identity), the constructed `deploy` command OMITS `--vault` too, so
- * `deploy` falls back to its own default (`<dirname(-f)>/secrets/vault.age`
- * — `commands/fleet-deploy.ts::runFleetDeploy`'s doc). That default is
- * SILENTLY WRONG unless the operator's `-f` points at (or, after a `git
- * pull`, becomes) a local clone of the fleet's own `<fleet>-control` repo —
- * `apply` durably writes the vault ONLY by pushing to that repo
- * (`apply-fleet.ts`'s module doc: the write-time checkout is an ephemeral
- * `mkdtemp` scratch dir, never a stable local path). {@link vaultLocationNote}
- * makes that precondition explicit instead of letting the omitted `--vault`
- * silently imply "there is nothing to say here."
+ * **The other-host note (review finding, macf#1014).** When `apply` was NOT
+ * given `--vault`, the constructed `deploy` command omits it too, so `deploy`
+ * defaults to `<dirname(-f)>/secrets/vault.age`. {@link vaultLocationNote}
+ * tells the operator how to place `fleet.yaml` and the vault on another host.
  */
 import { existsSync } from 'node:fs';
 import { dirname, resolve as resolvePath } from 'node:path';
 import type { FleetManifest } from './fleet-manifest.js';
-import { deriveControlRepoName } from './fleet-manifest.js';
 
 /**
  * Placeholder rendered in a deploy command's `--identity-key` when `apply`
@@ -119,19 +109,17 @@ function buildDeployCommand(manifestPath: string, role: string, flags: DeployFla
 }
 
 /**
- * The `--vault`-omitted precondition note — see the module doc's "The
- * `--vault` precondition" section for the full reasoning. `controlRepo` is
- * derived the SAME way `apply-fleet.ts`/`control-repo.ts` derive it
- * (`deriveControlRepoName`, never a manifest field), so this can never name
- * a different repo than the one `apply` actually pushed the vault to.
+ * The other-host guidance, shown once ahead of the per-agent lines when
+ * `apply` was not given `--vault`. A VM that runs agents has no GitHub login
+ * of its own, so it cannot clone the private control repo; the operator
+ * copies `fleet.yaml` and `secrets/vault.age` over instead.
  */
-function vaultLocationNote(manifest: FleetManifest): string {
-  const controlRepo = `${manifest.owner.account}/${deriveControlRepoName(manifest.metadata.name)}`;
+function vaultLocationNote(): string {
   return (
-    `these commands omit --vault, so \`fleet deploy\` will default to <dirname-of--f>/secrets/vault.age — that ` +
-    `default is WRONG unless -f points at (or, after a \`git pull\`, becomes) a local clone of "${controlRepo}": ` +
-    `apply durably wrote this run's vault ONLY by pushing to that repo, never to a stable ` +
-    'local path. Clone it first, or pass --vault explicitly.'
+    'On the host that will run it, put copies of the control repo\'s fleet.yaml and secrets/vault.age side ' +
+    'by side as DIR/fleet.yaml and DIR/secrets/vault.age (for example with scp from a clone on this ' +
+    'machine), then run:\n' +
+    "      macf fleet deploy --agent ROLE -f DIR/fleet.yaml --identity-key PATH_TO_YOUR_AGE_IDENTITY_KEY"
   );
 }
 
@@ -178,7 +166,7 @@ export function computeRemainingDeploy(
   }
   return {
     steps,
-    ...(steps.length > 0 && flags.vaultPath === undefined ? { vaultLocationNote: vaultLocationNote(manifest) } : {}),
+    ...(steps.length > 0 && flags.vaultPath === undefined ? { vaultLocationNote: vaultLocationNote() } : {}),
   };
 }
 

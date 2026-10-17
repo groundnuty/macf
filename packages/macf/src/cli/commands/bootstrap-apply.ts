@@ -1853,7 +1853,7 @@ export interface DeployPhaseRenderInput {
   readonly checkAgentCertPresent?: (destDir: string) => boolean;
   /**
    * The command to run on the host that will run a host-skipped agent. It
-   * names a clone of the control repo, never this host's own paths, which
+   * says to copy the control repo files over, never this host's own paths, which
    * do not exist there.
    */
   readonly commandFor?: (role: string) => string;
@@ -1878,14 +1878,16 @@ export interface DeployPhaseRenderInput {
  */
 /**
  * What a host-skipped agent's operator runs on the host that will run it. The
- * control repo carries `fleet.yaml` and `secrets/vault.age` side by side, and
- * `fleet deploy` defaults `--vault` to that layout, so a fresh clone is all
- * the other host needs besides the operator's age identity key.
+ * VM has no GitHub login, so it cannot clone the private control repo: the
+ * operator copies `fleet.yaml` and `secrets/vault.age` over, side by side,
+ * and `fleet deploy` defaults `--vault` to that layout.
  */
-export function otherHostDeployCommand(controlRepo: string, role: string): string {
+export function otherHostDeployCommand(_controlRepo: string, role: string): string {
   return (
-    `On the host that will run it, clone ${controlRepo}, then run: ` +
-    `macf fleet deploy --agent ${role} -f <clone>/fleet.yaml --identity-key PATH_TO_YOUR_AGE_IDENTITY_KEY`
+    "On the host that will run it, put copies of the control repo's fleet.yaml and " +
+    'secrets/vault.age side by side as DIR/fleet.yaml and DIR/secrets/vault.age ' +
+    '(for example with scp from a clone on this machine), then run: ' +
+    `macf fleet deploy --agent ${role} -f DIR/fleet.yaml --identity-key PATH_TO_YOUR_AGE_IDENTITY_KEY`
   );
 }
 

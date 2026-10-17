@@ -235,6 +235,12 @@ describe('noRunnerTokenReason', () => {
     expect(reason).toContain(RUNNER_TOKEN_ENV_VAR);
     expect(reason).toContain('gh api -X POST /orgs/<org>/actions/runners/registration-token --jq .token');
   });
+
+  it('says apply waits for runners it requests from the platform, without a token (#1212)', () => {
+    const reason = noRunnerTokenReason();
+    expect(reason).toContain('apply waits up to 10 minutes for each runner it requests from the platform this run');
+    expect(reason).not.toContain('will not wait for new runners');
+  });
 });
 
 describe('runnerTokenPollExhaustedReason', () => {
