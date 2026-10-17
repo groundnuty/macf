@@ -37,6 +37,7 @@
  * `execute` is set.
  */
 import { FleetLaunchBlockedError, type FleetDriver, type FleetState } from './fleet-driver.js';
+import { detectLaunchPrompt, isWatcherAnsweredPrompt } from './fleet-upgrade.js';
 
 /** One agent the operator declares SHOULD run on this host (DR-006 §A.2). */
 export interface DesiredAgent {
@@ -352,9 +353,39 @@ async function reconcileAgent(
     return { row: mkRow(agent, 'OK', 'reachable + accepting'), acted: false };
   }
 
-  // deaf → HEAL ladder.
+  // deaf → HEAL ladder, unless the pane waits for an answer the ladder must never type.
+  const waiting = await promptGuard(d, deps, config);
+  if (waiting) return waiting;
   await healAgent(d, state, deps, config);
   return { row: mkRow(agent, 'HEAL', 'registered but channel DOWN (deaf) → ladder'), acted: true };
+}
+
+/**
+ * Read the pane before any heal action. A prompt only the operator can answer is a BLOCKED
+ * row (no inject, no restart); one the prompt watcher answers is left alone this sweep.
+ * A failed read is no evidence, and the ladder runs as usual.
+ */
+async function promptGuard(
+  d: DesiredAgent,
+  deps: ReconcileDeps,
+  config: ReconcileConfig,
+): Promise<{ readonly row: ReconcileRow; readonly acted: boolean } | null> {
+  const agent = d.agent;
+  let prompt: string | null;
+  try {
+    prompt = detectLaunchPrompt(await deps.driver.capturePane(agent));
+  } catch {
+    return null;
+  }
+  if (prompt === null) return null;
+  if (isWatcherAnsweredPrompt(prompt)) {
+    const detail = `at a prompt (${prompt}) the prompt watcher answers — left alone this sweep`;
+    deps.log(`    ${agent} ${detail}`);
+    return { row: mkRow(agent, 'SKIP', detail), acted: false };
+  }
+  const detail = `${agent} is waiting at a prompt (${prompt}) in tmux session ${agent}; answer it there`;
+  await raiseAlert(agent, `waiting at a prompt (${prompt}); answer it in the pane`, deps, config);
+  return { row: mkRow(agent, 'BLOCKED', detail), acted: true };
 }
 
 /**

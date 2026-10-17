@@ -18,6 +18,8 @@
  *   - dry-run plans-without-acting; --execute acts
  */
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { PROMPT_RESPONSES_SEED } from '../src/prompt-responses.js';
 import {
   reconcileFleet,
   resolveReconcileConfig,
@@ -87,6 +89,8 @@ interface FakeDriverOpts {
   /** Make `launch` throw this for the named agent. */
   readonly launchThrows?: ReadonlyMap<string, Error>;
   readonly workspaces?: readonly WorkspaceRecord[];
+  /** Pane text per agent for `capturePane`; absent = no evidence (null). */
+  readonly panes?: ReadonlyMap<string, string>;
 }
 
 function fakeDriver(o: FakeDriverOpts): { driver: FleetDriver; calls: DriverCalls } {
@@ -101,6 +105,7 @@ function fakeDriver(o: FakeDriverOpts): { driver: FleetDriver; calls: DriverCall
       return busy.has(agent);
     },
     isRunning: async (agent: string) => !notRunning.has(agent),
+    capturePane: async (agent: string) => o.panes?.get(agent) ?? null,
     upgrade: async () => {},
     restart: async (agent: string) => void calls.restarted.push(agent),
     inject: async (agent: string, text: string) => void calls.injected.push({ agent, text }),
@@ -567,5 +572,68 @@ describe('reconcileFleet — Tier-3 alert dedup', () => {
     await reconcileFleet([{ agent: 'devops-agent', workspace: '/w/devops' }], h.deps, cfg({ execute: true }));
     expect(h.alerts).toEqual([]);
     expect(h.logs.some((l) => l.includes('already open (dedup)'))).toBe(true);
+  });
+});
+
+// --- the heal ladder never types into a pane waiting for the operator ---------
+
+describe('reconcileFleet — prompt guard before heal', () => {
+  const oneDeaf: readonly DesiredAgent[] = [{ agent: 'devops-agent', workspace: '/w/devops' }];
+  const fx = (n: string) => readFileSync(new URL(`./fixtures/${n}`, import.meta.url), 'utf8');
+  const paneFor = (text: string) => new Map([['devops-agent', text]]);
+  const deafProbe = () => fleet(agentState('devops-agent', false));
+
+  it('trust dialog → BLOCKED, no inject, no restart, alert, rc 3', async () => {
+    const h = harness({ probe: deafProbe(), panes: paneFor(fx('live-trust-pane.txt')) });
+    const r = await reconcileFleet(oneDeaf, h.deps, cfg({ execute: true, allowRestart: true }));
+    expect(decisionOf(r.rows, 'devops-agent')).toBe('BLOCKED');
+    expect(r.rows[0]!.detail).toContain('answer it there');
+    expect(r.rc).toBe(3);
+    expect(h.calls.injected).toEqual([]);
+    expect(h.calls.restarted).toEqual([]);
+    expect(h.alerts).toHaveLength(1);
+    expect(h.storeCalls.writes.every((w) => w.state.deafSweeps === 0)).toBe(true);
+  });
+
+  it('dry-run shows BLOCKED and raises no alert', async () => {
+    const h = harness({ probe: deafProbe(), panes: paneFor(fx('live-trust-pane.txt')) });
+    const r = await reconcileFleet(oneDeaf, h.deps, cfg());
+    expect(decisionOf(r.rows, 'devops-agent')).toBe('BLOCKED');
+    expect(h.alerts).toEqual([]);
+  });
+
+  it('live permission prompt → BLOCKED, no inject', async () => {
+    const h = harness({ probe: deafProbe(), panes: paneFor(fx('live-devops-permission-pane.txt')) });
+    const r = await reconcileFleet(oneDeaf, h.deps, cfg({ execute: true }));
+    expect(decisionOf(r.rows, 'devops-agent')).toBe('BLOCKED');
+    expect(h.calls.injected).toEqual([]);
+  });
+
+  it('watcher-answered prompt → no action, no alert, no deaf sweep counted', async () => {
+    const entry = PROMPT_RESPONSES_SEED.entries[0]!;
+    const h = harness({ probe: deafProbe(), panes: paneFor(entry.frame_contains.join('\n')) });
+    const r = await reconcileFleet(oneDeaf, h.deps, cfg({ execute: true, allowRestart: true }));
+    expect(r.rc).toBe(0);
+    expect(h.calls.injected).toEqual([]);
+    expect(h.calls.restarted).toEqual([]);
+    expect(h.alerts).toEqual([]);
+    expect(h.storeCalls.writes).toEqual([]);
+    expect(h.logs.some((l) => l.includes('prompt watcher'))).toBe(true);
+  });
+
+  it('no prompt → Tier-1 inject as before', async () => {
+    const h = harness({ probe: deafProbe(), panes: paneFor(fx('live-ready-pane.txt')) });
+    await reconcileFleet(oneDeaf, h.deps, cfg({ execute: true }));
+    expect(h.calls.injected).toHaveLength(1);
+  });
+
+  it('sweep-2 escalation with a trust pane → no restart', async () => {
+    const h = harness(
+      { probe: deafProbe(), panes: paneFor(fx('live-trust-pane.txt')) },
+      { 'devops-agent': { deafSweeps: 1 } },
+    );
+    await reconcileFleet(oneDeaf, h.deps, cfg({ execute: true, allowRestart: true }));
+    expect(h.calls.restarted).toEqual([]);
+    expect(h.calls.injected).toEqual([]);
   });
 });
