@@ -22,13 +22,22 @@ export const ORCHESTRATOR_IDENTITY_ENV_KEYS = [
   'CLAUDE_PROJECT_DIR',
 ] as const;
 
-/** The command tmux runs inside the new session. `workspaceRef` is a path or a shell variable. */
-export function launchInnerCommand(workspaceRef: string): string {
+/** Quote a literal path as one shell word, so `$`, backticks and quotes in it stay literal. */
+export function shellQuote(literal: string): string {
+  return `'${literal.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * The command tmux runs inside the new session. `workspaceWord` is already a
+ * shell word: `shellQuote(path)` for a literal path, or `"$WORKSPACE"` for the
+ * relauncher's variable.
+ */
+export function launchInnerCommand(workspaceWord: string): string {
   const unset = ORCHESTRATOR_IDENTITY_ENV_KEYS.map((k) => `-u ${k}`).join(' ');
-  return `exec env ${unset} MACF_NO_TMUX_WRAP=1 "${workspaceRef}/claude.sh"`;
+  return `exec env ${unset} MACF_NO_TMUX_WRAP=1 ${workspaceWord}/claude.sh`;
 }
 
 /** The `tmux` arguments that create the detached session and start the agent in it. */
 export function buildTmuxLaunchArgs(session: string, workspaceDir: string): readonly string[] {
-  return ['new-session', '-d', '-s', session, '-c', workspaceDir, launchInnerCommand(workspaceDir)];
+  return ['new-session', '-d', '-s', session, '-c', workspaceDir, launchInnerCommand(shellQuote(workspaceDir))];
 }

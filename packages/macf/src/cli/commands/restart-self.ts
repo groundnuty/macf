@@ -379,7 +379,7 @@ export function buildRelauncherScript(args: {
     '# runs it is already inside the fresh session, so $TMUX being set there is',
     '# the CORRECT signal, not a leftover artifact.',
     'exec tmux new-session -d -s "$SESSION" -c "$WORKSPACE" \\',
-    `  "${launchInnerCommand('$WORKSPACE').replace(/"/g, '\\"')}"`,
+    `  "${launchInnerCommand('"$WORKSPACE"').replace(/"/g, '\\"')}"`,
     '',
   ].join('\n');
 }

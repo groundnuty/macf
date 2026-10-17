@@ -626,6 +626,22 @@ describe('reconcileFleet — prompt guard before heal', () => {
     expect(r.rows[0]!.detail).toContain('in tmux session macf@devops-agent; answer it there');
   });
 
+  it('picks the desired workspace when two projects share the routing label', async () => {
+    const other = { agent: 'devops-agent', workspace: '/w/other', registry: 'o/r', project: 'other' } as unknown as WorkspaceRecord;
+    const mine = { agent: 'devops-agent', workspace: '/w/devops', registry: 'o/r', project: 'macf' } as unknown as WorkspaceRecord;
+    const h = harness({ probe: deafProbe(), panes: paneFor(fx('live-trust-pane.txt')), workspaces: [other, mine] });
+    const r = await reconcileFleet(oneDeaf, h.deps, cfg());
+    expect(r.rows[0]!.detail).toContain('in tmux session macf@devops-agent;');
+  });
+
+  it('does not guess between two same-label projects when neither is the desired workspace', async () => {
+    const a = { agent: 'devops-agent', workspace: '/w/a', registry: 'o/r', project: 'a' } as unknown as WorkspaceRecord;
+    const b = { agent: 'devops-agent', workspace: '/w/b', registry: 'o/r', project: 'b' } as unknown as WorkspaceRecord;
+    const h = harness({ probe: deafProbe(), panes: paneFor(fx('live-trust-pane.txt')), workspaces: [a, b] });
+    const r = await reconcileFleet(oneDeaf, h.deps, cfg());
+    expect(r.rows[0]!.detail).toContain('in its tmux session;');
+  });
+
   it('says "its tmux session" rather than guess when the project is unknown', async () => {
     const h = harness({ probe: deafProbe(), panes: paneFor(fx('live-trust-pane.txt')) });
     const r = await reconcileFleet(oneDeaf, h.deps, cfg());

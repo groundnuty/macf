@@ -389,7 +389,10 @@ async function promptGuard(
   }
   // Name the session the operator attaches to (`<project>@<routing-label>`)
   // when this host's discovery knows the project; never guess it.
-  const project = deps.driver.discoverWorkspaces().find((w) => w.agent === agent)?.project;
+  // Two projects may share a routing label: prefer the desired workspace, and
+  // accept a label-only match only when it is unambiguous.
+  const records = deps.driver.discoverWorkspaces().filter((w) => w.agent === agent);
+  const project = (records.find((w) => w.workspace === d.workspace) ?? (records.length === 1 ? records[0] : undefined))?.project;
   const where = project ? `tmux session ${project}@${agent}` : 'its tmux session';
   const detail = `${agent} is waiting at a prompt (${prompt}) in ${where}; answer it there`;
   await raiseAlert(agent, `waiting at a prompt (${prompt}); answer it in the pane`, deps, config);

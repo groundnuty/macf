@@ -181,7 +181,7 @@ function fakeSeams(o: SeamOverrides = {}): { seams: VmDriverSeams; rec: Recorder
 const OPTS = { workspaceDir: '/w/macf', project: 'macf', busyWindowMs: 1500 };
 const LAUNCH_ARGS_CODE = [
   'new-session', '-d', '-s', 'macf@code-agent', '-c', '/w/macf',
-  'exec env -u MACF_WORKSPACE_DIR -u MACF_PROJECT -u MACF_ROUTING_LABEL -u MACF_AGENT_NAME -u CLAUDE_PROJECT_DIR MACF_NO_TMUX_WRAP=1 "/w/macf/claude.sh"',
+  "exec env -u MACF_WORKSPACE_DIR -u MACF_PROJECT -u MACF_ROUTING_LABEL -u MACF_AGENT_NAME -u CLAUDE_PROJECT_DIR MACF_NO_TMUX_WRAP=1 '/w/macf'/claude.sh",
 ];
 
 // --- isRunning --------------------------------------------------------------
@@ -980,7 +980,7 @@ describe('launch', () => {
         bin: 'tmux',
         args: [
           'new-session', '-d', '-s', 'macf@science-agent', '-c', '/w/science',
-          'exec env -u MACF_WORKSPACE_DIR -u MACF_PROJECT -u MACF_ROUTING_LABEL -u MACF_AGENT_NAME -u CLAUDE_PROJECT_DIR MACF_NO_TMUX_WRAP=1 "/w/science/claude.sh"',
+          "exec env -u MACF_WORKSPACE_DIR -u MACF_PROJECT -u MACF_ROUTING_LABEL -u MACF_AGENT_NAME -u CLAUDE_PROJECT_DIR MACF_NO_TMUX_WRAP=1 '/w/science'/claude.sh",
         ],
         cwd: '/w/science',
       },

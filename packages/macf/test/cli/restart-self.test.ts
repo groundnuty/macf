@@ -812,7 +812,7 @@ describe('buildRelauncherScript', () => {
     const s = relauncher();
     expect(s).toContain('exec tmux new-session -d -s "$SESSION" -c "$WORKSPACE"');
     expect(s).toContain('exec env -u MACF_WORKSPACE_DIR -u MACF_PROJECT -u MACF_ROUTING_LABEL -u MACF_AGENT_NAME -u CLAUDE_PROJECT_DIR MACF_NO_TMUX_WRAP=1');
-    expect(s).toContain('$WORKSPACE/claude.sh');
+    expect(s).toContain('\\"$WORKSPACE\\"/claude.sh');
     // The old bare-exec form must be fully gone — that was the bug.
     expect(s).not.toMatch(/^exec \.\/claude\.sh$/m);
   });
