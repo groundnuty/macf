@@ -19,7 +19,7 @@
  *     invisible to every test that only calls the orchestrator directly).
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, realpathSync, rmSync, statSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PACKAGE_VERSION } from '../../src/package-version.js';
@@ -27,11 +27,15 @@ import {
   buildReconcileFlags,
   buildTokenPrefix,
   buildCronLine,
+  buildCronScript,
+  cronScriptPath,
+  MAX_CRON_LINE,
   stripMarkerLines,
   computeInstalledCrontab,
   computeUninstalledCrontab,
   runFleetInstallCron,
   runFleetInstallCronCommand,
+  createRealDeps,
   readAppCreds,
   WATCHDOG_MARKER,
   watchdogMarker,
@@ -88,6 +92,8 @@ interface Recorder {
   readonly writes: string[];
   readonly logs: string[];
   readonly warns: string[];
+  /** script path → content, as the fake script store holds it. */
+  readonly scripts: Map<string, string>;
 }
 
 /** A fake deps set recording crontab writes + log/warn output. */
@@ -95,7 +101,7 @@ function fakeDeps(overrides: Partial<FleetInstallCronDeps> = {}): {
   deps: FleetInstallCronDeps;
   rec: Recorder;
 } {
-  const rec: Recorder = { writes: [], logs: [], warns: [] };
+  const rec: Recorder = { writes: [], logs: [], warns: [], scripts: new Map() };
   const deps: FleetInstallCronDeps = {
     readCrontab: () => null,
     writeCrontab: (content: string) => {
@@ -108,6 +114,12 @@ function fakeDeps(overrides: Partial<FleetInstallCronDeps> = {}): {
     macfVersion: () => CLI_VER,
     helperExists: () => true,
     confirm: async () => true,
+    scriptDir: () => SCRIPT_DIR,
+    writeScript: (path: string, content: string) => {
+      rec.scripts.set(path, content);
+    },
+    readScript: (path: string) => rec.scripts.get(path) ?? null,
+    removeScript: (path: string) => rec.scripts.delete(path),
     log: (msg: string) => rec.logs.push(msg),
     warn: (msg: string) => rec.warns.push(msg),
     ...overrides,
@@ -116,6 +128,10 @@ function fakeDeps(overrides: Partial<FleetInstallCronDeps> = {}): {
 }
 
 const MARKER = watchdogMarker('acme', 'proj');
+const SCRIPT_DIR = '/home/u/.macf/cron';
+const SCRIPT = `${SCRIPT_DIR}/acme__proj.sh`;
+/** The one script the fake store holds after an install. */
+const scriptOf = (rec: Recorder): string => [...rec.scripts.values()][0]!;
 const MACF_BIN = '/opt/npm/bin/macf';
 const INSTALL_PATH = "/opt/npm/bin:/home/u/.local/bin:/usr/bin";
 const CLI_VER = '1.2.3';
@@ -249,74 +265,144 @@ describe('buildTokenPrefix', () => {
 describe('buildCronLine', () => {
   const parts = {
     schedule: DEFAULT_SCHEDULE,
+    scriptPath: SCRIPT,
+    logPath: '/home/agent/.macf/watchdog.log',
+    marker: MARKER,
+  };
+
+  it('runs only the script: schedule + sh script + log + marker', () => {
+    expect(buildCronLine(parts)).toBe(
+      `${DEFAULT_SCHEDULE} /bin/sh '${SCRIPT}' >> '/home/agent/.macf/watchdog.log' 2>&1 ${MARKER}`,
+    );
+  });
+
+  it('carries no PATH, token mint or macf path', () => {
+    const line = buildCronLine(parts);
+    expect(line).not.toContain('PATH=');
+    expect(line).not.toContain('GH_TOKEN');
+    expect(line).not.toContain(RECONCILE_ARGS);
+  });
+
+  it('quotes a script path containing a space and a single quote', () => {
+    expect(buildCronLine({ ...parts, scriptPath: "/my h/it's.sh" })).toContain(`'/my h/it'\\''s.sh'`);
+  });
+});
+
+describe('buildCronScript', () => {
+  const parts = {
     macfPath: MACF_BIN,
     installPath: INSTALL_PATH,
     preludePath: '/ws/.claude/.macf/host-prelude.sh',
     tokenPrefix: 'GH_TOKEN=$(x) || exit 1; export GH_TOKEN; ',
     reconcileFlags: [] as readonly string[],
-    logPath: '/home/agent/.macf/watchdog.log',
     marker: MARKER,
   };
 
-  it('assembles schedule + prelude + token + reconcile + log + marker', () => {
-    const line = buildCronLine(parts);
-    expect(line.startsWith(`${DEFAULT_SCHEDULE} `)).toBe(true);
-    expect(line).toContain("[ -f '/ws/.claude/.macf/host-prelude.sh' ] && . '/ws/.claude/.macf/host-prelude.sh';");
-    expect(line).toContain('GH_TOKEN=$(x) || exit 1; export GH_TOKEN;');
-    expect(line).toContain(INVOKE);
-    expect(line).toContain("'/home/agent/.macf/watchdog.log' 2>&1");
-    expect(line.endsWith(MARKER)).toBe(true);
+  it('holds shebang, marker, PATH, prelude, token, exec — in that order', () => {
+    const lines = buildCronScript(parts).split('\n');
+    expect(lines[0]).toBe('#!/bin/sh');
+    expect(lines[1]!.startsWith(MARKER)).toBe(true);
+    expect(lines[2]).toBe(`PATH='${INSTALL_PATH}'; export PATH`);
+    expect(lines[3]).toBe("[ -f '/ws/.claude/.macf/host-prelude.sh' ] && . '/ws/.claude/.macf/host-prelude.sh'");
+    expect(lines[4]).toBe('GH_TOKEN=$(x) || exit 1; export GH_TOKEN;');
+    expect(lines[5]).toBe(`exec ${INVOKE}`);
   });
 
-  it('the line starts with the installing PATH, before the prelude', () => {
-    const line = buildCronLine(parts);
-    expect(line.startsWith(`${DEFAULT_SCHEDULE} PATH='${INSTALL_PATH}'; export PATH; [ -f `)).toBe(true);
+  it('an empty token prefix leaves no blank line', () => {
+    expect(buildCronScript({ ...parts, tokenPrefix: '' }).split('\n')).toHaveLength(6);
   });
 
-  it('report-only line carries no --execute', () => {
-    const line = buildCronLine(parts);
-    expect(line).not.toContain('--execute');
+  it('report-only carries no --execute; execute carries it after the invocation', () => {
+    expect(buildCronScript(parts)).not.toContain('--execute');
+    expect(buildCronScript({ ...parts, reconcileFlags: ['--execute'] })).toContain(`exec ${INVOKE} --execute\n`);
   });
 
-  it('execute line carries --execute right after the invocation', () => {
-    const line = buildCronLine({ ...parts, reconcileFlags: ['--execute'] });
-    expect(line).toContain(`${INVOKE} --execute >> `);
+  it('carries --dir for a plain path and quotes an awkward one', () => {
+    const plain = buildReconcileFlags({ workspaceDir: '/ws', withRouting: false, execute: false, allowRestart: false });
+    expect(buildCronScript({ ...parts, reconcileFlags: plain })).toContain(`${INVOKE} --dir '/ws'`);
+    const odd = buildReconcileFlags({ workspaceDir: "/my ws/it's", withRouting: false, execute: false, allowRestart: false });
+    expect(buildCronScript({ ...parts, reconcileFlags: odd })).toContain(`--dir '/my ws/it'\\''s'`);
   });
 
-  it('line built from real flags carries --dir for a plain path', () => {
-    const reconcileFlags = buildReconcileFlags({
-      workspaceDir: '/ws', withRouting: false, execute: false, allowRestart: false,
+  it('cronScriptPath is <owner>__<project>.sh', () => {
+    expect(cronScriptPath('/d', 'acme', 'proj')).toBe('/d/acme__proj.sh');
+  });
+});
+
+describe('script naming and a failed crontab write', () => {
+  const REFUSAL = (what: string, v: string): string =>
+    `macf fleet install-cron: cannot name this fleet's cron script: ${what} "${v}" ` +
+    'contains characters other than letters, digits, "." and "-".';
+
+  it.each([
+    ['project', 'my_project', {}],
+    ['project', 'my project', {}],
+    ['owner', 'my_org', {}],
+    ['project', 'my project', { print: true }],
+    ['project', 'my project', { uninstall: true }],
+  ] as const)('refuses %s %j with exit 2 and writes nothing', async (what, value, extra) => {
+    const { deps, rec } = fakeDeps({ readCrontab: () => `* * * * * x ${MARKER}\n` });
+    const over = what === 'owner' ? { owner: value } : { project: value };
+    const code = await runFleetInstallCron(baseOpts({ ...over, ...extra }), deps);
+    expect(code).toBe(2);
+    expect(rec.warns).toContain(REFUSAL(what, value));
+    expect(rec.writes).toEqual([]);
+    expect(rec.scripts.size).toBe(0);
+  });
+
+  it('a failed crontab write leaves an existing script byte-identical', async () => {
+    const { deps, rec } = fakeDeps({
+      writeCrontab: () => {
+        throw new Error('crontab: boom');
+      },
     });
-    expect(buildCronLine({ ...parts, reconcileFlags })).toContain(`${INVOKE} --dir '/ws' >> `);
+    rec.scripts.set(SCRIPT, 'old script\n');
+    await expect(runFleetInstallCron(baseOpts(), deps)).rejects.toThrow('boom');
+    expect(rec.scripts.get(SCRIPT)).toBe('old script\n');
   });
 
-  it('quotes a workspace path containing a space and a single quote', () => {
-    const reconcileFlags = buildReconcileFlags({
-      workspaceDir: "/my ws/it's", withRouting: false, execute: false, allowRestart: false,
+  it('a failed crontab write with no existing script leaves none', async () => {
+    const { deps, rec } = fakeDeps({
+      writeCrontab: () => {
+        throw new Error('crontab: boom');
+      },
     });
-    expect(buildCronLine({ ...parts, reconcileFlags })).toContain(`--dir '/my ws/it'\\''s'`);
+    await expect(runFleetInstallCron(baseOpts(), deps)).rejects.toThrow('boom');
+    expect(rec.scripts.size).toBe(0);
   });
+});
 
-  it('the built reconcile command, run from a directory outside the workspace, gets --dir under a minimal env -i PATH', async () => {
+describe('executed: the crontab line command, from outside the workspace, under env -i', () => {
+  it('runs the script, and macf gets fleet reconcile --dir <workspace>', async () => {
     const ws = "/my ws/it's";
-    const reconcileFlags = buildReconcileFlags({
-      workspaceDir: ws, withRouting: false, execute: true, allowRestart: false,
-    });
     const root = mkdtempSync(join(tmpdir(), 'cron-exec-'));
-    const tools = join(root, 'tools');
-    const line = buildCronLine({ ...parts, installPath: `${tools}:/usr/bin:/bin`, macfPath: join(root, 'bin', 'macf'), tokenPrefix: '', preludePath: '/nonexistent/prelude.sh', logPath: '/dev/null', reconcileFlags });
-    // Everything after the schedule, minus the marker comment.
-    const cmd = line.slice(parts.schedule.length + 1, line.length - parts.marker.length - 1);
     try {
       const bin = join(root, 'bin');
+      const tools = join(root, 'tools');
       const cwd = join(root, 'elsewhere');
       const out = join(root, 'argv.txt');
       mkdirSync(bin); mkdirSync(cwd); mkdirSync(tools);
       // `fakenode` is on the installing PATH only, as node is under npm's bin.
       writeFileSync(join(tools, 'fakenode'), '#!/bin/sh\nexec /bin/sh "$@"\n', { mode: 0o755 });
       writeFileSync(join(bin, 'macf'), `#!/usr/bin/env fakenode\n{ pwd; for a in "$@"; do printf "%s\\n" "$a"; done; } > '${out}'\n`, { mode: 0o755 });
-      writeFileSync(join(root, 'cron.sh'), cmd + '\n');
+      const scriptDir = join(root, 'cron');
       const real = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+      const { deps } = fakeDeps({
+        installPath: () => `${tools}:/usr/bin:/bin`,
+        resolveMacf: () => join(bin, 'macf'),
+        scriptDir: () => scriptDir,
+        // the real writer, so the line runs what an install really writes
+        writeScript: createRealDeps(ws).writeScript,
+        helperExists: () => false,
+      });
+      const logs: string[] = [];
+      await runFleetInstallCron(
+        baseOpts({ workspaceDir: ws, noToken: true, execute: true, prelude: '/nonexistent/prelude.sh', log: '/dev/null' }),
+        { ...deps, log: (m) => logs.push(m), writeCrontab: (c) => logs.push(`CRON:${c}`) },
+      );
+      const line = logs.find((l) => l.startsWith('CRON:'))!.slice('CRON:'.length).trimEnd();
+      const cmd = line.slice(DEFAULT_SCHEDULE.length + 1, line.length - MARKER.length - 1);
+      writeFileSync(join(root, 'cron.sh'), cmd + '\n');
       real.execFileSync('/usr/bin/env', ['-i', `HOME=${root}`, 'PATH=/usr/bin:/bin', '/bin/sh', join(root, 'cron.sh')], { cwd });
       const lines = readFileSync(out, 'utf-8').trimEnd().split('\n');
       expect(lines[0]).toBe(realpathSync(cwd));
@@ -327,17 +413,98 @@ describe('buildCronLine', () => {
   });
 });
 
+describe('crontab line length', () => {
+  it('a 2,000-character PATH leaves the line well under the cap; the script carries the PATH', async () => {
+    const longPath = Array.from({ length: 130 }, (_, i) => `/opt/dir${String(i).padStart(3, '0')}/bin`).join(':');
+    expect(longPath.length).toBeGreaterThan(1999);
+    const { deps, rec } = fakeDeps({ installPath: () => longPath });
+    expect(await runFleetInstallCron(baseOpts(), deps)).toBe(0);
+    const line = rec.writes[0]!.trimEnd();
+    expect(line.length).toBeLessThan(MAX_CRON_LINE / 2);
+    expect(line).not.toContain(longPath);
+    expect(scriptOf(rec)).toContain(`PATH='${longPath}'; export PATH`);
+  });
+
+  it('a log path that pushes the line over the cap is refused, exit 2, naming it, nothing written', async () => {
+    for (const print of [false, true]) {
+      const { deps, rec } = fakeDeps();
+      const code = await runFleetInstallCron(baseOpts({ print, log: `/var/log/${'l'.repeat(900)}.log` }), deps);
+      expect(code).toBe(2);
+      expect(rec.writes).toHaveLength(0);
+      expect(rec.scripts.size).toBe(0);
+      const msg = rec.warns.join('\n');
+      expect(msg).toContain('1000');
+      expect(msg).toContain('log path');
+    }
+  });
+
+  it('measures the cap in UTF-8 bytes: a multibyte log path under 900 characters but over 900 bytes is refused', async () => {
+    const log = `/var/log/${'ł'.repeat(400)}.log`;
+    expect(log.length).toBeLessThan(MAX_CRON_LINE - 200);
+    const { deps, rec } = fakeDeps();
+    const code = await runFleetInstallCron(baseOpts({ log }), deps);
+    expect(code).toBe(2);
+    expect(rec.writes).toHaveLength(0);
+    expect(rec.warns.join('\n')).toContain('bytes');
+  });
+});
+
+describe('the script file', () => {
+  it('is written 0700 in a 0700 dir, with the content built from the parts', () => {
+    const root = mkdtempSync(join(tmpdir(), 'cron-script-'));
+    try {
+      const path = cronScriptPath(join(root, 'nested', 'cron'), 'acme', 'proj');
+      createRealDeps('/ws').writeScript(path, 'content\n');
+      expect(statSync(path).mode & 0o777).toBe(0o700);
+      expect(statSync(join(root, 'nested', 'cron')).mode & 0o777).toBe(0o700);
+      expect(readFileSync(path, 'utf-8')).toBe('content\n');
+      expect(existsSync(`${path}.${process.pid}.tmp`)).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('install writes the script at <dir>/<owner>__<project>.sh with the built content', async () => {
+    const { deps, rec } = fakeDeps();
+    await runFleetInstallCron(baseOpts({ execute: true }), deps);
+    expect([...rec.scripts.keys()]).toEqual([SCRIPT]);
+    const script = rec.scripts.get(SCRIPT)!;
+    expect(script.startsWith('#!/bin/sh\n')).toBe(true);
+    expect(script).toContain(`PATH='${INSTALL_PATH}'; export PATH\n`);
+    expect(script).toContain('GH_TOKEN=$(');
+    expect(script).toContain(`exec ${INVOKE} --dir '/ws' --execute\n`);
+  });
+
+  it('--print shows the line and the full script, writes nothing', async () => {
+    const { deps, rec } = fakeDeps();
+    await runFleetInstallCron(baseOpts({ print: true }), deps);
+    expect(rec.writes).toHaveLength(0);
+    expect(rec.scripts.size).toBe(0);
+    const out = rec.logs.join('\n');
+    expect(out).toContain(`/bin/sh '${SCRIPT}'`);
+    expect(out).toContain('#!/bin/sh');
+    expect(out).toContain('GH_TOKEN=$(');
+    expect(out).toContain(`exec ${INVOKE}`);
+  });
+
+  it('a declined confirmation writes no script', async () => {
+    const { deps, rec } = fakeDeps({ confirm: async () => false });
+    await runFleetInstallCron(baseOpts({ yes: false }), deps);
+    expect(rec.scripts.size).toBe(0);
+  });
+});
+
 describe('installing PATH', () => {
   it('install bakes the installing PATH into the written line', async () => {
     const { deps, rec } = fakeDeps();
     await runFleetInstallCron(baseOpts(), deps);
-    expect(rec.writes[0]!).toContain(`PATH='${INSTALL_PATH}'; export PATH; `);
+    expect(scriptOf(rec)).toContain(`PATH='${INSTALL_PATH}'; export PATH\n`);
   });
 
   it('--print shows the PATH', async () => {
     const { deps, rec } = fakeDeps();
     await runFleetInstallCron(baseOpts({ print: true }), deps);
-    expect(rec.logs.join('\n')).toContain(`PATH='${INSTALL_PATH}'; export PATH; `);
+    expect(rec.logs.join('\n')).toContain(`PATH='${INSTALL_PATH}'; export PATH`);
   });
 
   it('an empty PATH → exit 2, no write', async () => {
@@ -397,16 +564,16 @@ describe('runFleetInstallCron — install', () => {
     expect(rec.writes).toHaveLength(1);
     const written = rec.writes[0]!;
     expect(written).toContain(MARKER);
-    expect(written).toContain(INVOKE);
-    expect(written).not.toContain('--execute');
+    expect(scriptOf(rec)).toContain(INVOKE);
+    expect(scriptOf(rec)).not.toContain('--execute');
     // token-mint baked (full creds available)
-    expect(written).toContain('GH_TOKEN=$(');
+    expect(scriptOf(rec)).toContain('GH_TOKEN=$(');
   });
 
   it('--execute installs an acting line', async () => {
     const { deps, rec } = fakeDeps();
     await runFleetInstallCron(baseOpts({ execute: true }), deps);
-    expect(rec.writes[0]!).toContain('--execute');
+    expect(scriptOf(rec)).toContain('--execute');
   });
 
   it('is idempotent — re-run over an existing marker line replaces, not duplicates', async () => {
@@ -438,13 +605,13 @@ describe('runFleetInstallCron — install', () => {
     const { deps, rec } = fakeDeps({ readAppCreds: () => ({ appId: '1' }) });
     await runFleetInstallCron(baseOpts(), deps);
     expect(rec.warns.join('\n')).toMatch(/APP_ID\/INSTALL_ID\/KEY_PATH/);
-    expect(rec.writes[0]!).not.toContain('GH_TOKEN=$(');
+    expect(scriptOf(rec)).not.toContain('GH_TOKEN=$(');
   });
 
   it('--no-token bakes no token prefix, no warning', async () => {
     const { deps, rec } = fakeDeps();
     await runFleetInstallCron(baseOpts({ noToken: true }), deps);
-    expect(rec.writes[0]!).not.toContain('GH_TOKEN=$(');
+    expect(scriptOf(rec)).not.toContain('GH_TOKEN=$(');
     expect(rec.warns).toHaveLength(0);
   });
 
@@ -473,12 +640,32 @@ describe('runFleetInstallCron — uninstall', () => {
     expect(rec.logs.join('\n')).toMatch(/nothing to remove/i);
   });
 
-  it('declined uninstall confirmation → no write', async () => {
+  it('removes this fleet script and leaves another fleet script alone', async () => {
+    const other = `${SCRIPT_DIR}/acme__other.sh`;
+    const { deps, rec } = fakeDeps({ readCrontab: () => `*/10 * * * * x ${MARKER}` });
+    rec.scripts.set(SCRIPT, 'mine');
+    rec.scripts.set(other, 'theirs');
+    expect(await runFleetInstallCron(baseOpts({ uninstall: true }), deps)).toBe(0);
+    expect([...rec.scripts.keys()]).toEqual([other]);
+  });
+
+  it('with no line left, still removes a leftover script of this fleet; --print removes nothing', async () => {
+    const a = fakeDeps({ readCrontab: () => '@daily y' });
+    a.rec.scripts.set(SCRIPT, 'mine');
+    await runFleetInstallCron(baseOpts({ uninstall: true, print: true }), a.deps);
+    expect(a.rec.scripts.size).toBe(1);
+    await runFleetInstallCron(baseOpts({ uninstall: true }), a.deps);
+    expect(a.rec.scripts.size).toBe(0);
+  });
+
+  it('declined uninstall confirmation → no write, script kept', async () => {
     const existing = `*/10 * * * * x ${MARKER}`;
     const { deps, rec } = fakeDeps({ readCrontab: () => existing, confirm: async () => false });
+    rec.scripts.set(SCRIPT, 'mine');
     const code = await runFleetInstallCron(baseOpts({ uninstall: true, yes: false }), deps);
     expect(code).toBe(0);
     expect(rec.writes).toHaveLength(0);
+    expect(rec.scripts.size).toBe(1);
   });
 });
 
@@ -488,8 +675,8 @@ describe('absolute macf path', () => {
   it('the installed line contains the resolved absolute path, not a bare macf', async () => {
     const { deps, rec } = fakeDeps({ resolveMacf: () => '/home/u/.npm-global/bin/macf' });
     expect(await runFleetInstallCron(baseOpts(), deps)).toBe(0);
-    expect(rec.writes[0]!).toContain("'/home/u/.npm-global/bin/macf' fleet reconcile");
-    expect(rec.writes[0]!).not.toMatch(/[; ]macf fleet reconcile/);
+    expect(scriptOf(rec)).toContain("exec '/home/u/.npm-global/bin/macf' fleet reconcile");
+    expect(scriptOf(rec)).not.toMatch(/[; ]macf fleet reconcile/);
   });
 
   it('no macf on PATH → exit 2 with the install command, no write', async () => {
@@ -740,35 +927,37 @@ describe('runFleetInstallCronCommand — --dir vs ambient MACF_WORKSPACE_DIR (ma
   });
 });
 
-describe('refuses "%" in the cron command', () => {
-  it('a "%" in a PATH entry → exit 2, names PATH, no write', async () => {
-    const { deps, rec } = fakeDeps({ installPath: () => '/opt/a%b/bin:/usr/bin' });
-    expect(await runFleetInstallCron(baseOpts(), deps)).toBe(2);
-    expect(rec.writes).toHaveLength(0);
-    expect(rec.warns.join('\n')).toContain('PATH contains "%"');
-  });
-
+describe('refuses "%" in the crontab line', () => {
   it('a "%" in the log path → exit 2, names log, also with --print', async () => {
     for (const print of [false, true]) {
       const { deps, rec } = fakeDeps();
       const code = await runFleetInstallCron(baseOpts({ print, log: '/var/100%/w.log' }), deps);
       expect(code).toBe(2);
       expect(rec.writes).toHaveLength(0);
+      expect(rec.scripts.size).toBe(0);
       expect(rec.warns.join('\n')).toContain('log contains "%"');
     }
   });
 
-  it('a "%" in the workspace, manifest or prelude names that value', async () => {
-    const cases: ReadonlyArray<[Partial<RunFleetInstallCronOptions>, string]> = [
-      [{ workspaceDir: '/w%s' }, 'workspace'],
-      [{ manifest: '/m%.yaml' }, 'manifest'],
-      [{ prelude: '/p%.sh' }, 'prelude'],
+  it('a "%" in the script dir is refused, naming the script', async () => {
+    const { deps, rec } = fakeDeps({ scriptDir: () => '/home/100%/.macf/cron' });
+    expect(await runFleetInstallCron(baseOpts(), deps)).toBe(2);
+    expect(rec.warns.join('\n')).toContain('script contains "%"');
+  });
+
+  it('a "%" in PATH, workspace, manifest or prelude is harmless: it goes only into the script', async () => {
+    const cases: ReadonlyArray<Partial<RunFleetInstallCronOptions>> = [
+      { workspaceDir: '/w%s' }, { manifest: '/m%.yaml' }, { prelude: '/p%.sh' },
     ];
-    for (const [over, name] of cases) {
+    for (const over of cases) {
       const { deps, rec } = fakeDeps();
-      expect(await runFleetInstallCron(baseOpts(over), deps)).toBe(2);
-      expect(rec.warns.join('\n')).toContain(`${name} contains "%"`);
+      expect(await runFleetInstallCron(baseOpts(over), deps)).toBe(0);
+      expect(rec.writes[0]!).not.toContain('%');
+      expect(scriptOf(rec)).toContain('%');
     }
+    const { deps, rec } = fakeDeps({ installPath: () => '/opt/a%b/bin:/usr/bin' });
+    expect(await runFleetInstallCron(baseOpts(), deps)).toBe(0);
+    expect(scriptOf(rec)).toContain("PATH='/opt/a%b/bin:/usr/bin'");
   });
 
   it('a clean line is unaffected', async () => {
