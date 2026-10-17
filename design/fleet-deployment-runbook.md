@@ -50,20 +50,22 @@ This section and the next three are one worked example, meant to be followed top
 
 > **What has and has not been run end to end.**
 >
-> **Run, on `macf-trial` on 2026-10-17 (0.2.72/0.2.73), with its Apps, repos and runners kept:**
+> **Run, on `macf-trial` on 2026-10-17 (0.2.72–0.2.75), with its Apps, repos and runners kept:**
 > - `fleet deploy` for three agents;
 > - a `fleet reconcile` cold start;
 > - `fleet doctor --inject`;
 > - routing by label and by mention through the control repo (GitHub-hosted runners joined to the tailnet), and by CI completion on an agent repo's own runner;
 > - agent-to-agent messages;
-> - `fleet upgrade` of the agents (the recording `apply` on the Mac was not run).
+> - an upgrade, both halves: `fleet upgrade` of the agents to 0.2.74, then the recording `apply` on the Mac;
+> - `routing.runner.trusted_actors`: that apply added the operator's login to `MACF_TRUSTED_ACTORS` on every agent repo;
+> - `install-cron` (0.2.75): installed, its line run as cron runs it (from `$HOME`, empty environment) through a real reconcile, then uninstalled, leaving another fleet's watchdog line untouched.
 >
 > **Not yet run end to end:**
 > - the consent pages and App creation, including `router_app_scope: per-fleet`;
 > - label or mention routing on a self-hosted agent repo (the last check in §4);
 > - apply requesting runners from the runner platform;
-> - `routing.runner.trusted_actors`;
-> - the 0.2.74 `install-cron`;
+> - the router acting on a label or comment you make yourself (the last check in §4);
+> - a cron tick after a real reboot;
 > - the first launch by hand (§3.5);
 > - a VM with no GitHub login.
 >
@@ -76,7 +78,7 @@ This section and the next three are one worked example, meant to be followed top
 | Needed | Mac | VM |
 |---|---|---|
 | Node.js 22.12 or later | ✓ | ✓ |
-| `macf` at the fleet's version, installed globally: `npm install -g @groundnuty/macf@0.2.74`. If that needs `sudo`, first run `npm config set prefix ~/.npm-global` and add `~/.npm-global/bin` to `PATH` in your shell profile | ✓ | ✓ |
+| `macf` at the fleet's version, installed globally: `npm install -g @groundnuty/macf@0.2.75`. If that needs `sudo`, first run `npm config set prefix ~/.npm-global` and add `~/.npm-global/bin` to `PATH` in your shell profile | ✓ | ✓ |
 | `gh` with the token extension, `Link-/gh-token`. Every App token is minted with `gh token generate` | `gh extension install Link-/gh-token` | from the Mac: `gh auth token \| ssh $VM_SSH 'GH_TOKEN=$(cat) gh extension install Link-/gh-token'` (the install needs a token once; the extension itself needs none) |
 | `gh auth login` as an **owner of the org**, with the `workflow` and `admin:org` scopes (add them with `gh auth refresh -h github.com -s workflow,admin:org`) | ✓ | **no:** never log in as yourself on the VM, or an agent whose token fails falls back to your account (`gh-token-attribution-traps.md` mode 4) |
 | `git` able to push to GitHub over HTTPS (`gh auth setup-git`) | ✓ | — (agents push with their own App tokens) |
@@ -192,7 +194,7 @@ agents:
     repo: $OWNER/$PROJECT-writing-agent
     deploy_path: $VM_HOME/repos/$PROJECT/$PROJECT-writing-agent
 versions:
-  macf: 0.2.74
+  macf: 0.2.75
   actions: v3.6.2
 EOF
 ```
@@ -207,7 +209,7 @@ EOF
 - **`role_template`.** Each agent repo is created from this template. Its `CLAUDE.md` is a stub that you fill in at §3.4.
 - **`writing-agent` is the paper agent.** A role name is free-form: it sets the App, bot, label and session names, and nothing else. No role selects a persona; the agent's job comes from its `CLAUDE.md`. `writing-agent` is the paper role exercised end to end. `role: paper-agent` behaves identically, apart from the names and one informational line in `macf doctor`.
 - **`deploy_path` under `~/repos`.** `fleet reconcile` looks for workspaces under `~/repos`, down to four levels deep.
-- **`versions`.** It pins every workspace to `macf` 0.2.74 and every router caller to `macf-actions` v3.6.2.
+- **`versions`.** It pins every workspace to `macf` 0.2.75 and every router caller to `macf-actions` v3.6.2.
 
 **Left out deliberately:**
 - `agents[].profile` and `defaults.app_manifest` are accepted but consumed nowhere.
@@ -385,7 +387,7 @@ macf fleet install-cron --execute --manifest ~/macf-fleets/$PROJECT/desired-agen
 
 **Check after one tick.** Run `tail ~/.macf/watchdog.log`. The last reconcile should list your three agents.
 
-**The line belongs to this fleet only.** Other fleets' watchdog lines are left as they are.
+**The line belongs to this fleet only.** It runs a small script, `~/.macf/cron/$OWNER__$PROJECT.sh`, which holds the PATH, the token mint and the reconcile command. Other fleets' watchdog lines and scripts are left as they are.
 
 **Two flags change what it does:**
 - **Without `--execute`,** the line only reports.
@@ -450,7 +452,7 @@ gh run view $RUN -R $OWNER/$PROJECT-code-agent --log | grep -E 'Routed issue #[0
    cd $VM_HOME/repos/$PROJECT/$PROJECT-science-agent && macf fleet upgrade --fleet $PROJECT --target <new> --execute --wait
    ```
 
-   **Expect `GREEN on <new>` for each agent.** Upgrade to the newest release only: each agent's step runs `macf update`, which pins the newest release whatever `--target` says (§10).
+   **Expect `GREEN on <new>` for each agent.** Upgrade to the newest release only: each agent's step runs `macf update`, which pins the newest release whatever `--target` says (§10). Each workspace is left with `.gitignore`, `.claude/audit.log` and `claude.sh` changed; ask its agent to commit them. They do not block the next upgrade.
 2. **On the Mac, record the version.** Run `npm install -g @groundnuty/macf@<new>` first, because an older Mac CLI would regenerate the router callers with its older generator. Then set `versions.macf` in `$FLEET_DIR/fleet.yaml`, and run:
 
    ```bash
