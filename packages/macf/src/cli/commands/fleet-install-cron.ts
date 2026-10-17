@@ -147,6 +147,8 @@ export interface FleetInstallCronDeps {
   readonly scriptDir: () => string;
   /** Write `content` to `path` atomically, mode 0700, creating its dir 0700. Throws on failure. */
   readonly writeScript: (path: string, content: string) => void;
+  /** The script's current content, or null when there is none. */
+  readonly readScript: (path: string) => string | null;
   /** Delete the script at `path`; true iff it existed. */
   readonly removeScript: (path: string) => boolean;
   /** Info line to stdout. */
@@ -309,10 +311,23 @@ export function buildCronScript(parts: CronScriptParts): string {
   ].join('\n');
 }
 
-/** This fleet's script path under `dir`: `<owner>__<project>.sh`, unsafe characters made `_`. */
+/**
+ * This fleet's script path under `dir`: `<owner>__<project>.sh`. Owners and fleet
+ * names never contain `_`, so the name is unambiguous once `cronNameProblem` passes.
+ */
 export function cronScriptPath(dir: string, owner: string, project: string): string {
-  const safe = (v: string): string => v.replace(/[^A-Za-z0-9._-]/g, '_');
-  return join(dir, `${safe(owner)}__${safe(project)}.sh`);
+  return join(dir, `${owner}__${project}.sh`);
+}
+
+/** Refusal text when the owner or project cannot name a script file, else null. */
+export function cronNameProblem(owner: string, project: string): string | null {
+  const bad = ([['owner', owner], ['project', project]] as const).find(
+    ([, v]) => !/^[A-Za-z0-9.-]+$/.test(v),
+  );
+  return bad
+    ? `macf fleet install-cron: cannot name this fleet's cron script: ${bad[0]} "${bad[1]}" ` +
+        'contains characters other than letters, digits, "." and "-".'
+    : null;
 }
 
 /**
@@ -400,6 +415,12 @@ export async function runFleetInstallCron(
 ): Promise<number> {
   if (!deps.crontabAvailable()) {
     deps.warn('macf fleet install-cron: `crontab` not found on PATH. Cannot manage cron.');
+    return 2;
+  }
+
+  const nameProblem = cronNameProblem(opts.owner, opts.project);
+  if (nameProblem) {
+    deps.warn(nameProblem);
     return 2;
   }
 
@@ -527,9 +548,17 @@ export async function runFleetInstallCron(
   }
 
   // Script first: a crontab line must never point at a script that is not there.
+  const oldScript = deps.readScript(scriptPath);
   deps.writeScript(scriptPath, script);
   const next = computeInstalledCrontab(existing, line, marker, opts.workspaceDir);
-  deps.writeCrontab(next);
+  try {
+    deps.writeCrontab(next);
+  } catch (err) {
+    // The old line still runs; put its old script back (or remove the new one).
+    if (oldScript === null) deps.removeScript(scriptPath);
+    else deps.writeScript(scriptPath, oldScript);
+    throw err;
+  }
   deps.log(
     `Installed macf-watchdog cron [${mode}], schedule '${opts.schedule}', script ${scriptPath}, log ${logPath}.`,
   );
@@ -653,6 +682,13 @@ export function createRealDeps(workspaceDir: string): FleetInstallCronDeps {
       } catch (err) {
         rmSync(tmp, { force: true });
         throw new FleetInstallCronError(`failed to write ${path}: ${(err as Error).message}`);
+      }
+    },
+    readScript: (path: string) => {
+      try {
+        return readFileSync(path, 'utf-8');
+      } catch {
+        return null;
       }
     },
     removeScript: (path: string) => {

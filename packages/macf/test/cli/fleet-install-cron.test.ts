@@ -118,6 +118,7 @@ function fakeDeps(overrides: Partial<FleetInstallCronDeps> = {}): {
     writeScript: (path: string, content: string) => {
       rec.scripts.set(path, content);
     },
+    readScript: (path: string) => rec.scripts.get(path) ?? null,
     removeScript: (path: string) => rec.scripts.delete(path),
     log: (msg: string) => rec.logs.push(msg),
     warn: (msg: string) => rec.warns.push(msg),
@@ -323,9 +324,51 @@ describe('buildCronScript', () => {
     expect(buildCronScript({ ...parts, reconcileFlags: odd })).toContain(`--dir '/my ws/it'\\''s'`);
   });
 
-  it('cronScriptPath is <owner>__<project>.sh, unsafe characters made _', () => {
+  it('cronScriptPath is <owner>__<project>.sh', () => {
     expect(cronScriptPath('/d', 'acme', 'proj')).toBe('/d/acme__proj.sh');
-    expect(cronScriptPath('/d', 'a/b', 'p q')).toBe('/d/a_b__p_q.sh');
+  });
+});
+
+describe('script naming and a failed crontab write', () => {
+  const REFUSAL = (what: string, v: string): string =>
+    `macf fleet install-cron: cannot name this fleet's cron script: ${what} "${v}" ` +
+    'contains characters other than letters, digits, "." and "-".';
+
+  it.each([
+    ['project', 'my_project', {}],
+    ['project', 'my project', {}],
+    ['owner', 'my_org', {}],
+    ['project', 'my project', { print: true }],
+    ['project', 'my project', { uninstall: true }],
+  ] as const)('refuses %s %j with exit 2 and writes nothing', async (what, value, extra) => {
+    const { deps, rec } = fakeDeps({ readCrontab: () => `* * * * * x ${MARKER}\n` });
+    const over = what === 'owner' ? { owner: value } : { project: value };
+    const code = await runFleetInstallCron(baseOpts({ ...over, ...extra }), deps);
+    expect(code).toBe(2);
+    expect(rec.warns).toContain(REFUSAL(what, value));
+    expect(rec.writes).toEqual([]);
+    expect(rec.scripts.size).toBe(0);
+  });
+
+  it('a failed crontab write leaves an existing script byte-identical', async () => {
+    const { deps, rec } = fakeDeps({
+      writeCrontab: () => {
+        throw new Error('crontab: boom');
+      },
+    });
+    rec.scripts.set(SCRIPT, 'old script\n');
+    await expect(runFleetInstallCron(baseOpts(), deps)).rejects.toThrow('boom');
+    expect(rec.scripts.get(SCRIPT)).toBe('old script\n');
+  });
+
+  it('a failed crontab write with no existing script leaves none', async () => {
+    const { deps, rec } = fakeDeps({
+      writeCrontab: () => {
+        throw new Error('crontab: boom');
+      },
+    });
+    await expect(runFleetInstallCron(baseOpts(), deps)).rejects.toThrow('boom');
+    expect(rec.scripts.size).toBe(0);
   });
 });
 
