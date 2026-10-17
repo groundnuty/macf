@@ -433,12 +433,12 @@ fleet
     'The desired-state reconciler, porting devops-toolkit\'s fleet/reconcile.sh. ' +
     'Probes ACTUAL state (fleet /health) and drives it toward the ' +
     'operator-owned DESIRED set (a desired-agents.yaml manifest if present, else the ' +
-    "host's discovered workspaces): desired-and-down (not registered, or registered with no live session) → LAUNCH, verified (a launch that never comes up → FAILED, one stopped at a prompt → BLOCKED, exit 3); desired-and-deaf with a live session → HEAL " +
-    'via the tiered ladder (Tier-1 gated inject → Tier-2 graceful-restart [--allow-restart] → ' +
+    "host's discovered workspaces): desired with no live tmux session → LAUNCH, then verified (never comes up → FAILED; stops at a prompt → BLOCKED); desired with a live session but unreachable → HEAL " +
+    'via the tiered ladder, unless its pane waits at a prompt: one the prompt watcher answers → SKIP this sweep, any other → BLOCKED (Tier-1 gated inject → Tier-2 graceful-restart [--allow-restart] → ' +
     'Tier-3 gh-issue alert); desired-down (paused sentinel OR last-exit==0 /exit) → SKIP. ' +
     'Guards: aliveness-gate (NEVER restart a busy agent), EXPONENTIAL restart-backoff + ' +
     'stuck-in-backoff escalation (never restart-storm), launch-stagger (space cold-starts), ' +
-    'and a self-heartbeat. Exit codes: 0 nothing to do, 1 acted or action needed, 2 setup or probe error, 3 a launch failed or is blocked at a prompt. DRY-RUN BY DEFAULT — logs decisions, acts on nothing; pass ' +
+    'and a self-heartbeat. Exit codes: 0 nothing to do, 1 acted or action needed, 2 setup or probe error, 3 a launch failed, or an agent is waiting at a prompt only the operator can answer. DRY-RUN BY DEFAULT — logs decisions, acts on nothing; pass ' +
     '--execute to act. The cron consumer is `macf fleet install-cron`.',
   )
   .option('--execute', 'ACTUALLY act (launch/inject/restart/alert/heartbeat). Default: dry-run.', false)

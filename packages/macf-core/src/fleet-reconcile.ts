@@ -181,7 +181,7 @@ export interface ReconcileRow {
  *   - 0 = every desired agent OK / down (no action)
  *   - 1 = action(s) taken or needed
  *   - 2 = precondition/probe failure (bad manifest, probe threw)
- *   - 3 = a launch failed or stopped at a prompt (FAILED / BLOCKED rows)
+ *   - 3 = a launch failed, or an agent is waiting at a prompt only the operator can answer
  */
 export interface ReconcileResult {
   readonly rc: number;
@@ -307,7 +307,9 @@ export async function reconcileFleet(
   deps.log(
     rc === 0
       ? `reconcile [${mode}, restart:${restart}]: all desired agents OK / down — no action.`
-      : `reconcile [${mode}, restart:${restart}]: action(s) taken or needed above.`,
+      : rc === 3
+        ? `reconcile [${mode}, restart:${restart}]: a launch failed or an agent is waiting at a prompt; see the FAILED and BLOCKED rows above.`
+        : `reconcile [${mode}, restart:${restart}]: action(s) taken or needed above.`,
   );
 
   return { rc, rows };
@@ -383,8 +385,7 @@ async function promptGuard(
   }
   if (prompt === null) return null;
   if (isWatcherAnsweredPrompt(prompt)) {
-    const detail = `at a prompt (${prompt}) the prompt watcher answers — left alone this sweep`;
-    deps.log(`    ${agent} ${detail}`);
+    const detail = `waiting at a prompt (${prompt}) that the prompt watcher answers; left alone this sweep`;
     return { row: mkRow(agent, 'SKIP', detail), acted: false };
   }
   // Name the session the operator attaches to (`<project>@<routing-label>`)
@@ -394,8 +395,8 @@ async function promptGuard(
   const records = deps.driver.discoverWorkspaces().filter((w) => w.agent === agent);
   const project = (records.find((w) => w.workspace === d.workspace) ?? (records.length === 1 ? records[0] : undefined))?.project;
   const where = project ? `tmux session ${project}@${agent}` : 'its tmux session';
-  const detail = `${agent} is waiting at a prompt (${prompt}) in ${where}; answer it there`;
-  await raiseAlert(agent, `waiting at a prompt (${prompt}); answer it in the pane`, deps, config);
+  const detail = `waiting at a prompt (${prompt}) in ${where}; answer it there`;
+  await raiseAlert(agent, detail, deps, config);
   return { row: mkRow(agent, 'BLOCKED', detail), acted: true };
 }
 
@@ -419,7 +420,7 @@ async function launchRow(
     await deps.driver.launch(agent);
   } catch (err) {
     if (err instanceof FleetLaunchBlockedError) {
-      await raiseAlert(agent, `launch blocked: ${err.message}`, deps, config);
+      await raiseAlert(agent, err.message, deps, config);
       return { row: mkRow(agent, 'BLOCKED', err.message), acted: true };
     }
     const why = err instanceof Error ? err.message : String(err);

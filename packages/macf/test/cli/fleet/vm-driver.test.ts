@@ -1047,7 +1047,7 @@ describe('launch', () => {
       .launch('code-agent')
       .catch((e: unknown) => e);
     expect(err).toBeInstanceOf(FleetLaunchFailedError);
-    expect((err as Error).message).toContain('did not reach Claude Code');
+    expect((err as Error).message).toContain("tmux session macf@code-agent did not reach Claude Code's input prompt within 3s; attach to it to see why");
   });
 
   it('waits out a prompt the watcher answers, then succeeds once it clears', async () => {
@@ -1066,7 +1066,7 @@ describe('launch', () => {
       .launch('code-agent')
       .catch((e: unknown) => e);
     expect(err).toBeInstanceOf(FleetLaunchBlockedError);
-    expect((err as Error).message).toContain('prompt watcher did not clear');
+    expect((err as Error).message).toContain('which the prompt watcher did not clear');
   });
 
   it('reports BLOCKED at the real trust dialog on the first read, and answers nothing', async () => {

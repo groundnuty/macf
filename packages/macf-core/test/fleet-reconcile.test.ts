@@ -369,6 +369,8 @@ describe('reconcileFleet — launch outcome', () => {
     expect(decisionOf(r.rows, 'code-agent')).toBe('BLOCKED');
     expect(r.rows[0]!.detail).toContain('macf@code-agent');
     expect(h.alerts).toHaveLength(1);
+    expect(h.alerts[0]!.reason).toBe(r.rows[0]!.detail);
+    expect(h.alerts[0]!.reason).not.toContain('launch blocked');
     expect(r.rc).toBe(3);
   });
 
@@ -595,7 +597,9 @@ describe('reconcileFleet — prompt guard before heal', () => {
     const h = harness({ probe: deafProbe(), panes: paneFor(fx('live-trust-pane.txt')) });
     const r = await reconcileFleet(oneDeaf, h.deps, cfg({ execute: true, allowRestart: true }));
     expect(decisionOf(r.rows, 'devops-agent')).toBe('BLOCKED');
-    expect(r.rows[0]!.detail).toContain('answer it there');
+    expect(r.rows[0]!.detail).toMatch(/^waiting at a prompt \(.+\) in its tmux session; answer it there$/);
+    expect(h.alerts[0]!.reason).toBe(r.rows[0]!.detail);
+    expect(h.logs.some((l) => l.includes('a launch failed or an agent is waiting at a prompt; see the FAILED and BLOCKED rows above.'))).toBe(true);
     expect(r.rc).toBe(3);
     expect(h.calls.injected).toEqual([]);
     expect(h.calls.restarted).toEqual([]);
@@ -672,7 +676,8 @@ describe('reconcileFleet — prompt guard before heal', () => {
     expect(h.calls.restarted).toEqual([]);
     expect(h.alerts).toEqual([]);
     expect(h.storeCalls.writes).toEqual([]);
-    expect(h.logs.some((l) => l.includes('prompt watcher'))).toBe(true);
+    expect(r.rows[0]!.detail).toMatch(/^waiting at a prompt \(.+\) that the prompt watcher answers; left alone this sweep$/);
+    expect(h.logs.filter((l) => l.includes('prompt watcher'))).toHaveLength(1);
   });
 
   it('no prompt → Tier-1 inject as before', async () => {

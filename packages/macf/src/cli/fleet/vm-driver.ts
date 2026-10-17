@@ -621,10 +621,10 @@ export function createVmDriver(opts: VmDriverOptions, seams: VmDriverSeams): Fle
       if (prompt === null && isPaneReady(pane)) return;
       if (elapsed >= windowMs) {
         if (prompt !== null) {
-          throw new FleetLaunchBlockedError(session, `${prompt}; the prompt watcher did not clear it`);
+          throw new FleetLaunchBlockedError(session, `${prompt}, which the prompt watcher did not clear`);
         }
         throw new FleetLaunchFailedError(
-          `${session} did not reach Claude Code's input prompt within ${Math.round(windowMs / 1000)}s`,
+          `tmux session ${session} did not reach Claude Code's input prompt within ${Math.round(windowMs / 1000)}s; attach to it to see why`,
         );
       }
       await seams.sleep(pollMs);
