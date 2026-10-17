@@ -33,6 +33,23 @@ import { findCliPackageRoot } from '../../src/cli/rules.js';
 
 const HOOK_SCRIPT = join(findCliPackageRoot(), 'plugin', 'scripts', 'check-lgtm-gate.sh');
 
+/**
+ * Spawn a hook with an empty temp dir as cwd. The hook probes `.` for
+ * `.claude/scripts/macf-gh-token.sh`, so inheriting the runner's cwd finds the
+ * checkout's installed helper and breaks the "no workspace" tests.
+ */
+function spawnHookIsolated(
+  script: string,
+  opts: { readonly input: string; readonly env: Record<string, string>; readonly encoding: 'utf-8' },
+): ReturnType<typeof spawnSync> {
+  const cwd = mkdtempSync(join(tmpdir(), 'macf-lgtm-cwd-'));
+  try {
+    return spawnSync('bash', [script], { ...opts, cwd });
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+}
+
 interface StubReview {
   readonly authorLogin: string;
   readonly state: string;
@@ -173,7 +190,7 @@ function runHook(opts: {
     }
   }
   try {
-    return spawnSync('bash', [HOOK_SCRIPT], {
+    return spawnHookIsolated(HOOK_SCRIPT, {
       input: payload,
       env: cleanEnv,
       encoding: 'utf-8',
@@ -767,7 +784,7 @@ describe('check-lgtm-gate.sh (hook)', () => {
       // path then fires fail-open.
       const path = `${stubDir}:${process.env['PATH'] ?? ''}`;
       try {
-        const r = spawnSync('bash', [HOOK_SCRIPT], {
+        const r = spawnHookIsolated(HOOK_SCRIPT, {
           input: JSON.stringify({
             tool_name: 'Bash',
             tool_input: { command: 'gh pr merge 601 --repo owner/repo --squash' },
@@ -784,7 +801,7 @@ describe('check-lgtm-gate.sh (hook)', () => {
     it('falls through to allow on parse error (defense-in-depth)', () => {
       // Non-JSON stdin must not brick the harness — fail open.
       // Same convention as check-gh-token.sh + check-mention-routing.sh.
-      const r = spawnSync('bash', [HOOK_SCRIPT], {
+      const r = spawnHookIsolated(HOOK_SCRIPT, {
         input: 'not-json-at-all',
         env: { PATH: process.env['PATH'] ?? '' },
         encoding: 'utf-8',
@@ -793,7 +810,7 @@ describe('check-lgtm-gate.sh (hook)', () => {
     });
 
     it('falls through to allow on empty stdin', () => {
-      const r = spawnSync('bash', [HOOK_SCRIPT], {
+      const r = spawnHookIsolated(HOOK_SCRIPT, {
         input: '',
         env: { PATH: process.env['PATH'] ?? '' },
         encoding: 'utf-8',
@@ -831,7 +848,7 @@ exit 64
     it('blocks (fails CLOSED) when the extracted PR number is not a pull request — distinct message', () => {
       const stubDir = makeNotFoundStubGhDir();
       try {
-        const r = spawnSync('bash', [HOOK_SCRIPT], {
+        const r = spawnHookIsolated(HOOK_SCRIPT, {
           input: JSON.stringify({
             session_id: 'test',
             tool_name: 'Bash',
@@ -949,7 +966,7 @@ JSON_EOF
         env['KEY_PATH'] = '/irrelevant-to-the-stub.pem';
       }
       try {
-        return spawnSync('bash', [HOOK_SCRIPT], {
+        return spawnHookIsolated(HOOK_SCRIPT, {
           input: JSON.stringify({
             session_id: 'test',
             tool_name: 'Bash',
@@ -1025,7 +1042,7 @@ JSON_EOF
       const ws = makeWorkspace({ succeeds: true });
       const stubDir = makeTokenAwareStubGhDir(WITH_APPROVAL);
       try {
-        const r = spawnSync('bash', [HOOK_SCRIPT], {
+        const r = spawnHookIsolated(HOOK_SCRIPT, {
           input: JSON.stringify({
             session_id: 'test',
             tool_name: 'Bash',
@@ -1156,7 +1173,7 @@ exit 64
 `;
           writeFileSync(join(stubDir, 'gh'), stubScript);
           chmodSync(join(stubDir, 'gh'), 0o755);
-          const isolatedResult = spawnSync('bash', [isolatedHook], {
+          const isolatedResult = spawnHookIsolated(isolatedHook, {
             input: JSON.stringify({
               session_id: 'test',
               tool_name: 'Bash',
