@@ -51,7 +51,7 @@ import {
 } from '../config.js';
 import { createClientFromConfig } from '../registry-helper.js';
 import { discoverWorkspaces } from '../discovery.js';
-import { buildTmuxLaunchArgs } from './launch-command.js';
+import { buildTmuxLaunchArgs, ORCHESTRATOR_IDENTITY_ENV_KEYS } from './launch-command.js';
 import { gatherFleetStatus, type FleetProbeFn } from '../commands/fleet.js';
 import { classifyDirtyFile } from './canonical-compute.js';
 import { readMcpJsonChannelServerVersion } from '../mcp-json.js';
@@ -343,13 +343,7 @@ export function resolveTarget(
  * (defense-in-depth; not currently read by `resolveIdentity`, but it is the
  * other ambient workspace-identity var `claude.sh` exports).
  */
-export const ORCHESTRATOR_IDENTITY_ENV_KEYS = [
-  'MACF_WORKSPACE_DIR',
-  'MACF_PROJECT',
-  'MACF_ROUTING_LABEL',
-  'MACF_AGENT_NAME',
-  'CLAUDE_PROJECT_DIR',
-] as const;
+export { ORCHESTRATOR_IDENTITY_ENV_KEYS } from './launch-command.js';
 
 const DEFAULT_LAUNCH_TIMEOUT_MS = 30_000;
 const DEFAULT_LAUNCH_POLL_MS = 1_000;

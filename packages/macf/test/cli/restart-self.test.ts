@@ -434,7 +434,7 @@ describe('runRestartSelf — confirm path', () => {
     // `exec ./claude.sh` (which relies on claude.sh's own self-wrap — defeated
     // by inherited-but-stale $TMUX / no controlling terminal from a detached spawn).
     expect(relaunch!.content).toContain('exec tmux new-session -d -s "$SESSION"');
-    expect(relaunch!.content).toContain('MACF_NO_TMUX_WRAP=1 exec');
+    expect(relaunch!.content).toContain('exec env -u MACF_WORKSPACE_DIR -u MACF_PROJECT -u MACF_ROUTING_LABEL -u MACF_AGENT_NAME -u CLAUDE_PROJECT_DIR MACF_NO_TMUX_WRAP=1');
     expect(relaunch!.content).not.toMatch(/^exec \.\/claude\.sh$/m);
   });
 
@@ -811,7 +811,7 @@ describe('buildRelauncherScript', () => {
   it('relaunches via a fresh detached tmux session with MACF_NO_TMUX_WRAP=1 for the inner claude.sh (macf#711)', () => {
     const s = relauncher();
     expect(s).toContain('exec tmux new-session -d -s "$SESSION" -c "$WORKSPACE"');
-    expect(s).toContain('MACF_NO_TMUX_WRAP=1 exec');
+    expect(s).toContain('exec env -u MACF_WORKSPACE_DIR -u MACF_PROJECT -u MACF_ROUTING_LABEL -u MACF_AGENT_NAME -u CLAUDE_PROJECT_DIR MACF_NO_TMUX_WRAP=1');
     expect(s).toContain('$WORKSPACE/claude.sh');
     // The old bare-exec form must be fully gone — that was the bug.
     expect(s).not.toMatch(/^exec \.\/claude\.sh$/m);

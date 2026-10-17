@@ -8,9 +8,24 @@
  * terminal failed: not a terminal" when nothing has a terminal.
  */
 
+/**
+ * Identity variables a launched agent must never inherit (macf#763). A
+ * detached session takes the tmux SERVER's global environment, not the
+ * client's, and `env.identity` keeps an already-set value, so these are
+ * removed inside the session itself.
+ */
+export const ORCHESTRATOR_IDENTITY_ENV_KEYS = [
+  'MACF_WORKSPACE_DIR',
+  'MACF_PROJECT',
+  'MACF_ROUTING_LABEL',
+  'MACF_AGENT_NAME',
+  'CLAUDE_PROJECT_DIR',
+] as const;
+
 /** The command tmux runs inside the new session. `workspaceRef` is a path or a shell variable. */
 export function launchInnerCommand(workspaceRef: string): string {
-  return `MACF_NO_TMUX_WRAP=1 exec "${workspaceRef}/claude.sh"`;
+  const unset = ORCHESTRATOR_IDENTITY_ENV_KEYS.map((k) => `-u ${k}`).join(' ');
+  return `exec env ${unset} MACF_NO_TMUX_WRAP=1 "${workspaceRef}/claude.sh"`;
 }
 
 /** The `tmux` arguments that create the detached session and start the agent in it. */
