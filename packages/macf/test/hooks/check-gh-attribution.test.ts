@@ -19,7 +19,7 @@
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, readFileSync, existsSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { findCliPackageRoot } from '../../src/cli/rules.js';
@@ -71,11 +71,12 @@ function makeStubGhDir(stub: GhStub): string {
   const reviewArm =
     typeof stub === 'string'
       ? ''
-      : `printf '2025-01-01T00:00:00Z\\t%s\\t%s\\n' '${stub.login}' '${stub.type}'; exit 0`;
+      : `printf '%s\\t%s\\t%s\\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '${stub.login}' '${stub.type}'; exit 0`;
   const stubScript = `#!/usr/bin/env bash
 # Stub gh — handles \`gh api <path> --jq ...\` and \`gh repo view\`.
 [[ -n "\${STUB_LOG:-}" ]] && echo "$*" >> "$STUB_LOG"
 if [[ "$1" == "repo" ]]; then
+  [[ -n "\${STUB_CWD_LOG:-}" ]] && pwd >> "$STUB_CWD_LOG"
   echo "\${STUB_REPO:-groundnuty/macf}"; exit 0
 fi
 if [[ "$1" == "api" ]]; then
@@ -119,12 +120,15 @@ function runHook(opts: {
   readonly legacyOutputShape?: boolean;
   readonly env?: Record<string, string | undefined>;
   readonly stubGh?: GhStub;
+  /** The payload's `cwd` (where the command ran). */
+  readonly cwd?: string;
 }): ReturnType<typeof spawnSync> {
   const payload: Record<string, unknown> = {
     session_id: 'test',
     tool_name: 'Bash',
     tool_input: { command: opts.command },
   };
+  if (opts.cwd !== undefined) payload['cwd'] = opts.cwd;
   if (opts.output !== undefined) {
     if (opts.legacyOutputShape) {
       payload['tool_response'] = { stdout: opts.output };
@@ -481,6 +485,8 @@ describe('check-gh-attribution.sh (PostToolUse hook)', () => {
     const USER: GhStub = { login: 'orzech', type: 'User' };
     const BOTSTUB: GhStub = { login: BOT, type: 'Bot' };
     const bot = { MACF_EXPECTED_BOT_LOGIN: BOT };
+    const ago = (sec: number): string =>
+      new Date(Date.now() - sec * 1000).toISOString().replace(/\.\d+Z$/, 'Z');
 
     it('review by the bot → silent', () => {
       const { r } = hook('gh pr review 7 --approve', BOTSTUB, bot);
@@ -540,15 +546,68 @@ describe('check-gh-attribution.sh (PostToolUse hook)', () => {
       expect(r.status).toBe(2);
       expect(existsSync(marker)).toBe(false);
     });
-    it('the latest review on a later page decides', () => {
+    it('a recent review on a later page is read', () => {
       const { r, calls } = hook('gh pr review 7 --approve', USER, {
         ...bot,
-        STUB_PAGE1: `2025-01-01T00:00:00Z\\t${BOT}\\tBot`,
-        STUB_PAGE2: '2025-02-01T00:00:00Z\\torzech\\tUser',
+        STUB_PAGE1: `${ago(7200)}\\t${BOT}\\tBot`,
+        STUB_PAGE2: `${ago(10)}\\torzech\\tUser`,
       });
       expect(calls).toContain('--paginate');
       expect(r.status).toBe(2);
       expect(r.stderr).toContain('orzech');
+    });
+
+    it('the latest review is 2 hours old and by a user → silent (the command posted nothing)', () => {
+      const { r } = hook('gh pr review 7 --approve', USER, {
+        ...bot,
+        STUB_PAGE1: `${ago(7200)}\\torzech\\tUser`,
+        STUB_PAGE2: '',
+      });
+      expect(r.status).toBe(0);
+      expect(r.stderr).toBe('');
+    });
+    it('a recent review by the bot plus a recent one by a user → silent', () => {
+      const { r } = hook('gh pr review 7 --approve', USER, {
+        ...bot,
+        STUB_PAGE1: `${ago(20)}\\t${BOT}\\tBot`,
+        STUB_PAGE2: `${ago(5)}\\torzech\\tUser`,
+      });
+      expect(r.status).toBe(0);
+      expect(r.stderr).toBe('');
+    });
+    it('only a recent review by a user → warns', () => {
+      const { r } = hook('gh pr review 7 --approve', USER, {
+        ...bot,
+        STUB_PAGE1: `${ago(30)}\\torzech\\tUser`,
+        STUB_PAGE2: '',
+      });
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain('orzech');
+    });
+
+    it('a cd before the review with no --repo → silent, no repo lookup', () => {
+      const { r, calls } = hook('cd /x && gh pr review 7 --approve', USER, bot);
+      expect(r.status).toBe(0);
+      expect(r.stderr).toBe('');
+      expect(calls).not.toContain('repo view');
+    });
+    it('no --repo → the repo is looked up in the payload cwd', () => {
+      const dir = mkdtempSync(join(tmpdir(), 'macf-attr-cwd-'));
+      logs.push(dir);
+      const cwdDir = join(dir, 'elsewhere');
+      mkdirSync(cwdDir);
+      const cwdLog = join(dir, 'cwd.log');
+      const logDir = mkdtempSync(join(tmpdir(), 'macf-attr-log-'));
+      logs.push(logDir);
+      const r = runHook({
+        command: 'gh pr review 7 --approve',
+        output: '',
+        cwd: cwdDir,
+        stubGh: USER,
+        env: { STUB_LOG: join(logDir, 'gh.log'), STUB_CWD_LOG: cwdLog, ...bot },
+      });
+      expect(r.status).toBe(2);
+      expect(readFileSync(cwdLog, 'utf-8').trim()).toBe(realpathSync(cwdDir));
     });
 
     it('merge by the bot → silent', () => {

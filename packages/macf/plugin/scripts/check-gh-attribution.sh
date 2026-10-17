@@ -53,6 +53,8 @@ trap 'exit 0' ERR
 INPUT_JSON="$(cat)"
 COMMAND="$(jq -r '.tool_input.command // ""' <<<"$INPUT_JSON" 2>/dev/null || echo "")"
 [[ -z "$COMMAND" ]] && exit 0
+# The directory the command ran in (Claude Code passes it in the payload).
+CWD="$(jq -r '.cwd // ""' <<<"$INPUT_JSON" 2>/dev/null || echo "")"
 
 # ── Is this a gh-write op that produces an attributable resource? ─────────
 # Match the write subcommands whose output carries a resource/comment URL:
@@ -140,6 +142,8 @@ parse_pr_review() {
     if [[ "$started" -eq 0 ]]; then
       if [[ "$prev2" == "gh" && "$prev1" == "pr" && "$tok" == "review" ]]; then
         started=1
+      elif [[ "$tok" == "cd" || "$tok" == "pushd" ]]; then
+        SAW_CD=1
       fi
       prev2="$prev1"; prev1="$tok"
       continue
@@ -167,7 +171,7 @@ parse_pr_review() {
 }
 
 MODE=""
-OWNER=""; REPO=""; NUM=""; REPO_FLAG=""
+OWNER=""; REPO=""; NUM=""; REPO_FLAG=""; SAW_CD=0
 if is_gh_write "$COMMAND"; then
   MODE="generic"
 elif is_pr_review "$COMMAND"; then
@@ -268,7 +272,9 @@ fi
 # ── review / merge: resolve the repo (gh's own default if none given) ─────
 if [[ "$MODE" == "review" || "$MODE" == "merge" ]]; then
   if [[ -z "$OWNER" || -z "$REPO" ]]; then
-    NWO="$(GH_PAGER= macf_hook_gh repo view --json nameWithOwner -q .nameWithOwner)" || exit 0
+    # A cd/pushd earlier in the command may have moved gh to another repo.
+    [[ "$SAW_CD" == "1" ]] && exit 0
+    NWO="$( [[ -n "$CWD" && -d "$CWD" ]] && cd "$CWD"; GH_PAGER= macf_hook_gh repo view --json nameWithOwner -q .nameWithOwner)" || exit 0
     [[ "$NWO" == */* ]] || exit 0
     OWNER="$(cut -d/ -f1 <<<"$NWO")"
     REPO="$(cut -d/ -f2 <<<"$NWO")"
@@ -305,8 +311,12 @@ query_author() {
   if [[ "$MODE" == "review" ]]; then
     resp="$(GH_PAGER= macf_hook_gh api --paginate "$API_PATH" --jq "$AUTHOR_JQ")" || rc=$?
     if [[ "$rc" -eq 0 && -n "$resp" ]]; then
-      resp="$(printf '%s\n' "$resp" | LC_ALL=C sort -t$'\t' -k1,1 | tail -n 1 \
-        | jq -R 'split("\t") | {login: (.[1] // ""), type: (.[2] // "")}' 2>/dev/null || true)"
+      # Keep only reviews submitted within the window: an older review (or a
+      # concurrent one) is not evidence about what this command posted.
+      resp="$(printf '%s\n' "$resp" | jq -rR --argjson now "$(date -u +%s)" \
+        --argjson win "${MACF_ATTRIBUTION_REVIEW_WINDOW_SEC:-300}" \
+        'split("\t") | select((try (.[0] | fromdateiso8601) catch 0) > ($now - $win)) | @tsv' \
+        2>/dev/null | LC_ALL=C sort -t$'\t' -k1,1 || true)"
     fi
   else
     resp="$(GH_PAGER= macf_hook_gh api "$API_PATH" --jq "$AUTHOR_JQ")" || rc=$?
@@ -333,6 +343,17 @@ if [[ "$RC" -eq 1 ]]; then
 fi
 
 [[ -z "$RESP" ]] && exit 0
+
+# review: RESP holds the recent reviews, oldest first. None → nothing was
+# posted (or we cannot tell). Otherwise judge them all below and warn about
+# the most recent one.
+RECENT_REVIEWS=""
+if [[ "$MODE" == "review" ]]; then
+  RECENT_REVIEWS="$RESP"
+  RESP="$(printf '%s\n' "$RECENT_REVIEWS" | tail -n 1 \
+    | jq -R 'split("\t") | {login: (.[1] // ""), type: (.[2] // "")}' 2>/dev/null || true)"
+  [[ -z "$RESP" ]] && exit 0
+fi
 
 if [[ "$MODE" == "merge" ]]; then
   # The merge failed or was refused: nothing was merged, nothing to check.
@@ -387,33 +408,36 @@ normalize_login() {
   echo "${l,,}"
 }
 
-NORM_ACTUAL="$(normalize_login "$ACTUAL_LOGIN")"
+# Is this author acceptable? 0 = ok, 1 = mismatch (the trap).
+#   A matching login is ok. Otherwise trap when the expectation is
+#   AUTHORITATIVE (env / bot_login — a different author, even a Bot, is wrong)
+#   or a User wrote it (the Instance-12 trap, whatever the source). A Bot that
+#   only mismatches a NON-authoritative agent_name guess is the name!=slug
+#   case (macf#535) → ok. With no expected login, a Bot is ok, a User is not.
+author_ok() {
+  local login type norm_expected
+  login="$(normalize_login "$1")"; type="$2"
+  if [[ -n "$EXPECTED_LOGIN" ]]; then
+    norm_expected="$(normalize_login "$EXPECTED_LOGIN")"
+    [[ "$login" == "$norm_expected" ]] && return 0
+    if [[ "$EXPECTED_AUTHORITATIVE" == "1" || "$type" != "Bot" ]]; then
+      return 1
+    fi
+    return 0
+  fi
+  [[ "$type" == "Bot" ]] && return 0
+  return 1
+}
 
 # ── Decide: OK vs MISMATCH ────────────────────────────────────────────────
-MISMATCH=0
-if [[ -n "$EXPECTED_LOGIN" ]]; then
-  NORM_EXPECTED="$(normalize_login "$EXPECTED_LOGIN")"
-  if [[ "$NORM_ACTUAL" == "$NORM_EXPECTED" ]]; then
-    exit 0
-  fi
-  # Mismatch. Trap if the expectation is AUTHORITATIVE (env / bot_login — a
-  # different author, even a Bot, is wrong), OR a User authored it (the
-  # Instance-12 trap, regardless of source). A Bot author that only mismatches
-  # a NON-authoritative agent_name guess is the name!=slug case (macf#535) → ok.
-  if [[ "$EXPECTED_AUTHORITATIVE" == "1" || "$ACTUAL_TYPE" != "Bot" ]]; then
-    MISMATCH=1
-  else
-    exit 0
-  fi
-else
-  # No expected login known — best verifiable signal is the author TYPE.
-  # A Bot authored it → trust it (some bot posted; correct by design).
-  # A User authored it → the Instance-12 trap (a human account wrote it).
-  if [[ "$ACTUAL_TYPE" == "Bot" ]]; then
-    exit 0
-  fi
-  MISMATCH=1
+if [[ "$MODE" == "review" ]]; then
+  # Any recent review by the expected identity means ours landed.
+  while IFS=$'\t' read -r _ts r_login r_type; do
+    author_ok "$r_login" "$r_type" && exit 0
+  done <<<"$RECENT_REVIEWS"
 fi
+MISMATCH=0
+author_ok "$ACTUAL_LOGIN" "$ACTUAL_TYPE" || MISMATCH=1
 
 [[ "$MISMATCH" -ne 1 ]] && exit 0
 
