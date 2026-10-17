@@ -813,6 +813,47 @@ macf_extract_heredoc_body() {
 HANDLE_PATTERN='@[a-zA-Z][a-zA-Z0-9_-]*[[]bot[]]'
 
 # --- Chained comments: each is judged against its own body -----------------
+# Human mentions: a line-start @<login> (no [bot], not in fenced code) addresses
+# a person; GitHub notifies them directly. Reads text on stdin and prints
+# HUMAN:<login> per recipient, or TYPO:<login> when the login starts with
+# "${MACF_PROJECT}-" (a fleet agent missing its [bot] suffix).
+# This is a heuristic Markdown scan: it covers fenced code (with length),
+# blockquotes and indented code, and does not model HTML blocks or every
+# CommonMark edge case. A miss lets a recipient-free comment through, as before
+# this hook existed; it never blocks a real recipient.
+# Indented code: a line indented four or more spaces (or a tab) that follows a
+# blank line or another such line. List-item context is not modelled.
+macf_human_scan() {
+  awk -v proj="${MACF_PROJECT:-}" '
+  {
+    line = $0
+    sub(/^[[:space:]]*(>[[:space:]]?)+/, "", line)
+    if (match(line, /^[[:space:]]*(```+|~~~+)/)) {
+      run = substr(line, RSTART, RLENGTH)
+      sub(/^[[:space:]]+/, "", run)
+      fch = substr(run, 1, 1)
+      flen = length(run)
+      tail = substr(line, RSTART + RLENGTH)
+      if (in_fence == "") { in_fence = fch; open_len = flen }
+      else if (fch == in_fence && flen >= open_len && tail ~ /^[[:space:]]*$/) in_fence = ""
+      next
+    }
+    if (in_fence != "") next
+    if (line ~ /^[[:space:]]*$/) { blank = 1; next }
+    if (line ~ /^(    |\t)/ && (blank || icode)) { icode = 1; blank = 0; next }
+    icode = 0; blank = 0
+    sub(/^[[:space:]>]*([0-9]+\.[[:space:]]+|[-*][[:space:]]+)?/, "", line)
+    if (match(line, /^@[A-Za-z0-9][A-Za-z0-9-]*/)) {
+      login = substr(line, 2, RLENGTH - 1)
+      rest = substr(line, RLENGTH + 1, 1)
+      if (rest == "[" || rest == "_") next
+      if (proj != "" && index(login, proj "-") == 1) print "TYPO:" login
+      else print "HUMAN:" login
+    }
+  }
+'
+}
+
 # Counts routing-active mentions (not backticked) in the text on stdin.
 macf_count_active() {
   awk -v pat="$HANDLE_PATTERN" '
@@ -825,6 +866,19 @@ macf_count_active() {
     END { print n + 0 }'
 }
 
+# Mention count of the text on stdin: bot mentions plus one for any human
+# recipient. Prints TYPO:<login> instead when a fleet-typo recipient is found.
+macf_count_all() {
+  local t scan n typo
+  t="$(cat)"
+  scan="$(macf_human_scan <<<"$t")"
+  typo="$(grep -m1 '^TYPO:' <<<"$scan" || true)"
+  if [[ -n "$typo" ]]; then echo "$typo"; return 0; fi
+  n="$(macf_count_active <<<"$t")"
+  if [[ -n "$(grep '^HUMAN:' <<<"$scan" || true)" ]]; then n=$(( n + 1 )); fi
+  echo "$n"
+}
+
 # Prints the mention count of one chained comment's own body: its --body-file
 # (readable now, or a quoted heredoc in this command) or else its own text.
 # Prints nothing when its file cannot be resolved.
@@ -835,18 +889,24 @@ macf_chain_segment_count() {
     raw="${raw%\"}"; raw="${raw#\"}"; raw="${raw%\'}"; raw="${raw#\'}"
     path="$(macf_resolve_path_vars "$raw")"
     if [[ -n "$path" ]] && [[ -f "$path" ]] && [[ -r "$path" ]]; then
-      macf_count_active <"$path"
+      macf_count_all <"$path"
     elif body="$(macf_extract_heredoc_body "$raw" "$COMMAND")"; then
-      macf_count_active <<<"$body"
+      macf_count_all <<<"$body"
     fi
     return 0
   fi
-  macf_count_active <<<"$seg"
+  macf_count_all <<<"$seg"
 }
 
 if [[ "$IS_CREATE_SUBCOMMAND" == "true" || "$IS_CLOSE_SUBCOMMAND" == "true" ]]; then
   for seg in ${COMMENT_SEGS[@]+"${COMMENT_SEGS[@]}"}; do
     seg_count="$(macf_chain_segment_count "$seg")"
+    if [[ "$seg_count" == TYPO:* ]]; then
+      cat >&2 <<ERR
+BLOCKED by MACF mention-routing-hygiene hook: "@${seg_count#TYPO:}" looks like one of this fleet's agents but has no [bot] suffix, so it reaches no agent. Write @${seg_count#TYPO:}[bot] to reach the agent.
+ERR
+      exit 2
+    fi
     if [[ "$seg_count" == "0" ]]; then
       cat >&2 <<ERR
 BLOCKED by MACF mention-routing-hygiene hook: A comment chained after the create has no mention. Each chained comment needs its own mention of whoever should read it; neither the create nor the other comments cover it.
@@ -1042,6 +1102,22 @@ AWK_OUTPUT="$(awk -v pat="$HANDLE_PATTERN" '
 OFFENDING="$(grep '^LEAK:' <<<"$AWK_OUTPUT" | sed 's/^LEAK://' || true)"
 ACTIVE_COUNT="$(grep '^ACTIVE_COUNT:' <<<"$AWK_OUTPUT" | sed 's/^ACTIVE_COUNT://' || true)"
 
+# Human mentions: a line-start @<login> (no [bot]) addresses a person; GitHub
+# notifies them directly, so it satisfies Check A. A line-start @<login> that
+# starts with "${MACF_PROJECT}-" is a fleet agent missing its [bot] suffix.
+HUMAN_OUT="$(macf_human_scan <<<"$LINT_TARGET")"
+FLEET_TYPO="$(grep -m1 '^TYPO:' <<<"$HUMAN_OUT" | sed 's/^TYPO://' || true)"
+if [[ -n "$(grep '^HUMAN:' <<<"$HUMAN_OUT" || true)" ]]; then
+  ACTIVE_COUNT=$(( ACTIVE_COUNT + 1 ))
+fi
+
+if [[ -n "$FLEET_TYPO" ]]; then
+  cat >&2 <<ERR
+BLOCKED by MACF mention-routing-hygiene hook: "@$FLEET_TYPO" looks like one of this fleet's agents but has no [bot] suffix, so it reaches no agent. Write @$FLEET_TYPO[bot] to reach the agent.
+ERR
+  exit 2
+fi
+
 if [[ -n "$OFFENDING" ]]; then
   cat >&2 <<ERR
 BLOCKED by MACF mention-routing-hygiene hook: this comment/issue/PR body
@@ -1121,6 +1197,8 @@ Fix: add an addressing mention naming the recipient:
 Examples (where <recipient> is the issue reporter, PR reviewer, etc.):
   @macf-science-agent[bot] PR #N ready for review.
   @macf-code-agent[bot] LGTM, you can merge.
+
+To address a person rather than an agent, start a line with their GitHub login: @<login> <your message>
 
 Override (ONLY for legitimate no-recipient cases — rare; status posts
 on self-filed-self-closed issues, or test-orchestration scratch comments)

@@ -14,6 +14,8 @@ A raw `@handle[bot]` in an issue or PR comment routes the text to that agent, wh
 
 A comment with no routing-active `@mention` reaches nobody, so put the raw handle of whoever must act at the start of a line. A comment that only closes your own issue needs none.
 
+- A line-start `@<login>` for a person (no `[bot]`) also satisfies Check A: humans are notified by GitHub directly. A line-start `@<project>-<role>` without `[bot]` is blocked as a likely typo for the agent's handle.
+
 In a `--body` string, start the body with a newline before the handle, or use `--body-file`; the hook does not treat `--body "` as a line start.
 
 `gh issue create` needs an assignee label for another agent, or `backlog`. A mention in a new issue's body does not route, so the hook blocks a create without that label even when the body has a mention; to reach someone, mention them in a follow-up comment. A label naming yourself routes nowhere: the router skips a label applied by the agent it names. If the hook cannot confirm the label (no .github/agent-config.json in the workspace, or a --repo other than the workspace's), it allows the create and warns.

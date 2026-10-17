@@ -583,6 +583,117 @@ describe('check-mention-routing.sh (hook)', () => {
     });
   });
 
+  describe('human mentions (line-start @<login>)', () => {
+    const cmd = (body: string): string => `gh issue comment 123 --body "\n${body}"`;
+
+    it('allows a body that is only a line-start human mention', () => {
+      const r = runHook({ command: cmd('@groundnuty which dataset?') });
+      expect(r.status).toBe(0);
+    });
+
+    it('blocks a mid-line-only human mention (Check A, as before)', () => {
+      const r = runHook({ command: cmd('see @groundnuty') });
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain('zero');
+    });
+
+    it('does not count a backticked line-start human mention, but a bot mention elsewhere passes', () => {
+      const only = runHook({ command: cmd('`@groundnuty` fyi') });
+      expect(only.status).toBe(2);
+      const both = runHook({
+        command: 'gh issue comment 123 --body "$(cat <<EOF\n`@groundnuty` fyi\n@macf-science-agent[bot] ok?\nEOF\n)"',
+      });
+      expect(both.status).toBe(0);
+    });
+
+    it('blocks a line-start fleet name without [bot] and suggests the [bot] form', () => {
+      const r = runHook({ command: cmd('@demo-code-agent please look'), env: { MACF_PROJECT: 'demo' } });
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain('@demo-code-agent[bot]');
+      expect(r.stderr).toContain('no [bot] suffix');
+    });
+
+    it('does not count a human mention inside a fenced code block', () => {
+      const fence = '```';
+      const only = runHook({ command: cmd(`${fence}text\n@groundnuty example only\n${fence}`) });
+      expect(only.status).toBe(2);
+      expect(only.stderr).toContain('zero');
+      const both = runHook({
+        command: cmd(`${fence}text\n@groundnuty example only\n${fence}\n@groundnuty which dataset?`),
+      });
+      expect(both.status).toBe(0);
+    });
+
+    it('keeps a mention inside a four-backtick fence that holds a shorter fence line', () => {
+      const four = '````';
+      const three = '```';
+      const r = runHook({ command: cmd(`${four}text\n${three}\n@groundnuty example\n${four}`) });
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain('zero');
+    });
+
+    it('closes a four-backtick fence on a five-backtick line', () => {
+      const four = '````';
+      const five = '`````';
+      const r = runHook({ command: cmd(`${four}text\n@groundnuty example\n${five}\n@groundnuty which dataset?`) });
+      expect(r.status).toBe(0);
+    });
+
+    it('does not close a fence on a line that carries an info string', () => {
+      const three = '```';
+      const r = runHook({ command: cmd(`${three}\n${three}text\n@groundnuty example\n${three}`) });
+      expect(r.status).toBe(2);
+    });
+
+    it('does not count a human mention inside a blockquoted fence', () => {
+      const fence = '```';
+      const r = runHook({ command: cmd(`> ${fence}\n> @groundnuty example only\n> ${fence}`) });
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain('zero');
+    });
+
+    it('still counts a real line-start mention inside a blockquote', () => {
+      const r = runHook({ command: cmd('> @groundnuty question') });
+      expect(r.status).toBe(0);
+    });
+
+    it('does not count an indented code line after a blank line', () => {
+      const r = runHook({ command: cmd('see below\n\n    @groundnuty example') });
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain('zero');
+    });
+
+    it('counts a human recipient in a comment chained after a close', () => {
+      const chain = (body: string): string =>
+        `gh issue close 123 --comment done && gh issue comment 123 --body "\n${body}"`;
+      expect(runHook({ command: chain('@groundnuty question') }).status).toBe(0);
+      expect(runHook({ command: chain('no recipient here') }).status).toBe(2);
+      const fence = '```';
+      expect(runHook({ command: chain(`${fence}\n@groundnuty example\n${fence}`) }).status).toBe(2);
+      const typo = runHook({ command: chain('@demo-code-agent look'), env: { MACF_PROJECT: 'demo' } });
+      expect(typo.status).toBe(2);
+      expect(typo.stderr).toContain('no [bot] suffix');
+    });
+
+    it('gives no did-you-mean for a fleet name inside a fence', () => {
+      const fence = '```';
+      const r = runHook({
+        command: cmd(`${fence}\n@demo-code-agent please look\n${fence}`),
+        env: { MACF_PROJECT: 'demo' },
+      });
+      expect(r.status).toBe(2);
+      expect(r.stderr).not.toContain('no [bot] suffix');
+      expect(r.stderr).toContain('zero');
+    });
+
+    it('still passes a bot mention and still blocks zero mentions, with the person hint', () => {
+      expect(runHook({ command: cmd('@macf-science-agent[bot] ok?') }).status).toBe(0);
+      const r = runHook({ command: cmd('status only') });
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain('To address a person rather than an agent');
+    });
+  });
+
   describe('Check A — must-have-mention (macf#244)', () => {
     it('blocks `gh issue comment` with body containing zero @mentions', () => {
       // The canonical Check A failure mode: peer agent never sees the
