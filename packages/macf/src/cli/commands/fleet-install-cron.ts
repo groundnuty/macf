@@ -46,7 +46,7 @@ import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { MacfError } from '@groundnuty/macf-core';
 import { PACKAGE_VERSION } from '../../package-version.js';
-import { readAgentConfig, ownerAccountFromRegistry } from '../config.js';
+import { readAgentConfig, ownerAccountFromRegistry, tokenSourceFromConfig } from '../config.js';
 import { shellQuote } from '../fleet/launch-command.js';
 import { resolveWorkspaceDir, formatWorkspaceDirConflictWarning } from '../workspace-dir.js';
 
@@ -112,7 +112,7 @@ export interface FleetInstallCronDeps {
   readonly writeCrontab: (content: string) => void;
   /** True iff the `crontab` binary is on PATH. */
   readonly crontabAvailable: () => boolean;
-  /** App creds from `<workspace>/.claude/settings.local.json` `.env`, or null. */
+  /** App creds from `macf-agent.json` `github_app`, else `settings.local.json` `.env`, or null. */
   readonly readAppCreds: () => AppCreds | null;
   /** The installing shell's PATH, baked into the line; null or empty when unset. */
   readonly installPath: () => string | null;
@@ -207,6 +207,7 @@ export function buildTokenPrefix(args: {
 
   const helper = join(args.workspaceDir, TOKEN_HELPER_REL);
   const settings = join(args.workspaceDir, '.claude', 'settings.local.json');
+  const agentJson = join(args.workspaceDir, '.macf', 'macf-agent.json');
   if (!args.helperExists(helper)) {
     return {
       prefix: '',
@@ -223,7 +224,7 @@ export function buildTokenPrefix(args: {
     return {
       prefix: '',
       warning:
-        `APP_ID/INSTALL_ID/KEY_PATH not all readable from ${settings} — no token ` +
+        `APP_ID/INSTALL_ID/KEY_PATH not all readable from ${agentJson} or ${settings} — no token ` +
         `baked (fleet-doctor may 401). Pass --no-token to silence.`,
     };
   }
@@ -550,7 +551,7 @@ export function createRealDeps(workspaceDir: string): FleetInstallCronDeps {
         }
       }
     },
-    readAppCreds: () => readAppCredsFromSettings(workspaceDir),
+    readAppCreds: () => readAppCreds(workspaceDir),
     installPath: () => process.env['PATH'] ?? null,
     resolveMacf: () => resolveOnPath('macf'),
     macfVersion: (path: string) => {
@@ -591,6 +592,19 @@ function resolveOnPath(name: string): string | null {
     }
   }
   return null;
+}
+
+/**
+ * App creds for the token bake: `macf-agent.json` `github_app` first (what `macf init`
+ * writes), then `settings.local.json` `.env` for older workspaces.
+ */
+export function readAppCreds(workspaceDir: string): AppCreds | null {
+  const config = readAgentConfig(workspaceDir);
+  if (config?.github_app) {
+    const src = tokenSourceFromConfig(workspaceDir, config);
+    return { appId: src.appId, installId: src.installId, keyPath: src.keyPath };
+  }
+  return readAppCredsFromSettings(workspaceDir);
 }
 
 /** Read `.env.{APP_ID,INSTALL_ID,KEY_PATH}` from the workspace's settings.local.json. */
