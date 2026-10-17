@@ -747,7 +747,7 @@ describe('computePlan — runner_warm item (DR-043 Amendment I, groundnuty/macf#
     // now carry a `delete` verb (see `unimplementedReasonFor`'s doc: a
     // verb-level fact, checked before the per-kind switch this test's own
     // describe block otherwise exercises).
-    expect(Object.keys(APPLY_UNIMPLEMENTED_REASONS)).toEqual(['routing', 'rowFourDelete']);
+    expect(Object.keys(APPLY_UNIMPLEMENTED_REASONS)).toEqual(['rowFourDelete']);
   });
 
   it('is present in EVERY plan that declares routing.runner — a fleet-level item, not per-agent', () => {
@@ -1126,12 +1126,13 @@ describe('computePlan — row 4 (DR-043 Amendment P3, groundnuty/macf#1229): neg
     for (const item of orphanItems) {
       expect(planItemApplyCoverage(item)).toBe('implemented');
     }
-    // And 'delete' items DO surface as not_implemented — the deliberate
-    // "computation only, apply is unwired" contract for THIS change.
+    // 'delete' items for a secret fingerprint surface as not_implemented:
+    // apply-delete.ts has no variable name to target. A routing delete is
+    // implemented (apply-delete.ts executes it).
     const deleteItems = plan.items.filter((i) => i.verb === 'delete');
     expect(deleteItems.length).toBeGreaterThan(0);
     for (const item of deleteItems) {
-      expect(planItemApplyCoverage(item)).toBe('not_implemented');
+      expect(planItemApplyCoverage(item)).toBe(item.kind === 'routing' ? 'implemented' : 'not_implemented');
     }
     expect(plan.unimplementedByApply.some((i) => i.verb === 'delete')).toBe(true);
     expect(plan.unimplementedByApply.some((i) => i.verb === 'orphan')).toBe(false);
@@ -1674,6 +1675,8 @@ describe('planItemApplyCoverage — the single source of truth for what apply ca
     // absent) — only `update` (a diverging value) stays not_implemented,
     // see the table below.
     ['routing', 'create'],
+    ['routing', 'update'],
+    ['routing', 'delete'],
     // groundnuty/macf#943 — apply-fleet.ts drives the runner-ops
     // through the exact same applyIdentity gate1/gate2 primitive as an
     // 'app'/'install' item; a pure presence check (presenceVerb) so only
@@ -1683,7 +1686,7 @@ describe('planItemApplyCoverage — the single source of truth for what apply ca
     expect(planItemApplyCoverage(fakeItem(kind, verb))).toBe('implemented');
   });
 
-  it.each<[PlanItemKind, PlanVerb]>([['routing', 'update']])('%s/%s is not_implemented', (kind, verb) => {
+  it.each<[PlanItemKind, PlanVerb]>([['secret_fingerprint', 'delete']])('%s/%s is not_implemented', (kind, verb) => {
     expect(planItemApplyCoverage(fakeItem(kind, verb))).toBe('not_implemented');
   });
 
@@ -1708,24 +1711,14 @@ describe('computePlan — unimplementedByApply (plan must not overstate what app
     expect(plan.unimplementedByApply).toEqual([]);
   });
 
-  it('flags a diverging routing value (update) — CA never appears, and runner_warm no longer appears either (groundnuty/macf#943 — apply now calls the runner-provisioning contract)', () => {
+  it('does NOT flag a diverging routing value (update) — apply reconciles it (reconcileTrustedActors, macf#1319)', () => {
     const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
     const observed: ObservedState = { ...EMPTY_OBSERVED, routingTrustedActors: 'github-hosted' };
     const plan = computePlan(manifest, observed);
-    expect(plan.unimplementedByApply.map((i) => i.kind)).toEqual(['routing']);
-    expect(plan.unimplementedByApply[0]?.verb).toBe('update');
-    for (const item of plan.unimplementedByApply) {
-      expect(item.reason.length).toBeGreaterThan(0);
-      expect(item.reason).not.toBe(plan.items.find((p) => p.target === item.target)?.reason);
-    }
-    // groundnuty/macf#1229 / DR-043 Amendment P3 — `unimplementedReasonFor`
-    // now checks `item.verb === 'delete'` BEFORE its per-kind switch (see
-    // that function's own doc); this pins that a `routing`/`update` item
-    // still resolves through the UNCHANGED per-kind switch to its
-    // pre-existing reason, not accidentally to `rowFourDelete` (verb here is
-    // `'update'`, not `'delete'` — the two checks are disjoint by verb, but
-    // worth asserting the VALUE, not just the shape).
-    expect(plan.unimplementedByApply[0]?.reason).toBe(APPLY_UNIMPLEMENTED_REASONS.routing);
+    const routing = plan.items.find((i) => i.kind === 'routing');
+    expect(routing?.verb).toBe('update');
+    expect(plan.unimplementedByApply.some((i) => i.kind === 'routing')).toBe(false);
+    expect(formatPlanText(plan)).not.toMatch(/NOT IMPLEMENTED BY APPLY/);
   });
 
   it('does NOT flag routing when it matches (noop) or is absent (create) — runner_warm no longer appears either way (groundnuty/macf#943)', () => {
@@ -1816,28 +1809,32 @@ describe('computePlan — unimplementedByApply (plan must not overstate what app
     expect(plan.unimplementedByApply).toEqual([]);
   });
 
+  // The one kind apply still cannot action: a secret_fingerprint delete.
+  function planWithSecretDelete() {
+    const observed: ObservedState = {
+      lock: lockWithRole('gone-agent'),
+      agents: extraRoleObserved('gone-agent'),
+      caRegistry: 'unknown',
+      caRepos: {},
+      controlRepoPresence: 'absent',
+    };
+    return computePlan(baseManifest(), observed);
+  }
+
   it('formatUnimplementedLines renders the exact loud-line shape, distinct wording from SKIPPED', () => {
-    // macf#838 Amendment D phase 2 + macf#943: CA and runner_warm are both
-    // fully implemented now — the remaining unimplemented case is a
-    // diverging routing value.
-    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
-    const observed: ObservedState = { ...EMPTY_OBSERVED, routingTrustedActors: 'github-hosted' };
-    const plan = computePlan(manifest, observed);
+    const plan = planWithSecretDelete();
     const lines = formatUnimplementedLines(plan.unimplementedByApply);
-    expect(lines.length).toBe(1);
-    expect(lines[0]).toMatch(/^routing:.* \(update\) — NOT IMPLEMENTED BY APPLY \(.+\)$/);
+    expect(lines.length).toBeGreaterThan(0);
     for (const line of lines) {
+      expect(line).toMatch(/^secret_fingerprint:.* \(delete\) — NOT IMPLEMENTED BY APPLY \(.+\)$/);
       expect(line).not.toContain('SKIPPED');
     }
   });
 
   it('formatPlanText includes the ⚠ NOT IMPLEMENTED block when unimplementedByApply is non-empty', () => {
-    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
-    const observed: ObservedState = { ...EMPTY_OBSERVED, routingTrustedActors: 'github-hosted' };
-    const plan = computePlan(manifest, observed);
-    const text = formatPlanText(plan);
-    expect(text).toMatch(/NOT IMPLEMENTED BY APPLY/);
-    expect(text).toMatch(/routing:icsoc-2026:runner/);
+    const plan = planWithSecretDelete();
+    expect(plan.unimplementedByApply.length).toBeGreaterThan(0);
+    expect(formatPlanText(plan)).toMatch(/NOT IMPLEMENTED BY APPLY/);
   });
 
   it('formatPlanText OMITS the NOT IMPLEMENTED block entirely when unimplementedByApply is empty', () => {

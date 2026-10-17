@@ -1013,7 +1013,7 @@ export interface UnimplementedApplyItem {
 /**
  * The reason text for each kind/verb pair `apply` still cannot action.
  * Keyed by kind, not by item, so this stays the ONE place to update when a
- * future increment wires the remaining routing-update orchestrator step.
+ * future increment wires apply's remaining unimplemented step.
  *
  * `repoCreate` is GONE (macf#857, DR-043 Amendment F) — `apply-repo-init.ts`
  * ::`ensureAgentRepo` now creates a missing agent repo from
@@ -1054,23 +1054,12 @@ export interface UnimplementedApplyItem {
  * failure is reported via `FleetApplyResult.runnerProvision`, non-fatally).
  */
 export const APPLY_UNIMPLEMENTED_REASONS = {
-  routing:
-    'apply writes MACF_TRUSTED_ACTORS when the variable is ABSENT (create-only) but does NOT overwrite a PRESENT-but-' +
-    'diverging value — the task\'s create-only posture ("never silently overwrite") leaves this specific update ' +
-    'un-actioned. Set the repo variable manually to the declared value, or re-run apply once a future increment ' +
-    'adds confirmed per-item updates; nothing above was changed for this item.',
-  // groundnuty/macf#1229 / DR-043 Amendment P3 — row 4's `delete` verb, for
-  // EVERY kind it can appear on (variables via `routing`, secrets via
-  // `secret_fingerprint`): plan computes the negative diff, but this change
-  // deliberately does not wire apply's deletion path (plan-side computation
-  // only — see `planItemApplyCoverage`'s `delete` arm). One shared reason
-  // text, not one per kind, because the fact is verb-level ("apply doesn't
-  // delete yet"), not kind-level.
+  // Row 4's `delete` verb for `secret_fingerprint` only. A `routing` delete is
+  // executed by `apply-delete.ts`; a fingerprint is lock-only bookkeeping with
+  // no registry variable apply could target.
   rowFourDelete:
-    'plan has computed this as a negative diff (fleet.lock records this tool as the one that provisioned it, and ' +
-    "it is no longer declared) but apply's deletion path is deliberately left unwired in this change — plan " +
-    'computes the diff, nothing removes it automatically yet. Remove it by hand, or wait for a future increment ' +
-    'that wires confirmed per-item deletes; nothing above was changed for this item.',
+    'apply cannot delete this secret: its fingerprint is recorded only in fleet.lock, so apply has no ' +
+    'name to target and will not guess one. Remove it by hand; nothing above was changed for this item.',
 } as const;
 
 /**
@@ -1100,7 +1089,8 @@ export function planItemApplyCoverage(item: PlanItem): ApplyCoverage {
   // (which would require every present-and-future delete-eligible kind to
   // remember to say so), so a future deletion-wiring increment flips exactly
   // this line and nothing else.
-  if (item.verb === 'delete') return 'not_implemented';
+  // `routing` deletes run in `apply-delete.ts`; `secret_fingerprint` deletes do not.
+  if (item.verb === 'delete') return item.kind === 'routing' ? 'implemented' : 'not_implemented';
   switch (item.kind) {
     case 'app':
     case 'install':
@@ -1173,20 +1163,12 @@ export function planItemApplyCoverage(item: PlanItem): ApplyCoverage {
       // shape as 'ca'/'routing_client' above.
       return 'implemented';
     case 'routing':
-      // macf#838 Amendment D phase 2: apply-fleet.ts writes MACF_TRUSTED_ACTORS
-      // when absent (create) — macf#922 corrected the target from
-      // MACF_ROUTING_RUNS_ON, a variable the v3 router never reads. It does
-      // NOT overwrite a present-but-diverging value — the task's create-only
-      // posture forces `update` to stay un-actioned (see
-      // APPLY_UNIMPLEMENTED_REASONS.routing). By this point in the switch
-      // `item.verb` is guaranteed to be 'create' or 'update' (noop/report-
-      // extra returned above), so this is exhaustive over the two remaining
-      // verbs. (A 'create' item can STILL be skipped at apply time for want
-      // of a confirmed-registered runner — that is a runtime, per-repo gate
-      // rendered via `EnsureVariableOutcome`'s 'skipped' status in `apply`'s
-      // own summary, not a plan-time apply-coverage gap; see
-      // `apply-routing.ts`'s doc.)
-      return item.verb === 'create' ? 'implemented' : 'not_implemented';
+      // `create` writes MACF_TRUSTED_ACTORS when absent (apply-routing.ts);
+      // `update` reconciles a diverging value (`reconcileTrustedActors`,
+      // apply-fleet.ts, macf#1319). A `create` can still be skipped at apply
+      // time for want of a registered runner; that is a runtime gate shown in
+      // apply's own summary, not a coverage gap.
+      return 'implemented';
     case 'runner_warm':
       // groundnuty/macf#942 (DR-043 Amendment I) declared the field;
       // groundnuty/macf#943 wired the enforcement — `apply-fleet.ts` now
@@ -1306,7 +1288,6 @@ function unimplementedReasonFor(item: PlanItem): string {
   if (item.verb === 'delete') return APPLY_UNIMPLEMENTED_REASONS.rowFourDelete;
   switch (item.kind) {
     case 'routing':
-      return APPLY_UNIMPLEMENTED_REASONS.routing;
     case 'app':
     case 'install':
     case 'secret_fingerprint':

@@ -185,7 +185,7 @@ describe('runBootstrapPlan', () => {
     expect(json.unimplemented_by_apply).toEqual([]);
   });
 
-  it('--json carries ONLY a diverging routing value under unimplemented_by_apply — the remaining honest gap (macf#838 Amendment D phase 2); runner_warm is fully implemented as of groundnuty/macf#943', async () => {
+  it('--json has no unimplemented_by_apply entry for a diverging routing value — apply reconciles it (macf#1319)', async () => {
     const { dir, file } = writeManifest(VALID_FLEET_YAML_WITH_ROUTING);
     dirs.push(dir);
     logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -195,11 +195,7 @@ describe('runBootstrapPlan', () => {
     const json = JSON.parse(logSpy.mock.calls.flat().join('')) as {
       unimplemented_by_apply: ReadonlyArray<{ kind: string; target: string; verb: string; reason: string }>;
     };
-    expect(json.unimplemented_by_apply.length).toBe(1);
-    expect(json.unimplemented_by_apply.map((i) => i.kind)).toEqual(['routing']);
-    expect(json.unimplemented_by_apply[0]?.verb).toBe('update');
-    expect(json.unimplemented_by_apply.some((i) => i.kind === 'ca')).toBe(false);
-    expect(json.unimplemented_by_apply.some((i) => i.kind === 'runner_warm')).toBe(false);
+    expect(json.unimplemented_by_apply).toEqual([]);
   });
 
   it('plain-text mode renders the human table + the skipped-section loud line', async () => {
@@ -219,7 +215,7 @@ describe('runBootstrapPlan', () => {
     expect(out).not.toMatch(/NOT IMPLEMENTED BY APPLY/);
   });
 
-  it('plain-text mode STILL renders the ⚠ NOT IMPLEMENTED BY APPLY block for a diverging routing value', async () => {
+  it('plain-text mode lists a diverging routing value as an update, with no NOT IMPLEMENTED BY APPLY', async () => {
     const { dir, file } = writeManifest(VALID_FLEET_YAML_WITH_ROUTING);
     dirs.push(dir);
     logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -228,10 +224,7 @@ describe('runBootstrapPlan', () => {
     expect(code).toBe(0);
 
     const out = logSpy.mock.calls.flat().join('\n');
-    // macf#854 — the plan text names the items apply has no code path for
-    // yet (distinct wording from "SKIPPED" — see plan.ts's
-    // formatUnimplementedLines doc).
-    expect(out).toMatch(/NOT IMPLEMENTED BY APPLY/);
+    expect(out).not.toMatch(/NOT IMPLEMENTED BY APPLY/);
     expect(out).toContain('routing:icsoc-2026:runner');
   });
 

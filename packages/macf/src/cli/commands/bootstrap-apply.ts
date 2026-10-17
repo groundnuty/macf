@@ -1119,17 +1119,10 @@ export function formatApprovalBanner(plan: FleetPlan, creations: readonly Planne
   // typing "yes" — restate the count here so approving doesn't read as
   // approving work that will silently never happen.
   //
-  // groundnuty/macf#1272 — `'routing'`-kind `delete` items are excluded from
-  // this count: `plan.ts`'s `unimplementedReasonFor` still marks EVERY
-  // `delete`-verb item `'not_implemented'` (a plan.ts-side fact this file
-  // cannot change — row 4 is not this file's to correct), but this file DOES
-  // now action `'routing'` deletes (see `formatDeletionEnumerationLines`
-  // above) — leaving them in this count would restate the SAME false-promise
-  // shape the #1272 blocker fixed, just about "not implemented" instead of
-  // "nothing is deleted." `'secret_fingerprint'` items stay counted here —
-  // this file genuinely does not implement them this increment (see
-  // `apply-delete.ts`'s module doc).
-  const stillUnimplemented = plan.unimplementedByApply.filter((u) => !(u.verb === 'delete' && u.kind === 'routing'));
+  // `plan.unimplementedByApply` no longer lists `'routing'` deletes (apply
+  // executes them, see `apply-delete.ts`); only `'secret_fingerprint'`
+  // deletes remain counted here.
+  const stillUnimplemented = plan.unimplementedByApply;
   if (stillUnimplemented.length > 0) {
     lines.push(
       `⚠ ${String(stillUnimplemented.length)} item(s) in the plan above are NOT IMPLEMENTED by apply yet — ` +

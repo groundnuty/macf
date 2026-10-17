@@ -269,13 +269,13 @@ describe('macf bootstrap apply — increment 1 (dry-run only)', () => {
     expect(out).not.toMatch(/NOT IMPLEMENTED BY APPLY/);
   });
 
-  it('--dry-run STILL renders the ⚠ NOT IMPLEMENTED BY APPLY block for a diverging routing value (macf#838 Amendment D phase 2)', async () => {
+  it('--dry-run lists a diverging routing value as an update, with no NOT IMPLEMENTED BY APPLY block (macf#1319)', async () => {
     const file = writeManifest(FLEET_YAML_WITH_ROUTING);
     const code = await runBootstrapApply({ file, dryRun: true }, { observe: () => Promise.resolve(OBSERVED_ROUTING_DRIFT) });
     expect(code).toBe(0);
     const out = logs.join('\n');
-    expect(out).toMatch(/NOT IMPLEMENTED BY APPLY/);
-    expect(out).toMatch(/\brouting:.*\(update\)/);
+    expect(out).not.toMatch(/NOT IMPLEMENTED BY APPLY/);
+    expect(out).toMatch(/routing:\S+:runner/);
     expect(out).not.toMatch(/\bca:.*\(create\)/);
   });
 
@@ -2978,7 +2978,7 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
   // and it must do so EVEN UNDER --yes, since --yes skips the pre-approval
   // render entirely (the final summary is the ONLY output an automated run sees).
 
-  it('final summary (--yes, non-json) lists the ONE remaining apply-unimplemented item — a diverging routing value (macf#838 Amendment D phase 2) — the plan-approve-once artifact is skipped under --yes, so this is the only place it surfaces', async () => {
+  it('final summary (--yes, non-json) has no NOT IMPLEMENTED block for a diverging routing value — apply reconciles it (macf#1319)', async () => {
     const file = writeManifest(FLEET_YAML_WITH_ROUTING);
     // macf#932 — opts.runnerToken required so the pre-flight doesn't refuse
     // before this test's routing-drift/unimplemented-block assertions ever
@@ -2990,15 +2990,8 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     );
     expect(code).toBe(0);
     const out = logs.join('\n');
-    expect(out).toMatch(/NOT IMPLEMENTED BY APPLY/);
-    // CA is fully implemented now (macf#838 Amendment D phase 2) — it must
-    // NOT appear here; the routing update (diverging value, create-only
-    // posture never overwrites) does. The warm posture is ALSO fully
-    // implemented now (groundnuty/macf#943 — apply calls the runner-
-    // provisioning contract), so it must NOT appear either.
-    expect(out).not.toMatch(/\bca:/);
-    expect(out).not.toMatch(/\brunner_warm:/);
-    expect(out).toMatch(/\brouting:.*\(update\)/);
+    expect(out).not.toMatch(/NOT IMPLEMENTED BY APPLY/);
+    expect(out).not.toMatch(/\brouting:.*\(update\)/);
   });
 
   it('final summary (--yes, non-json) shows NO unimplemented block on a fresh fleet with no routing declared — CA is fully implemented (macf#838 Amendment D phase 2)', async () => {
@@ -3017,7 +3010,7 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     expect(out).toMatch(/Control repo sync: pushed\./);
   });
 
-  it('final summary (--yes, --json) carries unimplemented_by_apply with ONLY the diverging routing item (macf#838 Amendment D phase 2) — ca, repo, and runner_warm are NOT among them', async () => {
+  it('final summary (--yes, --json) carries an empty unimplemented_by_apply for a diverging routing value (macf#1319)', async () => {
     const file = writeManifest(FLEET_YAML_WITH_ROUTING);
     // macf#932 — see SENTINEL_RUNNER_TOKEN's doc above.
     const code = await runBootstrapApply(
@@ -3031,9 +3024,7 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       control_repo: { status: string };
       control_repo_sync: { status: string };
     };
-    expect(parsed.unimplemented_by_apply.length).toBe(1);
-    const routingItem = parsed.unimplemented_by_apply.find((i) => i.kind === 'routing');
-    expect(routingItem?.verb).toBe('update');
+    expect(parsed.unimplemented_by_apply).toEqual([]);
     // ca is fully implemented now (macf#838 Amendment D phase 2); repo has
     // been since macf#857; runner_warm has been since groundnuty/macf#943
     // (apply calls the runner-provisioning contract) — none appear here.
@@ -3185,7 +3176,7 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
     expect(parsed.version_phase).toMatchObject({ target: '0.2.60', halted: false });
   });
 
-  it('pre-approval stderr render (interactive path, confirmPlan declines) ALSO shows the NOT IMPLEMENTED block before the abort', async () => {
+  it('pre-approval stderr render (interactive path, confirmPlan declines) lists the routing update with no NOT IMPLEMENTED block', async () => {
     // The DR-035 §4 plan-approve-once artifact goes straight to
     // `process.stderr.write` (not `console.error`) so a human running
     // without --json sees the SAME text a script skips past — spy on the
@@ -3212,7 +3203,8 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       expect(code).toBe(1);
       // The plan-approve-once artifact is written to stderr BEFORE the
       // prompt — the operator must see this before typing "yes", not just after.
-      expect(rawWrites.join('')).toMatch(/NOT IMPLEMENTED BY APPLY/);
+      expect(rawWrites.join('')).not.toMatch(/NOT IMPLEMENTED BY APPLY/);
+      expect(rawWrites.join('')).toMatch(/routing:\S+:runner/);
     } finally {
       writeSpy.mockRestore();
     }
