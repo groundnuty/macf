@@ -509,13 +509,15 @@ export async function runFleetInstallCron(
   });
 
   const line = buildCronLine({ schedule: opts.schedule, scriptPath, logPath, marker });
-  if (line.length > MAX_CRON_LINE) {
+  // Cron's command buffer is in bytes, so measure UTF-8 bytes, not UTF-16 units.
+  const bytes = (v: string): number => Buffer.byteLength(v, 'utf8');
+  if (bytes(line) > MAX_CRON_LINE) {
     const [name, value] =
-      scriptPath.length >= logPath.length ? (['script path', scriptPath] as const) : (['log path', logPath] as const);
+      bytes(scriptPath) >= bytes(logPath) ? (['script path', scriptPath] as const) : (['log path', logPath] as const);
     deps.warn(
-      `macf fleet install-cron: the crontab line is ${line.length} characters; cron caps a command ` +
-        `at 1000 and this limit is ${MAX_CRON_LINE}. The longest value is the ${name} (${value.length} ` +
-        'characters); use a shorter one (for the log, pass --log).',
+      `macf fleet install-cron: the crontab line is ${bytes(line)} bytes; cron caps a command ` +
+        `at 1000 and this limit is ${MAX_CRON_LINE}. The longest value is the ${name} (${bytes(value)} ` +
+        'bytes); use a shorter one (for the log, pass --log).',
     );
     return 2;
   }

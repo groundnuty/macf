@@ -437,6 +437,16 @@ describe('crontab line length', () => {
       expect(msg).toContain('log path');
     }
   });
+
+  it('measures the cap in UTF-8 bytes: a multibyte log path under 900 characters but over 900 bytes is refused', async () => {
+    const log = `/var/log/${'ł'.repeat(400)}.log`;
+    expect(log.length).toBeLessThan(MAX_CRON_LINE - 200);
+    const { deps, rec } = fakeDeps();
+    const code = await runFleetInstallCron(baseOpts({ log }), deps);
+    expect(code).toBe(2);
+    expect(rec.writes).toHaveLength(0);
+    expect(rec.warns.join('\n')).toContain('bytes');
+  });
 });
 
 describe('the script file', () => {
