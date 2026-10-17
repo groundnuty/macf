@@ -4791,6 +4791,11 @@ describe('formatApplyResult / fleetApplyResultToJson / applyExitCode (pure)', ()
     expect(applyExitCode(result)).toBe(0);
   });
 
+  it('a deploy-phase host-skip does not fail the run', () => {
+    const skipped = [{ role: 'a', destDir: '/x', outcome: { role: 'a', status: 'skipped' as const, reason: 'not on this host' } }];
+    expect(applyExitCode(resultWith(), skipped)).toBe(0);
+  });
+
   it('applyExitCode: 1 when any agent is failed/drift/skipped-unverified', () => {
     expect(applyExitCode(resultWith({ agents: [{ role: 'a', identity: { role: 'a', status: 'failed', reason: 'x' } }] }))).toBe(1);
     expect(applyExitCode(resultWith({ agents: [{ role: 'a', identity: { role: 'a', status: 'skipped-unverified', appId: '1', reason: 'x' } }] }))).toBe(1);

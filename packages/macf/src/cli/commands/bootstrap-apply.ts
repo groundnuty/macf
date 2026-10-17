@@ -151,7 +151,7 @@ import { checkRegistryScopePreflight } from '../bootstrap/registry-scope-preflig
 import { ageRecipientsRecordAbsent, ageRecipientsRecordAbsentNotice, checkAgeRecipientsNarrowing } from '../bootstrap/age-recipients-narrowing.js';
 import { reconcileFederatedTrustVerdicts, federatedTrustNotices } from '../bootstrap/apply-federated-trust.js';
 import type { DeployFlagsEcho, RemainingDeployReport, RemainingDeployStep } from '../bootstrap/remaining-deploy.js';
-import { computeRemainingDeploy, formatRemainingDeployLines } from '../bootstrap/remaining-deploy.js';
+import { buildDeployCommand, computeRemainingDeploy, formatRemainingDeployLines } from '../bootstrap/remaining-deploy.js';
 import type { ApplyDeployPhaseDeps, DeployPhaseAgentResult } from '../bootstrap/apply-deploy.js';
 import { anyDeployFailed, runApplyDeployPhase } from '../bootstrap/apply-deploy.js';
 import { realAuthenticatedCloneRepo, realMintCloneToken, deployAgent as realDeployAgent } from '../bootstrap/fleet-deploy.js';
@@ -1850,6 +1850,8 @@ export interface DeployPhaseRenderInput {
   readonly results?: readonly DeployPhaseAgentResult[];
   readonly skipReason?: string;
   readonly checkAgentCertPresent?: (destDir: string) => boolean;
+  /** The copy-pasteable `macf fleet deploy` command for a role; names the remedy on a host-skipped agent. */
+  readonly commandFor?: (role: string) => string;
   /**
    * The fleet name (`manifest.metadata.name`) — macf#994's first-launch
    * guidance block needs it to build `<project>@<routing-label>`
@@ -1877,6 +1879,14 @@ function deployPhaseSummaryLines(deployPhase: DeployPhaseRenderInput): string[] 
   if (results.length === 0) return [];
   const lines: string[] = ['', 'Deploy phase (runs after the GitHub phase above):'];
   for (const r of results) {
+    if (r.outcome.status === 'skipped') {
+      const cmd = deployPhase.commandFor?.(r.role);
+      lines.push(
+        `  • ${r.role}: SKIPPED — ${r.destDir} is not on this host; run on the host that owns it` +
+          (cmd === undefined ? '' : `: ${cmd}`),
+      );
+      continue;
+    }
     lines.push(
       r.outcome.status === 'deployed'
         ? `  • ${r.role}: DEPLOYED — workspace ${r.outcome.workspace === 'cloned' ? 'cloned' : 'already present (not re-cloned)'} at ${r.destDir}`
@@ -2608,6 +2618,9 @@ function remainingDeployStepToJson(step: RemainingDeployStep): unknown {
  * `remainingDeployStepToJson`'s own `command` field).
  */
 function deployPhaseResultToJson(r: DeployPhaseAgentResult, checkAgentCertPresent: (destDir: string) => boolean): unknown {
+  if (r.outcome.status === 'skipped') {
+    return { role: r.role, status: 'skipped', reason: r.outcome.reason, workspace_dir: r.destDir };
+  }
   const base = { ...(fleetDeployOutcomeToJson(r.outcome) as Record<string, unknown>), workspace_dir: r.destDir };
   if (r.outcome.status !== 'deployed') return base;
   return {
@@ -3756,9 +3769,17 @@ export async function runBootstrapApply(
               flagless: versionRunFlagless,
             };
 
-      const remainingDeploy: RemainingDeployReport = controlRepoAborted
+      const remainingAll: RemainingDeployReport = controlRepoAborted
         ? { steps: [] }
         : computeRemainingDeploy(manifest, manifestPath, opts, resolved.checkDeployPathExists);
+      // An agent the deploy phase reported SKIPPED already names its command
+      // there; listing it again here would print the same agent twice.
+      const skippedRoles = new Set((deployResults ?? []).filter((r) => r.outcome.status === 'skipped').map((r) => r.role));
+      const remainingSteps = remainingAll.steps.filter((s) => !skippedRoles.has(s.role));
+      const remainingDeploy: RemainingDeployReport =
+        remainingSteps.length === 0
+          ? { steps: [] }
+          : { ...remainingAll, steps: remainingSteps };
       // macf#1013 + macf#1014 consistency: a SKIP banner on a fleet with
       // nothing left to deploy is pure noise — "I could not deploy" is a
       // non-event when every declared agent already has a workspace. Suppress
@@ -3774,6 +3795,7 @@ export async function runBootstrapApply(
               results: deployResults,
               skipReason: deploySkipReason,
               checkAgentCertPresent: resolved.checkAgentCertPresent,
+              commandFor: (role: string) => buildDeployCommand(manifestPath, role, opts),
               project: manifest.metadata.name,
             };
 

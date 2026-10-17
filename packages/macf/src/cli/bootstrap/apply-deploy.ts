@@ -35,7 +35,8 @@
  * see that module's own doc) — this file adds no new field that could carry
  * a secret.
  */
-import { resolve as resolvePath } from 'node:path';
+import { accessSync, constants as fsConstants, statSync } from 'node:fs';
+import { dirname, resolve as resolvePath } from 'node:path';
 import type { FleetManifest } from './fleet-manifest.js';
 import type { FleetDeployDeps, FleetDeployOutcome } from './fleet-deploy.js';
 import { deployAgent as realDeployAgent } from './fleet-deploy.js';
@@ -51,7 +52,46 @@ import type { VaultReadOptions } from './vault-read.js';
 export interface DeployPhaseAgentResult {
   readonly role: string;
   readonly destDir: string;
-  readonly outcome: FleetDeployOutcome;
+  readonly outcome: DeployPhaseOutcome;
+}
+
+/** An agent whose `deploy_path` this host cannot create, so no deploy was attempted. Never counted as a failure. */
+export interface DeploySkippedOutcome {
+  readonly role: string;
+  readonly status: 'skipped';
+  readonly reason: string;
+}
+
+/** What the deploy phase records per agent: a real {@link FleetDeployOutcome}, or a host-skip. */
+export type DeployPhaseOutcome = FleetDeployOutcome | DeploySkippedOutcome;
+
+/**
+ * Whether this host can create `path`: the path exists, or its nearest
+ * EXISTING ancestor is a directory this process can write. A writability
+ * fact, not a guess about which host owns the path.
+ */
+export function checkDeployPathCreatable(path: string): { readonly ok: true } | { readonly ok: false; readonly ancestor: string } {
+  let current = path;
+  for (;;) {
+    let exists = true;
+    try {
+      statSync(current);
+    } catch {
+      exists = false;
+    }
+    if (exists) {
+      if (current === path) return { ok: true };
+      try {
+        accessSync(current, fsConstants.W_OK);
+        return { ok: true };
+      } catch {
+        return { ok: false, ancestor: current };
+      }
+    }
+    const parent = dirname(current);
+    if (parent === current) return { ok: false, ancestor: current };
+    current = parent;
+  }
 }
 
 /**
@@ -62,15 +102,18 @@ export interface DeployPhaseAgentResult {
  */
 export interface ApplyDeployPhaseDeps extends FleetDeployDeps {
   readonly deployAgentFn?: typeof realDeployAgent;
+  /** Test seam for {@link checkDeployPathCreatable}; production never overrides it. */
+  readonly checkPathCreatable?: typeof checkDeployPathCreatable;
 }
 
 /**
- * Deploys EVERY declared agent (macf#1013 requirement 1 — "every agent with
- * a deploy_path", never a subset filtered by a same-host guess;
- * `deployAgent` itself is the thing that fails per-agent for a path it
- * cannot write — the "simplest defensible version" the issue's own proposal
- * settled on, rather than `apply` trying to predict which agents are
- * "local"). Sequential, not `Promise.all` — deliberate: `deployAgent` shells
+ * Deploys every declared agent whose `deploy_path` this host can create
+ * (macf#1013 requirement 1). The macf#1013 design rejected filtering by a
+ * same-host GUESS; the skip here is a writability FACT instead: the nearest
+ * existing ancestor of `deploy_path` is not writable by this process (e.g.
+ * `/home/ubuntu/...` on the operator's Mac), so deploying could only fail
+ * with ENOENT. Such an agent gets `status: 'skipped'`, which does not fail
+ * the run; a real deploy failure on a writable host still does. Sequential, not `Promise.all` — deliberate: `deployAgent` shells
  * out to `git`/`gh`/age-adjacent crypto per agent, a fleet is small (single
  * digits of agents, DR-043's own scope) by construction, and interleaved
  * stdout/stderr narration from `deps.log` across parallel agents would be
@@ -93,6 +136,15 @@ export async function runApplyDeployPhase(
   const results: DeployPhaseAgentResult[] = [];
   for (const agent of manifest.agents) {
     const destDir = resolvePath(agent.deploy_path);
+    const creatable = (deps.checkPathCreatable ?? checkDeployPathCreatable)(destDir);
+    if (!creatable.ok) {
+      results.push({
+        role: agent.role,
+        destDir,
+        outcome: { role: agent.role, status: 'skipped', reason: `not on this host — ${creatable.ancestor} is not writable here` },
+      });
+      continue;
+    }
     // eslint-disable-next-line no-await-in-loop -- sequential by design, see module doc.
     const outcome = await deployAgentFn(agent, manifest, destDir, flags, deps);
     results.push({ role: agent.role, destDir, outcome });
