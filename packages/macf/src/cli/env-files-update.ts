@@ -212,6 +212,18 @@ export function migrateTelemetryVersionLiteral(path: string): void {
     kept.push(line);
   }
   if (removed) writeFileSync(path, kept.join('\n'), { mode: 0o644 });
+  migrateTelemetryReenableComment(path);
+}
+
+const OLD_REENABLE_COMMENT = '# To re-enable: re-run `macf update` without MACF_OTEL_DISABLED set.';
+const NEW_REENABLE_COMMENT =
+  '# To re-enable: delete this file, then run `macf update` without MACF_OTEL_DISABLED set.';
+
+/** Replace the old generated re-enable hint, which no longer works, in an existing disabled file. */
+export function migrateTelemetryReenableComment(path: string): void {
+  const current = readFileSync(path, 'utf-8');
+  if (!current.includes(OLD_REENABLE_COMMENT)) return;
+  writeFileSync(path, current.replace(OLD_REENABLE_COMMENT, NEW_REENABLE_COMMENT), { mode: 0o644 });
 }
 
 // ---------------------------------------------------------------------------

@@ -568,6 +568,8 @@ describe('generateEnvTelemetry', () => {
     // But still has the schema header so the file is well-formed.
     expect(out).toContain('# schema_version: 1');
     expect(out).toContain('Telemetry intentionally disabled');
+    expect(out).toContain('# To re-enable: delete this file, then run `macf update`');
+    expect(out).not.toContain('re-run `macf update` without');
   });
 
   it('also accepts MACF_OTEL_DISABLED=true (matches claude-sh.ts)', () => {

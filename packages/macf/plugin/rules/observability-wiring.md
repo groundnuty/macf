@@ -20,7 +20,7 @@ The launcher exports Claude Code's OpenTelemetry variables so traces, metrics an
 
 - At launch the endpoint resolves from `MACF_OTEL_ENDPOINT` in the environment, then `settings.local.json`, then the default baked into the file when it was written; `OTEL_EXPORTER_OTLP_ENDPOINT` set in the shell overrides all of these.
 - Run `echo "$OTEL_EXPORTER_OTLP_ENDPOINT"` in a Bash call to see the active endpoint; a retired or wrong one drops telemetry with no error.
-- `MACF_OTEL_DISABLED=1` when the file is first written produces a minimal file with no exports, for hosts with no collector.
+- `MACF_OTEL_DISABLED=1` when the file is first written produces a minimal file with no exports, for hosts with no collector. To change the endpoint or the opt-out later, edit `.claude/.macf/env.telemetry`, or delete it and run `macf update` to regenerate it.
 
 ## Check the result
 

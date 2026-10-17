@@ -576,7 +576,7 @@ export function generateEnvTelemetry(
       '# `macf init` / `macf update` time). No OTel exporters or gates',
       '# are configured; sourcing this file is a no-op. See macf#197.',
       '#',
-      '# To re-enable: re-run `macf update` without MACF_OTEL_DISABLED set.',
+      '# To re-enable: delete this file, then run `macf update` without MACF_OTEL_DISABLED set.',
     ];
     return assemble(operatorHeaderLines('generateEnvTelemetry'), body);
   }
