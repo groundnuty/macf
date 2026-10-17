@@ -4960,8 +4960,8 @@ describe('formatApplyResult / fleetApplyResultToJson / applyExitCode (pure)', ()
     expect(applyExitCode(result)).toBe(0);
   });
 
-  it('applyExitCode: 0 when a routing leg is PENDING — an honest incomplete for a runner apply itself just provisioned, NOT a failure (groundnuty/macf#1212 operator ruling: "we cannot report an error... it sounds like the user\'s problem")', () => {
-    expect(applyExitCode(resultWith({ routing: { 'x/y': { status: 'pending', reason: 'still provisioning' } } }))).toBe(0);
+  it('applyExitCode: 2 when a routing leg is PENDING — an honest incomplete (groundnuty/macf#1212: not a failure), but that repo cannot route yet so never 0', () => {
+    expect(applyExitCode(resultWith({ routing: { 'x/y': { status: 'pending', reason: 'still provisioning' } } }))).toBe(2);
   });
 
   it('applyExitCode: 1 when a routing leg failed', () => {
@@ -5258,6 +5258,38 @@ describe('formatApplyResult / fleetApplyResultToJson / applyExitCode (pure)', ()
       resultWith({ runnerRequirement: { status: 'failed', reason: 'no runner registration token was supplied' } }),
     ) as { runner_requirement: { status: string; reason?: string } };
     expect(failed.runner_requirement).toEqual({ status: 'failed', reason: 'no runner registration token was supplied' });
+  });
+
+  it('a PENDING routing leg with no failed leg exits 2 and prints one "Not finished" line naming the repo', () => {
+    const result = resultWith({
+      routing: {
+        'groundnuty/x': { status: 'pending', reason: 'still provisioning, 30s/600s elapsed' },
+        'groundnuty/y': { status: 'created' },
+      },
+    });
+    expect(applyExitCode(result)).toBe(2);
+    const text = formatApplyResult(result);
+    expect(text.match(/Not finished:/g)).toHaveLength(1);
+    expect(text).toContain(
+      'Not finished: 1 repo(s) cannot route yet because their runner is not visible: groundnuty/x. ' +
+        'Re-run `macf bootstrap apply` with --vault and --identity-key once `macf bootstrap status` shows their runners.',
+    );
+  });
+
+  it('a FAILED routing leg alongside a PENDING one still exits 1', () => {
+    const result = resultWith({
+      routing: {
+        'groundnuty/x': { status: 'pending', reason: 'still provisioning' },
+        'groundnuty/y': { status: 'failed', reason: 'no runner' },
+      },
+    });
+    expect(applyExitCode(result)).toBe(1);
+  });
+
+  it('a clean routing run exits 0 with no "Not finished" line', () => {
+    const result = resultWith({ routing: { 'groundnuty/x': { status: 'created' } } });
+    expect(applyExitCode(result)).toBe(0);
+    expect(formatApplyResult(result)).not.toContain('Not finished');
   });
 
   it('formatApplyResult renders a PENDING routing leg with its reason, distinct from FAILED — groundnuty/macf#1212', () => {

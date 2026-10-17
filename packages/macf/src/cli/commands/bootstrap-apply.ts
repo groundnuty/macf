@@ -2269,6 +2269,13 @@ function routingSummaryLines(result: FleetApplyResult): string[] {
   if (entries.length === 0) return [];
   const lines = ['Routing (MACF_TRUSTED_ACTORS):'];
   for (const [repo, leg] of entries) lines.push(formatVariableLegLine(repo, leg));
+  const pending = pendingRoutingRepos(result);
+  if (pending.length > 0) {
+    lines.push(
+      `Not finished: ${String(pending.length)} repo(s) cannot route yet because their runner is not visible: ${pending.join(', ')}. ` +
+        'Re-run `macf bootstrap apply` with --vault and --identity-key once `macf bootstrap status` shows their runners.',
+    );
+  }
   return lines;
 }
 
@@ -3126,7 +3133,16 @@ export function applyExitCode(
   // vocabulary for the same shape.
   const controlRepoLabelsPending =
     result.controlRepoInit.status === 'written' && result.controlRepoInit.labels.status !== 'ok' && result.controlRepoInit.labelsGoodEnough;
-  return versionPartial || controlRepoLabelsPending ? 2 : 0;
+  // A routing leg left `'pending'` means a runner the platform accepted never
+  // became visible within the wait: that repo cannot route yet.
+  return versionPartial || controlRepoLabelsPending || pendingRoutingRepos(result).length > 0 ? 2 : 0;
+}
+
+/** Repos whose `MACF_TRUSTED_ACTORS` leg ended `'pending'` (runner not visible yet). */
+function pendingRoutingRepos(result: FleetApplyResult): string[] {
+  return Object.entries(result.routing)
+    .filter(([, leg]) => leg.status === 'pending')
+    .map(([repo]) => repo);
 }
 
 // --- Recovery-artifact presence notice (macf#988, DR-043 Amendment B requirement 4) ---
