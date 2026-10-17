@@ -4,6 +4,20 @@ All notable changes to the `macf` CLI. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.70] — 2026-10-17
+
+### Fixed
+
+- **Work routed to an agent while it was down is picked up when it relaunches.** `claude.sh` relaunches with `claude -c`, so every relaunch is a SessionStart `resume`: a fleet upgrade, `restart-self`, the operator. The startup pickup ran only on `startup`, so an issue routed during downtime sat unpicked, though the router tells its reporter it "will be picked up when the agent starts". The pickup now fires on `startup` and `resume`, and still never on compaction, `clear`, `fork` or in a subagent. `macf update` migrates the hook registration. (#1501)
+- **`bootstrap apply` run on the operator's machine no longer fails agents that live on another host.** Consent gates make `apply` run on the operator's machine, while agents may live on a VM. Every such agent's deploy failed with `ENOENT` and the run exited 1. When this host cannot create an agent's `deploy_path` (its nearest existing ancestor is not writable), the agent is reported as `SKIPPED` with the command to run on the other host, from a clone of the control repo. A skip does not fail the run, and the fleet verdict still reports the workspace as unconfirmed. (#1500)
+
+### Changed
+
+- **A self-hosted fleet's routing spends no metered GitHub-hosted job per event, and `plan` names every repo that still does.**
+  - **Caller gate:** when the fleet declares `routing.runner.runs_on: self-hosted`, the router caller's `gate` job runs on the fleet's runner. A fork PR stays hosted. Its prior-run query uses the Actions API directly, because self-hosted images may not ship `gh`.
+  - **Router:** `groundnuty/macf-actions` v3.6.2 does the same for its `pick-runner` job.
+  - **`plan`:** prints one line per repo whose routing still runs on hosted runners, with the setting that moves it. (#1499)
+
 ## [0.2.69] — 2026-10-16
 
 ### Fixed
