@@ -45,7 +45,7 @@
  * `'skipped'` branch) — including under `--yes`, which skips the
  * pre-approval plan render entirely.
  *
- * **Create-only — `update` stays un-actioned (macf#838 Phase 2b review).**
+ * **Create-only here — `update` is handled elsewhere (macf#838 Phase 2b review).**
  * `plan.ts::routingItem` can emit an `update` verb when an observed value
  * DIVERGES from the manifest-derived value (per-repo drift is possible;
  * different agent repos can independently disagree, or the agent roster
@@ -53,10 +53,9 @@
  * values or overwrite a present variable — it only
  * `ensure-variable.ts::ensureVariableCreated`s (write-if-absent, never
  * touch-if-present), matching the task's hard "create-only… never silently
- * overwrite" constraint. A drifted value is therefore reported by `plan`
- * (still `confirm_required: true`) but left un-actioned by `apply` — see
- * `plan.ts::planItemApplyCoverage`'s routing case for why `update` stays
- * `not_implemented` while `create` joins the implemented group.
+ * overwrite" constraint. A drifted value is therefore left untouched by this
+ * module; `apply-fleet.ts::reconcileTrustedActors` (macf#1319) overwrites a
+ * diverging value through its own confirmed path.
  *
  * **`--runner-token` — token = POLICY, detection = TIMING (macf#929).**
  * macf#922/#924 left the register-before-route gate as a single point-in-time

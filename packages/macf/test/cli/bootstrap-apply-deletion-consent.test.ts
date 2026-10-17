@@ -29,6 +29,7 @@ import {
   type MutateApplyDeps,
 } from '../../src/cli/commands/bootstrap-apply.js';
 import type { FleetPlan, ObservedState, PlanItem } from '../../src/cli/bootstrap/plan.js';
+import { computeUnimplementedByApply } from '../../src/cli/bootstrap/plan.js';
 import type { AgentApplyDeps } from '../../src/cli/bootstrap/apply-agent.js';
 import type { CaApplyDeps } from '../../src/cli/bootstrap/apply-ca.js';
 import type { RoutingClientApplyDeps } from '../../src/cli/bootstrap/apply-routing-client.js';
@@ -203,9 +204,7 @@ function basePlan(items: readonly PlanItem[]): FleetPlan {
     fleet: 'demo-fleet',
     items,
     skippedSections: [],
-    unimplementedByApply: items
-      .filter((i) => i.verb === 'delete')
-      .map((i) => ({ kind: i.kind, target: i.target, verb: i.verb, reason: 'apply has no code path for a delete-verb item of this kind yet.' })),
+    unimplementedByApply: computeUnimplementedByApply(items),
     registryScopeIssues: [],
     registryRepoScopeNotices: [],
     installScopeDrift: [],
@@ -284,7 +283,7 @@ describe('formatApprovalBanner — decisive pair (groundnuty/macf#1272)', () => 
     expect(text).toContain(SECRET_DELETE_ITEM.target);
   });
 
-  it('the "N item(s) NOT IMPLEMENTED" trailing line excludes routing-kind deletes apply now executes, but still counts a secret_fingerprint delete', () => {
+  it('the "N item(s) NOT IMPLEMENTED" trailing line does not count routing-kind deletes apply executes, but still counts a secret_fingerprint delete', () => {
     const plan = basePlan([ROUTING_DELETE_ITEM, SECRET_DELETE_ITEM]);
     const text = formatApprovalBanner(plan, [], [EXECUTABLE_ROUTING_ACTION, SKIPPED_SECRET_ACTION]);
     expect(text).toMatch(/⚠ 1 item\(s\) in the plan above are NOT IMPLEMENTED by apply yet/);
