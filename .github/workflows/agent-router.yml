@@ -171,7 +171,7 @@ jobs:
   route:
     needs: gate
     if: needs.gate.outputs.should-route == 'true'
-    uses: groundnuty/macf-actions/.github/workflows/agent-router.yml@v3.4.2
+    uses: groundnuty/macf-actions/.github/workflows/agent-router.yml@v3.5.0
     with:
       project: macf
       # Profile-scoped registry (DR-006): groundnuty is a user account, so the
