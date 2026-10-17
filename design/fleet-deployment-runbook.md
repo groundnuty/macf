@@ -1057,7 +1057,7 @@ something tries to actually read the registry through it.
 |---|---|
 | **0** | Every hard-failure predicate is false, **and** the version-reconcile phase (if attempted) left nobody behind. |
 | **1** | A **hard failure** needing operator attention: the control repo couldn't be provisioned or synced, any agent identity needs attention (`failed`/`drift`/`skipped-unverified`), the runner-ops or router App needs attention, the vault write failed, any CA leg failed, any of the six routing-secret legs `failed` (not merely `skipped`), or the version-reconcile phase **halted** (a confirmed-or-unconfirmable bad release). Checked first — a halt always reports `1` even if something else in the same run is *also* merely partial. |
-| **2** | **Not** a hard failure, but the version-reconcile phase left at least one discovered fleet member un-rolled (busy / config-dirty / off-branch / stale-pin / not-yet-serving). Distinguishes "this needs a look, but nothing is broken" from a genuine `1`. |
+| **2** | **Not** a hard failure, but the run is unfinished: the version-reconcile phase left at least one discovered fleet member un-rolled (busy / config-dirty / off-branch / stale-pin / not-yet-serving), or a repo's `MACF_TRUSTED_ACTORS` leg ended `pending` because its runner is not visible yet (the summary prints a `Not finished:` line naming the repos). Distinguishes "this needs a look, but nothing is broken" from a genuine `1`. |
 
 ### `macf fleet upgrade --execute`
 

@@ -231,7 +231,7 @@ export const OPERATOR_SECRETS_FILE_KEYS: readonly OperatorSecretsFileKeyInfo[] =
   {
     key: TS_OAUTH_CLIENT_ID_ENV_VAR,
     purpose: 'Tailscale OAuth client ID — lets apply mint an ephemeral tailnet auth key for cross-agent routing.',
-    howToObtain: 'Tailscale admin console -> Settings -> OAuth clients -> Generate client (tag the fleet needs, e.g. tag:ci).',
+    howToObtain: 'Tailscale admin console -> Settings -> OAuth clients -> Generate client, with write access to auth keys and allowed to create keys tagged tag:ci-runner (the tag the router requests when it joins the tailnet).',
     storageClass: 'org-secret',
   },
   {
@@ -242,7 +242,7 @@ export const OPERATOR_SECRETS_FILE_KEYS: readonly OperatorSecretsFileKeyInfo[] =
   },
   {
     key: RUNNER_TOKEN_ENV_VAR,
-    purpose: 'A GitHub Actions self-hosted runner registration token — only needed when a repo has no usable runner yet.',
+    purpose: 'Optional. Lets apply wait up to 10 minutes for a runner it did not request from the runner platform itself; runners it requested are waited for without it.',
     howToObtain: 'gh api -X POST /orgs/<org>/actions/runners/registration-token --jq .token (expires in about an hour — get a fresh one if apply is re-run later).',
     storageClass: 'ephemeral-discard',
   },
