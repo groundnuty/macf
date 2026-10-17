@@ -60,7 +60,11 @@ COMMAND="$(jq -r '.tool_input.command // ""' <<<"$INPUT_JSON" 2>/dev/null || ech
 #   gh issue create  / gh pr create    → creates the resource
 #   gh issue close … --comment         → posts a closing comment
 #   gh pr close    … --comment         → posts a closing comment
+#   gh pr review                       → posts a review (no URL in output)
+#   gh api -X PUT …/pulls/<N>/merge    → merges (no URL in output)
 # A bare `gh issue close` (no --comment) writes nothing attributable → skip.
+# The review and the API merge print no URL, so the hook reads the latest
+# review on the PR, or the PR's merged_by, instead of a URL from the output.
 # This is a RESULT check (not a blocker), so a simple wrapper-tolerant
 # `grep -qE` over the raw command suffices — we don't need the airtight
 # bypass-resistant regex the PreToolUse blockers carry.
@@ -79,45 +83,117 @@ is_gh_write() {
   fi
   return 1
 }
-is_gh_write "$COMMAND" || exit 0
 
-# ── Extract the resource URL from the tool output ─────────────────────────
-# `gh issue create` / `gh pr create` print the new URL on stdout; `gh issue
-# comment` / `gh pr comment` print the comment URL (…#issuecomment-<id>).
-# Read both PostToolUse output shapes (newer `.tool_output.stdout`, older
-# `.tool_response.stdout`, oldest `.tool_response` as a raw string).
-OUTPUT="$(jq -r '.tool_output.stdout // .tool_response.stdout // .tool_response // ""' <<<"$INPUT_JSON" 2>/dev/null || echo "")"
-[[ -z "$OUTPUT" ]] && exit 0
+# `gh pr review` posts a review and prints no URL.
+is_pr_review() {
+  grep -qiE 'gh[[:space:]]+pr[[:space:]]+review([[:space:]]|$)' <<<"$1"
+}
+# `gh api -X PUT repos/<o>/<r>/pulls/<N>/merge` merges and prints JSON or a sha.
+MERGE_PATH_RE='(^|[[:space:]"'"'"'])/?repos/([^/[:space:]"'"'"']+)/([^/[:space:]"'"'"']+)/pulls/([0-9]+)/merge([[:space:]"'"'"'?]|$)'
+is_api_merge() {
+  grep -qiE 'gh[[:space:]]+api[[:space:]]' <<<"$1" \
+    && grep -qE "$MERGE_PATH_RE" <<<"$1" \
+    && grep -qiE '(^|[[:space:]])(-X[[:space:]]*|--method[[:space:]=]+)PUT([[:space:]]|$)' <<<"$1"
+}
 
-URL="$(grep -oE 'https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/(issues|pull)/[0-9]+(#issuecomment-[0-9]+)?' <<<"$OUTPUT" | head -1 || true)"
-# No URL in output (e.g. `--json` suppressed it, or output was discarded) →
-# fail open. We can't verify what we can't see.
-[[ -z "$URL" ]] && exit 0
+# Parse `gh pr review …` into OWNER/REPO/NUM. Quoted strings (review bodies)
+# are dropped first so a number inside a body is never read as the PR number.
+# The PR number is the first positional; a PR URL there also gives the repo.
+parse_pr_review() {
+  local seg tok want=""
+  seg="$(tr '\n' ' ' <<<"$1" | sed -E 's/"[^"]*"//g; s/'"'"'[^'"'"']*'"'"'//g' \
+    | sed -E 's/.*gh[[:space:]]+pr[[:space:]]+review//; s/(&&|\|\||;|\|).*//')"
+  for tok in $seg; do
+    case "$want" in
+      repo) REPO_FLAG="$tok"; want=""; continue ;;
+      skip) want=""; continue ;;
+    esac
+    case "$tok" in
+      --repo|-R) want="repo" ;;
+      --repo=*) REPO_FLAG="${tok#--repo=}" ;;
+      --body|-b|--body-file|-F) want="skip" ;;
+      -*) ;;
+      *)
+        [[ -n "$NUM" ]] && continue
+        if [[ "$tok" =~ ^https://github\.com/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)/pull/([0-9]+) ]]; then
+          OWNER="${BASH_REMATCH[1]}"; REPO="${BASH_REMATCH[2]}"; NUM="${BASH_REMATCH[3]}"
+        elif [[ "$tok" =~ ^[0-9]+$ ]]; then
+          NUM="$tok"
+        fi
+        ;;
+    esac
+  done
+}
 
-# ── Parse the URL → owner / repo / kind / number / optional comment-id ────
-# Form: https://github.com/<owner>/<repo>/(issues|pull)/<N>[#issuecomment-<id>]
-URL_PATH="${URL#https://github.com/}"
-OWNER="$(cut -d/ -f1 <<<"$URL_PATH")"
-REPO="$(cut -d/ -f2 <<<"$URL_PATH")"
-KIND="$(cut -d/ -f3 <<<"$URL_PATH")"          # issues | pull
-NUM_AND_FRAG="$(cut -d/ -f4 <<<"$URL_PATH")"  # <N> | <N>#issuecomment-<id>
-NUM="${NUM_AND_FRAG%%#*}"
-COMMENT_ID=""
-if [[ "$NUM_AND_FRAG" == *"#issuecomment-"* ]]; then
-  COMMENT_ID="${NUM_AND_FRAG##*#issuecomment-}"
-fi
-# Sanity — if any required piece is missing/odd, fail open.
-[[ -z "$OWNER" || -z "$REPO" || -z "$KIND" || -z "$NUM" ]] && exit 0
-
-# ── Build the ACTUAL-resource API path ────────────────────────────────────
-# Comment-id present → both issue AND pr comments live under the issues
-# comments namespace; else a PR → pulls/<N>; else an issue → issues/<N>.
-if [[ -n "$COMMENT_ID" ]]; then
-  API_PATH="/repos/${OWNER}/${REPO}/issues/comments/${COMMENT_ID}"
-elif [[ "$KIND" == "pull" ]]; then
-  API_PATH="/repos/${OWNER}/${REPO}/pulls/${NUM}"
+MODE=""
+OWNER=""; REPO=""; NUM=""; REPO_FLAG=""
+if is_gh_write "$COMMAND"; then
+  MODE="generic"
+elif is_pr_review "$COMMAND"; then
+  MODE="review"
+elif is_api_merge "$COMMAND"; then
+  MODE="merge"
 else
-  API_PATH="/repos/${OWNER}/${REPO}/issues/${NUM}"
+  exit 0
+fi
+
+if [[ "$MODE" == "generic" ]]; then
+  # ── Extract the resource URL from the tool output ─────────────────────────
+  # `gh issue create` / `gh pr create` print the new URL on stdout; `gh issue
+  # comment` / `gh pr comment` print the comment URL (…#issuecomment-<id>).
+  # Read both PostToolUse output shapes (newer `.tool_output.stdout`, older
+  # `.tool_response.stdout`, oldest `.tool_response` as a raw string).
+  OUTPUT="$(jq -r '.tool_output.stdout // .tool_response.stdout // .tool_response // ""' <<<"$INPUT_JSON" 2>/dev/null || echo "")"
+  [[ -z "$OUTPUT" ]] && exit 0
+
+  URL="$(grep -oE 'https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/(issues|pull)/[0-9]+(#issuecomment-[0-9]+)?' <<<"$OUTPUT" | head -1 || true)"
+  # No URL in output (e.g. `--json` suppressed it, or output was discarded) →
+  # fail open. We can't verify what we can't see.
+  [[ -z "$URL" ]] && exit 0
+
+  # ── Parse the URL → owner / repo / kind / number / optional comment-id ────
+  # Form: https://github.com/<owner>/<repo>/(issues|pull)/<N>[#issuecomment-<id>]
+  URL_PATH="${URL#https://github.com/}"
+  OWNER="$(cut -d/ -f1 <<<"$URL_PATH")"
+  REPO="$(cut -d/ -f2 <<<"$URL_PATH")"
+  KIND="$(cut -d/ -f3 <<<"$URL_PATH")"          # issues | pull
+  NUM_AND_FRAG="$(cut -d/ -f4 <<<"$URL_PATH")"  # <N> | <N>#issuecomment-<id>
+  NUM="${NUM_AND_FRAG%%#*}"
+  COMMENT_ID=""
+  if [[ "$NUM_AND_FRAG" == *"#issuecomment-"* ]]; then
+    COMMENT_ID="${NUM_AND_FRAG##*#issuecomment-}"
+  fi
+  # Sanity — if any required piece is missing/odd, fail open.
+  [[ -z "$OWNER" || -z "$REPO" || -z "$KIND" || -z "$NUM" ]] && exit 0
+
+  # ── Build the ACTUAL-resource API path ────────────────────────────────────
+  # Comment-id present → both issue AND pr comments live under the issues
+  # comments namespace; else a PR → pulls/<N>; else an issue → issues/<N>.
+  if [[ -n "$COMMENT_ID" ]]; then
+    API_PATH="/repos/${OWNER}/${REPO}/issues/comments/${COMMENT_ID}"
+  elif [[ "$KIND" == "pull" ]]; then
+    API_PATH="/repos/${OWNER}/${REPO}/pulls/${NUM}"
+  else
+    API_PATH="/repos/${OWNER}/${REPO}/issues/${NUM}"
+  fi
+
+fi
+
+# ── review / merge: no URL in the output — locate the PR from the command ─
+AUTHOR_JQ='{login: .user.login, type: .user.type}'
+if [[ "$MODE" == "review" ]]; then
+  parse_pr_review "$COMMAND"
+  [[ -z "$NUM" ]] && exit 0
+  if [[ -n "$REPO_FLAG" && "$REPO_FLAG" == */* ]]; then
+    REPO_FLAG="${REPO_FLAG#https://github.com/}"
+    OWNER="$(cut -d/ -f1 <<<"$REPO_FLAG")"
+    REPO="$(cut -d/ -f2 <<<"$REPO_FLAG")"
+  fi
+elif [[ "$MODE" == "merge" ]]; then
+  if [[ "$COMMAND" =~ $MERGE_PATH_RE ]]; then
+    OWNER="${BASH_REMATCH[2]}"; REPO="${BASH_REMATCH[3]}"; NUM="${BASH_REMATCH[4]}"
+  fi
+  [[ -z "$OWNER" || -z "$REPO" || -z "$NUM" ]] && exit 0
 fi
 
 # hook-gh-token.sh is copied alongside this file by every distribution path,
@@ -148,6 +224,25 @@ else
   }
 fi
 
+# ── review / merge: resolve the repo (gh's own default if none given) ─────
+if [[ "$MODE" == "review" || "$MODE" == "merge" ]]; then
+  if [[ -z "$OWNER" || -z "$REPO" ]]; then
+    NWO="$(GH_PAGER= macf_hook_gh repo view --json nameWithOwner -q .nameWithOwner)" || exit 0
+    [[ "$NWO" == */* ]] || exit 0
+    OWNER="$(cut -d/ -f1 <<<"$NWO")"
+    REPO="$(cut -d/ -f2 <<<"$NWO")"
+  fi
+  if [[ "$MODE" == "review" ]]; then
+    URL="the review on ${OWNER}/${REPO}#${NUM}"
+    API_PATH="/repos/${OWNER}/${REPO}/pulls/${NUM}/reviews?per_page=100"
+    AUTHOR_JQ='(sort_by(.submitted_at) | last) as $r | {login: ($r.user.login // ""), type: ($r.user.type // "")}'
+  else
+    URL="the merge of ${OWNER}/${REPO}#${NUM}"
+    API_PATH="/repos/${OWNER}/${REPO}/pulls/${NUM}"
+    AUTHOR_JQ='{login: (.merged_by.login // ""), type: (.merged_by.type // ""), merged: (.merged // false)}'
+  fi
+fi
+
 # ── Query the author (short timeout; one brief retry for API consistency) ─
 # The resource was JUST created, so a first read can occasionally race the
 # write through GitHub's read replicas. One `sleep 1` retry handles that
@@ -165,7 +260,7 @@ fi
 # distinguishable from "the check ran and found no mismatch" in the log.
 query_author() {
   local resp rc=0
-  resp="$(GH_PAGER= macf_hook_gh api "$API_PATH" --jq '{login: .user.login, type: .user.type}')" || rc=$?
+  resp="$(GH_PAGER= macf_hook_gh api "$API_PATH" --jq "$AUTHOR_JQ")" || rc=$?
   printf '%s' "$resp"
   return "$rc"
 }
@@ -188,6 +283,11 @@ if [[ "$RC" -eq 1 ]]; then
 fi
 
 [[ -z "$RESP" ]] && exit 0
+
+if [[ "$MODE" == "merge" ]]; then
+  # The merge failed or was refused: nothing was merged, nothing to check.
+  [[ "$(jq -r '.merged // false' <<<"$RESP" 2>/dev/null || echo false)" == "true" ]] || exit 0
+fi
 
 ACTUAL_LOGIN="$(jq -r '.login // ""' <<<"$RESP" 2>/dev/null || echo "")"
 ACTUAL_TYPE="$(jq -r '.type // ""' <<<"$RESP" 2>/dev/null || echo "")"
