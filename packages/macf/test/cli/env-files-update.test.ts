@@ -165,6 +165,19 @@ describe('refreshEnvFiles', () => {
     });
   });
 
+  it('rewrites the old re-enable hint in an existing disabled env.telemetry, keeping other lines', () => {
+    mkdirSync(join(tmpRoot, '.claude', '.macf'), { recursive: true });
+    const path = join(tmpRoot, '.claude', '.macf', 'env.telemetry');
+    writeFileSync(
+      path,
+      '# mine\n# To re-enable: re-run `macf update` without MACF_OTEL_DISABLED set.\nexport KEEP=1\n',
+    );
+    refreshEnvFiles(tmpRoot, baseConfig);
+    expect(readFileSync(path, 'utf-8')).toBe(
+      '# mine\n# To re-enable: delete this file, then run `macf update` without MACF_OTEL_DISABLED set.\nexport KEEP=1\n',
+    );
+  });
+
   it('preserves operator-managed env.telemetry when present (operator edits intact)', () => {
     mkdirSync(join(tmpRoot, '.claude', '.macf'), { recursive: true });
     const customTelemetry =

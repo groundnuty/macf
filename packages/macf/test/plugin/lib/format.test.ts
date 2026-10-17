@@ -234,6 +234,15 @@ describe('formatSweepInstruction — DR-038 Decision 5 §Communication 5 injecti
     expect(text).toContain('gate-sweep');
     expect(text.toLowerCase()).toContain('mention-sweep');
   });
+
+  it('(a) covers every open PR by others with no approval, with the not-APPROVED query', () => {
+    const line = formatSweepInstruction().split('\n').find(l => l.includes('(a)')) ?? '';
+    expect(line).toContain('every open PR by others with no approval yet');
+    expect(line).toContain('requested from you or not');
+    expect(line).toContain('reviewDecision is empty, not REVIEW_REQUIRED');
+    expect(line).toContain('Skip your own PRs; a bot author shows as app/<app-slug>.');
+    expect(line).toContain('select(.reviewDecision != "APPROVED")');
+  });
 });
 
 describe('formatStartupReconcile — extended SessionStart startup_check (DR-038 Decision 5)', () => {

@@ -576,7 +576,7 @@ export function generateEnvTelemetry(
       '# `macf init` / `macf update` time). No OTel exporters or gates',
       '# are configured; sourcing this file is a no-op. See macf#197.',
       '#',
-      '# To re-enable: re-run `macf update` without MACF_OTEL_DISABLED set.',
+      '# To re-enable: delete this file, then run `macf update` without MACF_OTEL_DISABLED set.',
     ];
     return assemble(operatorHeaderLines('generateEnvTelemetry'), body);
   }
@@ -632,8 +632,8 @@ export function generateEnvTelemetry(
     '# gap — only traces had the exporter set; metrics + logs were dark).',
     '#',
     '# Endpoint override has two layers (groundnuty/macf#282):',
-    '#   - Template-time: MACF_OTEL_ENDPOINT=<url> at `macf init` /',
-    '#     `macf update` bakes a different default into this file',
+    '#   - Template-time: MACF_OTEL_ENDPOINT=<url> when this file is first',
+    '#     written (`macf init`) bakes a different default into it',
     '#   - Run-time: OTEL_EXPORTER_OTLP_ENDPOINT=<url> in the shell',
     '#     BEFORE invoking ./claude.sh overrides the baked default',
     '#',
