@@ -4,6 +4,12 @@ All notable changes to the `macf` CLI. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.73] — 2026-10-17
+
+### Fixed
+
+- **A missing-CA message no longer sends the operator to `macf certs init` after a deactivate.** `fleet reconcile`, `fleet status`, `fleet doctor`, `status` and `registry prune` now say that a deactivated fleet is restored with `macf bootstrap apply`, and that `macf certs init` is for a fleet with no CA yet; following the old advice mints a new CA and orphans every certificate. Found in a from-scratch e2e (#1507).
+
 ## [0.2.72] — 2026-10-17
 
 ### Fixed
