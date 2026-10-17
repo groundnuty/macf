@@ -13,6 +13,9 @@
  * can't install it (on cold-boot nothing launches to install it).
  *
  * The generated cron line, in order:
+ *   0. sets PATH to the installing shell's PATH (cron's PATH is /usr/bin:/bin, which
+ *      finds neither `node` for the `macf` shebang nor `claude` in the tmux session
+ *      reconcile launches);
  *   1. sources the host-prelude IF present (cron's bare env lacks the toolchain —
  *      the CLI / tmux / gh; DR-029/#599 host-prelude generator, DR-031 bootstrap);
  *   2. mints a FRESH `GH_TOKEN` fail-loud (cron has no ambient token; the watchdog's
@@ -42,6 +45,9 @@ import { existsSync, readFileSync, accessSync, constants as fsConstants } from '
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { MacfError } from '@groundnuty/macf-core';
+import { PACKAGE_VERSION } from '../../package-version.js';
+import { readAgentConfig, ownerAccountFromRegistry } from '../config.js';
+import { shellQuote } from '../fleet/launch-command.js';
 import { resolveWorkspaceDir, formatWorkspaceDirConflictWarning } from '../workspace-dir.js';
 
 /** Raised on a genuine crontab-write failure (fail-loud, never silent). */
@@ -52,14 +58,32 @@ export class FleetInstallCronError extends MacfError {
   }
 }
 
-/** The stable marker that guards idempotency — a re-run strips lines carrying it. */
+/**
+ * The bare marker older installs wrote (one global string, shared with other
+ * tools' watchdog lines). Kept only to recognise legacy lines; new lines carry
+ * `watchdogMarker(owner, project)`.
+ */
 export const WATCHDOG_MARKER = '# macf-watchdog (DR-006)';
+
+/**
+ * This fleet's marker, `# macf-watchdog (DR-006) [fleet=<owner>/<project>]`. Two
+ * owners can run a fleet of the same project name on one host, so it names both.
+ * The brackets stop one name matching inside a longer one; lines are matched by
+ * ENDING with it.
+ */
+export function watchdogMarker(owner: string, project: string): string {
+  return `${WATCHDOG_MARKER} [fleet=${owner}/${project}]`;
+}
 
 /** Coarse default cadence (DR-006 §A.4 heartbeat cadence). */
 export const DEFAULT_SCHEDULE = '*/10 * * * *';
 
-/** The command string the cron invokes (DR-037: the cron consumer of reconcile). */
-export const RECONCILE_INVOCATION = 'macf fleet reconcile';
+/**
+ * The subcommand the cron invokes (DR-037: the cron consumer of reconcile). It
+ * runs after the absolute `macf` path, because cron's PATH does not include npm's
+ * global bin.
+ */
+export const RECONCILE_ARGS = 'fleet reconcile';
 
 /** Default host-prelude path, relative to the workspace (DR-029/#599 generator). */
 const HOST_PRELUDE_REL = join('.claude', '.macf', 'host-prelude.sh');
@@ -90,6 +114,12 @@ export interface FleetInstallCronDeps {
   readonly crontabAvailable: () => boolean;
   /** App creds from `<workspace>/.claude/settings.local.json` `.env`, or null. */
   readonly readAppCreds: () => AppCreds | null;
+  /** The installing shell's PATH, baked into the line; null or empty when unset. */
+  readonly installPath: () => string | null;
+  /** Absolute path of the first `macf` on the installing shell's PATH, or null. */
+  readonly resolveMacf: () => string | null;
+  /** `<path> --version` of that binary (semver part), or null when it cannot be read. */
+  readonly macfVersion: (path: string) => string | null;
   /** True iff the token-mint helper exists + is executable at `path`. */
   readonly helperExists: (path: string) => boolean;
   /** Interactive y/N confirm (default No). */
@@ -102,6 +132,12 @@ export interface FleetInstallCronDeps {
 
 /** Already-resolved orchestrator input (env/config resolution done upstream). */
 export interface RunFleetInstallCronOptions {
+  /** The workspace's `macf-agent.json` `project`; scopes the crontab marker. */
+  readonly project: string;
+  /** The GitHub owner of the fleet's registry; scopes the crontab marker. */
+  readonly owner: string;
+  /** The running CLI's version; the `macf` baked into the line must match it. */
+  readonly cliVersion: string;
   /** Absolute workspace dir (holds `claude.sh`, `.claude/scripts`, `settings.local.json`). */
   readonly workspaceDir: string;
   /** Cron schedule expression. */
@@ -132,17 +168,20 @@ export interface RunFleetInstallCronOptions {
 
 /**
  * Build the reconcile flag list forwarded into the cron's `macf fleet reconcile`
- * invocation. Order mirrors the reference: manifest → routing → execute → restart.
- * Report-only is the ABSENCE of `--execute` (reconcile's dry-run default).
+ * invocation. Order: `--dir` → manifest → routing → execute → restart. `--dir` is
+ * always first: reconcile resolves its project from the cwd and cron runs in $HOME.
+ * Paths are emitted as quoted shell words. Report-only is the ABSENCE of
+ * `--execute` (reconcile's dry-run default).
  */
 export function buildReconcileFlags(opts: {
+  readonly workspaceDir: string;
   readonly manifest?: string;
   readonly withRouting: boolean;
   readonly execute: boolean;
   readonly allowRestart: boolean;
 }): readonly string[] {
-  const flags: string[] = [];
-  if (opts.manifest) flags.push('--manifest', opts.manifest);
+  const flags: string[] = ['--dir', shellQuote(opts.workspaceDir)];
+  if (opts.manifest) flags.push('--manifest', shellQuote(opts.manifest));
   if (opts.withRouting) flags.push('--with-routing');
   if (opts.execute) flags.push('--execute');
   if (opts.allowRestart) flags.push('--allow-restart');
@@ -192,14 +231,18 @@ export function buildTokenPrefix(args: {
   // Absolutize a relative key path against the workspace (matches claude.sh).
   const keyPath = rawKey.startsWith('/') ? rawKey : join(args.workspaceDir, rawKey);
   const prefix =
-    `GH_TOKEN=$(${helper} --app-id ${appId} --install-id ${installId} ` +
-    `--key ${keyPath}) || exit 1; export GH_TOKEN; `;
+    `GH_TOKEN=$(${shellQuote(helper)} --app-id ${appId} --install-id ${installId} ` +
+    `--key ${shellQuote(keyPath)}) || exit 1; export GH_TOKEN; `;
   return { prefix };
 }
 
 /** All resolved pieces of a cron line (pure input to `buildCronLine`). */
 export interface CronLineParts {
   readonly schedule: string;
+  /** Absolute path of the `macf` binary the cron runs. */
+  readonly macfPath: string;
+  /** The installing shell's PATH, set at the start of the line. */
+  readonly installPath: string;
   readonly preludePath: string;
   readonly tokenPrefix: string;
   readonly reconcileFlags: readonly string[];
@@ -209,38 +252,90 @@ export interface CronLineParts {
 
 /**
  * Assemble the full crontab line:
- *   `<schedule> [ -f <prelude> ] && . <prelude>; <token>macf fleet reconcile <flags> >> <log> 2>&1 <marker>`
+ *   `<schedule> PATH='<path>'; export PATH; [ -f <prelude> ] && . <prelude>; <token><absolute macf> fleet reconcile --dir <workspace> <flags> >> <log> 2>&1 <marker>`
+ * Every path is a quoted shell word.
  */
 export function buildCronLine(parts: CronLineParts): string {
-  const prelude = `[ -f ${parts.preludePath} ] && . ${parts.preludePath}; `;
+  const prelude = `[ -f ${shellQuote(parts.preludePath)} ] && . ${shellQuote(parts.preludePath)}; `;
   const flags = parts.reconcileFlags.length > 0 ? ` ${parts.reconcileFlags.join(' ')}` : '';
+  const pathSet = `PATH=${shellQuote(parts.installPath)}; export PATH; `;
   const cmd =
-    `${prelude}${parts.tokenPrefix}${RECONCILE_INVOCATION}${flags} ` +
-    `>> ${parts.logPath} 2>&1`;
+    `${pathSet}${prelude}${parts.tokenPrefix}${shellQuote(parts.macfPath)} ${RECONCILE_ARGS}${flags} ` +
+    `>> ${shellQuote(parts.logPath)} 2>&1`;
   return `${parts.schedule} ${cmd} ${parts.marker}`;
 }
 
-/** Split a crontab into lines, dropping the marker line(s) and any blank lines. */
-export function stripMarkerLines(existing: string, marker: string): readonly string[] {
-  return existing
-    .split('\n')
-    .filter((line) => !line.includes(marker) && line.trim() !== '');
+/**
+ * True iff `line` holds one of this workspace's own paths as a complete argument:
+ * the token helper, or the default host-prelude (a `--no-token` line has only that).
+ */
+function namesWorkspaceHelper(line: string, workspaceDir: string): boolean {
+  return [TOKEN_HELPER_REL, HOST_PRELUDE_REL].some((rel) => {
+    const path = join(workspaceDir, rel).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`(?:^|[\\s'"]|\\$\\()${path}(?=[\\s'";\\]]|$)`).test(line);
+  });
 }
 
-/** The crontab after installing `newLine` (idempotent: strips any prior marker line). */
+/** A line is this fleet's if it ends with its marker, or is a legacy line naming its workspace. */
+function isOwnedLine(line: string, marker: string, workspaceDir: string): boolean {
+  const t = line.trimEnd();
+  if (t.endsWith(marker)) return true;
+  return t.endsWith(WATCHDOG_MARKER) && namesWorkspaceHelper(line, workspaceDir);
+}
+
+/** Legacy bare-marker lines that do NOT belong to this workspace (left untouched). */
+export function foreignLegacyLines(existing: string, workspaceDir: string): readonly string[] {
+  return existing
+    .split('\n')
+    .filter((l) => l.trimEnd().endsWith(WATCHDOG_MARKER) && !namesWorkspaceHelper(l, workspaceDir));
+}
+
+/** Split a crontab into lines, dropping THIS fleet's line(s) and any blank lines. */
+export function stripMarkerLines(
+  existing: string,
+  marker: string,
+  workspaceDir: string,
+): readonly string[] {
+  return existing
+    .split('\n')
+    .filter((line) => !isOwnedLine(line, marker, workspaceDir) && line.trim() !== '');
+}
+
+/** The crontab after installing `newLine` (idempotent: strips this fleet's prior line). */
 export function computeInstalledCrontab(
   existing: string,
   newLine: string,
   marker: string,
+  workspaceDir: string,
 ): string {
-  const kept = stripMarkerLines(existing, marker);
+  const kept = stripMarkerLines(existing, marker, workspaceDir);
   return [...kept, newLine].join('\n') + '\n';
 }
 
-/** The crontab after removing the marker line(s); '' when nothing else remains. */
-export function computeUninstalledCrontab(existing: string, marker: string): string {
-  const kept = stripMarkerLines(existing, marker);
+/** The crontab after removing this fleet's line(s); '' when nothing else remains. */
+export function computeUninstalledCrontab(
+  existing: string,
+  marker: string,
+  workspaceDir: string,
+): string {
+  const kept = stripMarkerLines(existing, marker, workspaceDir);
   return kept.length > 0 ? kept.join('\n') + '\n' : '';
+}
+
+/** One notice naming a legacy line we left alone (cut to ~100 chars). */
+function noticeForeignLegacy(
+  existing: string,
+  workspaceDir: string,
+  warn: (msg: string) => void,
+): void {
+  const foreign = foreignLegacyLines(existing, workspaceDir);
+  if (foreign.length === 0) return;
+  const first = foreign[0]!.trim();
+  const shown = first.length > 100 ? `${first.slice(0, 100)}…` : first;
+  const more = foreign.length > 1 ? ` (+${foreign.length - 1} more)` : '';
+  warn(
+    `NOTE: left a crontab line in place because it does not belong to this fleet${more}: ${shown}`,
+  );
 }
 
 // --- Orchestrator (pure control flow over injected deps) ---
@@ -259,11 +354,15 @@ export async function runFleetInstallCron(
   }
 
   const existing = deps.readCrontab() ?? '';
+  const marker = watchdogMarker(opts.owner, opts.project);
+  noticeForeignLegacy(existing, opts.workspaceDir, deps.warn);
 
   // --- Uninstall path ---
   if (opts.uninstall) {
-    const hadLine = existing.split('\n').some((l) => l.includes(WATCHDOG_MARKER));
-    const next = computeUninstalledCrontab(existing, WATCHDOG_MARKER);
+    const hadLine = existing
+      .split('\n')
+      .some((l) => isOwnedLine(l, marker, opts.workspaceDir));
+    const next = computeUninstalledCrontab(existing, marker, opts.workspaceDir);
     if (!hadLine) {
       deps.log('No macf-watchdog cron line found — nothing to remove.');
       return 0;
@@ -286,6 +385,21 @@ export async function runFleetInstallCron(
   const preludePath = opts.prelude ?? join(opts.workspaceDir, HOST_PRELUDE_REL);
   const logPath = opts.log ?? join(homedirOf(deps, opts), WATCHDOG_LOG_REL);
 
+  const macf = checkMacfBinary(opts.cliVersion, deps);
+  if (!macf.ok) {
+    deps.warn(`macf fleet install-cron: ${macf.message}`);
+    return 2;
+  }
+
+  const installPath = deps.installPath()?.trim();
+  if (!installPath) {
+    deps.warn(
+      'macf fleet install-cron: PATH is empty here. The cron line sets the installing ' +
+        "shell's PATH; run this from a shell with PATH set.",
+    );
+    return 2;
+  }
+
   const token = buildTokenPrefix({
     noToken: opts.noToken,
     workspaceDir: opts.workspaceDir,
@@ -294,7 +408,26 @@ export async function runFleetInstallCron(
   });
   if (token.warning) deps.warn(`WARN: ${token.warning}`);
 
+  const percent = findPercentValue([
+    ['PATH', installPath],
+    ['workspace', opts.workspaceDir],
+    ['manifest', opts.manifest],
+    ['log', logPath],
+    ['prelude', preludePath],
+    ['token helper', token.prefix],
+    ['macf', macf.path],
+  ]);
+  if (percent) {
+    deps.warn(
+      `macf fleet install-cron: cannot install: ${percent} contains "%", which cron treats as ` +
+        'the end of the command. Use a path without "%" (or pass --log / --manifest / --prelude ' +
+        'pointing elsewhere).',
+    );
+    return 2;
+  }
+
   const reconcileFlags = buildReconcileFlags({
+    workspaceDir: opts.workspaceDir,
     manifest: opts.manifest,
     withRouting: opts.withRouting,
     execute: opts.execute,
@@ -303,11 +436,13 @@ export async function runFleetInstallCron(
 
   const line = buildCronLine({
     schedule: opts.schedule,
+    macfPath: macf.path,
+    installPath,
     preludePath,
     tokenPrefix: token.prefix,
     reconcileFlags,
     logPath,
-    marker: WATCHDOG_MARKER,
+    marker,
   });
 
   const mode = describeMode(opts);
@@ -324,13 +459,47 @@ export async function runFleetInstallCron(
     return 0;
   }
 
-  const next = computeInstalledCrontab(existing, line, WATCHDOG_MARKER);
+  const next = computeInstalledCrontab(existing, line, marker, opts.workspaceDir);
   deps.writeCrontab(next);
   deps.log(
     `Installed macf-watchdog cron [${mode}], schedule '${opts.schedule}', log ${logPath}.`,
   );
   deps.log('Verify: crontab -l | grep macf-watchdog');
   return 0;
+}
+
+/** Name of the first value containing `%` (cron ends the command there), or null. */
+export function findPercentValue(
+  values: ReadonlyArray<readonly [string, string | undefined]>,
+): string | null {
+  return values.find(([, v]) => v?.includes('%'))?.[0] ?? null;
+}
+
+/** Resolve the `macf` cron will run; refuse when absent or a different version. */
+export function checkMacfBinary(
+  cliVersion: string,
+  deps: Pick<FleetInstallCronDeps, 'resolveMacf' | 'macfVersion'>,
+): { readonly ok: true; readonly path: string } | { readonly ok: false; readonly message: string } {
+  const fix = `npm install -g @groundnuty/macf@${cliVersion}`;
+  const path = deps.resolveMacf();
+  if (!path) {
+    return {
+      ok: false,
+      message:
+        `no \`macf\` found on PATH. The cron line runs an absolute \`macf\` at this CLI's ` +
+        `version (${cliVersion}); install one with: ${fix}`,
+    };
+  }
+  const found = deps.macfVersion(path);
+  if (found !== cliVersion) {
+    return {
+      ok: false,
+      message:
+        `${path} reports version ${found ?? 'unknown'} but this CLI is ${cliVersion}. ` +
+        `Cron must run the same version; install it with: ${fix}`,
+    };
+  }
+  return { ok: true, path };
 }
 
 /** Human-readable install mode for the confirmation/summary lines. */
@@ -382,6 +551,19 @@ export function createRealDeps(workspaceDir: string): FleetInstallCronDeps {
       }
     },
     readAppCreds: () => readAppCredsFromSettings(workspaceDir),
+    installPath: () => process.env['PATH'] ?? null,
+    resolveMacf: () => resolveOnPath('macf'),
+    macfVersion: (path: string) => {
+      try {
+        const out = execFileSync(path, ['--version'], {
+          encoding: 'utf-8',
+          stdio: ['ignore', 'pipe', 'ignore'],
+        }).trim();
+        return out.split('+')[0] || null;
+      } catch {
+        return null;
+      }
+    },
     helperExists: (path: string) => {
       try {
         accessSync(path, fsConstants.X_OK);
@@ -394,6 +576,21 @@ export function createRealDeps(workspaceDir: string): FleetInstallCronDeps {
     log: (msg: string) => console.log(msg),
     warn: (msg: string) => console.error(msg),
   };
+}
+
+/** First executable `name` on `$PATH`, as an absolute path (like `command -v`). */
+function resolveOnPath(name: string): string | null {
+  for (const dir of (process.env['PATH'] ?? '').split(':')) {
+    if (!dir || !dir.startsWith('/')) continue;
+    const candidate = join(dir, name);
+    try {
+      accessSync(candidate, fsConstants.X_OK);
+      return candidate;
+    } catch {
+      // not here — keep looking
+    }
+  }
+  return null;
 }
 
 /** Read `.env.{APP_ID,INSTALL_ID,KEY_PATH}` from the workspace's settings.local.json. */
@@ -460,9 +657,33 @@ export async function runFleetInstallCronCommand(
   if (conflictWarning) console.error(conflictWarning);
   const workspaceDir = resolved.workspaceDir;
 
+  const config = readAgentConfig(workspaceDir);
+  const project = config?.project;
+  if (!config || !project) {
+    console.error(
+      `macf fleet install-cron: no project found in ${workspaceDir}/.macf/macf-agent.json ` +
+        '(run `macf init` first). The cron marker is per project, so it cannot be installed.',
+    );
+    return 2;
+  }
+
+  let owner: string;
+  try {
+    owner = ownerAccountFromRegistry(config.registry);
+  } catch {
+    console.error(
+      `macf fleet install-cron: no registry owner derivable from ${workspaceDir}/.macf/macf-agent.json ` +
+        '(`registry` must be org, profile or repo). The cron marker names the owner, so it cannot be installed.',
+    );
+    return 2;
+  }
+
   const deps = createRealDeps(workspaceDir);
   return runFleetInstallCron(
     {
+      project,
+      owner,
+      cliVersion: PACKAGE_VERSION,
       workspaceDir,
       schedule: cliOpts.schedule?.trim() || DEFAULT_SCHEDULE,
       execute: Boolean(cliOpts.execute),
