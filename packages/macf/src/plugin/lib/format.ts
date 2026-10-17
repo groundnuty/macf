@@ -204,7 +204,7 @@ export function formatIssuesOneline(
 export function formatSweepInstruction(): string {
   return [
     'Coordination sweep (coordination.md §Communication 5) — run before considering yourself idle:',
-    '  (a) reviewer-sweep: every open PR by others with no approval yet, requested from you or not, bot-authored included. A PR with no review has an empty reviewDecision, so test for not APPROVED: gh pr list --repo <repo> --state open --json number,author,reviewDecision --jq \'.[] | select(.reviewDecision != "APPROVED")\'',
+    '  (a) reviewer-sweep: every open PR by others with no approval yet, requested from you or not, bot-authored included. reviewDecision is empty, not REVIEW_REQUIRED, when no review is required, so filter on not APPROVED: gh pr list --repo <repo> --state open --json number,author,reviewDecision --jq \'.[] | select(.reviewDecision != "APPROVED")\'. Skip your own PRs; a bot author shows as app/<app-slug>.',
     '  (b) inbound-review-sweep + mention-sweep: any review request, or @mention on an open thread, addressed to you that you have not yet actioned?',
     '  (c) gate-sweep: for anything you are waiting on, does the APPROVED review or artifact already exist on GitHub?',
     'Assert against live GitHub state directly — do not wait for a ping that may have already arrived and been missed.',

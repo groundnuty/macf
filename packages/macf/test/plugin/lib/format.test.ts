@@ -239,7 +239,8 @@ describe('formatSweepInstruction — DR-038 Decision 5 §Communication 5 injecti
     const line = formatSweepInstruction().split('\n').find(l => l.includes('(a)')) ?? '';
     expect(line).toContain('every open PR by others with no approval yet');
     expect(line).toContain('requested from you or not');
-    expect(line).toContain('empty reviewDecision');
+    expect(line).toContain('reviewDecision is empty, not REVIEW_REQUIRED');
+    expect(line).toContain('Skip your own PRs; a bot author shows as app/<app-slug>.');
     expect(line).toContain('select(.reviewDecision != "APPROVED")');
   });
 });

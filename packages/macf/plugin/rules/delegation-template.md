@@ -8,8 +8,8 @@ Decide whether the work is for now or the backlog; ask only when someone asked y
 
 ## Verifications to forbid
 
-Where the intuitive way to verify the work is wrong, the spec names it and says why, not leaves it merely unlisted.
+In the Acceptance Criteria, name any obvious verification that would prove nothing, and say why; leaving it unlisted is not enough.
 
 - Circular: a reference value derived from what it checks (scaffold a manifest from live state, then diff it against live state; a fixture and its expectation built by the same helper). Agreement proves nothing, so there is no correct version.
-- Unspecified consequence: if a spec says a state is "a skip, not a halt" but not what it exits, the test will invent an exit code. Put the consequence in the spec ("a roll that leaves any agent behind exits 2").
+- Unspecified consequence: if an issue says a state is "a skip, not a halt" but not what it exits, the test will invent an exit code. Put the consequence in the Acceptance Criteria ("a roll that leaves any agent behind exits 2").
 - Excluded case: a population that cannot produce the failing case (all-created fixtures, a warm org). Ask which case the population lacks, and whether that is the case the code gets wrong.
