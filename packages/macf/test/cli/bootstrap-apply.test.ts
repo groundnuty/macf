@@ -4823,9 +4823,9 @@ describe('formatApplyResult / fleetApplyResultToJson / applyExitCode (pure)', ()
     const cmd = otherHostDeployCommand('macf-experiment/macf-trial-control', 'code-agent');
     expect(cmd).toBe(
       "On the host that will run it, put copies of the control repo's fleet.yaml and "
-        + 'secrets/vault.age side by side as <dir>/fleet.yaml and <dir>/secrets/vault.age '
+        + 'secrets/vault.age side by side as DIR/fleet.yaml and DIR/secrets/vault.age '
         + '(for example with scp from a clone on this machine), then run: '
-        + "macf fleet deploy --agent code-agent -f <dir>/fleet.yaml --identity-key <that host's age key>",
+        + "macf fleet deploy --agent code-agent -f DIR/fleet.yaml --identity-key PATH_TO_YOUR_AGE_IDENTITY_KEY",
     );
     expect(cmd).toContain('fleet.yaml and secrets/vault.age');
     expect(cmd).not.toContain('clone macf-experiment/macf-trial-control');

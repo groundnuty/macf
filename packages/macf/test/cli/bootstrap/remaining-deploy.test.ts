@@ -108,8 +108,8 @@ describe('computeRemainingDeploy', () => {
       expect(step.command).not.toContain('--vault');
     }
     expect(report.vaultLocationNote).toContain('fleet.yaml and secrets/vault.age');
-    expect(report.vaultLocationNote).toContain('<dir>/fleet.yaml');
-    expect(report.vaultLocationNote).toContain("--identity-key <that host's age key>");
+    expect(report.vaultLocationNote).toContain('DIR/fleet.yaml');
+    expect(report.vaultLocationNote).toContain("--identity-key PATH_TO_YOUR_AGE_IDENTITY_KEY");
     // The old guidance told the operator to clone the private control repo on the agent host.
     expect(report.vaultLocationNote).not.toMatch(/clone it first|local clone of|git pull|pass --vault/i);
   });

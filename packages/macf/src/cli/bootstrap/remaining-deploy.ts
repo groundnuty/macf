@@ -117,9 +117,9 @@ function buildDeployCommand(manifestPath: string, role: string, flags: DeployFla
 function vaultLocationNote(): string {
   return (
     'On the host that will run it, put copies of the control repo\'s fleet.yaml and secrets/vault.age side ' +
-    'by side as <dir>/fleet.yaml and <dir>/secrets/vault.age (for example with scp from a clone on this ' +
+    'by side as DIR/fleet.yaml and DIR/secrets/vault.age (for example with scp from a clone on this ' +
     'machine), then run:\n' +
-    "      macf fleet deploy --agent <role> -f <dir>/fleet.yaml --identity-key <that host's age key>"
+    "      macf fleet deploy --agent ROLE -f DIR/fleet.yaml --identity-key PATH_TO_YOUR_AGE_IDENTITY_KEY"
   );
 }
 
