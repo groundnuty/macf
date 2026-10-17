@@ -331,10 +331,15 @@ async function reconcileAgent(
 
   const actual = classifyReachability(fleet, agent);
 
-  // A registered agent with no live runtime is not running (stale registration).
-  const stale = actual === 'deaf' && !(await deps.driver.isRunning(agent));
+  if (actual === 'reachable') {
+    if (config.execute) deps.store.reset(agent);
+    return { row: mkRow(agent, 'OK', 'reachable + accepting'), acted: false };
+  }
 
-  if (actual === 'absent' || stale) {
+  // Whether the agent runs is the host's fact (a live session), not the
+  // registry's: a registration can outlive a reboot, and a starting or stuck
+  // agent has a session before it registers.
+  if (!(await deps.driver.isRunning(agent))) {
     // exit-code intent: not running + last-exit==0 (operator typed /exit) → desired-down.
     if (state.lastExit === 0) {
       return {
@@ -342,22 +347,21 @@ async function reconcileAgent(
         acted: false,
       };
     }
-    const detail = stale
+    const detail = actual === 'deaf'
       ? `registered but not running here (stale registration, e.g. after a reboot) → cold-start (ws: ${d.workspace})`
       : `not running, last-exit!=0/absent → cold-start (ws: ${d.workspace})`;
     return launchRow(d, detail, deps, config, launchCount);
   }
 
-  if (actual === 'reachable') {
-    if (config.execute) deps.store.reset(agent);
-    return { row: mkRow(agent, 'OK', 'reachable + accepting'), acted: false };
-  }
-
-  // deaf → HEAL ladder, unless the pane waits for an answer the ladder must never type.
+  // Running but not reachable → HEAL ladder, unless the pane waits for an
+  // answer the ladder must never type. A second instance is never launched.
   const waiting = await promptGuard(d, deps, config);
   if (waiting) return waiting;
   await healAgent(d, state, deps, config);
-  return { row: mkRow(agent, 'HEAL', 'registered but channel DOWN (deaf) → ladder'), acted: true };
+  const detail = actual === 'deaf'
+    ? 'registered but channel DOWN (deaf) → ladder'
+    : 'session running but not registered (channel server down or not yet up) → ladder';
+  return { row: mkRow(agent, 'HEAL', detail), acted: true };
 }
 
 /**
@@ -514,8 +518,11 @@ async function raiseAlert(
     deps.log(`    [skip] Tier-3 alert for ${agent} already open (dedup)`);
     return;
   }
+  if (!config.execute) {
+    deps.log(`    (dry-run) would raise a Tier-3 alert for ${agent} (${reason})`);
+    return;
+  }
   deps.log(`    Tier-3 alert for ${agent} (${reason})`);
-  if (!config.execute) return;
   await deps.alert(agent, reason);
   const fresh = deps.store.read(agent);
   deps.store.write(agent, { ...fresh, alertOpen: true });

@@ -84,8 +84,10 @@ interface DriverCalls {
 interface FakeDriverOpts {
   readonly probe: FleetState | (() => Promise<FleetState>);
   readonly busy?: ReadonlySet<string>;
-  /** Agents with no live session (registered or not). Default: all running. */
+  /** Agents with no live session. Default: a registered agent runs, an unregistered one does not. */
   readonly notRunning?: ReadonlySet<string>;
+  /** Unregistered agents that nevertheless have a live session (starting, or stuck at a prompt). */
+  readonly runningUnregistered?: ReadonlySet<string>;
   /** Make `launch` throw this for the named agent. */
   readonly launchThrows?: ReadonlyMap<string, Error>;
   readonly workspaces?: readonly WorkspaceRecord[];
@@ -97,14 +99,20 @@ function fakeDriver(o: FakeDriverOpts): { driver: FleetDriver; calls: DriverCall
   const calls: DriverCalls = { launched: [], injected: [], restarted: [], busyChecks: [] };
   const busy = o.busy ?? new Set<string>();
   const notRunning = o.notRunning ?? new Set<string>();
+  let last: FleetState | null = null;
+  const probe = typeof o.probe === 'function' ? o.probe : async () => o.probe as FleetState;
   const driver: FleetDriver = {
-    probe: typeof o.probe === 'function' ? o.probe : async () => o.probe,
+    probe: async () => (last = await probe()),
     discoverWorkspaces: () => o.workspaces ?? [],
     isBusy: async (agent: string) => {
       calls.busyChecks.push(agent);
       return busy.has(agent);
     },
-    isRunning: async (agent: string) => !notRunning.has(agent),
+    isRunning: async (agent: string) => {
+      if (notRunning.has(agent)) return false;
+      if (o.runningUnregistered?.has(agent)) return true;
+      return last?.agents.some((a) => a.name === agent) ?? false;
+    },
     capturePane: async (agent: string) => o.panes?.get(agent) ?? null,
     upgrade: async () => {},
     restart: async (agent: string) => void calls.restarted.push(agent),
@@ -593,6 +601,22 @@ describe('reconcileFleet — prompt guard before heal', () => {
     expect(h.calls.restarted).toEqual([]);
     expect(h.alerts).toHaveLength(1);
     expect(h.storeCalls.writes.every((w) => w.state.deafSweeps === 0)).toBe(true);
+  });
+
+  it('an unregistered agent whose session is alive at the trust dialog is BLOCKED, never launched again', async () => {
+    const h = harness({ probe: fleet(), runningUnregistered: new Set(['devops-agent']), panes: paneFor(fx('live-trust-pane.txt')) });
+    const r = await reconcileFleet(oneDeaf, h.deps, cfg({ execute: true }));
+    expect(decisionOf(r.rows, 'devops-agent')).toBe('BLOCKED');
+    expect(h.calls.launched).toEqual([]);
+    expect(h.calls.injected).toEqual([]);
+  });
+
+  it('an unregistered agent with a live session and no prompt gets the heal ladder, not a second launch', async () => {
+    const h = harness({ probe: fleet(), runningUnregistered: new Set(['devops-agent']) });
+    const r = await reconcileFleet(oneDeaf, h.deps, cfg({ execute: true }));
+    expect(decisionOf(r.rows, 'devops-agent')).toBe('HEAL');
+    expect(r.rows[0]!.detail).toContain('session running but not registered');
+    expect(h.calls.launched).toEqual([]);
   });
 
   it('names the real tmux session when discovery knows the project', async () => {

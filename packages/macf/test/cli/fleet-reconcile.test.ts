@@ -89,7 +89,8 @@ function stubDriver(workspaces: readonly WorkspaceRecord[]): FleetDriver {
     probe: async () => ({ agents: [] }),
     discoverWorkspaces: () => workspaces,
     isBusy: async () => false,
-    isRunning: async () => true,
+    // Nothing is registered (probe above), so nothing has a live session either.
+    isRunning: async () => false,
     upgrade: async () => {},
     restart: async () => {},
     inject: async () => {},
