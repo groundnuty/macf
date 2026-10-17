@@ -109,6 +109,7 @@ interface PersistedState {
   readonly restartAttempts: number;
   readonly backoffUntil: number;
   readonly alertOpen: boolean;
+  readonly watcherPromptSweeps: number;
 }
 
 /** Parse a persisted state JSON (defensive — a corrupt/partial file degrades to zeros). */
@@ -120,9 +121,10 @@ function readPersisted(path: string): PersistedState {
       restartAttempts: Number(raw.restartAttempts ?? 0),
       backoffUntil: Number(raw.backoffUntil ?? 0),
       alertOpen: Boolean(raw.alertOpen ?? false),
+      watcherPromptSweeps: Number(raw.watcherPromptSweeps ?? 0),
     };
   } catch {
-    return { deafSweeps: 0, restartAttempts: 0, backoffUntil: 0, alertOpen: false };
+    return { deafSweeps: 0, restartAttempts: 0, backoffUntil: 0, alertOpen: false, watcherPromptSweeps: 0 };
   }
 }
 
@@ -148,7 +150,7 @@ export function createFsStateStore(dirs: ReconcileStateDirs): ReconcileStateStor
     read: (agent: string): ReconcileAgentState => {
       const persisted = existsSync(statePath(agent))
         ? readPersisted(statePath(agent))
-        : { deafSweeps: 0, restartAttempts: 0, backoffUntil: 0, alertOpen: false };
+        : { deafSweeps: 0, restartAttempts: 0, backoffUntil: 0, alertOpen: false, watcherPromptSweeps: 0 };
       return {
         ...EMPTY_RECONCILE_STATE,
         ...persisted,
@@ -163,6 +165,7 @@ export function createFsStateStore(dirs: ReconcileStateDirs): ReconcileStateStor
         restartAttempts: state.restartAttempts,
         backoffUntil: state.backoffUntil,
         alertOpen: state.alertOpen,
+        watcherPromptSweeps: state.watcherPromptSweeps ?? 0,
       };
       writeFileSync(statePath(agent), JSON.stringify(persisted));
     },

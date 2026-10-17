@@ -144,6 +144,12 @@ describe('createFsStateStore', () => {
     });
   });
 
+  it('persists the watcher-prompt grace counter across sweeps (write → read)', () => {
+    const store = createFsStateStore(dirs());
+    store.write('code-agent', { ...store.read('code-agent'), watcherPromptSweeps: 1 });
+    expect(createFsStateStore(dirs()).read('code-agent').watcherPromptSweeps).toBe(1);
+  });
+
   it('round-trips persisted escalation state (write → read)', () => {
     const store = createFsStateStore(dirs());
     store.write('devops-agent', {
