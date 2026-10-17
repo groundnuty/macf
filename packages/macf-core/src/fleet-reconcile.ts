@@ -67,6 +67,8 @@ export interface ReconcileAgentState {
   readonly lastExit: number | null;
   /** Explicit operator `paused` sentinel → desired-down. */
   readonly paused: boolean;
+  /** Consecutive sweeps that found a prompt the prompt watcher should answer still showing. */
+  readonly watcherPromptSweeps?: number;
 }
 
 /** The zero state for an agent with no persisted history. */
@@ -77,6 +79,7 @@ export const EMPTY_RECONCILE_STATE: ReconcileAgentState = {
   alertOpen: false,
   lastExit: null,
   paused: false,
+  watcherPromptSweeps: 0,
 };
 
 /**
@@ -357,7 +360,7 @@ async function reconcileAgent(
 
   // Running but not reachable → HEAL ladder, unless the pane waits for an
   // answer the ladder must never type. A second instance is never launched.
-  const waiting = await promptGuard(d, deps, config);
+  const waiting = await promptGuard(d, state, deps, config);
   if (waiting) return waiting;
   await healAgent(d, state, deps, config);
   const detail = actual === 'deaf'
@@ -373,20 +376,32 @@ async function reconcileAgent(
  */
 async function promptGuard(
   d: DesiredAgent,
+  state: ReconcileAgentState,
   deps: ReconcileDeps,
   config: ReconcileConfig,
 ): Promise<{ readonly row: ReconcileRow; readonly acted: boolean } | null> {
   const agent = d.agent;
+  const seenBefore = state.watcherPromptSweeps ?? 0;
   let prompt: string | null;
   try {
     prompt = detectLaunchPrompt(await deps.driver.capturePane(agent));
   } catch {
     return null;
   }
-  if (prompt === null) return null;
+  if (prompt === null) {
+    if (config.execute && seenBefore > 0) deps.store.write(agent, { ...state, watcherPromptSweeps: 0 });
+    return null;
+  }
   if (isWatcherAnsweredPrompt(prompt)) {
-    const detail = `waiting at a prompt (${prompt}) that the prompt watcher answers; left alone this sweep`;
-    return { row: mkRow(agent, 'SKIP', detail), acted: false };
+    // The watcher answers within seconds, so one sweep of grace is enough. A
+    // prompt still showing a whole sweep later means the watcher is off, has no
+    // config, or gave up: report it instead of skipping it forever.
+    if (seenBefore === 0) {
+      if (config.execute) deps.store.write(agent, { ...state, watcherPromptSweeps: 1 });
+      const detail = `waiting at a prompt (${prompt}) that the prompt watcher answers; left alone this sweep`;
+      return { row: mkRow(agent, 'SKIP', detail), acted: false };
+    }
+    prompt = `${prompt}, which the prompt watcher did not clear since the last sweep`;
   }
   // Name the session the operator attaches to (`<project>@<routing-label>`)
   // when this host's discovery knows the project; never guess it.

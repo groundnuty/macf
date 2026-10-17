@@ -140,6 +140,7 @@ describe('createFsStateStore', () => {
       alertOpen: false,
       lastExit: null,
       paused: false,
+      watcherPromptSweeps: 0,
     });
   });
 

@@ -675,9 +675,28 @@ describe('reconcileFleet — prompt guard before heal', () => {
     expect(h.calls.injected).toEqual([]);
     expect(h.calls.restarted).toEqual([]);
     expect(h.alerts).toEqual([]);
-    expect(h.storeCalls.writes).toEqual([]);
+    // Only the grace counter is recorded; no deaf sweep is counted.
+    expect(h.storeCalls.writes.map((w) => [w.agent, w.state.watcherPromptSweeps, w.state.deafSweeps])).toEqual([['devops-agent', 1, 0]]);
     expect(r.rows[0]!.detail).toMatch(/^waiting at a prompt \(.+\) that the prompt watcher answers; left alone this sweep$/);
     expect(h.logs.filter((l) => l.includes('prompt watcher'))).toHaveLength(1);
+  });
+
+  it('a watcher-answered prompt still showing a sweep later → BLOCKED, alert, rc 3, nothing typed', async () => {
+    const entry = PROMPT_RESPONSES_SEED.entries[0]!;
+    const h = harness({ probe: deafProbe(), panes: paneFor(entry.frame_contains.join('\n')) }, { 'devops-agent': { watcherPromptSweeps: 1 } });
+    const r = await reconcileFleet(oneDeaf, h.deps, cfg({ execute: true, allowRestart: true }));
+    expect(decisionOf(r.rows, 'devops-agent')).toBe('BLOCKED');
+    expect(r.rows[0]!.detail).toContain('which the prompt watcher did not clear since the last sweep');
+    expect(r.rc).toBe(3);
+    expect(h.alerts).toHaveLength(1);
+    expect(h.calls.injected).toEqual([]);
+    expect(h.calls.restarted).toEqual([]);
+  });
+
+  it('a cleared pane resets the watcher grace counter', async () => {
+    const h = harness({ probe: deafProbe(), panes: paneFor(fx('live-ready-pane.txt')) }, { 'devops-agent': { watcherPromptSweeps: 1 } });
+    await reconcileFleet(oneDeaf, h.deps, cfg({ execute: true }));
+    expect(h.storeCalls.writes.some((w) => w.state.watcherPromptSweeps === 0)).toBe(true);
   });
 
   it('no prompt → Tier-1 inject as before', async () => {
