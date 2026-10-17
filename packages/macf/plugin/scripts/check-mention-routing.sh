@@ -817,10 +817,17 @@ HANDLE_PATTERN='@[a-zA-Z][a-zA-Z0-9_-]*[[]bot[]]'
 # a person; GitHub notifies them directly. Reads text on stdin and prints
 # HUMAN:<login> per recipient, or TYPO:<login> when the login starts with
 # "${MACF_PROJECT}-" (a fleet agent missing its [bot] suffix).
+# This is a heuristic Markdown scan: it covers fenced code (with length),
+# blockquotes and indented code, and does not model HTML blocks or every
+# CommonMark edge case. A miss lets a recipient-free comment through, as before
+# this hook existed; it never blocks a real recipient.
+# Indented code: a line indented four or more spaces (or a tab) that follows a
+# blank line or another such line. List-item context is not modelled.
 macf_human_scan() {
   awk -v proj="${MACF_PROJECT:-}" '
   {
     line = $0
+    sub(/^[[:space:]]*(>[[:space:]]?)+/, "", line)
     if (match(line, /^[[:space:]]*(```+|~~~+)/)) {
       run = substr(line, RSTART, RLENGTH)
       sub(/^[[:space:]]+/, "", run)
@@ -832,6 +839,9 @@ macf_human_scan() {
       next
     }
     if (in_fence != "") next
+    if (line ~ /^[[:space:]]*$/) { blank = 1; next }
+    if (line ~ /^(    |\t)/ && (blank || icode)) { icode = 1; blank = 0; next }
+    icode = 0; blank = 0
     sub(/^[[:space:]>]*([0-9]+\.[[:space:]]+|[-*][[:space:]]+)?/, "", line)
     if (match(line, /^@[A-Za-z0-9][A-Za-z0-9-]*/)) {
       login = substr(line, 2, RLENGTH - 1)

@@ -645,6 +645,24 @@ describe('check-mention-routing.sh (hook)', () => {
       expect(r.status).toBe(2);
     });
 
+    it('does not count a human mention inside a blockquoted fence', () => {
+      const fence = '```';
+      const r = runHook({ command: cmd(`> ${fence}\n> @groundnuty example only\n> ${fence}`) });
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain('zero');
+    });
+
+    it('still counts a real line-start mention inside a blockquote', () => {
+      const r = runHook({ command: cmd('> @groundnuty question') });
+      expect(r.status).toBe(0);
+    });
+
+    it('does not count an indented code line after a blank line', () => {
+      const r = runHook({ command: cmd('see below\n\n    @groundnuty example') });
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain('zero');
+    });
+
     it('counts a human recipient in a comment chained after a close', () => {
       const chain = (body: string): string =>
         `gh issue close 123 --comment done && gh issue comment 123 --body "\n${body}"`;
