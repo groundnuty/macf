@@ -17,6 +17,7 @@ import {
   buildBranchSkipMessage,
   describeInspectedWorkspace,
   detectLaunchPrompt,
+  isPaneReady,
   isWatcherAnsweredPrompt,
   type FleetDriver,
   type FleetState,
@@ -1917,6 +1918,19 @@ describe('upgradeFleets', () => {
     expect(report.halted).toBe(false);
     expect(report.fleets[0]).toMatchObject({ fleet: 'fleet-1', skipped: 'driver-unresolved' });
     expect(calls.upgrade).toEqual(['b']); // fleet-2 still rolled
+  });
+});
+
+describe('isPaneReady', () => {
+  const fx = (n: string) => readFileSync(new URL(`./fixtures/${n}`, import.meta.url), 'utf8');
+  it('is true for the live ready pane', () => {
+    expect(isPaneReady(fx('live-ready-pane.txt'))).toBe(true);
+  });
+  it('is false for the live trust pane', () => {
+    expect(isPaneReady(fx('live-trust-pane.txt'))).toBe(false);
+  });
+  it('is false for a pane before Claude Code has drawn', () => {
+    expect(isPaneReady(fx('pre-start-pane.txt'))).toBe(false);
   });
 });
 

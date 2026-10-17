@@ -1,0 +1,10 @@
+──────────────────────────────────────────────────────────────────── usability ─
+❯ Pick up pending issues: o/r#1: example issue
+    example wrapped input text
+    example wrapped input text
+    example wrapped input text
+    example wrapped input text
+    example wrapped input text
+────────────────────────────────────────────────────────────────────────────────
+   Opus 5.5 xhigh |  84.0% | ⎇ insights/live-test-conditions(+63,-7) | SB...
+  ⏵⏵ auto mode on (shift+tab to cycle)

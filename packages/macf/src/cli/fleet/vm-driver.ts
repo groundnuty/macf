@@ -26,6 +26,7 @@ import {
   FleetLaunchBlockedError,
   FleetLaunchFailedError,
   detectLaunchPrompt,
+  isPaneReady,
   isWatcherAnsweredPrompt,
   ROLL_TOUCHED_CONFIG_PATTERNS,
   createRegistryFromConfig,
@@ -619,16 +620,21 @@ export function createVmDriver(opts: VmDriverOptions, seams: VmDriverSeams): Fle
     // The watcher answers its own prompts; anything else on the pane waits for an operator.
     const windowMs = opts.launchPromptWindowMs ?? DEFAULT_LAUNCH_PROMPT_WINDOW_MS;
     let elapsed = 0;
-    let prompt = detectLaunchPrompt(seams.capturePane(session));
     for (;;) {
-      if (prompt === null) return;
-      if (!isWatcherAnsweredPrompt(prompt)) throw new FleetLaunchBlockedError(session, prompt);
+      const pane = seams.capturePane(session);
+      const prompt = detectLaunchPrompt(pane);
+      if (prompt !== null && !isWatcherAnsweredPrompt(prompt)) throw new FleetLaunchBlockedError(session, prompt);
+      if (prompt === null && isPaneReady(pane)) return;
       if (elapsed >= windowMs) {
-        throw new FleetLaunchBlockedError(session, `${prompt}; the prompt watcher did not clear it`);
+        if (prompt !== null) {
+          throw new FleetLaunchBlockedError(session, `${prompt}; the prompt watcher did not clear it`);
+        }
+        throw new FleetLaunchFailedError(
+          `${session} did not reach Claude Code's input prompt within ${Math.round(windowMs / 1000)}s`,
+        );
       }
       await seams.sleep(pollMs);
       elapsed += pollMs;
-      prompt = detectLaunchPrompt(seams.capturePane(session));
     }
   }
 

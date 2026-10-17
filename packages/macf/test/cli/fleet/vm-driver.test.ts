@@ -96,6 +96,9 @@ interface Recorder {
   readonly spawnEnvs: (NodeJS.ProcessEnv | undefined)[];
 }
 
+/** A real ready Claude Code pane: the only frame a launch verifies OK on. */
+const READY_PANE = readFileSync(new URL('./fixtures/live-ready-pane.txt', import.meta.url), 'utf8');
+
 /** Per-call capturePane return values (drained in order; repeats last). */
 interface SeamOverrides {
   readonly workspaces?: readonly WorkspaceRecord[];
@@ -906,7 +909,7 @@ describe('restart', () => {
   });
 
   it('cold-launches when the agent is dead (restart == launch)', async () => {
-    const { seams, rec } = fakeSeams({ liveSessions: new Set() });
+    const { seams, rec } = fakeSeams({ liveSessions: new Set(), paneReads: [READY_PANE] });
     await createVmDriver(OPTS, seams).restart('code-agent');
     expect(rec.execs).toEqual([{ bin: 'tmux', args: LAUNCH_ARGS_CODE, cwd: '/w/macf' }]);
     expect(rec.spawns).toEqual([]);
@@ -970,7 +973,7 @@ describe('inject', () => {
 
 describe('launch', () => {
   it('creates a detached tmux session running claude.sh, and never spawns claude.sh itself', async () => {
-    const { seams, rec } = fakeSeams();
+    const { seams, rec } = fakeSeams({ paneReads: [READY_PANE] });
     await createVmDriver(OPTS, seams).launch('science-agent');
     expect(rec.execs).toEqual([
       {
@@ -1011,15 +1014,45 @@ describe('launch', () => {
     expect(rec.sleeps).toEqual([1000, 1000, 1000]);
   });
 
-  it('succeeds when the pane shows no prompt', async () => {
-    const { seams, rec } = fakeSeams({ paneReads: ['Claude Code v2 — ready'] });
+  const fx = (n: string) => readFileSync(new URL(`./fixtures/${n}`, import.meta.url), 'utf8');
+  const READY = READY_PANE;
+  const PRE_START = fx('pre-start-pane.txt');
+
+  it('succeeds at once when the first read is the ready pane', async () => {
+    const { seams, rec } = fakeSeams({ paneReads: [READY] });
     await createVmDriver({ ...OPTS, launchPromptWindowMs: 5000 }, seams).launch('code-agent');
+    expect(rec.captured).toHaveLength(1);
     expect(rec.submits).toEqual([]);
+  });
+
+  it('waits through a pre-start pane, then succeeds on the ready pane', async () => {
+    const { seams, rec } = fakeSeams({ paneReads: [PRE_START, PRE_START, READY] });
+    await createVmDriver({ ...OPTS, launchPromptWindowMs: 5000, launchPollMs: 1000 }, seams).launch('code-agent');
+    expect(rec.captured).toHaveLength(3);
+  });
+
+  it('reports BLOCKED when the trust dialog follows a pre-start pane', async () => {
+    const { seams } = fakeSeams({ paneReads: [PRE_START, fx('live-trust-pane.txt')] });
+    const err = await createVmDriver({ ...OPTS, launchPromptWindowMs: 5000, launchPollMs: 1000 }, seams)
+      .launch('code-agent')
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(FleetLaunchBlockedError);
+    expect((err as FleetLaunchBlockedError).prompt).toBe('trust-dialog');
+  });
+
+  it('fails loudly when the pane never reaches the input prompt', async () => {
+    const { seams } = fakeSeams();
+    seams.capturePane = () => PRE_START;
+    const err = await createVmDriver({ ...OPTS, launchPromptWindowMs: 3000, launchPollMs: 1000 }, seams)
+      .launch('code-agent')
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(FleetLaunchFailedError);
+    expect((err as Error).message).toContain('did not reach Claude Code');
   });
 
   it('waits out a prompt the watcher answers, then succeeds once it clears', async () => {
     const seed = 'I am using this for local development';
-    const { seams, rec } = fakeSeams({ paneReads: [seed, seed, 'Claude Code v2 — ready'] });
+    const { seams, rec } = fakeSeams({ paneReads: [seed, seed, READY] });
     await createVmDriver({ ...OPTS, launchPromptWindowMs: 5000, launchPollMs: 1000 }, seams).launch('code-agent');
     expect(rec.sleeps).toEqual([1000, 1000]);
     expect(rec.submits).toEqual([]);
@@ -1131,7 +1164,7 @@ describe('orchestrator-identity-env scrub on exec/spawnDetached (macf#763)', () 
   });
 
   it('restart (session dead → cold-start launch): the spawnDetached child env carries NONE of the orchestrator identity', async () => {
-    const { seams, rec } = fakeSeams({ liveSessions: new Set() });
+    const { seams, rec } = fakeSeams({ liveSessions: new Set(), paneReads: [READY_PANE] });
     await createVmDriver(OPTS, seams).restart('science-agent');
     expect(rec.execEnvs).toHaveLength(1);
     const env = rec.execEnvs[0]!;
@@ -1141,7 +1174,7 @@ describe('orchestrator-identity-env scrub on exec/spawnDetached (macf#763)', () 
   });
 
   it('launch: the spawnDetached child env carries NONE of the orchestrator identity', async () => {
-    const { seams, rec } = fakeSeams();
+    const { seams, rec } = fakeSeams({ paneReads: [READY_PANE] });
     await createVmDriver(OPTS, seams).launch('science-agent');
     expect(rec.execEnvs).toHaveLength(1);
     const env = rec.execEnvs[0]!;
