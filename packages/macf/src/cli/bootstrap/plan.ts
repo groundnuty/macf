@@ -813,6 +813,8 @@ export interface FleetPlan {
    * ever adds a named fact alongside it.
    */
   readonly runnerDeclarationMismatches: readonly RunnerDeclarationFinding[];
+  /** groundnuty/macf#1497 — router-carrying repos whose routing runs on GitHub-hosted (metered) runners. Informational; never affects the exit code. */
+  readonly meteredRoutingRepos: readonly MeteredRoutingRepo[];
   /**
    * groundnuty/macf#1336 — zero-to-N per-secret findings, one per routing
    * secret genuinely SPLIT across the fleet's agent repos (present on some,
@@ -3437,6 +3439,7 @@ export function computePlan(
   // reconciles against) — never a live enumeration of the owner's other
   // repos, so a repo the fleet does not own is still never consulted; see
   // `findRoutingSecretAsymmetries`'s own doc.
+  const meteredRoutingRepos = computeMeteredRoutingRepos(manifest);
   const routingSecretAsymmetries = findRoutingSecretAsymmetries(routerCarryingRepos(manifest), observed.routingSecretRepos ?? {});
 
   // groundnuty/macf#1348 — same derivation `routerCarryingRepos` itself
@@ -3457,9 +3460,45 @@ export function computePlan(
     installScopeDrift,
     scopeCredentials,
     runnerDeclarationMismatches,
+    meteredRoutingRepos,
     routingSecretAsymmetries,
     controlRepoRouterCoverage,
   };
+}
+
+/**
+ * groundnuty/macf#1497 — the router-carrying repos whose caller runs on
+ * GitHub-hosted runners: every agent repo unless `routing.runner.runs_on` is
+ * `self-hosted`, plus the control repo unless `routing.control_repo_runs_on`
+ * is. Derived from the manifest alone (what the generator will emit).
+ */
+/** A router-carrying repo whose routing runs on GitHub-hosted runners, and which kind it is. */
+export interface MeteredRoutingRepo {
+  readonly repo: string;
+  readonly kind: 'agent' | 'control';
+}
+
+function computeMeteredRoutingRepos(manifest: FleetManifest): readonly MeteredRoutingRepo[] {
+  const repos = routerCarryingRepos(manifest);
+  const controlRepo = repos.at(-1);
+  const agentsSelfHosted = manifest.routing?.runner?.runs_on === 'self-hosted';
+  return [...new Set(repos)]
+    .map((repo): MeteredRoutingRepo => ({ repo, kind: repo === controlRepo ? 'control' : 'agent' }))
+    .filter((r) => (r.kind === 'control' ? !controlRepoSelfHosted(manifest) : !agentsSelfHosted));
+}
+
+/**
+ * groundnuty/macf#1497 — one informational line per repo that routes on
+ * metered GitHub-hosted runners, with the remedy for that repo's kind. The
+ * control repo's field is refused unless the agent repos' is also set.
+ */
+export function formatMeteredRoutingLines(repos: readonly MeteredRoutingRepo[]): readonly string[] {
+  return repos.map(({ repo, kind }) =>
+    `${repo}: routing runs on GitHub-hosted runners, which bill per minute on a private repo. ` +
+    (kind === 'control'
+      ? 'To move it, set routing.runner.runs_on and routing.control_repo_runs_on to self-hosted, then re-run apply.'
+      : 'To move it, set routing.runner.runs_on: self-hosted and re-run apply.'),
+  );
 }
 
 // --- Formatting (human table + --json) ---
@@ -3952,6 +3991,10 @@ export function formatPlanText(plan: FleetPlan): string {
   const runnerDeclarationLines = formatRunnerDeclarationLines(plan.runnerDeclarationMismatches);
   if (runnerDeclarationLines.length > 0) {
     parts.push('', ...runnerDeclarationLines);
+  }
+  const meteredRoutingLines = formatMeteredRoutingLines(plan.meteredRoutingRepos);
+  if (meteredRoutingLines.length > 0) {
+    parts.push('', ...meteredRoutingLines);
   }
   const routingSecretAsymmetryLines = formatRoutingSecretAsymmetryLines(plan.routingSecretAsymmetries);
   if (routingSecretAsymmetryLines.length > 0) {

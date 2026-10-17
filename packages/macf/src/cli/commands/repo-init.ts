@@ -479,6 +479,11 @@ export function generateWorkflow(
   v3Inputs?: V3WorkflowInputs,
   ciWorkflows: readonly string[] = [],
 ): string {
+  const gateSelfHosted =
+    v3Inputs !== undefined &&
+    isV3PlusActionsVersion(actionsVersion) &&
+    v3Inputs.runnerRunsOn === 'self-hosted' &&
+    isRunnerRunsOnCapableActionsVersion(actionsVersion);
   const lines = [
     'name: Agent Router',
     'on:',
@@ -570,7 +575,13 @@ export function generateWorkflow(
     // behind the false-red signal, with exactly one of the six failing on
     // its own merits (#174, a genuine TypeScript 6.0 incompatibility).
     '  gate:',
-    '    runs-on: ubuntu-latest',
+    // groundnuty/macf#1497: the gate runs on the runner the caller declares, so
+    // a self-hosted fleet spends no metered hosted job per event. Same
+    // capability condition as the `runner-runs-on:` input below. A fork PR
+    // stays hosted, as the router's own pick-runner does (macf-actions v3.6.2).
+    gateSelfHosted
+      ? "    runs-on: ${{ github.event.pull_request.head.repo.fork == true && 'ubuntu-latest' || fromJSON('[\"self-hosted\",\"macf-vm\"]') }}"
+      : '    runs-on: ubuntu-latest',
     '    permissions:',
     '      actions: read',
     '    outputs:',
@@ -620,12 +631,20 @@ export function generateWorkflow(
     '          # synchronize: recovery-only. Route only if no PRIOR pull_request-',
     '          # triggered "Agent Router" run exists for this branch, EXCLUDING',
     '          # the run this step is itself executing in (that run already',
-    '          # appears in `gh run list` — without excluding RUN_ID the query',
+    '          # appears in the run list — without excluding RUN_ID the query',
     '          # always finds >=1 and the gate would ALWAYS suppress, permanently',
     '          # defeating the recovery path this fix exists to restore).',
-    '          PRIOR_COUNT=$(gh run list --repo "$REPO" --workflow agent-router.yml \\',
-    '            --branch "$HEAD_REF" --event pull_request --json databaseId \\',
-    '            | jq --arg run_id "$RUN_ID" \'[.[] | select((.databaseId | tostring) != $run_id)] | length\')',
+    '          # curl and jq, not the GitHub CLI: self-hosted runner images may',
+    '          # lack it (#1498). A failed query routes, and says so.',
+    '          BRANCH_ENC=$(jq -rn --arg b "$HEAD_REF" \'$b|@uri\')',
+    '          RUNS_URL="https://api.github.com/repos/$REPO/actions/workflows/agent-router.yml/runs?branch=$BRANCH_ENC&event=pull_request&per_page=100"',
+    '          if RUNS_JSON=$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$RUNS_URL") \\',
+    '            && PRIOR_COUNT=$(printf \'%s\' "$RUNS_JSON" | jq --arg run_id "$RUN_ID" \'[.workflow_runs[] | select((.id | tostring) != $run_id)] | length\'); then',
+    '            :',
+    '          else',
+    '            echo "route: prior-run query failed for branch $HEAD_REF — routing anyway"',
+    '            PRIOR_COUNT=0',
+    '          fi',
     '',
     '          if [ "${PRIOR_COUNT:-0}" -gt 0 ]; then',
     '            echo "should-route=false" >> "$GITHUB_OUTPUT"',
