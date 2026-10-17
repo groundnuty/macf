@@ -34,8 +34,7 @@ source this document was written from.
 `packages/macf/src/cli/bootstrap/fleet-manifest.ts`, the command definitions
 in `packages/macf/src/cli/index.ts`, and the modules under
 `packages/macf/src/cli/bootstrap/`** — never from another doc, and never from
-DR-043's own §D1 example, which predates several amendments (see the callout
-in §6). Where a fact could not be confirmed from source or a live run, it is
+DR-043's own §D1 example, which predates Amendments F and O. Where a fact could not be confirmed from source or a live run, it is
 marked **unverified** rather than guessed.
 
 ---
@@ -55,12 +54,13 @@ This section and the next three are one worked example, meant to be followed top
 > - `fleet deploy` for three agents;
 > - a `fleet reconcile` cold start;
 > - `fleet doctor --inject`;
-> - routing by label, by mention and by CI completion, all on the fleet's own runners;
+> - routing by label and by mention through the control repo (GitHub-hosted runners joined to the tailnet), and by CI completion on an agent repo's own runner;
 > - agent-to-agent messages;
-> - an upgrade.
+> - `fleet upgrade` of the agents (the recording `apply` on the Mac was not run).
 >
 > **Not yet run end to end:**
 > - the consent pages and App creation, including `router_app_scope: per-fleet`;
+> - label or mention routing on a self-hosted agent repo (the last check in §4);
 > - apply requesting runners from the runner platform;
 > - `routing.runner.trusted_actors`;
 > - the 0.2.74 `install-cron`;
@@ -77,7 +77,7 @@ This section and the next three are one worked example, meant to be followed top
 |---|---|---|
 | Node.js 22.12 or later | ✓ | ✓ |
 | `macf` at the fleet's version, installed globally: `npm install -g @groundnuty/macf@0.2.74`. If that needs `sudo`, first run `npm config set prefix ~/.npm-global` and add `~/.npm-global/bin` to `PATH` in your shell profile | ✓ | ✓ |
-| `gh` with the token extension, `Link-/gh-token`. Every App token is minted with `gh token generate` | `gh extension install Link-/gh-token` | from the Mac: `ssh $VM_SSH "GH_TOKEN=$(gh auth token) gh extension install Link-/gh-token"` (the install needs a token once; the extension itself needs none) |
+| `gh` with the token extension, `Link-/gh-token`. Every App token is minted with `gh token generate` | `gh extension install Link-/gh-token` | from the Mac: `gh auth token \| ssh $VM_SSH 'GH_TOKEN=$(cat) gh extension install Link-/gh-token'` (the install needs a token once; the extension itself needs none) |
 | `gh auth login` as an **owner of the org**, with the `workflow` and `admin:org` scopes (add them with `gh auth refresh -h github.com -s workflow,admin:org`) | ✓ | **no:** never log in as yourself on the VM, or an agent whose token fails falls back to your account (`gh-token-attribution-traps.md` mode 4) |
 | `git` able to push to GitHub over HTTPS (`gh auth setup-git`) | ✓ | — (agents push with their own App tokens) |
 | `age` (`brew install age` on the Mac, `sudo apt install age` on Ubuntu) | ✓ | ✓ |
@@ -132,7 +132,7 @@ mkdir -p ~/.config/macf && age-keygen -o $MAC_AGE_KEY
 mkdir -p ~/.config/macf && age-keygen -o $VM_AGE_KEY
 ```
 
-Keep both private files safe. Without one of them, nobody (you included) can decrypt the vault again (Amendment C).
+Keep both private files safe. Without one of them, nobody (you included) can decrypt the vault again (Amendment C). An empty `age_recipients` list is refused before any App is created; it never means "skip encryption".
 
 **2. The operator secrets file.** It is one file on the Mac, and it is never committed:
 
@@ -145,7 +145,7 @@ Fill in three keys, and leave the rest blank:
 
 | Key | Value | Why it is needed |
 |---|---|---|
-| `MACF_BOOTSTRAP_TS_OAUTH_CLIENT_ID`, `MACF_BOOTSTRAP_TS_OAUTH_SECRET` | A Tailscale OAuth client with write access to auth keys, allowed to create keys tagged `tag:ci-runner` | The control repo routes on GitHub-hosted runners, which join the tailnet to reach the agents (§7.4). GitHub cannot show an existing value back to you, so reuse the pair your other fleets use, or generate one under Tailscale admin console → Settings → OAuth clients. |
+| `MACF_BOOTSTRAP_TS_OAUTH_CLIENT_ID`, `MACF_BOOTSTRAP_TS_OAUTH_SECRET` | A Tailscale OAuth client with write access to auth keys, allowed to create keys tagged `tag:ci-runner` | The control repo routes on GitHub-hosted runners, which join the tailnet to reach the agents (§7.4). GitHub cannot show a stored value back to you: reuse the pair only if you kept a copy, otherwise generate one under Tailscale admin console → Settings → OAuth clients. |
 | `MACF_RUNNER_PLATFORM_ENDPOINT` | `http://orzech-dev-agents-monitoring.tail491af.ts.net:8088` | apply asks this runner platform for one self-hosted runner per agent repo, and waits for them. Without it, no runner is created and routing jobs wait for one forever (§6.6). |
 
 ---
@@ -199,7 +199,7 @@ EOF
 
 **Why each part is there.**
 
-- **`registry: { type: repo, … $PROJECT-control }`.** The control repo is the fleet's registry. This is the form that works for an org; `{ type: org }` is refused (§7.5), and `{ type: profile }` points at a repo apply never creates (§6.2).
+- **`registry: { type: repo, … $PROJECT-control }`.** The control repo is the fleet's registry. This is the form that works for an org; `{ type: org }` is refused (§7.5), and for an org, `{ type: profile, user: <org> }` points at `<org>/<org>`, a repo apply never creates (§6.2).
 - **`router_app_scope: per-fleet`.** The fleet gets its own router App, `$PROJECT-router`, at the cost of two more clicks. The default, `shared`, reuses one `<org>-router` App across every fleet in the org. That works only if this fleet's vault already holds the router's key, so in an org that already hosts a fleet the run ends `name-taken` and the fleet cannot route (§7.3).
 - **Both `age_recipients` from the start.** Adding the VM's key later works, but costs an extra apply with `--vault` and `--identity-key` to re-encrypt.
 - **`routing.runner`.** Every routing job on the agent repos runs on the fleet's own runner, never on GitHub-hosted minutes. A job with no runner waits; it never falls back (§6.5).
@@ -250,10 +250,10 @@ cd $FLEET_DIR
 macf bootstrap apply -f fleet.yaml --secrets-file secrets.env
 ```
 
-A first run takes neither `--vault` nor `--identity-key`, because no vault exists yet. It warns early that no runner registration token was supplied. That is expected: the runner platform creates the runners, and apply waits for those without a token. What follows (steps 3 and 4 are the clicks):
+A first run takes neither `--vault` nor `--identity-key`, because no vault exists yet. It also says early on that no runner registration token was supplied, and that this is fine when the runner platform is configured. Do not fetch a token: apply waits for the runners it requests from the platform. What follows (steps 3 and 4 are the clicks):
 
 1. You see the plan again, and approve it once with `y`.
-2. apply creates `$OWNER/$PROJECT-control` and the three agent repos (from the template) before any consent page.
+2. apply creates `$OWNER/$PROJECT-control` first, then each agent repo (from the template) just before that agent's consent pages.
 3. **Consent gate 1, once per App.** The terminal says `press Enter to open the browser`. A local page opens and forwards you to GitHub. **Click "Create GitHub App".** There is nothing to copy back.
 4. **Consent gate 2, once per App.** The install page opens. **Choose "Only select repositories", select exactly the repos the terminal lists, and click Install.** Never choose "All repositories"; apply refuses that install (§7.2). The repos per App:
    - each agent's App gets its own repo plus `$PROJECT-control`;
@@ -268,7 +268,7 @@ A first run takes neither `--vault` nor `--identity-key`, because no vault exist
    - it mints the CA and the routing-client certificate;
    - it writes every routing secret on every repo;
    - it commits the vault (`secrets/vault.age`) and `fleet.lock` to the control repo.
-7. The deploy phase is skipped: `deploying needs --vault + --identity-key`. The agents are deployed on the VM in §3.4.
+7. The deploy phase is skipped: `deploying needs --vault + --identity-key`. apply then prints a `macf fleet deploy` command per agent for the host that will run it. That is the same procedure as §3.4, which deploys the agents on the VM.
 
 **Read the summary at the end.** The exit code tells you where you are:
 
@@ -277,6 +277,10 @@ A first run takes neither `--vault` nor `--identity-key`, because no vault exist
 | `0` | Everything is in place | Go to §3.4 |
 | `2` | Finished, but something is still partial. The likeliest case on a first run is a runner that took longer than 10 minutes, shown as `Not finished: … cannot route yet` | Re-run as below once `macf bootstrap status` shows the runner |
 | `1` | A leg failed, and the summary names it | Fix the cause, then re-run as below |
+
+**Two lines on the Mac are expected and change no exit code:**
+- `Version reconcile: could not attempt … (driver-unresolved)`, on every run, because the agents' workspaces are on the VM;
+- on a run with the vault flags, one deploy line per agent saying `this host cannot create …` for its `/home/…` path.
 
 **To re-run, from `$FLEET_DIR`:**
 
@@ -370,7 +374,7 @@ macf fleet install-cron --execute --manifest ~/macf-fleets/$PROJECT/desired-agen
 macf fleet install-cron --execute --manifest ~/macf-fleets/$PROJECT/desired-agents.yaml --yes
 ```
 
-**It refuses if the global `macf` is missing or is not the fleet's version.** The command it refuses with tells you what to install.
+**It refuses if no `macf` is on PATH, or if that `macf` is not the version you are running.** The refusal names the `npm install -g` to run.
 
 **Every 10 minutes, cron runs `macf fleet reconcile` for this fleet:**
 - an agent with no session is launched;
@@ -410,7 +414,7 @@ Run these after §3.5. Each row answers a different question, and none implies a
 macf fleet doctor --inject
 ```
 
-**Expect `HEALTHY`, and `PROCESSED` for all three agents.** `PROCESSED` means each agent's session consumed a real injected message, not only that the server accepted it.
+**Expect `HEALTHY`, and a ✓ in the `PROCESSED` column for all three agents.** `PROCESSED` means each agent's session consumed a real injected message, not only that the server accepted it.
 
 **Then prove routing through GitHub.** From the code agent's workspace:
 
@@ -424,10 +428,12 @@ macf routing doctor --e2e --target-repo $OWNER/$PROJECT-control --recipient scie
 **Last, prove it works for you.** As yourself, on the Mac, open an issue on an agent repo, then read the router's log for it:
 
 ```bash
+T=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 gh issue create -R $OWNER/$PROJECT-code-agent -l code-agent -t "hello from $OPERATOR" \
   -b "Reply to me once to say you received this; take no other action."
-sleep 90
-RUN=$(gh run list -R $OWNER/$PROJECT-code-agent -w agent-router.yml -e issues -L 1 --json databaseId --jq '.[0].databaseId')
+until RUN=$(gh run list -R $OWNER/$PROJECT-code-agent -w agent-router.yml -e issues --created ">=$T" -L 1 \
+    --json databaseId --jq '.[0].databaseId // empty') && [ -n "$RUN" ]; do sleep 5; done
+gh run watch "$RUN" -R $OWNER/$PROJECT-code-agent > /dev/null
 gh run view $RUN -R $OWNER/$PROJECT-code-agent --log | grep -E 'Routed issue #[0-9]+ to code-agent|not listed in the MACF_TRUSTED_ACTORS'
 ```
 
@@ -452,7 +458,7 @@ gh run view $RUN -R $OWNER/$PROJECT-code-agent --log | grep -E 'Routed issue #[0
    macf bootstrap apply -f fleet.yaml --secrets-file secrets.env --vault control/secrets/vault.age --identity-key $MAC_AGE_KEY
    ```
 
-   That commits the version to the control repo; when `versions.actions` changed, it also re-pins every router caller. The Mac has no agent workspaces, so apply's own version roll finds nothing to do there.
+   That commits the version to the control repo; when `versions.actions` changed, it also re-pins every router caller. Expect the `Version reconcile: … (driver-unresolved)` line from §3.3: the Mac has no agent workspaces, so apply's own roll has nothing to do there.
 3. **Copy the new files to the VM,** exactly as in §3.4 step b. That step starts with the pull, so the VM gets the versions apply just committed. A later `fleet deploy` then installs the same version.
 
 To take a fleet down, see §9.
@@ -462,7 +468,7 @@ To take a fleet down, see §9.
 ## 4a. Adding an agent to an already-provisioned fleet
 
 > **`MACF_TRUSTED_ACTORS` follows the manifest.** On every repo the value is the
-> fleet's agent bots (`<fleet>-<role>-agent[bot]`) followed by any logins in
+> fleet's agent bots (`<fleet>-<role>[bot]`) followed by any logins in
 > `routing.runner.trusted_actors`. `apply` reconciles it: where a repo holds a
 > different value, `plan` reports an `update` and `apply` rewrites it after one
 > confirmation (`--yes` confirms), so adding an agent widens every existing repo
@@ -569,7 +575,9 @@ same scope inherits whatever coverage already exists, not a clean slate.**
    exists — and the CLI polls the same way gate 2 always does (10-minute
    budget, same cancel/resume semantics as §7.6/§7.7: a cancelled or timed-
    out widen is safe to retry, a re-run reopens only whatever is still
-   stale). Control-repo labels for the new role are created automatically as
+   stale). **Then run the same `apply` command once more.** The "Save" page
+   opens after this run has already asked for the new repo's runner, so only
+   a re-run asks again and writes `MACF_TRUSTED_ACTORS`. Control-repo labels for the new role are created automatically as
    part of this same run's control-repo sync — no separate click for that
    (verified in step 4 of "Verify," below).
 
@@ -614,7 +622,8 @@ macf bootstrap plan -f fleet.yaml --vault <path> --identity-key <path>
 # 2. The new repo has a registered, usable runner (§4 row 5, same command).
 gh api /repos/<owner>/<new-agent-repo>/actions/runners --jq '.total_count'
 # expect: 1 (may still read 0 for a few minutes right after the widen click —
-# that is provisioning latency, not a failure; re-check rather than re-running apply)
+# that is provisioning latency; if it stays 0, or check 3 shows no variable, re-run apply
+# with --vault/--identity-key)
 
 # 3. Routing is live for the new repo.
 gh variable get MACF_TRUSTED_ACTORS --repo <owner>/<new-agent-repo>
@@ -785,7 +794,7 @@ silently-dropped typo.
 | `owner.type` | required | — | `user` \| `org` — shapes the manifest-form URL and interacts with the router-App scope derivation (§6.5) |
 | `owner.registry` | required | — | see §6.2 |
 | `network.advertise_host` | required | — | the tailnet hostname other agents use to reach this fleet's channel servers; consumed by `macf fleet deploy` (`advertiseHost`) |
-| `transport.age_recipients` | required (array; `.min(0)`, **not** `.min(1)`) | `[]` is the create-path REFUSAL trigger, never "skip minting" — see §1 | operator-supplied public keys only, never a private key, never tool-minted (Amendment C) |
+| `transport.age_recipients` | required (array; `.min(0)`, **not** `.min(1)`) | `[]` is the create-path REFUSAL trigger, never "skip minting" — see §1.3 | operator-supplied public keys only, never a private key, never tool-minted (Amendment C) |
 | `transport.tailscale_oauth_required` | optional | `false` | declares that this fleet's router needs `TS_OAUTH_CLIENT_ID`/`TS_OAUTH_SECRET`; when `true` and none of the flags, env, the secrets file or the vault supplies the pair, `apply` refuses **before gate 1** rather than spend a click on a fleet that can't route (§7.4) |
 | `transport.router_app_scope` | optional | `'shared'` | `'shared'` (one router App per **owner scope**, reused across every fleet on that account) vs `'per-fleet'` (a dedicated router App for this fleet alone). For a new fleet in an org that already hosts a fleet, `'per-fleet'` is the path that works without copying another fleet's router credentials — see §6.5, §7.3 |
 | `transport.age_recipients_narrowing_override` | optional | omitted | a non-empty string that acknowledges removing a recipient from an existing vault's `age_recipients`; without it `apply` refuses to narrow the set (`bootstrap-apply.ts`, `apply-fleet.ts`) |
@@ -855,10 +864,12 @@ does not satisfy the other (§7.1's "silent cost" made concrete):**
 
 1. **`MACF_TRUSTED_ACTORS`** — the trust-allowlist variable `pick-runner`
    reads. Written **only after** `apply` confirms a usable runner exists
-   (register-before-route, DR-043 Amendment H.1). Without `--runner-token`,
-   `apply` checks once per repo and writes the variable wherever a runner is
-   already visible; the token only adds a wait of up to 10 minutes for a runner
-   to appear (`apply-routing.ts`; #1195). Under `macf-actions` v3.6.2, a caller
+   (register-before-route, DR-043 Amendment H.1). For each repo whose runner
+   `apply` requested from the runner platform this run, `apply` waits up to 10
+   minutes for GitHub to see it, with or without `--runner-token`; if it is still
+   not visible, the leg is `pending` and the run exits 2. For any other repo,
+   `apply` checks once if no token was given, or waits up to 10 minutes if one
+   was (`apply-fleet.ts`, `apply-routing.ts`; #1195, #1212). Under `macf-actions` v3.6.2, a caller
    that declares `runner-runs-on: self-hosted` never falls back to a hosted
    runner: with no runner its jobs queue, and an unlisted actor is refused at
    `pick-runner`.
@@ -957,7 +968,7 @@ changes what the command does, not merely a documentation nicety:
 | `fleet deploy` | `--identity-key <path>` is **required**; `--vault <path>` is optional | `--vault` defaults to `<fleet.yaml dir>/secrets/vault.age`; `--identity-key` alone is accepted (`commands/fleet-deploy.ts`). |
 | `fleet destroy` | `--age-identity <path>` is **required when** `--shred-age-key` is given (not required otherwise) | `--shred-age-key` alone doesn't refuse at the flag level, but the shred step has nothing to act on without a path — always pass both together. |
 | `fleet destroy` | `--destroy-repositories`, the interactive fleet-name confirmation, **and** `MACF_I_UNDERSTAND_THIS_DELETES_REPOSITORIES=1` are **all three required** | Missing any one refuses the run — none of the three is optional or implied by either of the others (§9). |
-| `bootstrap apply` | `--runner-token <token>` (or `MACF_BOOTSTRAP_RUNNER_TOKEN`) is **advised when** the manifest declares `routing.runner.runs_on: self-hosted` | Not required: without it `apply` prints a warning before gate 1 and every leg still runs. Each repo is checked once and `MACF_TRUSTED_ACTORS` is written where a runner is visible; the token only adds a wait of up to 10 minutes. The run exits 1 only if a trusted-actors leg failed, or no repo was confirmed at all (§6.5, §7.1). |
+| `bootstrap apply` | `--runner-token <token>` (or `MACF_BOOTSTRAP_RUNNER_TOKEN`) is **advised when** the manifest declares `routing.runner.runs_on: self-hosted` | Not required: without it `apply` prints a warning before gate 1 and every leg still runs. For each repo whose runner `apply` requested from the runner platform this run, it waits up to 10 minutes with or without a token; for any other repo, it checks once without a token, or waits up to 10 minutes with one. A `pending` leg exits 2; a `failed` leg exits 1 (§6.5, §8). |
 | `bootstrap apply` | `--ts-oauth-client-id` and `--ts-oauth-secret` are **mutually required** — supplying one without the other is refused before the manifest is even parsed. Both are **required when** the manifest declares `transport.tailscale_oauth_required: true` and neither env, the secrets file nor the vault supplies the pair. |
 | `bootstrap manifest scaffold` | `--owner`, `--fleet`, and at least one `--agent role=owner/repo` are all `requiredOption`s; `--vault`/`--identity-key` follow the same together-or-neither rule as the row above | The three required options have no defaults at all (commander refuses to run without them); the vault pair is optional but paired. |
 
@@ -1020,7 +1031,7 @@ merely a cost — it is a runner class that **cannot reach the private
 endpoint the routed job needs to deliver to.**
 
 **Fix:** declare the `routing.runner` block from §6.5 (`macf-trial` does), then
-re-run `apply`; `--runner-token` only adds a wait for a runner to appear.
+re-run `apply`. With the runner platform resolved (§6.6), apply requests the runners and waits for them.
 
 ### 7.2 An install scoped to "All repositories" — refused
 
@@ -1097,7 +1108,7 @@ vault.
 **What happens:** `checkTailscaleOauthPreflight` runs before any consent gate
 opens (the vault is read only when `--vault`/`--identity-key` are given), and
 refuses outright if the declared requirement isn't satisfiable — same posture as
-the age-recipient refusal in §1: a declared intent the tool cannot honor is
+the age-recipient refusal in §1.3: a declared intent the tool cannot honor is
 refused, never silently skipped and never silently proceeded-with.
 
 **The flag only controls the loudness of the ABSENT case — it never gates
@@ -1198,7 +1209,8 @@ detects the change automatically on retry, no full re-run needed.
 **Why a `404` here doesn't over-claim a single cause:** GitHub returns the
 identical `404` whether the repo exists but isn't in this App's selected
 set, *or* the repo itself doesn't exist / was renamed. The registry repo is
-never auto-created by `apply` (only each agent's own home repo is) — so
+never auto-created by `apply`, unless it is the fleet's control repo, which
+`apply` creates first (otherwise only each agent's own home repo is) — so
 "the registry repo doesn't exist" is a genuinely reachable cause, not a
 theoretical one. Where the tool can independently confirm the repo exists
 (an unauthenticated `GET /repos/{owner}/{repo}` — a `200` proves existence;
@@ -1314,12 +1326,13 @@ that periodically runs `fleet reconcile`. Flags: `--schedule <cron>`,
 `--allow-restart`, `--with-routing` (a no-op), `--manifest <path>`, `--no-token`
 (don't bake a `GH_TOKEN` mint into the cron line), `--uninstall`, `--print`
 (preview without touching crontab), `--prelude <path>`, `--log <path>`,
-`--yes`, `--dir <path>`. The line passes `--dir <workspace>` and carries a
-per-project marker, `# macf-watchdog (DR-006) [project=<project>]`; install and
-uninstall touch only that project's line and leave another fleet's watchdog line
-alone. There is no `@reboot` line, so recovery after a reboot waits for the first
-tick. The line runs the `macf` on PATH, so install the fleet's version globally
-on that host (#1508).
+`--yes`, `--dir <path>`. The line sets the installing shell's `PATH`, runs the
+absolute path of the global `macf`, and passes `--dir <workspace>`. It carries the
+marker `# macf-watchdog (DR-006) [fleet=<owner>/<project>]`, and install and
+uninstall touch only that fleet's line. It refuses (exit 2) if no `macf` is on
+PATH, if that `macf` is not the version of the CLI you are running (#1508), if
+PATH is empty, or if any value baked into the line contains `%`. There is no
+`@reboot` line, so recovery after a reboot waits for the first tick.
 
 **`macf fleet reconcile`** [`--help`] — the desired-state watchdog: probes
 actual `/health` against a desired set and launches/heals/skips accordingly.
@@ -1357,7 +1370,7 @@ into that fleet's `fleet.lock`; omitted = unchanged).
 - `packages/macf/src/cli/bootstrap/fleet-manifest.ts` — the manifest/lock
   schema, authoritative over §6 and over DR-043's own §D1 example (which
   predates Amendment F's removal of `transport.vault_repo` and Amendment
-  O's `router_app_scope` — see the callout at the top of this document).
+  O's `router_app_scope`).
   `run` `--help` on any command before trusting a flag against this doc.
 - `use-cases/scientific-paper-fleet.md` — a worked, narrative walkthrough of
   one specific fleet shape (science + code + writer agents), cross-checked
