@@ -822,9 +822,13 @@ macf_human_scan() {
   {
     line = $0
     if (match(line, /^[[:space:]]*(```+|~~~+)/)) {
-      fence = substr(line, RSTART + RLENGTH - 1, 1)
-      if (in_fence == "") in_fence = fence
-      else if (in_fence == fence) in_fence = ""
+      run = substr(line, RSTART, RLENGTH)
+      sub(/^[[:space:]]+/, "", run)
+      fch = substr(run, 1, 1)
+      flen = length(run)
+      tail = substr(line, RSTART + RLENGTH)
+      if (in_fence == "") { in_fence = fch; open_len = flen }
+      else if (fch == in_fence && flen >= open_len && tail ~ /^[[:space:]]*$/) in_fence = ""
       next
     }
     if (in_fence != "") next

@@ -624,6 +624,27 @@ describe('check-mention-routing.sh (hook)', () => {
       expect(both.status).toBe(0);
     });
 
+    it('keeps a mention inside a four-backtick fence that holds a shorter fence line', () => {
+      const four = '````';
+      const three = '```';
+      const r = runHook({ command: cmd(`${four}text\n${three}\n@groundnuty example\n${four}`) });
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain('zero');
+    });
+
+    it('closes a four-backtick fence on a five-backtick line', () => {
+      const four = '````';
+      const five = '`````';
+      const r = runHook({ command: cmd(`${four}text\n@groundnuty example\n${five}\n@groundnuty which dataset?`) });
+      expect(r.status).toBe(0);
+    });
+
+    it('does not close a fence on a line that carries an info string', () => {
+      const three = '```';
+      const r = runHook({ command: cmd(`${three}\n${three}text\n@groundnuty example\n${three}`) });
+      expect(r.status).toBe(2);
+    });
+
     it('counts a human recipient in a comment chained after a close', () => {
       const chain = (body: string): string =>
         `gh issue close 123 --comment done && gh issue comment 123 --body "\n${body}"`;
