@@ -4,6 +4,27 @@ All notable changes to the `macf` CLI. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.71] — 2026-10-17
+
+### Fixed
+
+- **`macf fleet reconcile` recovers a fleet after a reboot, and says when it can't.** Found live after a VM reboot (#1502).
+  - **Cold start:** a launch now creates the agent's tmux session detached. Before, `claude.sh` died with "open terminal failed" when started with no terminal, while reconcile reported the launch as done.
+  - **Launch verification:** a launch counts only once Claude Code's input prompt appears. A session that never appears or never gets there is `FAILED`. A pane stopped at a prompt only the operator can answer, such as the trust dialog, is `BLOCKED`, naming the tmux session to attach to. A prompt the prompt watcher answers is waited out.
+  - **Running vs registered:** running is judged by the live session, not the registry. An agent whose registration outlived a reboot is launched, and an agent whose session is alive is never launched a second time.
+  - **The heal ladder** never types into a pane waiting at such a prompt. An inject would have pressed Enter on the trust dialog, which selects "No, exit".
+  - **Exit code:** `FAILED` and `BLOCKED` exit 3 and raise the Tier-3 alert.
+- **A launched or relaunched agent no longer inherits another agent's identity.** A detached tmux session takes the tmux server's global environment. `fleet reconcile`'s launch and `restart-self`'s relauncher now unset the `MACF_*` identity variables inside the session (#1502).
+- **The attribution check also reads back reviews and API merges** (#1475).
+  - **Reviews:** after `gh pr review`, it checks the reviews submitted in the last five minutes on that PR, and warns when none of them is by the bot.
+  - **API merges:** after a `gh api … /pulls/<N>/merge`, it checks who merged the PR, if the merge happened in that window.
+  - **Repository:** without `--repo` or a PR URL, the repository is resolved where the command ran, and not guessed after a `cd`.
+- **Re-enabling telemetry:** the generated `env.telemetry` comments no longer claim `macf update` rewrites the file. `macf update` replaces the old hint in existing workspaces (#1503).
+
+### Changed
+
+- **The startup sweep's reviewer query is now in the injected text.** It covers every open PR by others with no approval, including bot-authored ones, and skips your own (#1503).
+
 ## [0.2.70] — 2026-10-17
 
 ### Fixed
