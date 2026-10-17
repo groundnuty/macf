@@ -4,6 +4,28 @@ All notable changes to the `macf` CLI. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.74] — 2026-10-17
+
+The release a new fleet is set up with: `design/fleet-deployment-runbook.md` §1–§4 is now a copy-paste walkthrough for a three-agent fleet named from one `PROJECT` variable (#1516), and the fixes below came from checking every step of it against the code.
+
+### Added
+
+- **`routing.runner.trusted_actors`:** the humans (or extra bots) who may trigger routing on the fleet's self-hosted repos. On such a repo the router acts only for listed actors, and the list used to hold only the fleet's bots, so an operator's own labels, comments and reviews on agent repos reached no agent. The logins are appended after the bots in `MACF_TRUSTED_ACTORS`, and the trusted-actors reconcile keeps them (#1509).
+- **Agents can address their human operator.** A line-start `@<login>` for a person now satisfies the mention-routing hook (outside fenced, blockquoted-fenced and indented code); before, an agent's reply to a human was blocked unless it also mentioned a bot. `@<project>-<role>` without `[bot]` is blocked with a did-you-mean (#1513).
+
+### Fixed
+
+- **`macf fleet install-cron` recovers the fleet** (#1511, #1514).
+  - **`--dir`:** the line now passes `--dir <workspace>`. It used to run reconcile from cron's `$HOME`, where reconcile exits `Not in a MACF project`.
+  - **PATH and `macf`:** it starts with the installing shell's PATH and runs the absolute global `macf`. Under cron's minimal PATH, `node` and `claude` were not found.
+  - **Token:** it mints a token from the workspace's App, so reconcile's alert for a stuck agent can be filed.
+  - **Per-fleet marker:** the marker is now per fleet (`[fleet=<owner>/<project>]`). Install and uninstall used to strip every watchdog line on the host, including other fleets'.
+  - **Refusals:** it refuses loudly on a missing or mismatched global `macf`, an empty PATH, or a `%` in the line.
+- **`bootstrap apply` exits 2, not 0, while a repo cannot route yet,** because its runner did not appear in the 10-minute wait. A `Not finished:` line names the repos (#1510).
+- **No more false "falls back to ubuntu-latest".** Seven apply and plan messages claimed a self-hosted repo without `MACF_TRUSTED_ACTORS` "continues routing on ubuntu-latest (billed on private repos)". Under macf-actions v3.6.2 it never falls back: its jobs wait for a runner (#1509). The no-runner-token warning no longer says apply will not wait for new runners: it waits for the ones it requests from the runner platform (#1515).
+- **The other-host deploy hints match the runbook.** apply's printed hints for deploying on another host now say to copy the control repo's `fleet.yaml` and `secrets/vault.age` there, not to clone a private repo on a VM that has no GitHub login (#1515).
+- **The secrets template names the Tailscale tag the router requests,** `tag:ci-runner`, and describes the runner token as optional (#1510).
+
 ## [0.2.73] — 2026-10-17
 
 ### Fixed
