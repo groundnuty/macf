@@ -52,10 +52,11 @@
 # NOT instant by design as of groundnuty/macf#802 — see below.
 #
 # TRIGGER + SUBAGENT GATE (groundnuty/macf#930): the pickup nudge is
-# appropriate ONLY for a genuine fresh client start. Pre-#930 this hook was
-# registered matcher-less (fires on every SessionStart source) and never
-# read its own payload, so it ALSO fired on `compact` / `resume` / `clear` /
-# `fork` (competing with in-flight work right after the agent lost context
+# appropriate only for a session that starts a client: `startup`, or `resume`
+# from a `claude -c` relaunch. Pre-#930 this hook was registered matcher-less
+# (fires on every SessionStart source) and never read its own payload, so it
+# ALSO fired on `compact` / `clear` / `fork` (competing with in-flight work
+# right after the agent lost context
 # to compaction — the worst time to spend it re-injecting a queue prompt)
 # and reached at least one MACF-orchestrated worker/subagent session
 # (operator-witnessed live, groundnuty/macf#930 comments), which cannot
@@ -74,8 +75,8 @@
 #     assumed from memory.
 #     `resume` is accepted because `claude.sh` relaunches with `claude -c`,
 #     so every relaunch (fleet upgrade, restart-self, the operator) is
-#     `source=resume`; with startup-only, work routed while the agent was
-#     down was never picked up after a relaunch. `compact`, `clear` and
+#     `source=resume`; accepting it picks up work routed while the agent was
+#     down. `compact`, `clear` and
 #     `fork` stay excluded: they are mid-session context events, where
 #     re-injecting a queue prompt competes with in-flight work.
 #   - `agent_id` must be absent — Claude Code documents `agent_id` as
@@ -276,7 +277,7 @@ fi
 #    "TRIGGER + SUBAGENT GATE" section for the full rationale + citations.
 #    Read now (not drained/ignored, pre-#930 behavior) because this is the
 #    place that can actually be tested: the `matcher: "startup|resume"` on this
-#    hook's registration (settings-writer.ts / hooks.json) is
+#    hook's registration (settings-writer.ts, in settings.json) is
 #    defense-in-depth, but Claude Code evaluates matchers before invoking
 #    the command at all, so a matcher alone is unobservable/untestable from
 #    inside the script — this script-side check is what a test actually
