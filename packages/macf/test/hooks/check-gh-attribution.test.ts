@@ -36,6 +36,8 @@ type GhStub =
       readonly type: 'Bot' | 'User';
       /** Merge reads only: whether the PR is merged (default true). */
       readonly merged?: boolean;
+      /** Merge reads only: ISO merge time (default now). */
+      readonly mergedAt?: string;
     }
   | 'fail' // gh api exits non-zero, non-auth (network / 404 / 5xx)
   | 'authfail'; // gh api exits non-zero with an auth-failure shape (groundnuty/macf#938)
@@ -64,6 +66,7 @@ function makeStubGhDir(stub: GhStub): string {
       login: stub.login,
       type: stub.type,
       merged: stub.merged ?? true,
+      merged_at: stub.mergedAt ?? new Date().toISOString().replace(/\.\d+Z$/, 'Z'),
     });
     // Single-quote the JSON for echo; JSON has no single quotes.
     arm = `echo '${body}'; exit 0`;
@@ -507,6 +510,13 @@ describe('check-gh-attribution.sh (PostToolUse hook)', () => {
       expect(calls).toContain('/repos/acme/widgets/pulls/12/reviews');
       expect(calls).not.toContain('repo view');
     });
+    it('review with an attached -R<repo> reads that repo', () => {
+      const { r, calls } = hook('gh pr review 7 -Racme/widgets --approve', USER, bot);
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain('the review on acme/widgets#7');
+      expect(calls).toContain('/repos/acme/widgets/pulls/7/reviews');
+      expect(calls).not.toContain('repo view');
+    });
     it('review via a PR URL is parsed', () => {
       const { r, calls } = hook(
         'gh pr review https://github.com/acme/widgets/pull/31 --comment --body hi',
@@ -620,6 +630,12 @@ describe('check-gh-attribution.sh (PostToolUse hook)', () => {
       expect(r.status).toBe(2);
       expect(r.stderr).toContain('the merge of o/r#9');
       expect(calls).toContain('/repos/o/r/pulls/9');
+    });
+    it('merge that happened 2 hours ago → silent', () => {
+      const old = new Date(Date.now() - 2 * 3600 * 1000).toISOString().replace(/\.\d+Z$/, 'Z');
+      const { r } = hook('gh api -X PUT repos/o/r/pulls/9/merge', { ...USER, mergedAt: old }, bot);
+      expect(r.status).toBe(0);
+      expect(r.stderr).toBe('');
     });
     it('merge that did not merge → silent', () => {
       const { r } = hook('gh api -X PUT repos/o/r/pulls/9/merge', { ...USER, merged: false }, bot);

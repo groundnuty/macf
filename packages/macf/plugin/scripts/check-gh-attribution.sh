@@ -156,6 +156,7 @@ parse_pr_review() {
     case "$tok" in
       --repo|-R) want="repo" ;;
       --repo=*) REPO_FLAG="${tok#--repo=}" ;;
+      -R?*) REPO_FLAG="${tok#-R}" ;;
       --body|-b|--body-file|-F) want="skip" ;;
       -*) ;;
       *)
@@ -287,7 +288,7 @@ if [[ "$MODE" == "review" || "$MODE" == "merge" ]]; then
   else
     URL="the merge of ${OWNER}/${REPO}#${NUM}"
     API_PATH="/repos/${OWNER}/${REPO}/pulls/${NUM}"
-    AUTHOR_JQ='{login: (.merged_by.login // ""), type: (.merged_by.type // ""), merged: (.merged // false)}'
+    AUTHOR_JQ='{login: (.merged_by.login // ""), type: (.merged_by.type // ""), merged: (.merged // false), merged_at: (.merged_at // "")}'
   fi
 fi
 
@@ -314,7 +315,7 @@ query_author() {
       # Keep only reviews submitted within the window: an older review (or a
       # concurrent one) is not evidence about what this command posted.
       resp="$(printf '%s\n' "$resp" | jq -rR --argjson now "$(date -u +%s)" \
-        --argjson win "${MACF_ATTRIBUTION_REVIEW_WINDOW_SEC:-300}" \
+        --argjson win "${MACF_ATTRIBUTION_WINDOW_SEC:-300}" \
         'split("\t") | select((try (.[0] | fromdateiso8601) catch 0) > ($now - $win)) | @tsv' \
         2>/dev/null | LC_ALL=C sort -t$'\t' -k1,1 || true)"
     fi
@@ -358,6 +359,10 @@ fi
 if [[ "$MODE" == "merge" ]]; then
   # The merge failed or was refused: nothing was merged, nothing to check.
   [[ "$(jq -r '.merged // false' <<<"$RESP" 2>/dev/null || echo false)" == "true" ]] || exit 0
+  # An older merge is not evidence about this command: a failed retry on a PR
+  # merged earlier proves nothing. Same window as the review path.
+  jq -e --argjson now "$(date -u +%s)" --argjson win "${MACF_ATTRIBUTION_WINDOW_SEC:-300}" \
+    '(try (.merged_at | fromdateiso8601) catch 0) > ($now - $win)' <<<"$RESP" >/dev/null 2>&1 || exit 0
 fi
 
 ACTUAL_LOGIN="$(jq -r '.login // ""' <<<"$RESP" 2>/dev/null || echo "")"
