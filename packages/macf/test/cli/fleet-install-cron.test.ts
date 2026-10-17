@@ -738,3 +738,50 @@ describe('runFleetInstallCronCommand — --dir vs ambient MACF_WORKSPACE_DIR (ma
     expect(logSpy).not.toHaveBeenCalled();
   });
 });
+
+describe('refuses "%" in the cron command', () => {
+  it('a "%" in a PATH entry → exit 2, names PATH, no write', async () => {
+    const { deps, rec } = fakeDeps({ installPath: () => '/opt/a%b/bin:/usr/bin' });
+    expect(await runFleetInstallCron(baseOpts(), deps)).toBe(2);
+    expect(rec.writes).toHaveLength(0);
+    expect(rec.warns.join('\n')).toContain('PATH contains "%"');
+  });
+
+  it('a "%" in the log path → exit 2, names log, also with --print', async () => {
+    for (const print of [false, true]) {
+      const { deps, rec } = fakeDeps();
+      const code = await runFleetInstallCron(baseOpts({ print, log: '/var/100%/w.log' }), deps);
+      expect(code).toBe(2);
+      expect(rec.writes).toHaveLength(0);
+      expect(rec.warns.join('\n')).toContain('log contains "%"');
+    }
+  });
+
+  it('a "%" in the workspace, manifest or prelude names that value', async () => {
+    const cases: ReadonlyArray<[Partial<RunFleetInstallCronOptions>, string]> = [
+      [{ workspaceDir: '/w%s' }, 'workspace'],
+      [{ manifest: '/m%.yaml' }, 'manifest'],
+      [{ prelude: '/p%.sh' }, 'prelude'],
+    ];
+    for (const [over, name] of cases) {
+      const { deps, rec } = fakeDeps();
+      expect(await runFleetInstallCron(baseOpts(over), deps)).toBe(2);
+      expect(rec.warns.join('\n')).toContain(`${name} contains "%"`);
+    }
+  });
+
+  it('a clean line is unaffected', async () => {
+    const { deps, rec } = fakeDeps();
+    expect(await runFleetInstallCron(baseOpts(), deps)).toBe(0);
+    expect(rec.writes).toHaveLength(1);
+  });
+
+  it('--uninstall still works with a "%" in PATH', async () => {
+    const { deps, rec } = fakeDeps({
+      installPath: () => '/opt/a%b/bin',
+      readCrontab: () => `*/10 * * * * x ${MARKER}`,
+    });
+    expect(await runFleetInstallCron(baseOpts({ uninstall: true }), deps)).toBe(0);
+    expect(rec.writes).toHaveLength(1);
+  });
+});

@@ -408,6 +408,24 @@ export async function runFleetInstallCron(
   });
   if (token.warning) deps.warn(`WARN: ${token.warning}`);
 
+  const percent = findPercentValue([
+    ['PATH', installPath],
+    ['workspace', opts.workspaceDir],
+    ['manifest', opts.manifest],
+    ['log', logPath],
+    ['prelude', preludePath],
+    ['token helper', token.prefix],
+    ['macf', macf.path],
+  ]);
+  if (percent) {
+    deps.warn(
+      `macf fleet install-cron: cannot install: ${percent} contains "%", which cron treats as ` +
+        'the end of the command. Use a path without "%" (or pass --log / --manifest / --prelude ' +
+        'pointing elsewhere).',
+    );
+    return 2;
+  }
+
   const reconcileFlags = buildReconcileFlags({
     workspaceDir: opts.workspaceDir,
     manifest: opts.manifest,
@@ -448,6 +466,13 @@ export async function runFleetInstallCron(
   );
   deps.log('Verify: crontab -l | grep macf-watchdog');
   return 0;
+}
+
+/** Name of the first value containing `%` (cron ends the command there), or null. */
+export function findPercentValue(
+  values: ReadonlyArray<readonly [string, string | undefined]>,
+): string | null {
+  return values.find(([, v]) => v?.includes('%'))?.[0] ?? null;
 }
 
 /** Resolve the `macf` cron will run; refuse when absent or a different version. */
