@@ -19,7 +19,7 @@ import {
   agentCertPath,
   agentKeyPath,
 } from '../config.js';
-import { createClientFromConfig } from '../registry-helper.js';
+import { createClientFromConfig, CA_NOT_IN_REGISTRY_MESSAGE } from '../registry-helper.js';
 import {
   createRegistryFromConfig,
   generateToken,
@@ -205,7 +205,7 @@ export async function runRegistryPrune(
   const client = createClientFromConfig(config.registry, token);
   const caCertPem = await client.readVariable(`${toVariableSegment(config.project)}_CA_CERT`);
   if (!caCertPem) {
-    console.error('CA certificate not found in registry. Run `macf certs init` first.');
+    console.error(CA_NOT_IN_REGISTRY_MESSAGE);
     return 1;
   }
 

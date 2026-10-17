@@ -1,6 +1,6 @@
 import { loadAllAgentsWithCwdFallback, readAgentConfig, agentCertPath, agentKeyPath, tokenSourceFromConfig } from '../config.js';
 import { toVariableSegment } from '@groundnuty/macf-core';
-import { createClientFromConfig } from '../registry-helper.js';
+import { createClientFromConfig, CA_NOT_IN_REGISTRY_MESSAGE } from '../registry-helper.js';
 import { createRegistryFromConfig } from '@groundnuty/macf-core';
 import { generateToken } from '@groundnuty/macf-core';
 // Shared with `src/plugin/lib/health.ts` — see ultrareview finding A3.
@@ -58,7 +58,7 @@ export async function showStatus(projectDir?: string): Promise<void> {
   const caCertPem = await client.readVariable(`${toVariableSegment(driverConfig.project)}_CA_CERT`);
 
   if (!caCertPem) {
-    console.log('CA certificate not found in registry. Run `macf certs init` first.');
+    console.log(CA_NOT_IN_REGISTRY_MESSAGE);
     return;
   }
 
