@@ -64,6 +64,7 @@ import type { AgentRepoDeps, RepoInitStepDeps } from '../bootstrap/apply-repo-in
 import { applyFleet } from '../bootstrap/apply-fleet.js';
 import type { ActionsPinRepoStatus, ControlRepoSyncOutcome, FleetApplyDeps, FleetApplyResult } from '../bootstrap/apply-fleet.js';
 import type { ControlRepoDeps } from '../bootstrap/control-repo.js';
+import { controlRepoFullName } from '../bootstrap/control-repo.js';
 import { checkControlRepoMeta, realControlRepoCommitAndPush, realReadControlManifestFile } from '../bootstrap/control-repo.js';
 import { realUnarchiveRepo } from '../bootstrap/repo-archive.js';
 import {
@@ -1851,6 +1852,12 @@ export interface DeployPhaseRenderInput {
   readonly skipReason?: string;
   readonly checkAgentCertPresent?: (destDir: string) => boolean;
   /**
+   * The command to run on the host that will run a host-skipped agent. It
+   * names a clone of the control repo, never this host's own paths, which
+   * do not exist there.
+   */
+  readonly commandFor?: (role: string) => string;
+  /**
    * The fleet name (`manifest.metadata.name`) — macf#994's first-launch
    * guidance block needs it to build `<project>@<routing-label>`
    * (coordination.md's canonical tmux session name) for each deployed
@@ -1869,6 +1876,19 @@ export interface DeployPhaseRenderInput {
  * (the "what to do now" section, requirement 5) — this section is "what
  * just happened."
  */
+/**
+ * What a host-skipped agent's operator runs on the host that will run it. The
+ * control repo carries `fleet.yaml` and `secrets/vault.age` side by side, and
+ * `fleet deploy` defaults `--vault` to that layout, so a fresh clone is all
+ * the other host needs besides the operator's age identity key.
+ */
+export function otherHostDeployCommand(controlRepo: string, role: string): string {
+  return (
+    `On the host that will run it, clone ${controlRepo}, then run: ` +
+    `macf fleet deploy --agent ${role} -f <clone>/fleet.yaml --identity-key PATH_TO_YOUR_AGE_IDENTITY_KEY`
+  );
+}
+
 function deployPhaseSummaryLines(deployPhase: DeployPhaseRenderInput): string[] {
   if (deployPhase.skipReason !== undefined) {
     return ['', `⚠ ${deployPhase.skipReason}`];
@@ -1877,6 +1897,11 @@ function deployPhaseSummaryLines(deployPhase: DeployPhaseRenderInput): string[] 
   if (results.length === 0) return [];
   const lines: string[] = ['', 'Deploy phase (runs after the GitHub phase above):'];
   for (const r of results) {
+    if (r.outcome.status === 'skipped') {
+      const cmd = deployPhase.commandFor?.(r.role);
+      lines.push(`  • ${r.role}: SKIPPED — ${r.outcome.reason}.` + (cmd === undefined ? '' : ` ${cmd}`));
+      continue;
+    }
     lines.push(
       r.outcome.status === 'deployed'
         ? `  • ${r.role}: DEPLOYED — workspace ${r.outcome.workspace === 'cloned' ? 'cloned' : 'already present (not re-cloned)'} at ${r.destDir}`
@@ -2475,7 +2500,15 @@ export function formatApplyResult(
   if (statusNextStep !== undefined) {
     parts.push(...bootstrapStatusNextStepLines(statusNextStep.manifestPath, statusNextStep.flags));
   }
-  const remainingDeployLines = formatRemainingDeployLines(remainingDeploy);
+  // An agent the deploy phase reported SKIPPED already names its command
+  // there; listing it again here would print the same agent twice.
+  const skippedRoles = new Set(
+    (deployPhase?.results ?? []).filter((r) => r.outcome.status === 'skipped').map((r) => r.role),
+  );
+  const remainingDeployLines = formatRemainingDeployLines({
+    ...remainingDeploy,
+    steps: remainingDeploy.steps.filter((step) => !skippedRoles.has(step.role)),
+  });
   if (remainingDeployLines.length > 0) {
     parts.push('', ...remainingDeployLines);
   }
@@ -2608,6 +2641,9 @@ function remainingDeployStepToJson(step: RemainingDeployStep): unknown {
  * `remainingDeployStepToJson`'s own `command` field).
  */
 function deployPhaseResultToJson(r: DeployPhaseAgentResult, checkAgentCertPresent: (destDir: string) => boolean): unknown {
+  if (r.outcome.status === 'skipped') {
+    return { role: r.role, status: 'skipped', reason: r.outcome.reason, workspace_dir: r.destDir };
+  }
   const base = { ...(fleetDeployOutcomeToJson(r.outcome) as Record<string, unknown>), workspace_dir: r.destDir };
   if (r.outcome.status !== 'deployed') return base;
   return {
@@ -3756,6 +3792,10 @@ export async function runBootstrapApply(
               flagless: versionRunFlagless,
             };
 
+      // The FULL report feeds the fleet verdict and --json: a host-skipped
+      // agent is still not deployed, so the verdict must stay unknown and
+      // JSON consumers keep its deploy command. Only the rendered text drops
+      // agents the deploy phase already printed as SKIPPED (formatApplyResult).
       const remainingDeploy: RemainingDeployReport = controlRepoAborted
         ? { steps: [] }
         : computeRemainingDeploy(manifest, manifestPath, opts, resolved.checkDeployPathExists);
@@ -3774,6 +3814,7 @@ export async function runBootstrapApply(
               results: deployResults,
               skipReason: deploySkipReason,
               checkAgentCertPresent: resolved.checkAgentCertPresent,
+              commandFor: (role: string) => otherHostDeployCommand(controlRepoFullName(manifest), role),
               project: manifest.metadata.name,
             };
 

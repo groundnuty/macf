@@ -27,6 +27,7 @@ import {
   recoveryResumableRoles,
   formatApplyResult,
   fleetApplyResultToJson,
+  otherHostDeployCommand,
   applyExitCode,
   findAvailableRecoveryArtifacts,
   formatRecoveryArtifactNotice,
@@ -4789,6 +4790,49 @@ describe('formatApplyResult / fleetApplyResultToJson / applyExitCode (pure)', ()
       vault: { status: 'written', path: '/x/secrets/vault.age', versioned: false },
     });
     expect(applyExitCode(result)).toBe(0);
+  });
+
+  it('a host-skipped agent prints once, keeps the workspace verdict unknown, and keeps its command in --json', () => {
+    const remaining = {
+      steps: [{
+        role: 'a',
+        deployPath: '/vm/only/a',
+        presence: 'unknown' as const,
+        reason: 'parent directory /vm does not exist on this host',
+        command: 'macf fleet deploy --agent a -f /m/fleet.yaml',
+      }],
+    };
+    const deployPhase = {
+      results: [{ role: 'a', destDir: '/vm/only/a', outcome: { role: 'a', status: 'skipped' as const, reason: 'this host cannot create /vm/only/a (/ is not writable)' } }],
+      project: 'p',
+    };
+    const text = formatApplyResult(resultWith(), [], remaining, deployPhase);
+    // Printed once (the SKIPPED line), not again as remaining-deploy guidance.
+    expect(text).toContain('a: SKIPPED — this host cannot create /vm/only/a (/ is not writable).');
+    expect(text).not.toContain('a: UNKNOWN whether deployed');
+    // The verdict still sees the agent: workspaces are not confirmed.
+    expect(text).toMatch(/workspaces: UNKNOWN/);
+    const json = fleetApplyResultToJson(resultWith(), [], remaining, deployPhase) as { remaining_deploy?: { role: string; command: string }[] };
+    expect(json.remaining_deploy?.map((r) => r.command)).toEqual(['macf fleet deploy --agent a -f /m/fleet.yaml']);
+  });
+
+  it('runBootstrapApply wires the other-host command, not this host\'s deploy command (source tripwire)', () => {
+    const src = readFileSync(new URL('../../src/cli/commands/bootstrap-apply.ts', import.meta.url), 'utf-8');
+    expect(src).toContain('commandFor: (role: string) => otherHostDeployCommand(controlRepoFullName(manifest), role),');
+  });
+
+  it("the other-host command names a control-repo clone, never this host's own paths", () => {
+    const cmd = otherHostDeployCommand('macf-experiment/macf-trial-control', 'code-agent');
+    expect(cmd).toBe(
+      'On the host that will run it, clone macf-experiment/macf-trial-control, then run: '
+        + 'macf fleet deploy --agent code-agent -f <clone>/fleet.yaml --identity-key PATH_TO_YOUR_AGE_IDENTITY_KEY',
+    );
+    expect(cmd).not.toContain('--vault');
+  });
+
+  it('a deploy-phase host-skip does not fail the run', () => {
+    const skipped = [{ role: 'a', destDir: '/x', outcome: { role: 'a', status: 'skipped' as const, reason: 'this host cannot create /x (/ is not writable)' } }];
+    expect(applyExitCode(resultWith(), skipped)).toBe(0);
   });
 
   it('applyExitCode: 1 when any agent is failed/drift/skipped-unverified', () => {
