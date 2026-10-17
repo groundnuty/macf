@@ -307,8 +307,8 @@ export function noRunnerRegisteredReason(repo: string, usability: RunnerUsabilit
   const detailSuffix = usability.detail !== undefined ? ` ${usability.detail}` : '';
   const handoverSuffix = usability.handover !== undefined ? ` ${usability.handover}` : '';
   return (
-    `${cause} for "${repo}" — MACF_TRUSTED_ACTORS was NOT written; this repo continues routing on ` +
-    'ubuntu-latest (billed on private repos) until a runner is registered and confirmed ' +
+    `${cause} for "${repo}" — MACF_TRUSTED_ACTORS was NOT written. ` +
+    'This repo cannot route until it is written: its routing jobs wait for a self-hosted runner and never fall back to a GitHub-hosted one. It is written once a runner is registered and confirmed ' +
     `(register-before-route — see macf-devops-toolkit's runner/RUNNER.md §"The security model").${detailSuffix}${handoverSuffix}`
   );
 }
@@ -637,8 +637,9 @@ export function runnerNeverRegisteredReason(repo: string, usability: RunnerUsabi
   const handoverSuffix = usability.handover !== undefined ? ` ${usability.handover}` : '';
   return (
     `role/repo "${repo}": no runner is registered for this repository, at either the repo or the organization ` +
-    'level, and this tool does not provision one for you yet. MACF_TRUSTED_ACTORS was NOT written; this repo ' +
-    'continues routing on ubuntu-latest (billed on private repos). Register a self-hosted runner for this repo ' +
+    'level, and apply did not get one requested this run: MACF_RUNNER_PLATFORM_ENDPOINT may not be set ' +
+    '(see `macf bootstrap secrets template`), or the request failed (see the runner provision result). ' +
+    'MACF_TRUSTED_ACTORS was NOT written. This repo cannot route until it is written: its routing jobs wait for a self-hosted runner and never fall back to a GitHub-hosted one. Register a self-hosted runner for this repo ' +
     "(or the organization), or change `runs_on` in the fleet manifest, then re-run `macf bootstrap apply`." +
     `${detailSuffix}${handoverSuffix}`
   );
@@ -653,8 +654,7 @@ export function runnerJustCreatedRepoReason(repo: string, usability: RunnerUsabi
   const handoverSuffix = usability.handover !== undefined ? ` ${usability.handover}` : '';
   return (
     `role/repo "${repo}": a runner registration token was supplied but ${cause} — ` +
-    'MACF_TRUSTED_ACTORS was NOT written; this repo routes on hosted runners (billed on private repos) ' +
-    'until a runner is confirmed. Register a runner for this repo, then re-run `macf bootstrap apply`.' +
+    'MACF_TRUSTED_ACTORS was NOT written. This repo cannot route until it is written: its routing jobs wait for a self-hosted runner and never fall back to a GitHub-hosted one. Register a runner for this repo, then re-run `macf bootstrap apply`.' +
     `${detailSuffix}${handoverSuffix}`
   );
 }
@@ -668,8 +668,8 @@ export function runnerTokenPollExhaustedReason(repo: string, usability: RunnerUs
   const handoverSuffix = usability.handover !== undefined ? ` ${usability.handover}` : '';
   return (
     `role/repo "${repo}": a runner registration token was supplied but ${cause} within the ` +
-    `${String(Math.round(timeoutMs / 1000))}s poll window — MACF_TRUSTED_ACTORS was NOT written; this repo ` +
-    'routes on hosted runners (billed on private repos) until a runner is confirmed. Re-run `macf bootstrap ' +
+    `${String(Math.round(timeoutMs / 1000))}s poll window — MACF_TRUSTED_ACTORS was NOT written. ` +
+    'This repo cannot route until it is written: its routing jobs wait for a self-hosted runner and never fall back to a GitHub-hosted one. Re-run `macf bootstrap ' +
     `apply\` once it is registered.${detailSuffix}${handoverSuffix}`
   );
 }
@@ -1118,9 +1118,8 @@ export async function publishTrustedActorsGated(
       // disabled the fast-exit, so a `neverRegistered` result here means the
       // poll genuinely WAITED the full budget and the runner still never
       // registered) — `runnerTokenPollExhaustedReason` is the HONEST framing
-      // for that case, not `runnerNeverRegisteredReason` (whose "this tool
-      // does not provision one for you yet" clause would be false: it just
-      // tried). The `justCreatedRepos` fast path (`!pollJustified`)
+      // for that case, not `runnerNeverRegisteredReason` (whose "apply did not get
+      // one requested this run" clause would be false: it just tried). The `justCreatedRepos` fast path (`!pollJustified`)
       // deliberately keeps its OWN `runnerJustCreatedRepoReason` even when
       // `neverRegistered` is ALSO true (it almost always is, for a repo this
       // run itself created and never successfully provisioned) — that text
@@ -1220,8 +1219,8 @@ export function runnerStillProvisioningReason(repo: string, elapsedMs: number, t
   return (
     `role/repo "${repo}": a self-hosted runner was requested for this repo THIS run and has not yet become ` +
     `usable to GitHub within the ${String(Math.round(elapsedMs / 1000))}s this run waited (budget ` +
-    `${String(Math.round(timeoutMs / 1000))}s) — MACF_TRUSTED_ACTORS was NOT written; this repo continues ` +
-    'routing on ubuntu-latest (billed on private repos) in the meantime. This is expected provisioning ' +
+    `${String(Math.round(timeoutMs / 1000))}s) — MACF_TRUSTED_ACTORS was NOT written; this repo ` +
+    'cannot route in the meantime: its routing jobs wait for the runner. This is expected provisioning ' +
     'latency, not a failure — re-run `macf bootstrap apply` once the runner is up, or `macf bootstrap status` ' +
     'to check progress without re-provisioning anything.'
   );
@@ -1232,8 +1231,8 @@ export function runnerProvisioningTerminalFailureReason(repo: string, failure: {
   return (
     `role/repo "${repo}": the runner-provisioning platform reports a TERMINAL failure for this repo's runner — ` +
     `${failure.reason} (${failure.message}). This is not a startup delay; polling will not clear it. ` +
-    'MACF_TRUSTED_ACTORS was NOT written; this repo continues routing on ubuntu-latest (billed on private ' +
-    'repos) until the underlying provisioning problem is fixed (commonly: the fleet\'s GitHub App is not ' +
+    'MACF_TRUSTED_ACTORS was NOT written. This repo cannot route until it is written: its routing jobs wait for a self-hosted runner and never fall back to a GitHub-hosted one. It is written once the underlying ' +
+    'provisioning problem is fixed (commonly: the fleet\'s GitHub App is not ' +
     'installed on the repo owner, so no registration token can be minted) and `macf bootstrap apply` is re-run.'
   );
 }

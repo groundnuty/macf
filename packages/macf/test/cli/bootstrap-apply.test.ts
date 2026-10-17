@@ -1568,7 +1568,7 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       // The message names the cost consequence — same reason text
       // `apply-routing.ts::runnerTokenPollExhaustedReason` has always
       // produced, now paired with a FAILED status instead of SKIPPED.
-      expect(all).toContain('billed on private repos');
+      expect(all).toContain('never fall back to a GitHub-hosted one');
       expect(all).toContain('MACF_TRUSTED_ACTORS was NOT written');
       expect(all).toContain('groundnuty/demo-code: FAILED —');
       expect(all).not.toContain('groundnuty/demo-code: SKIPPED');
