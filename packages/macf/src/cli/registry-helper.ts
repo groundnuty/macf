@@ -32,3 +32,11 @@ export function createClientFromConfig(
 ): GitHubVariablesClient {
   return createGitHubClient(registryPathPrefix(registry), token);
 }
+
+/**
+ * Shown when `<SEG>_CA_CERT` is absent from the registry. `fleet deactivate`
+ * removes it on purpose, and `certs init` after that would orphan every cert.
+ */
+export const CA_NOT_IN_REGISTRY_MESSAGE =
+  'CA certificate not found in registry. If this fleet was deactivated, restore it with ' +
+  '`macf bootstrap apply`; for a fleet that has no CA yet, run `macf certs init`.';

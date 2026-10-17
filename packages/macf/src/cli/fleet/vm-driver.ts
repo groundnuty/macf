@@ -49,7 +49,7 @@ import {
   agentKeyPath,
   type MacfAgentConfig,
 } from '../config.js';
-import { createClientFromConfig } from '../registry-helper.js';
+import { createClientFromConfig, CA_NOT_IN_REGISTRY_MESSAGE } from '../registry-helper.js';
 import { discoverWorkspaces } from '../discovery.js';
 import { buildTmuxLaunchArgs, ORCHESTRATOR_IDENTITY_ENV_KEYS } from './launch-command.js';
 import { gatherFleetStatus, type FleetProbeFn } from '../commands/fleet.js';
@@ -974,7 +974,7 @@ export async function createVmDriverFromConfig(
   const client = createClientFromConfig(config.registry, token);
   const caCertPem = await client.readVariable(`${toVariableSegment(config.project)}_CA_CERT`);
   if (!caCertPem) {
-    console.error('CA certificate not found in registry. Run `macf certs init` first.');
+    console.error(CA_NOT_IN_REGISTRY_MESSAGE);
     return null;
   }
 

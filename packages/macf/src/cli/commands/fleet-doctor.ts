@@ -39,7 +39,7 @@ import {
   agentKeyPath,
   findProjectRoot,
 } from '../config.js';
-import { createClientFromConfig } from '../registry-helper.js';
+import { createClientFromConfig, CA_NOT_IN_REGISTRY_MESSAGE } from '../registry-helper.js';
 import {
   createRegistryFromConfig,
   generateToken,
@@ -854,7 +854,7 @@ async function resolveDepsFromRegistry(
   if (!caCertPem) {
     const failure: FleetDoctorFailure = {
       code: 'no_ca_cert',
-      message: 'CA certificate not found in registry. Run `macf certs init` first.',
+      message: CA_NOT_IN_REGISTRY_MESSAGE,
     };
     console.error(failure.message);
     return { ok: false, code: 1, failure };
