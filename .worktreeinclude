@@ -1,0 +1,6 @@
+# Gitignored files Claude Code copies into every worktree it creates
+# (https://code.claude.com/docs/en/worktrees.md). .claude/settings.json is
+# tracked and registers hooks at $CLAUDE_PROJECT_DIR/.claude/scripts/, but the
+# scripts themselves are installed by `macf rules refresh` and gitignored
+# (#1395), so a fresh worktree would otherwise have none of them.
+.claude/scripts/*.sh
