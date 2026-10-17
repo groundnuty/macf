@@ -2,7 +2,7 @@
 #
 # check-gh-attribution.sh — Claude Code PostToolUse hook that, AFTER a
 # `gh`-write Bash op, verifies the just-written GitHub resource (issue /
-# PR / comment) was authored by the BOT, not the operator's user account.
+# PR / comment / review / merge) was authored by the BOT, not the operator's user account.
 # A user-attributed write is the silent-fallback Instance-12 attribution
 # trap: the `gh` call fell back to stored `gh auth login` (user) because
 # GH_TOKEN was empty / a `ghp_`/`gho_`/`ghu_` user token / the literal
@@ -53,6 +53,8 @@ trap 'exit 0' ERR
 INPUT_JSON="$(cat)"
 COMMAND="$(jq -r '.tool_input.command // ""' <<<"$INPUT_JSON" 2>/dev/null || echo "")"
 [[ -z "$COMMAND" ]] && exit 0
+# The directory the command ran in (Claude Code passes it in the payload).
+CWD="$(jq -r '.cwd // ""' <<<"$INPUT_JSON" 2>/dev/null || echo "")"
 
 # ── Is this a gh-write op that produces an attributable resource? ─────────
 # Match the write subcommands whose output carries a resource/comment URL:
@@ -60,7 +62,12 @@ COMMAND="$(jq -r '.tool_input.command // ""' <<<"$INPUT_JSON" 2>/dev/null || ech
 #   gh issue create  / gh pr create    → creates the resource
 #   gh issue close … --comment         → posts a closing comment
 #   gh pr close    … --comment         → posts a closing comment
+#   gh pr review                       → posts a review (no URL in output)
+#   gh api -X PUT …/pulls/<N>/merge    → merges (no URL in output)
 # A bare `gh issue close` (no --comment) writes nothing attributable → skip.
+# The review and the API merge print no URL, so the hook reads every review
+# on the PR from the last five minutes (the window), or the PR's merged_by,
+# instead of a URL from the output.
 # This is a RESULT check (not a blocker), so a simple wrapper-tolerant
 # `grep -qE` over the raw command suffices — we don't need the airtight
 # bypass-resistant regex the PreToolUse blockers carry.
@@ -79,45 +86,162 @@ is_gh_write() {
   fi
   return 1
 }
-is_gh_write "$COMMAND" || exit 0
 
-# ── Extract the resource URL from the tool output ─────────────────────────
-# `gh issue create` / `gh pr create` print the new URL on stdout; `gh issue
-# comment` / `gh pr comment` print the comment URL (…#issuecomment-<id>).
-# Read both PostToolUse output shapes (newer `.tool_output.stdout`, older
-# `.tool_response.stdout`, oldest `.tool_response` as a raw string).
-OUTPUT="$(jq -r '.tool_output.stdout // .tool_response.stdout // .tool_response // ""' <<<"$INPUT_JSON" 2>/dev/null || echo "")"
-[[ -z "$OUTPUT" ]] && exit 0
+# `gh pr review` posts a review and prints no URL.
+is_pr_review() {
+  grep -qiE 'gh[[:space:]]+pr[[:space:]]+review([[:space:]]|$)' <<<"$1"
+}
+# `gh api -X PUT repos/<o>/<r>/pulls/<N>/merge` merges and prints JSON or a sha.
+MERGE_PATH_RE='(^|[[:space:]"'"'"'])/?repos/([^/[:space:]"'"'"']+)/([^/[:space:]"'"'"']+)/pulls/([0-9]+)/merge([[:space:]"'"'"'?]|$)'
+is_api_merge() {
+  grep -qiE 'gh[[:space:]]+api[[:space:]]' <<<"$1" \
+    && grep -qE "$MERGE_PATH_RE" <<<"$1" \
+    && grep -qiE '(^|[[:space:]])(-X[[:space:]]*|--method[[:space:]=]+)PUT([[:space:]]|$)' <<<"$1"
+}
 
-URL="$(grep -oE 'https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/(issues|pull)/[0-9]+(#issuecomment-[0-9]+)?' <<<"$OUTPUT" | head -1 || true)"
-# No URL in output (e.g. `--json` suppressed it, or output was discarded) →
-# fail open. We can't verify what we can't see.
-[[ -z "$URL" ]] && exit 0
+# Split a command into shell-style words WITHOUT evaluating anything: single
+# quotes are literal, double quotes honour \", a backslash outside quotes
+# escapes the next char, unquoted whitespace splits. Each unquoted ; | & run
+# is emitted as a lone \001 line. One token per line; newlines become spaces.
+shell_tokens() {
+  MACF_CMD="$1" awk 'BEGIN {
+    s = ENVIRON["MACF_CMD"]; n = length(s); tok = ""; intok = 0; q = ""
+    for (i = 1; i <= n; i++) {
+      c = substr(s, i, 1)
+      if (q == "\047") { if (c == "\047") q = ""; else tok = tok c; continue }
+      if (q == "\"") {
+        if (c == "\\" && substr(s, i + 1, 1) == "\"") { tok = tok "\""; i++ }
+        else if (c == "\"") q = ""
+        else tok = tok c
+        continue
+      }
+      if (c == "\047" || c == "\"") { q = c; intok = 1; continue }
+      if (c == "\\") {
+        nx = substr(s, i + 1, 1); i++
+        if (nx != "\n") { tok = tok nx; intok = 1 }
+        continue
+      }
+      if (c == " " || c == "\t" || c == "\n") { flush(); continue }
+      if (c == ";" || c == "|" || c == "&") { flush(); print "\001"; continue }
+      tok = tok c; intok = 1
+    }
+    flush()
+  }
+  function flush() {
+    if (intok) { gsub("\n", " ", tok); print tok }
+    tok = ""; intok = 0
+  }'
+}
 
-# ── Parse the URL → owner / repo / kind / number / optional comment-id ────
-# Form: https://github.com/<owner>/<repo>/(issues|pull)/<N>[#issuecomment-<id>]
-URL_PATH="${URL#https://github.com/}"
-OWNER="$(cut -d/ -f1 <<<"$URL_PATH")"
-REPO="$(cut -d/ -f2 <<<"$URL_PATH")"
-KIND="$(cut -d/ -f3 <<<"$URL_PATH")"          # issues | pull
-NUM_AND_FRAG="$(cut -d/ -f4 <<<"$URL_PATH")"  # <N> | <N>#issuecomment-<id>
-NUM="${NUM_AND_FRAG%%#*}"
-COMMENT_ID=""
-if [[ "$NUM_AND_FRAG" == *"#issuecomment-"* ]]; then
-  COMMENT_ID="${NUM_AND_FRAG##*#issuecomment-}"
-fi
-# Sanity — if any required piece is missing/odd, fail open.
-[[ -z "$OWNER" || -z "$REPO" || -z "$KIND" || -z "$NUM" ]] && exit 0
+# Parse `gh pr review …` into OWNER/REPO/NUM. Quoted strings are kept as
+# single tokens; only the value after --body/-b/--body-file/-F is skipped, so
+# a number inside a body is never read as the PR number. The PR number is the
+# first positional; a PR URL there also gives the repo.
+parse_pr_review() {
+  local tok want="" started=0 prev1="" prev2="" sep
+  sep=$'\001'
+  while IFS= read -r tok; do
+    if [[ "$started" -eq 0 ]]; then
+      if [[ "$prev2" == "gh" && "$prev1" == "pr" && "$tok" == "review" ]]; then
+        started=1
+      elif [[ "$tok" == "cd" || "$tok" == "pushd" ]]; then
+        SAW_CD=1
+      fi
+      prev2="$prev1"; prev1="$tok"
+      continue
+    fi
+    [[ "$tok" == "$sep" ]] && break
+    case "$want" in
+      repo) REPO_FLAG="$tok"; want=""; continue ;;
+      skip) want=""; continue ;;
+    esac
+    case "$tok" in
+      --repo|-R) want="repo" ;;
+      --repo=*) REPO_FLAG="${tok#--repo=}" ;;
+      -R?*) REPO_FLAG="${tok#-R}" ;;
+      --body|-b|--body-file|-F) want="skip" ;;
+      -*) ;;
+      *)
+        [[ -n "$NUM" ]] && continue
+        if [[ "$tok" =~ ^https://github\.com/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)/pull/([0-9]+) ]]; then
+          OWNER="${BASH_REMATCH[1]}"; REPO="${BASH_REMATCH[2]}"; NUM="${BASH_REMATCH[3]}"
+        elif [[ "$tok" =~ ^[0-9]+$ ]]; then
+          NUM="$tok"
+        fi
+        ;;
+    esac
+  done < <(shell_tokens "$1")
+}
 
-# ── Build the ACTUAL-resource API path ────────────────────────────────────
-# Comment-id present → both issue AND pr comments live under the issues
-# comments namespace; else a PR → pulls/<N>; else an issue → issues/<N>.
-if [[ -n "$COMMENT_ID" ]]; then
-  API_PATH="/repos/${OWNER}/${REPO}/issues/comments/${COMMENT_ID}"
-elif [[ "$KIND" == "pull" ]]; then
-  API_PATH="/repos/${OWNER}/${REPO}/pulls/${NUM}"
+MODE=""
+OWNER=""; REPO=""; NUM=""; REPO_FLAG=""; SAW_CD=0
+if is_gh_write "$COMMAND"; then
+  MODE="generic"
+elif is_pr_review "$COMMAND"; then
+  MODE="review"
+elif is_api_merge "$COMMAND"; then
+  MODE="merge"
 else
-  API_PATH="/repos/${OWNER}/${REPO}/issues/${NUM}"
+  exit 0
+fi
+
+if [[ "$MODE" == "generic" ]]; then
+  # ── Extract the resource URL from the tool output ─────────────────────────
+  # `gh issue create` / `gh pr create` print the new URL on stdout; `gh issue
+  # comment` / `gh pr comment` print the comment URL (…#issuecomment-<id>).
+  # Read both PostToolUse output shapes (newer `.tool_output.stdout`, older
+  # `.tool_response.stdout`, oldest `.tool_response` as a raw string).
+  OUTPUT="$(jq -r '.tool_output.stdout // .tool_response.stdout // .tool_response // ""' <<<"$INPUT_JSON" 2>/dev/null || echo "")"
+  [[ -z "$OUTPUT" ]] && exit 0
+
+  URL="$(grep -oE 'https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/(issues|pull)/[0-9]+(#issuecomment-[0-9]+)?' <<<"$OUTPUT" | head -1 || true)"
+  # No URL in output (e.g. `--json` suppressed it, or output was discarded) →
+  # fail open. We can't verify what we can't see.
+  [[ -z "$URL" ]] && exit 0
+
+  # ── Parse the URL → owner / repo / kind / number / optional comment-id ────
+  # Form: https://github.com/<owner>/<repo>/(issues|pull)/<N>[#issuecomment-<id>]
+  URL_PATH="${URL#https://github.com/}"
+  OWNER="$(cut -d/ -f1 <<<"$URL_PATH")"
+  REPO="$(cut -d/ -f2 <<<"$URL_PATH")"
+  KIND="$(cut -d/ -f3 <<<"$URL_PATH")"          # issues | pull
+  NUM_AND_FRAG="$(cut -d/ -f4 <<<"$URL_PATH")"  # <N> | <N>#issuecomment-<id>
+  NUM="${NUM_AND_FRAG%%#*}"
+  COMMENT_ID=""
+  if [[ "$NUM_AND_FRAG" == *"#issuecomment-"* ]]; then
+    COMMENT_ID="${NUM_AND_FRAG##*#issuecomment-}"
+  fi
+  # Sanity — if any required piece is missing/odd, fail open.
+  [[ -z "$OWNER" || -z "$REPO" || -z "$KIND" || -z "$NUM" ]] && exit 0
+
+  # ── Build the ACTUAL-resource API path ────────────────────────────────────
+  # Comment-id present → both issue AND pr comments live under the issues
+  # comments namespace; else a PR → pulls/<N>; else an issue → issues/<N>.
+  if [[ -n "$COMMENT_ID" ]]; then
+    API_PATH="/repos/${OWNER}/${REPO}/issues/comments/${COMMENT_ID}"
+  elif [[ "$KIND" == "pull" ]]; then
+    API_PATH="/repos/${OWNER}/${REPO}/pulls/${NUM}"
+  else
+    API_PATH="/repos/${OWNER}/${REPO}/issues/${NUM}"
+  fi
+
+fi
+
+# ── review / merge: no URL in the output — locate the PR from the command ─
+AUTHOR_JQ='{login: .user.login, type: .user.type}'
+if [[ "$MODE" == "review" ]]; then
+  parse_pr_review "$COMMAND"
+  [[ -z "$NUM" ]] && exit 0
+  if [[ -n "$REPO_FLAG" && "$REPO_FLAG" == */* ]]; then
+    REPO_FLAG="${REPO_FLAG#https://github.com/}"
+    OWNER="$(cut -d/ -f1 <<<"$REPO_FLAG")"
+    REPO="$(cut -d/ -f2 <<<"$REPO_FLAG")"
+  fi
+elif [[ "$MODE" == "merge" ]]; then
+  if [[ "$COMMAND" =~ $MERGE_PATH_RE ]]; then
+    OWNER="${BASH_REMATCH[2]}"; REPO="${BASH_REMATCH[3]}"; NUM="${BASH_REMATCH[4]}"
+  fi
+  [[ -z "$OWNER" || -z "$REPO" || -z "$NUM" ]] && exit 0
 fi
 
 # hook-gh-token.sh is copied alongside this file by every distribution path,
@@ -148,6 +272,28 @@ else
   }
 fi
 
+# ── review / merge: resolve the repo (gh's own default if none given) ─────
+if [[ "$MODE" == "review" || "$MODE" == "merge" ]]; then
+  if [[ -z "$OWNER" || -z "$REPO" ]]; then
+    # A cd/pushd earlier in the command may have moved gh to another repo.
+    [[ "$SAW_CD" == "1" ]] && exit 0
+    NWO="$( [[ -n "$CWD" && -d "$CWD" ]] && cd "$CWD"; GH_PAGER= macf_hook_gh repo view --json nameWithOwner -q .nameWithOwner)" || exit 0
+    [[ "$NWO" == */* ]] || exit 0
+    OWNER="$(cut -d/ -f1 <<<"$NWO")"
+    REPO="$(cut -d/ -f2 <<<"$NWO")"
+  fi
+  if [[ "$MODE" == "review" ]]; then
+    URL="the latest review on ${OWNER}/${REPO}#${NUM}"
+    API_PATH="/repos/${OWNER}/${REPO}/pulls/${NUM}/reviews?per_page=100"
+    # One line per review, every page; the latest is picked in query_author.
+    AUTHOR_JQ='.[] | [.submitted_at, .user.login, .user.type] | @tsv'
+  else
+    URL="the merge of ${OWNER}/${REPO}#${NUM}"
+    API_PATH="/repos/${OWNER}/${REPO}/pulls/${NUM}"
+    AUTHOR_JQ='{login: (.merged_by.login // ""), type: (.merged_by.type // ""), merged: (.merged // false), merged_at: (.merged_at // "")}'
+  fi
+fi
+
 # ── Query the author (short timeout; one brief retry for API consistency) ─
 # The resource was JUST created, so a first read can occasionally race the
 # write through GitHub's read replicas. One `sleep 1` retry handles that
@@ -165,7 +311,19 @@ fi
 # distinguishable from "the check ran and found no mismatch" in the log.
 query_author() {
   local resp rc=0
-  resp="$(GH_PAGER= macf_hook_gh api "$API_PATH" --jq '{login: .user.login, type: .user.type}')" || rc=$?
+  if [[ "$MODE" == "review" ]]; then
+    resp="$(GH_PAGER= macf_hook_gh api --paginate "$API_PATH" --jq "$AUTHOR_JQ")" || rc=$?
+    if [[ "$rc" -eq 0 && -n "$resp" ]]; then
+      # Keep only reviews submitted within the window: an older review (or a
+      # concurrent one) is not evidence about what this command posted.
+      resp="$(printf '%s\n' "$resp" | jq -rR --argjson now "$(date -u +%s)" \
+        --argjson win "${MACF_ATTRIBUTION_WINDOW_SEC:-300}" \
+        'split("\t") | select((try (.[0] | fromdateiso8601) catch 0) > ($now - $win)) | @tsv' \
+        2>/dev/null | LC_ALL=C sort -t$'\t' -k1,1 || true)"
+    fi
+  else
+    resp="$(GH_PAGER= macf_hook_gh api "$API_PATH" --jq "$AUTHOR_JQ")" || rc=$?
+  fi
   printf '%s' "$resp"
   return "$rc"
 }
@@ -188,6 +346,26 @@ if [[ "$RC" -eq 1 ]]; then
 fi
 
 [[ -z "$RESP" ]] && exit 0
+
+# review: RESP holds the recent reviews, oldest first. None → nothing was
+# posted (or we cannot tell). Otherwise judge them all below and warn about
+# the most recent one.
+RECENT_REVIEWS=""
+if [[ "$MODE" == "review" ]]; then
+  RECENT_REVIEWS="$RESP"
+  RESP="$(printf '%s\n' "$RECENT_REVIEWS" | tail -n 1 \
+    | jq -R 'split("\t") | {login: (.[1] // ""), type: (.[2] // "")}' 2>/dev/null || true)"
+  [[ -z "$RESP" ]] && exit 0
+fi
+
+if [[ "$MODE" == "merge" ]]; then
+  # The merge failed or was refused: nothing was merged, nothing to check.
+  [[ "$(jq -r '.merged // false' <<<"$RESP" 2>/dev/null || echo false)" == "true" ]] || exit 0
+  # An older merge is not evidence about this command: a failed retry on a PR
+  # merged earlier proves nothing. Same window as the review path.
+  jq -e --argjson now "$(date -u +%s)" --argjson win "${MACF_ATTRIBUTION_WINDOW_SEC:-300}" \
+    '(try (.merged_at | fromdateiso8601) catch 0) > ($now - $win)' <<<"$RESP" >/dev/null 2>&1 || exit 0
+fi
 
 ACTUAL_LOGIN="$(jq -r '.login // ""' <<<"$RESP" 2>/dev/null || echo "")"
 ACTUAL_TYPE="$(jq -r '.type // ""' <<<"$RESP" 2>/dev/null || echo "")"
@@ -237,33 +415,36 @@ normalize_login() {
   echo "${l,,}"
 }
 
-NORM_ACTUAL="$(normalize_login "$ACTUAL_LOGIN")"
+# Is this author acceptable? 0 = ok, 1 = mismatch (the trap).
+#   A matching login is ok. Otherwise trap when the expectation is
+#   AUTHORITATIVE (env / bot_login — a different author, even a Bot, is wrong)
+#   or a User wrote it (the Instance-12 trap, whatever the source). A Bot that
+#   only mismatches a NON-authoritative agent_name guess is the name!=slug
+#   case (macf#535) → ok. With no expected login, a Bot is ok, a User is not.
+author_ok() {
+  local login type norm_expected
+  login="$(normalize_login "$1")"; type="$2"
+  if [[ -n "$EXPECTED_LOGIN" ]]; then
+    norm_expected="$(normalize_login "$EXPECTED_LOGIN")"
+    [[ "$login" == "$norm_expected" ]] && return 0
+    if [[ "$EXPECTED_AUTHORITATIVE" == "1" || "$type" != "Bot" ]]; then
+      return 1
+    fi
+    return 0
+  fi
+  [[ "$type" == "Bot" ]] && return 0
+  return 1
+}
 
 # ── Decide: OK vs MISMATCH ────────────────────────────────────────────────
-MISMATCH=0
-if [[ -n "$EXPECTED_LOGIN" ]]; then
-  NORM_EXPECTED="$(normalize_login "$EXPECTED_LOGIN")"
-  if [[ "$NORM_ACTUAL" == "$NORM_EXPECTED" ]]; then
-    exit 0
-  fi
-  # Mismatch. Trap if the expectation is AUTHORITATIVE (env / bot_login — a
-  # different author, even a Bot, is wrong), OR a User authored it (the
-  # Instance-12 trap, regardless of source). A Bot author that only mismatches
-  # a NON-authoritative agent_name guess is the name!=slug case (macf#535) → ok.
-  if [[ "$EXPECTED_AUTHORITATIVE" == "1" || "$ACTUAL_TYPE" != "Bot" ]]; then
-    MISMATCH=1
-  else
-    exit 0
-  fi
-else
-  # No expected login known — best verifiable signal is the author TYPE.
-  # A Bot authored it → trust it (some bot posted; correct by design).
-  # A User authored it → the Instance-12 trap (a human account wrote it).
-  if [[ "$ACTUAL_TYPE" == "Bot" ]]; then
-    exit 0
-  fi
-  MISMATCH=1
+if [[ "$MODE" == "review" ]]; then
+  # Any recent review by the expected identity means ours landed.
+  while IFS=$'\t' read -r _ts r_login r_type; do
+    author_ok "$r_login" "$r_type" && exit 0
+  done <<<"$RECENT_REVIEWS"
 fi
+MISMATCH=0
+author_ok "$ACTUAL_LOGIN" "$ACTUAL_TYPE" || MISMATCH=1
 
 [[ "$MISMATCH" -ne 1 ]] && exit 0
 
@@ -273,6 +454,26 @@ if [[ -n "$EXPECTED_LOGIN" ]]; then
   EXPECTED_LINE="$EXPECTED_LOGIN"
 fi
 
+AUTHOR_LABEL="Authored by:     "
+[[ "$MODE" == "merge" ]] && AUTHOR_LABEL="Merged by:       "
+case "$MODE" in
+  merge)
+    REPAIR_2="A merge cannot be redone; do not revert it. Comment on the PR as the bot that the
+     merge ran under the wrong account."
+    REPAIR_3="" ;;
+  review)
+    REPAIR_2="Submit the review again as the bot, then comment that the earlier one ran under the
+     wrong account."
+    REPAIR_3="" ;;
+  *)
+    REPAIR_2="If the resource has NOT been replied-to yet, delete the mis-attributed
+     write and re-post it as the bot (clean correction)."
+    REPAIR_3="
+  3. If it HAS already been replied-to / acted-on, do NOT delete — post a
+     short clarify-forward correction comment AS THE BOT noting the prior
+     write was mis-attributed, so the thread stays coherent." ;;
+esac
+
 cat >&2 <<ERR
 WARNING (MACF attribution-result check): the GitHub resource you just wrote
 appears to be authored by the WRONG account — the silent-fallback Instance-12
@@ -280,7 +481,7 @@ attribution trap (a \`gh\` write fell back to the operator's USER auth instead
 of the bot installation token).
 
 Resource:        ${URL}
-Authored by:     ${ACTUAL_LOGIN} (type: ${ACTUAL_TYPE:-unknown})
+${AUTHOR_LABEL}${ACTUAL_LOGIN} (type: ${ACTUAL_TYPE:-unknown})
 Expected (bot):  ${EXPECTED_LINE}
 
 The tool already ran — this is a PostToolUse check, so the resource is live on
@@ -295,11 +496,7 @@ Repair:
          --app-id "\$APP_ID" --install-id "\$INSTALL_ID" --key "\$KEY_PATH") || exit 1
        export GH_TOKEN
 
-  2. If the resource has NOT been replied-to yet, delete the mis-attributed
-     write and re-post it as the bot (clean correction).
-  3. If it HAS already been replied-to / acted-on, do NOT delete — post a
-     short clarify-forward correction comment AS THE BOT noting the prior
-     write was mis-attributed, so the thread stays coherent.
+  2. ${REPAIR_2}${REPAIR_3}
 
 Verify your identity any time:
   GH_TOKEN=\$GH_TOKEN "\$MACF_WORKSPACE_DIR/.claude/scripts/macf-whoami.sh"

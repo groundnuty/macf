@@ -17,9 +17,9 @@
  * the tests prepend a stub `gh` shim to PATH (mirrors check-close-keyword.sh /
  * check-lgtm-gate.sh test pattern).
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, readFileSync, existsSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { findCliPackageRoot } from '../../src/cli/rules.js';
@@ -31,7 +31,14 @@ const BOT = 'macf-code-agent[bot]';
 /** What the stub `gh api` returns for the resource: an author login+type, or
  *  a failure sentinel. */
 type GhStub =
-  | { readonly login: string; readonly type: 'Bot' | 'User' }
+  | {
+      readonly login: string;
+      readonly type: 'Bot' | 'User';
+      /** Merge reads only: whether the PR is merged (default true). */
+      readonly merged?: boolean;
+      /** Merge reads only: ISO merge time (default now). */
+      readonly mergedAt?: string;
+    }
   | 'fail' // gh api exits non-zero, non-auth (network / 404 / 5xx)
   | 'authfail'; // gh api exits non-zero with an auth-failure shape (groundnuty/macf#938)
 
@@ -55,13 +62,36 @@ function makeStubGhDir(stub: GhStub): string {
     // (`gh pr view`) — groundnuty/macf#938.
     arm = `echo "gh: Bad credentials (HTTP 401)" >&2; exit 1`;
   } else {
-    const body = JSON.stringify({ login: stub.login, type: stub.type });
+    const body = JSON.stringify({
+      login: stub.login,
+      type: stub.type,
+      merged: stub.merged ?? true,
+      merged_at: stub.mergedAt ?? new Date().toISOString().replace(/\.\d+Z$/, 'Z'),
+    });
     // Single-quote the JSON for echo; JSON has no single quotes.
     arm = `echo '${body}'; exit 0`;
   }
+  const reviewArm =
+    typeof stub === 'string'
+      ? ''
+      : `printf '%s\\t%s\\t%s\\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '${stub.login}' '${stub.type}'; exit 0`;
   const stubScript = `#!/usr/bin/env bash
-# Stub gh — only handles \`gh api <path> --jq ...\`.
+# Stub gh — handles \`gh api <path> --jq ...\` and \`gh repo view\`.
+[[ -n "\${STUB_LOG:-}" ]] && echo "$*" >> "$STUB_LOG"
+if [[ "$1" == "repo" ]]; then
+  [[ -n "\${STUB_CWD_LOG:-}" ]] && pwd >> "$STUB_CWD_LOG"
+  echo "\${STUB_REPO:-groundnuty/macf}"; exit 0
+fi
 if [[ "$1" == "api" ]]; then
+  if [[ "$*" == */reviews* ]]; then
+    # Reviews are read as one TSV line per review (the hook passes --paginate).
+    if [[ -n "\${STUB_PAGE1:-}" ]]; then
+      printf '%b\\n' "$STUB_PAGE1"
+      [[ "$*" == *--paginate* ]] && printf '%b\\n' "\${STUB_PAGE2:-}"
+      exit 0
+    fi
+    ${reviewArm}
+  fi
   ${arm}
 fi
 echo "stub gh: unexpected subcommand: $*" >&2
@@ -93,12 +123,15 @@ function runHook(opts: {
   readonly legacyOutputShape?: boolean;
   readonly env?: Record<string, string | undefined>;
   readonly stubGh?: GhStub;
+  /** The payload's `cwd` (where the command ran). */
+  readonly cwd?: string;
 }): ReturnType<typeof spawnSync> {
   const payload: Record<string, unknown> = {
     session_id: 'test',
     tool_name: 'Bash',
     tool_input: { command: opts.command },
   };
+  if (opts.cwd !== undefined) payload['cwd'] = opts.cwd;
   if (opts.output !== undefined) {
     if (opts.legacyOutputShape) {
       payload['tool_response'] = { stdout: opts.output };
@@ -181,6 +214,18 @@ describe('check-gh-attribution.sh (PostToolUse hook)', () => {
       // Names the trap + repair guidance.
       expect(r.stderr).toContain('macf#489');
       expect(r.stderr).toContain('macf-gh-token.sh');
+    });
+    it('keeps the generic repair steps and the Authored by label', () => {
+      const r = runHook({
+        command: 'gh issue create --repo groundnuty/macf --title x --body y',
+        output: `Creating issue...\n${ISSUE_URL}\n`,
+        stubGh: { login: 'orzech', type: 'User' },
+      });
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain('Authored by:');
+      expect(r.stderr).toContain('delete the mis-attributed');
+      expect(r.stderr).toContain('do NOT delete');
+      expect(r.stderr).not.toContain('cannot be redone');
     });
 
     it('warns for a user-authored comment (comment-id URL → issues/comments path)', () => {
@@ -426,6 +471,203 @@ describe('check-gh-attribution.sh (PostToolUse hook)', () => {
       } finally {
         rmSync(ws, { recursive: true, force: true });
       }
+    });
+  });
+
+  describe('(m) gh pr review / gh api merge are read back (macf#1475)', () => {
+    const logs: string[] = [];
+    function hook(command: string, stub: GhStub, extraEnv: Record<string, string> = {}) {
+      const dir = mkdtempSync(join(tmpdir(), 'macf-attr-log-'));
+      const log = join(dir, 'gh.log');
+      logs.push(dir);
+      const r = runHook({
+        command,
+        output: '',
+        stubGh: stub,
+        env: { STUB_LOG: log, ...extraEnv },
+      });
+      let calls = '';
+      try {
+        calls = readFileSync(log, 'utf-8');
+      } catch {
+        calls = '';
+      }
+      return { r, calls };
+    }
+    afterEach(() => {
+      for (const d of logs.splice(0)) rmSync(d, { recursive: true, force: true });
+    });
+    const USER: GhStub = { login: 'orzech', type: 'User' };
+    const BOTSTUB: GhStub = { login: BOT, type: 'Bot' };
+    const bot = { MACF_EXPECTED_BOT_LOGIN: BOT };
+    const ago = (sec: number): string =>
+      new Date(Date.now() - sec * 1000).toISOString().replace(/\.\d+Z$/, 'Z');
+
+    it('review by the bot → silent', () => {
+      const { r } = hook('gh pr review 7 --approve', BOTSTUB, bot);
+      expect(r.status).toBe(0);
+      expect(r.stderr).toBe('');
+    });
+    it('review by a user → warns, naming the review', () => {
+      const { r, calls } = hook('gh pr review 7 --approve --body "LGTM 99"', USER, bot);
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain('the latest review on groundnuty/macf#7');
+      expect(r.stderr).toContain('Submit the review again');
+      expect(r.stderr).toContain('orzech');
+      expect(calls).toContain('/repos/groundnuty/macf/pulls/7/reviews');
+    });
+    it('review with --repo reads that repo', () => {
+      const { r, calls } = hook('gh pr review -R acme/widgets 12 --request-changes', USER, bot);
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain('the latest review on acme/widgets#12');
+      expect(calls).toContain('/repos/acme/widgets/pulls/12/reviews');
+      expect(calls).not.toContain('repo view');
+    });
+    it('review with an attached -R<repo> reads that repo', () => {
+      const { r, calls } = hook('gh pr review 7 -Racme/widgets --approve', USER, bot);
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain('the latest review on acme/widgets#7');
+      expect(calls).toContain('/repos/acme/widgets/pulls/7/reviews');
+      expect(calls).not.toContain('repo view');
+    });
+    it('review via a PR URL is parsed', () => {
+      const { r, calls } = hook(
+        'gh pr review https://github.com/acme/widgets/pull/31 --comment --body hi',
+        USER,
+        bot,
+      );
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain('the latest review on acme/widgets#31');
+      expect(calls).toContain('/repos/acme/widgets/pulls/31/reviews');
+    });
+    it('review with no repo uses the repo gh would use', () => {
+      const { r } = hook('gh pr review 3 --approve', USER, { ...bot, STUB_REPO: 'o/dflt' });
+      expect(r.stderr).toContain('the latest review on o/dflt#3');
+    });
+
+    it('review with the body before the PR number still reads that PR', () => {
+      const { r, calls } = hook('gh pr review --body "LGTM" 7 --approve', USER, bot);
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain('the latest review on groundnuty/macf#7');
+      expect(calls).toContain('/repos/groundnuty/macf/pulls/7/reviews');
+    });
+    it('review with a quoted PR URL is parsed', () => {
+      const { r, calls } = hook('gh pr review "https://github.com/o/r/pull/9" --approve', USER, bot);
+      expect(r.stderr).toContain('the latest review on o/r#9');
+      expect(calls).toContain('/repos/o/r/pulls/9/reviews');
+    });
+    it('review with a quoted --repo value reads that repo', () => {
+      const { r, calls } = hook('gh pr review 5 --repo "o/r" --approve', USER, bot);
+      expect(r.stderr).toContain('the latest review on o/r#5');
+      expect(calls).not.toContain('repo view');
+    });
+    it('a command substitution in the body is never executed', () => {
+      const dir = mkdtempSync(join(tmpdir(), 'macf-attr-inj-'));
+      logs.push(dir);
+      const marker = join(dir, 'x');
+      const { r } = hook(`gh pr review 7 --approve --body "$(touch ${marker})"`, USER, bot);
+      expect(r.status).toBe(2);
+      expect(existsSync(marker)).toBe(false);
+    });
+    it('a recent review on a later page is read', () => {
+      const { r, calls } = hook('gh pr review 7 --approve', USER, {
+        ...bot,
+        STUB_PAGE1: `${ago(7200)}\\t${BOT}\\tBot`,
+        STUB_PAGE2: `${ago(10)}\\torzech\\tUser`,
+      });
+      expect(calls).toContain('--paginate');
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain('orzech');
+    });
+
+    it('the latest review is 2 hours old and by a user → silent (the command posted nothing)', () => {
+      const { r } = hook('gh pr review 7 --approve', USER, {
+        ...bot,
+        STUB_PAGE1: `${ago(7200)}\\torzech\\tUser`,
+        STUB_PAGE2: '',
+      });
+      expect(r.status).toBe(0);
+      expect(r.stderr).toBe('');
+    });
+    it('a recent review by the bot plus a recent one by a user → silent', () => {
+      const { r } = hook('gh pr review 7 --approve', USER, {
+        ...bot,
+        STUB_PAGE1: `${ago(20)}\\t${BOT}\\tBot`,
+        STUB_PAGE2: `${ago(5)}\\torzech\\tUser`,
+      });
+      expect(r.status).toBe(0);
+      expect(r.stderr).toBe('');
+    });
+    it('only a recent review by a user → warns', () => {
+      const { r } = hook('gh pr review 7 --approve', USER, {
+        ...bot,
+        STUB_PAGE1: `${ago(30)}\\torzech\\tUser`,
+        STUB_PAGE2: '',
+      });
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain('orzech');
+    });
+
+    it('a cd before the review with no --repo → silent, no repo lookup', () => {
+      const { r, calls } = hook('cd /x && gh pr review 7 --approve', USER, bot);
+      expect(r.status).toBe(0);
+      expect(r.stderr).toBe('');
+      expect(calls).not.toContain('repo view');
+    });
+    it('no --repo → the repo is looked up in the payload cwd', () => {
+      const dir = mkdtempSync(join(tmpdir(), 'macf-attr-cwd-'));
+      logs.push(dir);
+      const cwdDir = join(dir, 'elsewhere');
+      mkdirSync(cwdDir);
+      const cwdLog = join(dir, 'cwd.log');
+      const logDir = mkdtempSync(join(tmpdir(), 'macf-attr-log-'));
+      logs.push(logDir);
+      const r = runHook({
+        command: 'gh pr review 7 --approve',
+        output: '',
+        cwd: cwdDir,
+        stubGh: USER,
+        env: { STUB_LOG: join(logDir, 'gh.log'), STUB_CWD_LOG: cwdLog, ...bot },
+      });
+      expect(r.status).toBe(2);
+      expect(readFileSync(cwdLog, 'utf-8').trim()).toBe(realpathSync(cwdDir));
+    });
+
+    it('merge by the bot → silent', () => {
+      const { r } = hook('gh api -X PUT repos/o/r/pulls/9/merge -f merge_method=squash', BOTSTUB, bot);
+      expect(r.status).toBe(0);
+      expect(r.stderr).toBe('');
+    });
+    it('merge by a user → warns, naming the merge', () => {
+      const { r, calls } = hook('gh api -X PUT repos/o/r/pulls/9/merge', USER, bot);
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain('the merge of o/r#9');
+      expect(r.stderr).toContain('Merged by:');
+      expect(r.stderr).not.toContain('Authored by:');
+      expect(r.stderr).toContain('cannot be redone');
+      expect(r.stderr).not.toContain('delete the mis-attributed');
+      expect(calls).toContain('/repos/o/r/pulls/9');
+    });
+    it('merge that happened 2 hours ago → silent', () => {
+      const old = new Date(Date.now() - 2 * 3600 * 1000).toISOString().replace(/\.\d+Z$/, 'Z');
+      const { r } = hook('gh api -X PUT repos/o/r/pulls/9/merge', { ...USER, mergedAt: old }, bot);
+      expect(r.status).toBe(0);
+      expect(r.stderr).toBe('');
+    });
+    it('merge that did not merge → silent', () => {
+      const { r } = hook('gh api -X PUT repos/o/r/pulls/9/merge', { ...USER, merged: false }, bot);
+      expect(r.status).toBe(0);
+      expect(r.stderr).toBe('');
+    });
+    it('merge with a leading slash, flag after the path, and --jq .sha → still matched', () => {
+      const { r } = hook('gh api /repos/o/r/pulls/9/merge --method PUT --jq .sha', USER, bot);
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain('the merge of o/r#9');
+    });
+    it('a gh api call that is not a merge is not matched', () => {
+      const { r, calls } = hook('gh api repos/o/r/issues', USER, bot);
+      expect(r.status).toBe(0);
+      expect(calls).toBe('');
     });
   });
 });
