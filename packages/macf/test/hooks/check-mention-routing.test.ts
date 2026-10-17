@@ -613,6 +613,28 @@ describe('check-mention-routing.sh (hook)', () => {
       expect(r.stderr).toContain('no [bot] suffix');
     });
 
+    it('does not count a human mention inside a fenced code block', () => {
+      const fence = '```';
+      const only = runHook({ command: cmd(`${fence}text\n@groundnuty example only\n${fence}`) });
+      expect(only.status).toBe(2);
+      expect(only.stderr).toContain('zero');
+      const both = runHook({
+        command: cmd(`${fence}text\n@groundnuty example only\n${fence}\n@groundnuty which dataset?`),
+      });
+      expect(both.status).toBe(0);
+    });
+
+    it('gives no did-you-mean for a fleet name inside a fence', () => {
+      const fence = '```';
+      const r = runHook({
+        command: cmd(`${fence}\n@demo-code-agent please look\n${fence}`),
+        env: { MACF_PROJECT: 'demo' },
+      });
+      expect(r.status).toBe(2);
+      expect(r.stderr).not.toContain('no [bot] suffix');
+      expect(r.stderr).toContain('zero');
+    });
+
     it('still passes a bot mention and still blocks zero mentions, with the person hint', () => {
       expect(runHook({ command: cmd('@macf-science-agent[bot] ok?') }).status).toBe(0);
       const r = runHook({ command: cmd('status only') });

@@ -1048,6 +1048,13 @@ ACTIVE_COUNT="$(grep '^ACTIVE_COUNT:' <<<"$AWK_OUTPUT" | sed 's/^ACTIVE_COUNT://
 HUMAN_OUT="$(awk -v proj="${MACF_PROJECT:-}" '
   {
     line = $0
+    if (match(line, /^[[:space:]]*(```+|~~~+)/)) {
+      fence = substr(line, RSTART + RLENGTH - 1, 1)
+      if (in_fence == "") in_fence = fence
+      else if (in_fence == fence) in_fence = ""
+      next
+    }
+    if (in_fence != "") next
     sub(/^[[:space:]>]*([0-9]+\.[[:space:]]+|[-*][[:space:]]+)?/, "", line)
     if (match(line, /^@[A-Za-z0-9][A-Za-z0-9-]*/)) {
       login = substr(line, 2, RLENGTH - 1)
