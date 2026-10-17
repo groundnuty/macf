@@ -389,6 +389,8 @@ export function isSelfHostedCapableActionsVersion(version: string): boolean {
   return major > minMajor || (major === minMajor && minor >= minMinor!);
 }
 
+const TRUSTED_ACTOR_LOGIN_RE = /^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}(?:\[bot\])?$/;
+
 export const FleetRoutingRunnerSchema = z
   .object({
     runs_on: z.string().min(1),
@@ -427,6 +429,29 @@ export const FleetRoutingRunnerSchema = z
      * — see `plan.ts`'s `runnerWarmItem`.
      */
     warm: z.number().int().nonnegative().default(1),
+    /**
+     * Extra GitHub logins (the fleet's humans, or additional bots) allowed to
+     * trigger routing on the fleet's self-hosted repos. Appended after the
+     * fleet's own agent bots in `MACF_TRUSTED_ACTORS` (see
+     * {@link buildTrustedActorsValue}); without them the router refuses any
+     * actor but the bots, so a human's label, @mention or approval reaches
+     * no agent. Optional; defaults to none.
+     */
+    trusted_actors: z
+      .array(z.string().regex(TRUSTED_ACTOR_LOGIN_RE, {
+        message: 'routing.runner.trusted_actors entries must be GitHub logins (optionally followed by [bot])',
+      }))
+      .optional()
+      .superRefine((list, ctx) => {
+        if (list === undefined) return;
+        const seen = new Set<string>();
+        for (const login of list) {
+          if (seen.has(login)) {
+            ctx.addIssue({ code: 'custom', message: `routing.runner.trusted_actors lists "${login}" more than once` });
+          }
+          seen.add(login);
+        }
+      }),
   })
   .strict();
 
@@ -1194,8 +1219,14 @@ export function deriveAppHandle(fleetName: string, role: string): string {
  * router's own split (`${TRUSTED_ACTORS//,/ }`) tolerates commas too, but
  * space matches the documented operator convention.
  */
-export function buildTrustedActorsValue(fleetName: string, agents: readonly FleetAgent[]): string {
-  return agents.map((agent) => `${deriveAppHandle(fleetName, agent.role)}[bot]`).join(' ');
+export function buildTrustedActorsValue(
+  fleetName: string,
+  agents: readonly FleetAgent[],
+  extraActors: readonly string[],
+): string {
+  const bots = agents.map((agent) => `${deriveAppHandle(fleetName, agent.role)}[bot]`);
+  const extras = extraActors.filter((actor) => !bots.includes(actor));
+  return [...bots, ...extras].join(' ');
 }
 
 /**

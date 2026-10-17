@@ -3407,6 +3407,38 @@ agents:
         expect(confirmCalled).toBe(false);
       });
 
+      it('trusted_actors: a present value that already carries the declared human is untouched; one missing it is reconciled to a value including it', async () => {
+        const manifestPath = manifestPathIn();
+        const manifest: FleetManifest = {
+          ...manifestWith([CODE_AGENT]),
+          routing: { runner: { runs_on: 'self-hosted', warm: 1, trusted_actors: ['groundnuty'] } },
+        };
+        const run = async (present: string) => {
+          const updates: string[] = [];
+          const deps: FleetApplyDeps = {
+            ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath),
+            trustDeps: {
+              ...trustDepsFor({ checkRepoPresence: async (_repo, name) => (name === 'MACF_TRUSTED_ACTORS' ? 'present' : 'absent') }),
+              readRepoVariableValue: async () => present,
+              updateRepoVariable: async (_repo, _name, value) => {
+                updates.push(value);
+                return 'updated';
+              },
+              confirmReconciliation: async () => true,
+            },
+          };
+          const result = await applyFleet(manifest, manifestPath, null, deps);
+          return { updates, result };
+        };
+
+        const keeps = await run('demo-fleet-code-agent[bot] groundnuty');
+        expect(keeps.updates).toEqual([]);
+        expect(keeps.result.routing['groundnuty/demo-code']).toEqual({ status: 'already-present' });
+
+        const adds = await run('demo-fleet-code-agent[bot]');
+        expect(adds.updates).toEqual(['demo-fleet-code-agent[bot] groundnuty']);
+      });
+
       it('honest-unknown: a value that cannot be re-read is reported (never overwritten, never assumed current)', async () => {
         const manifestPath = manifestPathIn();
         const manifest: FleetManifest = { ...manifestWith([CODE_AGENT]), routing: { runner: { runs_on: 'self-hosted', warm: 1 } } };

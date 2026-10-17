@@ -434,6 +434,18 @@ describe('computePlan — a version/config mismatch → update + confirm_require
     expect(routing?.reason).toMatch(/Runner class: self-hosted/);
   });
 
+  it('renders the declared trusted_actors in the expected value, and treats a value carrying them as matching', () => {
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1, trusted_actors: ['groundnuty'] } } });
+    const bots = 'icsoc-2026-science-agent[bot] icsoc-2026-code-agent[bot]';
+    const drift = computePlan(manifest, { ...EMPTY_OBSERVED, routingTrustedActors: bots, routingRunnerRegistered: 'present' });
+    const item = itemFor(drift.items, 'routing', 'routing:icsoc-2026:runner');
+    expect(item?.verb).toBe('update');
+    expect(item?.reason).toContain(`derive "${bots} groundnuty"`);
+
+    const match = computePlan(manifest, { ...EMPTY_OBSERVED, routingTrustedActors: `${bots} groundnuty` });
+    expect(itemFor(match.items, 'routing', 'routing:icsoc-2026:runner')?.verb).toBe('noop');
+  });
+
   it('does not flag update when the observed value already matches', () => {
     const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
     const observed: ObservedState = {

@@ -393,20 +393,19 @@ export const RUNNER_TOKEN_ENV_VAR = 'MACF_BOOTSTRAP_RUNNER_TOKEN';
  * the write-time gate consults live presence first (a repo with an
  * ALREADY-usable runner proceeds without a token — see
  * {@link noUsableRunnerWithoutTokenReason}), a token-absent manifest is only
- * a REQUIREMENT-FOR-REGISTERING-A-NEW-RUNNER, not a guaranteed refusal —
- * this text is worded to say exactly that, since the actual per-repo
- * outcome isn't knowable yet at this point in the flow (before `observe`
- * has even run).
+ * only the reason apply will not WAIT for a new runner, not a guaranteed
+ * refusal — this text says exactly that, since the actual per-repo outcome
+ * isn't knowable yet at this point in the flow (before `observe` has even
+ * run). Apply never registers a runner itself.
  */
 export function noRunnerTokenReason(): string {
   return (
-    'manifest declares routing.runner (runs_on: "self-hosted") but no runner registration ' +
-    'token was supplied — apply cannot REGISTER a new runner without one. A repo whose runner is ALREADY ' +
-    'confirmed usable still proceeds without a token; a repo with no usable runner yet will have its ' +
-    'MACF_TRUSTED_ACTORS write refused until a runner is registered directly (no token needed for that) or a ' +
-    'token is supplied so this run can confirm/wait for one. Supply one via ' +
-    `${RUNNER_TOKEN_FLAG} <token> (or the ${RUNNER_TOKEN_ENV_VAR} env var). Obtain a fresh registration ` +
-    'token with: gh api -X POST /orgs/<org>/actions/runners/registration-token --jq .token'
+    'manifest declares routing.runner (runs_on: "self-hosted") but no runner registration token was ' +
+    'supplied, so apply will not wait for new runners to come up. It checks each repo once: a repo whose ' +
+    'runner is already visible gets MACF_TRUSTED_ACTORS, and one whose runner is not visible yet does not, ' +
+    'and cannot route until a re-run writes it. To have this run wait up to 10 minutes instead, supply ' +
+    `${RUNNER_TOKEN_FLAG} <token> (or the ${RUNNER_TOKEN_ENV_VAR} env var). Get a token with: ` +
+    'gh api -X POST /orgs/<org>/actions/runners/registration-token --jq .token'
   );
 }
 
@@ -716,11 +715,11 @@ export function noUsableRunnerWithoutTokenReason(repo: string, usability: Runner
   const detailSuffix = usability.detail !== undefined ? ` ${usability.detail}` : '';
   const handoverSuffix = usability.handover !== undefined ? ` ${usability.handover}` : '';
   return (
-    `role/repo "${repo}": no runner registration token was supplied and ${cause} — MACF_TRUSTED_ACTORS was NOT ` +
-    'written; this repo continues routing on ubuntu-latest (billed on private repos). Register a self-hosted ' +
-    'runner for this repo (or the organization) and re-run `macf bootstrap apply` — no token is needed once a ' +
-    `runner is visible — or supply one now via ${RUNNER_TOKEN_FLAG} <token> (or the ${RUNNER_TOKEN_ENV_VAR} env ` +
-    'var) so this run can confirm/wait for it. Obtain a fresh registration token with: gh api -X POST ' +
+    `role/repo "${repo}": no runner registration token was supplied and ${cause}, so MACF_TRUSTED_ACTORS ` +
+    'was NOT written. This repo cannot route until it is: its routing jobs wait for a self-hosted runner ' +
+    'and never fall back to a GitHub-hosted one. Re-run `macf bootstrap apply` once a runner for this repo ' +
+    `is visible (no token is needed then), or supply ${RUNNER_TOKEN_FLAG} <token> (or the ` +
+    `${RUNNER_TOKEN_ENV_VAR} env var) so this run waits for it. Get a token with: gh api -X POST ` +
     `/orgs/<org>/actions/runners/registration-token --jq .token.${detailSuffix}${handoverSuffix}`
   );
 }

@@ -2163,7 +2163,7 @@ export async function applyFleet(
   const routingProvisioned: Readonly<Record<string, EnsureVariableOutcome>> =
     provisionedNowRepos.size > 0
       ? await publishTrustedActorsForProvisioned(
-          buildTrustedActorsValue(manifest.metadata.name, manifest.agents),
+          buildTrustedActorsValue(manifest.metadata.name, manifest.agents, manifest.routing?.runner.trusted_actors ?? []),
           [...provisionedNowRepos],
           {
             ...deps.trustDeps,
@@ -2879,7 +2879,7 @@ export async function applyFleet(
   const routingRest =
     manifest.routing?.runner !== undefined && manifest.routing.runner.runs_on === 'self-hosted'
       ? await publishTrustedActorsGated(
-          buildTrustedActorsValue(manifest.metadata.name, manifest.agents),
+          buildTrustedActorsValue(manifest.metadata.name, manifest.agents, manifest.routing?.runner.trusted_actors ?? []),
           nonProvisionedRepos,
           deps.trustDeps,
           // POLICY only (macf#929): the token gates whether we ATTEMPT the
@@ -2945,7 +2945,7 @@ export async function applyFleet(
     .map(([repo]) => repo);
   const routingReconciled: Readonly<Record<string, EnsureVariableOutcome>> =
     manifest.routing?.runner !== undefined && manifest.routing.runner.runs_on === 'self-hosted' && alreadyPresentRoutingRepos.length > 0
-      ? await reconcileTrustedActors(buildTrustedActorsValue(manifest.metadata.name, manifest.agents), alreadyPresentRoutingRepos, deps.trustDeps)
+      ? await reconcileTrustedActors(buildTrustedActorsValue(manifest.metadata.name, manifest.agents, manifest.routing?.runner.trusted_actors ?? []), alreadyPresentRoutingRepos, deps.trustDeps)
       : {};
   for (const [repo, leg] of Object.entries(routingReconciled)) {
     if (leg.status === 'updated' || leg.status === 'declined' || leg.status === 'failed' || leg.status === 'skipped') {

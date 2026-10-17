@@ -3116,7 +3116,7 @@ export function computePlan(
     // when the manifest opts it in (no row at all otherwise).
     if (controlRepoSelfHosted(manifest)) {
       items.push(
-        controlRepoRunnerItem(fleetName, controlRepo, buildTrustedActorsValue(fleetName, manifest.agents), {
+        controlRepoRunnerItem(fleetName, controlRepo, buildTrustedActorsValue(fleetName, manifest.agents, manifest.routing?.runner.trusted_actors ?? []), {
           callerRunsOn: observed.controlRepoRunnerRunsOn,
           callerReadable: observed.controlRepoCallerReadable ?? false,
           trustedActors: observed.controlRepoTrustedActors,
@@ -3151,7 +3151,7 @@ export function computePlan(
   }
 
   if (manifest.routing?.runner) {
-    const desiredTrustedActors = buildTrustedActorsValue(fleetName, manifest.agents);
+    const desiredTrustedActors = buildTrustedActorsValue(fleetName, manifest.agents, manifest.routing?.runner.trusted_actors ?? []);
     // Same representative-repo derivation `observer.ts::githubRegistryObserver`
     // uses for its live reads (macf#857) — recomputed here (not threaded
     // through `ObservedState`) since `computePlan` already has `manifest`.
