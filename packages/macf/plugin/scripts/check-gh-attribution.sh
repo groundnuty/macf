@@ -2,7 +2,7 @@
 #
 # check-gh-attribution.sh — Claude Code PostToolUse hook that, AFTER a
 # `gh`-write Bash op, verifies the just-written GitHub resource (issue /
-# PR / comment) was authored by the BOT, not the operator's user account.
+# PR / comment / review / merge) was authored by the BOT, not the operator's user account.
 # A user-attributed write is the silent-fallback Instance-12 attribution
 # trap: the `gh` call fell back to stored `gh auth login` (user) because
 # GH_TOKEN was empty / a `ghp_`/`gho_`/`ghu_` user token / the literal
@@ -65,8 +65,9 @@ CWD="$(jq -r '.cwd // ""' <<<"$INPUT_JSON" 2>/dev/null || echo "")"
 #   gh pr review                       → posts a review (no URL in output)
 #   gh api -X PUT …/pulls/<N>/merge    → merges (no URL in output)
 # A bare `gh issue close` (no --comment) writes nothing attributable → skip.
-# The review and the API merge print no URL, so the hook reads the latest
-# review on the PR, or the PR's merged_by, instead of a URL from the output.
+# The review and the API merge print no URL, so the hook reads every review
+# on the PR from the last five minutes (the window), or the PR's merged_by,
+# instead of a URL from the output.
 # This is a RESULT check (not a blocker), so a simple wrapper-tolerant
 # `grep -qE` over the raw command suffices — we don't need the airtight
 # bypass-resistant regex the PreToolUse blockers carry.
@@ -98,9 +99,6 @@ is_api_merge() {
     && grep -qiE '(^|[[:space:]])(-X[[:space:]]*|--method[[:space:]=]+)PUT([[:space:]]|$)' <<<"$1"
 }
 
-# Parse `gh pr review …` into OWNER/REPO/NUM. Quoted strings (review bodies)
-# are dropped first so a number inside a body is never read as the PR number.
-# The PR number is the first positional; a PR URL there also gives the repo.
 # Split a command into shell-style words WITHOUT evaluating anything: single
 # quotes are literal, double quotes honour \", a backslash outside quotes
 # escapes the next char, unquoted whitespace splits. Each unquoted ; | & run
@@ -135,6 +133,10 @@ shell_tokens() {
   }'
 }
 
+# Parse `gh pr review …` into OWNER/REPO/NUM. Quoted strings are kept as
+# single tokens; only the value after --body/-b/--body-file/-F is skipped, so
+# a number inside a body is never read as the PR number. The PR number is the
+# first positional; a PR URL there also gives the repo.
 parse_pr_review() {
   local tok want="" started=0 prev1="" prev2="" sep
   sep=$'\001'
@@ -281,7 +283,7 @@ if [[ "$MODE" == "review" || "$MODE" == "merge" ]]; then
     REPO="$(cut -d/ -f2 <<<"$NWO")"
   fi
   if [[ "$MODE" == "review" ]]; then
-    URL="the review on ${OWNER}/${REPO}#${NUM}"
+    URL="the latest review on ${OWNER}/${REPO}#${NUM}"
     API_PATH="/repos/${OWNER}/${REPO}/pulls/${NUM}/reviews?per_page=100"
     # One line per review, every page; the latest is picked in query_author.
     AUTHOR_JQ='.[] | [.submitted_at, .user.login, .user.type] | @tsv'
@@ -452,6 +454,26 @@ if [[ -n "$EXPECTED_LOGIN" ]]; then
   EXPECTED_LINE="$EXPECTED_LOGIN"
 fi
 
+AUTHOR_LABEL="Authored by:     "
+[[ "$MODE" == "merge" ]] && AUTHOR_LABEL="Merged by:       "
+case "$MODE" in
+  merge)
+    REPAIR_2="A merge cannot be redone; do not revert it. Comment on the PR as the bot that the
+     merge ran under the wrong account."
+    REPAIR_3="" ;;
+  review)
+    REPAIR_2="Submit the review again as the bot, then comment that the earlier one ran under the
+     wrong account."
+    REPAIR_3="" ;;
+  *)
+    REPAIR_2="If the resource has NOT been replied-to yet, delete the mis-attributed
+     write and re-post it as the bot (clean correction)."
+    REPAIR_3="
+  3. If it HAS already been replied-to / acted-on, do NOT delete — post a
+     short clarify-forward correction comment AS THE BOT noting the prior
+     write was mis-attributed, so the thread stays coherent." ;;
+esac
+
 cat >&2 <<ERR
 WARNING (MACF attribution-result check): the GitHub resource you just wrote
 appears to be authored by the WRONG account — the silent-fallback Instance-12
@@ -459,7 +481,7 @@ attribution trap (a \`gh\` write fell back to the operator's USER auth instead
 of the bot installation token).
 
 Resource:        ${URL}
-Authored by:     ${ACTUAL_LOGIN} (type: ${ACTUAL_TYPE:-unknown})
+${AUTHOR_LABEL}${ACTUAL_LOGIN} (type: ${ACTUAL_TYPE:-unknown})
 Expected (bot):  ${EXPECTED_LINE}
 
 The tool already ran — this is a PostToolUse check, so the resource is live on
@@ -474,11 +496,7 @@ Repair:
          --app-id "\$APP_ID" --install-id "\$INSTALL_ID" --key "\$KEY_PATH") || exit 1
        export GH_TOKEN
 
-  2. If the resource has NOT been replied-to yet, delete the mis-attributed
-     write and re-post it as the bot (clean correction).
-  3. If it HAS already been replied-to / acted-on, do NOT delete — post a
-     short clarify-forward correction comment AS THE BOT noting the prior
-     write was mis-attributed, so the thread stays coherent.
+  2. ${REPAIR_2}${REPAIR_3}
 
 Verify your identity any time:
   GH_TOKEN=\$GH_TOKEN "\$MACF_WORKSPACE_DIR/.claude/scripts/macf-whoami.sh"

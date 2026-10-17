@@ -215,6 +215,18 @@ describe('check-gh-attribution.sh (PostToolUse hook)', () => {
       expect(r.stderr).toContain('macf#489');
       expect(r.stderr).toContain('macf-gh-token.sh');
     });
+    it('keeps the generic repair steps and the Authored by label', () => {
+      const r = runHook({
+        command: 'gh issue create --repo groundnuty/macf --title x --body y',
+        output: `Creating issue...\n${ISSUE_URL}\n`,
+        stubGh: { login: 'orzech', type: 'User' },
+      });
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain('Authored by:');
+      expect(r.stderr).toContain('delete the mis-attributed');
+      expect(r.stderr).toContain('do NOT delete');
+      expect(r.stderr).not.toContain('cannot be redone');
+    });
 
     it('warns for a user-authored comment (comment-id URL → issues/comments path)', () => {
       const r = runHook({
@@ -499,21 +511,22 @@ describe('check-gh-attribution.sh (PostToolUse hook)', () => {
     it('review by a user → warns, naming the review', () => {
       const { r, calls } = hook('gh pr review 7 --approve --body "LGTM 99"', USER, bot);
       expect(r.status).toBe(2);
-      expect(r.stderr).toContain('the review on groundnuty/macf#7');
+      expect(r.stderr).toContain('the latest review on groundnuty/macf#7');
+      expect(r.stderr).toContain('Submit the review again');
       expect(r.stderr).toContain('orzech');
       expect(calls).toContain('/repos/groundnuty/macf/pulls/7/reviews');
     });
     it('review with --repo reads that repo', () => {
       const { r, calls } = hook('gh pr review -R acme/widgets 12 --request-changes', USER, bot);
       expect(r.status).toBe(2);
-      expect(r.stderr).toContain('the review on acme/widgets#12');
+      expect(r.stderr).toContain('the latest review on acme/widgets#12');
       expect(calls).toContain('/repos/acme/widgets/pulls/12/reviews');
       expect(calls).not.toContain('repo view');
     });
     it('review with an attached -R<repo> reads that repo', () => {
       const { r, calls } = hook('gh pr review 7 -Racme/widgets --approve', USER, bot);
       expect(r.status).toBe(2);
-      expect(r.stderr).toContain('the review on acme/widgets#7');
+      expect(r.stderr).toContain('the latest review on acme/widgets#7');
       expect(calls).toContain('/repos/acme/widgets/pulls/7/reviews');
       expect(calls).not.toContain('repo view');
     });
@@ -524,28 +537,28 @@ describe('check-gh-attribution.sh (PostToolUse hook)', () => {
         bot,
       );
       expect(r.status).toBe(2);
-      expect(r.stderr).toContain('the review on acme/widgets#31');
+      expect(r.stderr).toContain('the latest review on acme/widgets#31');
       expect(calls).toContain('/repos/acme/widgets/pulls/31/reviews');
     });
     it('review with no repo uses the repo gh would use', () => {
       const { r } = hook('gh pr review 3 --approve', USER, { ...bot, STUB_REPO: 'o/dflt' });
-      expect(r.stderr).toContain('the review on o/dflt#3');
+      expect(r.stderr).toContain('the latest review on o/dflt#3');
     });
 
     it('review with the body before the PR number still reads that PR', () => {
       const { r, calls } = hook('gh pr review --body "LGTM" 7 --approve', USER, bot);
       expect(r.status).toBe(2);
-      expect(r.stderr).toContain('the review on groundnuty/macf#7');
+      expect(r.stderr).toContain('the latest review on groundnuty/macf#7');
       expect(calls).toContain('/repos/groundnuty/macf/pulls/7/reviews');
     });
     it('review with a quoted PR URL is parsed', () => {
       const { r, calls } = hook('gh pr review "https://github.com/o/r/pull/9" --approve', USER, bot);
-      expect(r.stderr).toContain('the review on o/r#9');
+      expect(r.stderr).toContain('the latest review on o/r#9');
       expect(calls).toContain('/repos/o/r/pulls/9/reviews');
     });
     it('review with a quoted --repo value reads that repo', () => {
       const { r, calls } = hook('gh pr review 5 --repo "o/r" --approve', USER, bot);
-      expect(r.stderr).toContain('the review on o/r#5');
+      expect(r.stderr).toContain('the latest review on o/r#5');
       expect(calls).not.toContain('repo view');
     });
     it('a command substitution in the body is never executed', () => {
@@ -629,6 +642,10 @@ describe('check-gh-attribution.sh (PostToolUse hook)', () => {
       const { r, calls } = hook('gh api -X PUT repos/o/r/pulls/9/merge', USER, bot);
       expect(r.status).toBe(2);
       expect(r.stderr).toContain('the merge of o/r#9');
+      expect(r.stderr).toContain('Merged by:');
+      expect(r.stderr).not.toContain('Authored by:');
+      expect(r.stderr).toContain('cannot be redone');
+      expect(r.stderr).not.toContain('delete the mis-attributed');
       expect(calls).toContain('/repos/o/r/pulls/9');
     });
     it('merge that happened 2 hours ago → silent', () => {
