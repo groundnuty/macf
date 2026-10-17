@@ -350,8 +350,10 @@ same scope inherits whatever coverage already exists, not a clean slate.**
    pending widen.
 
 3. **Apply for real.** If the fleet declares `routing.runner.runs_on:
-   self-hosted` (§6.5), mint a fresh runner-registration token first (§1 —
-   one-hour TTL, needed again even if you minted one for this fleet before):
+   self-hosted` (§6.5), you can supply a fresh runner-registration token (§1 —
+   one-hour TTL). It is optional: without it `apply` checks each repo once and
+   writes `MACF_TRUSTED_ACTORS` only where a runner is already visible; with it,
+   `apply` waits up to 10 minutes for the new repo's runner:
 
    ```bash
    macf bootstrap apply -f fleet.yaml --vault <path> --identity-key <path> \
@@ -375,8 +377,8 @@ same scope inherits whatever coverage already exists, not a clean slate.**
 
 **The new agent's own self-hosted runner never comes up, while its siblings
 already show a healthy count.** Because the manifest declares
-`routing.runner.runs_on: self-hosted`, `apply` waits for the new repo's
-runner unconditionally, narrating progress as it goes (e.g. `waiting for the
+`routing.runner.runs_on: self-hosted` and you supplied `--runner-token`, `apply`
+waits for the new repo's runner, narrating progress as it goes (e.g. `waiting for the
 runner requested THIS run to become usable for "<owner>/<new-agent-repo>" …
 45s/600s elapsed; runner platform reports 0 available`). If the underlying
 platform confirms a genuinely terminal state — not a startup delay, one that
@@ -390,6 +392,14 @@ exact reason text for that repo:
     until the underlying provisioning problem is fixed (commonly: the fleet's GitHub App is
     not installed on the repo owner, so no registration token can be minted) and
     `macf bootstrap apply` is re-run.
+
+The "continues routing on ubuntu-latest" clause is stale for a caller that
+declares `runner-runs-on: self-hosted` (`macf-actions` v3.6.2): that repo never
+falls back to a hosted runner. Its routing jobs wait for a runner, and an actor
+missing from `MACF_TRUSTED_ACTORS` is refused at `pick-runner`. Without
+`--runner-token`, the message `apply` prints for a repo with no visible runner
+says the same: its routing jobs wait for a self-hosted runner and never fall back
+to a GitHub-hosted one.
 
 That "GitHub App is not installed on the repo owner" line **is** the drift
 step 2's `install_scope` row already named — `runner-ops` (the App that
