@@ -2485,7 +2485,15 @@ export function formatApplyResult(
   if (statusNextStep !== undefined) {
     parts.push(...bootstrapStatusNextStepLines(statusNextStep.manifestPath, statusNextStep.flags));
   }
-  const remainingDeployLines = formatRemainingDeployLines(remainingDeploy);
+  // An agent the deploy phase reported SKIPPED already names its command
+  // there; listing it again here would print the same agent twice.
+  const skippedRoles = new Set(
+    (deployPhase?.results ?? []).filter((r) => r.outcome.status === 'skipped').map((r) => r.role),
+  );
+  const remainingDeployLines = formatRemainingDeployLines({
+    ...remainingDeploy,
+    steps: remainingDeploy.steps.filter((step) => !skippedRoles.has(step.role)),
+  });
   if (remainingDeployLines.length > 0) {
     parts.push('', ...remainingDeployLines);
   }
@@ -3769,17 +3777,13 @@ export async function runBootstrapApply(
               flagless: versionRunFlagless,
             };
 
-      const remainingAll: RemainingDeployReport = controlRepoAborted
+      // The FULL report feeds the fleet verdict and --json: a host-skipped
+      // agent is still not deployed, so the verdict must stay unknown and
+      // JSON consumers keep its deploy command. Only the rendered text drops
+      // agents the deploy phase already printed as SKIPPED (formatApplyResult).
+      const remainingDeploy: RemainingDeployReport = controlRepoAborted
         ? { steps: [] }
         : computeRemainingDeploy(manifest, manifestPath, opts, resolved.checkDeployPathExists);
-      // An agent the deploy phase reported SKIPPED already names its command
-      // there; listing it again here would print the same agent twice.
-      const skippedRoles = new Set((deployResults ?? []).filter((r) => r.outcome.status === 'skipped').map((r) => r.role));
-      const remainingSteps = remainingAll.steps.filter((s) => !skippedRoles.has(s.role));
-      const remainingDeploy: RemainingDeployReport =
-        remainingSteps.length === 0
-          ? { steps: [] }
-          : { ...remainingAll, steps: remainingSteps };
       // macf#1013 + macf#1014 consistency: a SKIP banner on a fleet with
       // nothing left to deploy is pure noise — "I could not deploy" is a
       // non-event when every declared agent already has a workspace. Suppress

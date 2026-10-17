@@ -4791,6 +4791,30 @@ describe('formatApplyResult / fleetApplyResultToJson / applyExitCode (pure)', ()
     expect(applyExitCode(result)).toBe(0);
   });
 
+  it('a host-skipped agent prints once, keeps the workspace verdict unknown, and keeps its command in --json', () => {
+    const remaining = {
+      steps: [{
+        role: 'a',
+        deployPath: '/vm/only/a',
+        presence: 'unknown' as const,
+        reason: 'parent directory /vm does not exist on this host',
+        command: 'macf fleet deploy --agent a -f /m/fleet.yaml',
+      }],
+    };
+    const deployPhase = {
+      results: [{ role: 'a', destDir: '/vm/only/a', outcome: { role: 'a', status: 'skipped' as const, reason: 'not on this host — / is not writable here' } }],
+      project: 'p',
+    };
+    const text = formatApplyResult(resultWith(), [], remaining, deployPhase);
+    // Printed once (the SKIPPED line), not again as remaining-deploy guidance.
+    expect(text).toContain('a: SKIPPED');
+    expect(text).not.toContain('a: UNKNOWN whether deployed');
+    // The verdict still sees the agent: workspaces are not confirmed.
+    expect(text).toMatch(/workspaces: UNKNOWN/);
+    const json = fleetApplyResultToJson(resultWith(), [], remaining, deployPhase) as { remaining_deploy?: { role: string; command: string }[] };
+    expect(json.remaining_deploy?.map((r) => r.command)).toEqual(['macf fleet deploy --agent a -f /m/fleet.yaml']);
+  });
+
   it('a deploy-phase host-skip does not fail the run', () => {
     const skipped = [{ role: 'a', destDir: '/x', outcome: { role: 'a', status: 'skipped' as const, reason: 'not on this host' } }];
     expect(applyExitCode(resultWith(), skipped)).toBe(0);
