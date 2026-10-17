@@ -32,6 +32,7 @@ import {
   computeUninstalledCrontab,
   runFleetInstallCron,
   runFleetInstallCronCommand,
+  readAppCreds,
   WATCHDOG_MARKER,
   watchdogMarker,
   DEFAULT_SCHEDULE,
@@ -783,5 +784,59 @@ describe('refuses "%" in the cron command', () => {
     });
     expect(await runFleetInstallCron(baseOpts({ uninstall: true }), deps)).toBe(0);
     expect(rec.writes).toHaveLength(1);
+  });
+});
+
+describe('readAppCreds + token prefix', () => {
+  let ws: string;
+  beforeEach(() => {
+    ws = mkdtempSync(join(tmpdir(), 'cron-creds-'));
+  });
+  afterEach(() => {
+    rmSync(ws, { recursive: true, force: true });
+    configMock.readAgentConfig.mockImplementation(() => ({
+      project: 'proj',
+      registry: { type: 'org', org: 'acme' },
+    }));
+  });
+  const prefixFor = (dir: string) =>
+    buildTokenPrefix({
+      noToken: false,
+      workspaceDir: dir,
+      creds: readAppCreds(dir),
+      helperExists: () => true,
+    });
+
+  it('macf-agent.json github_app with no settings.local.json bakes a token, no warning', () => {
+    configMock.readAgentConfig.mockImplementation(() => ({
+      project: 'proj',
+      registry: { type: 'org', org: 'acme' },
+      github_app: { app_id: '777', install_id: '888', key_path: '.github-app-key.pem' },
+    }));
+    const { prefix, warning } = prefixFor(ws);
+    expect(warning).toBeUndefined();
+    expect(prefix).toContain('--app-id 777 --install-id 888');
+    expect(prefix).toContain(`'${join(ws, '.github-app-key.pem')}'`);
+  });
+
+  it('settings.local.json alone still works', () => {
+    configMock.readAgentConfig.mockImplementation(() => null);
+    mkdirSync(join(ws, '.claude'), { recursive: true });
+    writeFileSync(
+      join(ws, '.claude', 'settings.local.json'),
+      JSON.stringify({ env: { APP_ID: '11', INSTALL_ID: '22', KEY_PATH: '/k/key.pem' } }),
+    );
+    const { prefix, warning } = prefixFor(ws);
+    expect(warning).toBeUndefined();
+    expect(prefix).toContain('--app-id 11 --install-id 22');
+    expect(prefix).toContain("'/k/key.pem'");
+  });
+
+  it('neither source warns, naming both places', () => {
+    configMock.readAgentConfig.mockImplementation(() => null);
+    const { prefix, warning } = prefixFor(ws);
+    expect(prefix).toBe('');
+    expect(warning).toContain(join(ws, '.macf', 'macf-agent.json'));
+    expect(warning).toContain(join(ws, '.claude', 'settings.local.json'));
   });
 });
