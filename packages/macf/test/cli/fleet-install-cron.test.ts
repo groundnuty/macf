@@ -19,6 +19,9 @@
  *     invisible to every test that only calls the orchestrator directly).
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   buildReconcileFlags,
   buildTokenPrefix,
@@ -109,26 +112,29 @@ function baseOpts(over: Partial<RunFleetInstallCronOptions> = {}): RunFleetInsta
 
 describe('buildReconcileFlags', () => {
   it('report-only default omits --execute', () => {
-    const flags = buildReconcileFlags({ execute: false, allowRestart: false, withRouting: false });
+    const flags = buildReconcileFlags({ workspaceDir: '/ws', execute: false, allowRestart: false, withRouting: false });
     expect(flags).not.toContain('--execute');
-    expect(flags).toEqual([]);
+    expect(flags).toEqual(['--dir', "'/ws'"]);
   });
 
   it('--execute adds the flag', () => {
-    const flags = buildReconcileFlags({ execute: true, allowRestart: false, withRouting: false });
+    const flags = buildReconcileFlags({ workspaceDir: '/ws', execute: true, allowRestart: false, withRouting: false });
     expect(flags).toContain('--execute');
   });
 
   it('forwards manifest, routing, and allow-restart in reference order', () => {
     const flags = buildReconcileFlags({
+      workspaceDir: '/ws',
       manifest: '/etc/desired.yaml',
       withRouting: true,
       execute: true,
       allowRestart: true,
     });
     expect(flags).toEqual([
+      '--dir',
+      "'/ws'",
       '--manifest',
-      '/etc/desired.yaml',
+      "'/etc/desired.yaml'",
       '--with-routing',
       '--execute',
       '--allow-restart',
@@ -145,7 +151,7 @@ describe('buildTokenPrefix', () => {
       helperExists: () => true,
     });
     expect(warning).toBeUndefined();
-    expect(prefix).toContain('/ws/.claude/scripts/macf-gh-token.sh');
+    expect(prefix).toContain("'/ws/.claude/scripts/macf-gh-token.sh'");
     expect(prefix).toContain('--app-id 123');
     expect(prefix).toContain('--install-id 456');
     // fail-loud: || exit 1 aborts the sweep on a mint failure; then export.
@@ -162,7 +168,7 @@ describe('buildTokenPrefix', () => {
       creds: { appId: '1', installId: '2', keyPath: '.github-app-key.pem' },
       helperExists: () => true,
     });
-    expect(prefix).toContain('--key /ws/.github-app-key.pem');
+    expect(prefix).toContain("--key '/ws/.github-app-key.pem'");
   });
 
   it('preserves an already-absolute key path', () => {
@@ -172,7 +178,7 @@ describe('buildTokenPrefix', () => {
       creds: { appId: '1', installId: '2', keyPath: '/etc/macf/key.pem' },
       helperExists: () => true,
     });
-    expect(prefix).toContain('--key /etc/macf/key.pem');
+    expect(prefix).toContain("--key '/etc/macf/key.pem'");
   });
 
   it('--no-token yields an empty prefix, no warning', () => {
@@ -222,10 +228,10 @@ describe('buildCronLine', () => {
   it('assembles schedule + prelude + token + reconcile + log + marker', () => {
     const line = buildCronLine(parts);
     expect(line.startsWith(`${DEFAULT_SCHEDULE} `)).toBe(true);
-    expect(line).toContain('[ -f /ws/.claude/.macf/host-prelude.sh ] && . /ws/.claude/.macf/host-prelude.sh;');
+    expect(line).toContain("[ -f '/ws/.claude/.macf/host-prelude.sh' ] && . '/ws/.claude/.macf/host-prelude.sh';");
     expect(line).toContain('GH_TOKEN=$(x) || exit 1; export GH_TOKEN;');
     expect(line).toContain(RECONCILE_INVOCATION);
-    expect(line).toContain('>> /home/agent/.macf/watchdog.log 2>&1');
+    expect(line).toContain("'/home/agent/.macf/watchdog.log' 2>&1");
     expect(line.endsWith(WATCHDOG_MARKER)).toBe(true);
   });
 
@@ -237,6 +243,48 @@ describe('buildCronLine', () => {
   it('execute line carries --execute right after the invocation', () => {
     const line = buildCronLine({ ...parts, reconcileFlags: ['--execute'] });
     expect(line).toContain(`${RECONCILE_INVOCATION} --execute >> `);
+  });
+
+  it('line built from real flags carries --dir for a plain path', () => {
+    const reconcileFlags = buildReconcileFlags({
+      workspaceDir: '/ws', withRouting: false, execute: false, allowRestart: false,
+    });
+    expect(buildCronLine({ ...parts, reconcileFlags })).toContain(`${RECONCILE_INVOCATION} --dir '/ws' >> `);
+  });
+
+  it('quotes a workspace path containing a space and a single quote', () => {
+    const reconcileFlags = buildReconcileFlags({
+      workspaceDir: "/my ws/it's", withRouting: false, execute: false, allowRestart: false,
+    });
+    expect(buildCronLine({ ...parts, reconcileFlags })).toContain(`--dir '/my ws/it'\\''s'`);
+  });
+
+  it('the built reconcile command, run from a directory outside the workspace, gets --dir', async () => {
+    const ws = "/my ws/it's";
+    const reconcileFlags = buildReconcileFlags({
+      workspaceDir: ws, withRouting: false, execute: true, allowRestart: false,
+    });
+    const line = buildCronLine({ ...parts, tokenPrefix: '', preludePath: '/nonexistent/prelude.sh', logPath: '/dev/null', reconcileFlags });
+    // Everything after the schedule, minus the marker comment.
+    const cmd = line.slice(parts.schedule.length + 1, line.length - parts.marker.length - 1);
+    const root = mkdtempSync(join(tmpdir(), 'cron-exec-'));
+    try {
+      const bin = join(root, 'bin');
+      const cwd = join(root, 'elsewhere');
+      const out = join(root, 'argv.txt');
+      mkdirSync(bin); mkdirSync(cwd);
+      writeFileSync(join(bin, 'macf'), '#!/bin/sh\n{ pwd; for a in "$@"; do printf "%s\\n" "$a"; done; } > "$STUB_OUT"\n', { mode: 0o755 });
+      writeFileSync(join(root, 'cron.sh'), cmd + '\n');
+      const real = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+      real.execFileSync('/bin/sh', [join(root, 'cron.sh')], {
+        cwd, env: { PATH: `${bin}:${process.env['PATH'] ?? ''}`, STUB_OUT: out },
+      });
+      const lines = readFileSync(out, 'utf-8').trimEnd().split('\n');
+      expect(lines[0]).toBe(realpathSync(cwd));
+      expect(lines.slice(1)).toEqual(['fleet', 'reconcile', '--dir', ws, '--execute']);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 

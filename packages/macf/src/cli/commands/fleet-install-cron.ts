@@ -42,6 +42,7 @@ import { existsSync, readFileSync, accessSync, constants as fsConstants } from '
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { MacfError } from '@groundnuty/macf-core';
+import { shellQuote } from '../fleet/launch-command.js';
 import { resolveWorkspaceDir, formatWorkspaceDirConflictWarning } from '../workspace-dir.js';
 
 /** Raised on a genuine crontab-write failure (fail-loud, never silent). */
@@ -132,17 +133,20 @@ export interface RunFleetInstallCronOptions {
 
 /**
  * Build the reconcile flag list forwarded into the cron's `macf fleet reconcile`
- * invocation. Order mirrors the reference: manifest → routing → execute → restart.
- * Report-only is the ABSENCE of `--execute` (reconcile's dry-run default).
+ * invocation. Order: `--dir` → manifest → routing → execute → restart. `--dir` is
+ * always first: reconcile resolves its project from the cwd and cron runs in $HOME.
+ * Paths are emitted as quoted shell words. Report-only is the ABSENCE of
+ * `--execute` (reconcile's dry-run default).
  */
 export function buildReconcileFlags(opts: {
+  readonly workspaceDir: string;
   readonly manifest?: string;
   readonly withRouting: boolean;
   readonly execute: boolean;
   readonly allowRestart: boolean;
 }): readonly string[] {
-  const flags: string[] = [];
-  if (opts.manifest) flags.push('--manifest', opts.manifest);
+  const flags: string[] = ['--dir', shellQuote(opts.workspaceDir)];
+  if (opts.manifest) flags.push('--manifest', shellQuote(opts.manifest));
   if (opts.withRouting) flags.push('--with-routing');
   if (opts.execute) flags.push('--execute');
   if (opts.allowRestart) flags.push('--allow-restart');
@@ -192,8 +196,8 @@ export function buildTokenPrefix(args: {
   // Absolutize a relative key path against the workspace (matches claude.sh).
   const keyPath = rawKey.startsWith('/') ? rawKey : join(args.workspaceDir, rawKey);
   const prefix =
-    `GH_TOKEN=$(${helper} --app-id ${appId} --install-id ${installId} ` +
-    `--key ${keyPath}) || exit 1; export GH_TOKEN; `;
+    `GH_TOKEN=$(${shellQuote(helper)} --app-id ${appId} --install-id ${installId} ` +
+    `--key ${shellQuote(keyPath)}) || exit 1; export GH_TOKEN; `;
   return { prefix };
 }
 
@@ -209,14 +213,15 @@ export interface CronLineParts {
 
 /**
  * Assemble the full crontab line:
- *   `<schedule> [ -f <prelude> ] && . <prelude>; <token>macf fleet reconcile <flags> >> <log> 2>&1 <marker>`
+ *   `<schedule> [ -f <prelude> ] && . <prelude>; <token>macf fleet reconcile --dir <workspace> <flags> >> <log> 2>&1 <marker>`
+ * Every path is a quoted shell word.
  */
 export function buildCronLine(parts: CronLineParts): string {
-  const prelude = `[ -f ${parts.preludePath} ] && . ${parts.preludePath}; `;
+  const prelude = `[ -f ${shellQuote(parts.preludePath)} ] && . ${shellQuote(parts.preludePath)}; `;
   const flags = parts.reconcileFlags.length > 0 ? ` ${parts.reconcileFlags.join(' ')}` : '';
   const cmd =
     `${prelude}${parts.tokenPrefix}${RECONCILE_INVOCATION}${flags} ` +
-    `>> ${parts.logPath} 2>&1`;
+    `>> ${shellQuote(parts.logPath)} 2>&1`;
   return `${parts.schedule} ${cmd} ${parts.marker}`;
 }
 
@@ -295,6 +300,7 @@ export async function runFleetInstallCron(
   if (token.warning) deps.warn(`WARN: ${token.warning}`);
 
   const reconcileFlags = buildReconcileFlags({
+    workspaceDir: opts.workspaceDir,
     manifest: opts.manifest,
     withRouting: opts.withRouting,
     execute: opts.execute,
