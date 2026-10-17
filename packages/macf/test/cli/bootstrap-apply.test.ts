@@ -1568,7 +1568,7 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       // The message names the cost consequence — same reason text
       // `apply-routing.ts::runnerTokenPollExhaustedReason` has always
       // produced, now paired with a FAILED status instead of SKIPPED.
-      expect(all).toContain('billed on private repos');
+      expect(all).toContain('never fall back to a GitHub-hosted one');
       expect(all).toContain('MACF_TRUSTED_ACTORS was NOT written');
       expect(all).toContain('groundnuty/demo-code: FAILED —');
       expect(all).not.toContain('groundnuty/demo-code: SKIPPED');
@@ -1604,7 +1604,7 @@ describe('runBootstrapApply — mutating apply (increment 5a)', () => {
       // still warns unconditionally at this point in the flow — it fires
       // before any repo is observed, so it genuinely cannot know the
       // outcome below will succeed. That is expected, not a bug: the
-      // warning names a REQUIREMENT ("apply cannot REGISTER a new runner
+      // warning names a REQUIREMENT ("apply will not wait for a new runner
       // without one"), never a guaranteed refusal — see
       // `noRunnerTokenReason`'s doc.
       expect(errs.join('\n')).toContain(RUNNER_TOKEN_FLAG);
@@ -5232,7 +5232,7 @@ describe('formatApplyResult / fleetApplyResultToJson / applyExitCode (pure)', ()
       const text = formatApplyResult(
         resultWith({
           routing: {},
-          runnerRequirement: { status: 'failed', reason: 'no runner registration token was supplied — apply cannot REGISTER a new runner without one' },
+          runnerRequirement: { status: 'failed', reason: 'no runner registration token was supplied — apply will not wait for a new runner without one' },
         }),
       );
       expect(text).toMatch(/Runner requirement: FAILED — no runner registration token was supplied/);
@@ -6073,7 +6073,7 @@ describe('the #1184 fleet verdict, wired through formatApplyResult / fleetApplyR
         routing: {},
         runnerRequirement: {
           status: 'failed',
-          reason: 'manifest declares routing.runner (runs_on: "self-hosted") but no runner registration token was supplied — apply cannot REGISTER a new runner without one',
+          reason: 'manifest declares routing.runner (runs_on: "self-hosted") but no runner registration token was supplied — apply will not wait for a new runner without one',
         },
       });
 

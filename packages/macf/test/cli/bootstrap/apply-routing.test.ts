@@ -19,6 +19,7 @@ import {
   publishTrustedActors,
   publishTrustedActorsForProvisioned,
   publishTrustedActorsGated,
+  runnerJustCreatedRepoReason,
   runnerNeverRegisteredReason,
   runnerPermissionDeniedReason,
   runnerProvisioningTerminalFailureReason,
@@ -177,10 +178,10 @@ describe('publishTrustedActors', () => {
 });
 
 describe('noRunnerRegisteredReason', () => {
-  it('names the repo + the billing consequence + the register-before-route remedy', () => {
+  it('names the repo + the cannot-route consequence + the register-before-route remedy', () => {
     const reason = noRunnerRegisteredReason('groundnuty/x', { presence: 'absent' });
     expect(reason).toContain('groundnuty/x');
-    expect(reason).toMatch(/billed on private repos/);
+    expect(reason).toContain('never fall back to a GitHub-hosted one');
     expect(reason).toMatch(/register-before-route/);
     expect(reason).not.toMatch(/could not confirm/);
   });
@@ -384,7 +385,7 @@ describe('noUsableRunnerWithoutTokenReason (groundnuty/macf#1195)', () => {
     expect(reason).toContain(RUNNER_TOKEN_FLAG);
     expect(reason).toContain(RUNNER_TOKEN_ENV_VAR);
     expect(reason).toContain('gh api -X POST /orgs/<org>/actions/runners/registration-token --jq .token');
-    expect(reason).toContain('billed on private repos');
+    expect(reason).toContain('never fall back to a GitHub-hosted one');
   });
 
   it('distinguishes unknown / just-created / ordinary-absent with three different cause sentences', () => {
@@ -485,7 +486,7 @@ describe('publishTrustedActorsGated (macf#929)', () => {
     expect(reason).toMatch(/no usable self-hosted runner became visible/);
     expect(reason).toContain('MACF_TRUSTED_ACTORS was NOT written');
     // The cost consequence is named in the SAME reason text — unchanged.
-    expect(reason).toContain('billed on private repos');
+    expect(reason).toContain('never fall back to a GitHub-hosted one');
     expect(createCalled).toBe(false);
   });
 
@@ -1047,12 +1048,12 @@ describe('pollForUsableRunner — neverRegistered fail-fast (groundnuty/macf#943
 });
 
 describe('runnerNeverRegisteredReason (groundnuty/macf#943)', () => {
-  it('names the repo, says apply does not provision a runner, and gives the register-or-reconfigure remedy', () => {
+  it('names the repo, says why no runner was requested, and gives the register-or-reconfigure remedy', () => {
     const usability: RunnerUsability = { presence: 'absent', neverRegistered: true };
     const reason = runnerNeverRegisteredReason('groundnuty/exp-code-agent', usability);
     expect(reason).toContain('groundnuty/exp-code-agent');
     expect(reason).toMatch(/no runner is registered/);
-    expect(reason).toMatch(/does not provision/);
+    expect(reason).toMatch(/did not get one requested/);
     expect(reason).toMatch(/register/i);
     expect(reason).toMatch(/runs_on/);
     expect(reason).toContain('MACF_TRUSTED_ACTORS was NOT written');
@@ -1135,7 +1136,7 @@ describe('publishTrustedActorsGated — neverRegistered fail-fast (groundnuty/ma
     expect(result['a/b']?.status).toBe('failed');
     const reason = (result['a/b'] as { reason: string }).reason;
     expect(reason).toMatch(/poll window/); // the genuine timeout wording — budget WAS spent
-    expect(reason).not.toMatch(/does not provision/);
+    expect(reason).not.toMatch(/did not get one requested/);
     expect(checkCalls).toBeGreaterThan(1);
     expect(sleeps.length).toBeGreaterThan(0); // proves the budget was actually consumed this time
   });
@@ -1148,7 +1149,7 @@ describe('publishTrustedActorsGated — neverRegistered fail-fast (groundnuty/ma
     expect(result['a/b']?.status).toBe('failed');
     const reason = (result['a/b'] as { reason: string }).reason;
     expect(reason).toContain('created during THIS run');
-    expect(reason).not.toMatch(/does not provision/); // not the generic never-registered wording
+    expect(reason).not.toMatch(/did not get one requested/); // not the generic never-registered wording
   });
 });
 
@@ -1289,7 +1290,7 @@ describe('publishTrustedActorsGated — justProvisionedRepos disables neverRegis
     expect(result['a/b']?.status).toBe('failed');
     const reason = (result['a/b'] as { reason: string }).reason;
     expect(reason).toMatch(/poll window/); // the honest "we waited" framing
-    expect(reason).not.toMatch(/does not provision/); // NOT the never-registered wording — apply just tried
+    expect(reason).not.toMatch(/did not get one requested/); // NOT the never-registered wording — apply just tried
     expect(checkCalls).toBeGreaterThan(1);
     expect(sleeps.length).toBeGreaterThan(0);
   });
@@ -1346,7 +1347,7 @@ describe('publishTrustedActorsGated — justProvisionedRepos disables neverRegis
     );
     expect(result['a/b']?.status).toBe('failed');
     const reason = (result['a/b'] as { reason: string }).reason;
-    expect(reason).toMatch(/does not provision/);
+    expect(reason).toMatch(/did not get one requested/);
     expect(checkCalls).toBe(1);
     expect(sleepCalls).toBe(0);
   });
@@ -1667,5 +1668,29 @@ describe('runnerRequirementOutcome (groundnuty/macf#1323)', () => {
     const preflight = checkRunnerTokenPreflight(routing, undefined);
     const outcome = runnerRequirementOutcome(routing, undefined);
     expect(outcome).toEqual({ status: 'failed', reason: preflight?.message });
+  });
+});
+
+describe('no reason text claims a self-hosted repo falls back to ubuntu-latest', () => {
+  it('renders every reason function and finds no "ubuntu-latest"', () => {
+    const absent: RunnerUsability = { presence: 'absent' };
+    const unknown: RunnerUsability = { presence: 'unknown' };
+    const never: RunnerUsability = { presence: 'absent', neverRegistered: true };
+    const texts = [
+      noRunnerTokenReason(),
+      noRunnerRegisteredReason('o/x', absent),
+      noRunnerRegisteredReason('o/x', unknown),
+      noUsableRunnerWithoutTokenReason('o/x', absent, false),
+      noUsableRunnerWithoutTokenReason('o/x', absent, true),
+      runnerNeverRegisteredReason('o/x', never),
+      runnerJustCreatedRepoReason('o/x', absent),
+      runnerTokenPollExhaustedReason('o/x', absent, 60_000),
+      runnerStillProvisioningReason('o/x', 30_000, 600_000),
+      runnerProvisioningTerminalFailureReason('o/x', { reason: 'r', message: 'm' }),
+    ];
+    for (const text of texts) {
+      expect(text).not.toContain('ubuntu-latest');
+      expect(text).not.toContain('billed on private repos');
+    }
   });
 });

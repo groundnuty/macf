@@ -12,6 +12,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   buildTrustedActorsValue,
+  FleetRoutingRunnerSchema,
   deriveAppHandle,
   deriveControlRepoName,
   effectiveFleetFingerprints,
@@ -729,30 +730,67 @@ function agent(role: string, repo: string): FleetAgent {
 describe('buildTrustedActorsValue — MACF_TRUSTED_ACTORS shape (macf#922)', () => {
   it('space-joins every agent\'s <deriveAppHandle>[bot] login, in agents[] order', () => {
     const agents = [agent('code-agent', 'groundnuty/a'), agent('science-agent', 'groundnuty/b')];
-    expect(buildTrustedActorsValue('icsoc-2026', agents)).toBe(
+    expect(buildTrustedActorsValue('icsoc-2026', agents, [])).toBe(
       'icsoc-2026-code-agent[bot] icsoc-2026-science-agent[bot]',
     );
   });
 
   it('every entry carries the [bot] suffix — NOT the bare deriveAppHandle output', () => {
-    const value = buildTrustedActorsValue('macf', [agent('devops-agent', 'groundnuty/x')]);
+    const value = buildTrustedActorsValue('macf', [agent('devops-agent', 'groundnuty/x')], []);
     expect(value).toBe('macf-devops-agent[bot]');
     expect(value).not.toBe(deriveAppHandle('macf', 'devops-agent'));
   });
 
   it('a single agent produces no separator artifacts', () => {
-    expect(buildTrustedActorsValue('ppam-2026', [agent('writer-agent', 'groundnuty/x')])).toBe('ppam-2026-writer-agent[bot]');
+    expect(buildTrustedActorsValue('ppam-2026', [agent('writer-agent', 'groundnuty/x')], [])).toBe('ppam-2026-writer-agent[bot]');
   });
 
   it('an empty agents[] produces an empty string (schema forbids this in practice — agents is .min(1) — but the function itself stays total)', () => {
-    expect(buildTrustedActorsValue('icsoc-2026', [])).toBe('');
+    expect(buildTrustedActorsValue('icsoc-2026', [], [])).toBe('');
   });
 
   it('is space-separated, never comma or JSON — macf-devops-toolkit RUNNER.md: a JSON array silently fails to match', () => {
-    const value = buildTrustedActorsValue('icsoc-2026', [agent('code-agent', 'groundnuty/a'), agent('science-agent', 'groundnuty/b')]);
+    const value = buildTrustedActorsValue('icsoc-2026', [agent('code-agent', 'groundnuty/a'), agent('science-agent', 'groundnuty/b')], []);
     expect(value).not.toContain(',');
     expect(value).not.toMatch(/^\[.*\]$/);
     expect(value.split(' ')).toEqual(['icsoc-2026-code-agent[bot]', 'icsoc-2026-science-agent[bot]']);
+  });
+});
+
+describe('buildTrustedActorsValue — extra actors (routing.runner.trusted_actors)', () => {
+  const agents = [agent('code-agent', 'groundnuty/a')];
+
+  it('appends the extras in order after the agent bots', () => {
+    expect(buildTrustedActorsValue('f', agents, ['groundnuty', 'other'])).toBe('f-code-agent[bot] groundnuty other');
+  });
+
+  it('does not repeat an extra that equals an agent bot', () => {
+    expect(buildTrustedActorsValue('f', agents, ['f-code-agent[bot]', 'groundnuty'])).toBe('f-code-agent[bot] groundnuty');
+  });
+});
+
+describe('routing.runner.trusted_actors schema', () => {
+  const parse = (v: unknown) => FleetRoutingRunnerSchema.safeParse({ runs_on: 'self-hosted', trusted_actors: v });
+  const msg = (v: unknown) => {
+    const r = parse(v);
+    return r.success ? '' : r.error.issues.map((i) => i.message).join('\n');
+  };
+
+  it('accepts a valid list, including a [bot] login', () => {
+    expect(parse(['groundnuty', 'some-user', 'dependabot[bot]']).success).toBe(true);
+  });
+
+  it('refuses an invalid login, naming the field', () => {
+    expect(msg(['-bad'])).toContain('routing.runner.trusted_actors');
+    expect(msg(['has space'])).toContain('routing.runner.trusted_actors');
+  });
+
+  it('refuses a duplicate, naming the field', () => {
+    expect(msg(['a', 'a'])).toContain('routing.runner.trusted_actors');
+  });
+
+  it('refuses a non-array', () => {
+    expect(parse('groundnuty').success).toBe(false);
   });
 });
 
