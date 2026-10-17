@@ -99,11 +99,52 @@ is_api_merge() {
 # Parse `gh pr review …` into OWNER/REPO/NUM. Quoted strings (review bodies)
 # are dropped first so a number inside a body is never read as the PR number.
 # The PR number is the first positional; a PR URL there also gives the repo.
+# Split a command into shell-style words WITHOUT evaluating anything: single
+# quotes are literal, double quotes honour \", a backslash outside quotes
+# escapes the next char, unquoted whitespace splits. Each unquoted ; | & run
+# is emitted as a lone \001 line. One token per line; newlines become spaces.
+shell_tokens() {
+  MACF_CMD="$1" awk 'BEGIN {
+    s = ENVIRON["MACF_CMD"]; n = length(s); tok = ""; intok = 0; q = ""
+    for (i = 1; i <= n; i++) {
+      c = substr(s, i, 1)
+      if (q == "\047") { if (c == "\047") q = ""; else tok = tok c; continue }
+      if (q == "\"") {
+        if (c == "\\" && substr(s, i + 1, 1) == "\"") { tok = tok "\""; i++ }
+        else if (c == "\"") q = ""
+        else tok = tok c
+        continue
+      }
+      if (c == "\047" || c == "\"") { q = c; intok = 1; continue }
+      if (c == "\\") {
+        nx = substr(s, i + 1, 1); i++
+        if (nx != "\n") { tok = tok nx; intok = 1 }
+        continue
+      }
+      if (c == " " || c == "\t" || c == "\n") { flush(); continue }
+      if (c == ";" || c == "|" || c == "&") { flush(); print "\001"; continue }
+      tok = tok c; intok = 1
+    }
+    flush()
+  }
+  function flush() {
+    if (intok) { gsub("\n", " ", tok); print tok }
+    tok = ""; intok = 0
+  }'
+}
+
 parse_pr_review() {
-  local seg tok want=""
-  seg="$(tr '\n' ' ' <<<"$1" | sed -E 's/"[^"]*"//g; s/'"'"'[^'"'"']*'"'"'//g' \
-    | sed -E 's/.*gh[[:space:]]+pr[[:space:]]+review//; s/(&&|\|\||;|\|).*//')"
-  for tok in $seg; do
+  local tok want="" started=0 prev1="" prev2="" sep
+  sep=$'\001'
+  while IFS= read -r tok; do
+    if [[ "$started" -eq 0 ]]; then
+      if [[ "$prev2" == "gh" && "$prev1" == "pr" && "$tok" == "review" ]]; then
+        started=1
+      fi
+      prev2="$prev1"; prev1="$tok"
+      continue
+    fi
+    [[ "$tok" == "$sep" ]] && break
     case "$want" in
       repo) REPO_FLAG="$tok"; want=""; continue ;;
       skip) want=""; continue ;;
@@ -122,7 +163,7 @@ parse_pr_review() {
         fi
         ;;
     esac
-  done
+  done < <(shell_tokens "$1")
 }
 
 MODE=""
@@ -235,7 +276,8 @@ if [[ "$MODE" == "review" || "$MODE" == "merge" ]]; then
   if [[ "$MODE" == "review" ]]; then
     URL="the review on ${OWNER}/${REPO}#${NUM}"
     API_PATH="/repos/${OWNER}/${REPO}/pulls/${NUM}/reviews?per_page=100"
-    AUTHOR_JQ='(sort_by(.submitted_at) | last) as $r | {login: ($r.user.login // ""), type: ($r.user.type // "")}'
+    # One line per review, every page; the latest is picked in query_author.
+    AUTHOR_JQ='.[] | [.submitted_at, .user.login, .user.type] | @tsv'
   else
     URL="the merge of ${OWNER}/${REPO}#${NUM}"
     API_PATH="/repos/${OWNER}/${REPO}/pulls/${NUM}"
@@ -260,7 +302,15 @@ fi
 # distinguishable from "the check ran and found no mismatch" in the log.
 query_author() {
   local resp rc=0
-  resp="$(GH_PAGER= macf_hook_gh api "$API_PATH" --jq "$AUTHOR_JQ")" || rc=$?
+  if [[ "$MODE" == "review" ]]; then
+    resp="$(GH_PAGER= macf_hook_gh api --paginate "$API_PATH" --jq "$AUTHOR_JQ")" || rc=$?
+    if [[ "$rc" -eq 0 && -n "$resp" ]]; then
+      resp="$(printf '%s\n' "$resp" | LC_ALL=C sort -t$'\t' -k1,1 | tail -n 1 \
+        | jq -R 'split("\t") | {login: (.[1] // ""), type: (.[2] // "")}' 2>/dev/null || true)"
+    fi
+  else
+    resp="$(GH_PAGER= macf_hook_gh api "$API_PATH" --jq "$AUTHOR_JQ")" || rc=$?
+  fi
   printf '%s' "$resp"
   return "$rc"
 }

@@ -19,7 +19,7 @@
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { findCliPackageRoot } from '../../src/cli/rules.js';
@@ -68,6 +68,10 @@ function makeStubGhDir(stub: GhStub): string {
     // Single-quote the JSON for echo; JSON has no single quotes.
     arm = `echo '${body}'; exit 0`;
   }
+  const reviewArm =
+    typeof stub === 'string'
+      ? ''
+      : `printf '2025-01-01T00:00:00Z\\t%s\\t%s\\n' '${stub.login}' '${stub.type}'; exit 0`;
   const stubScript = `#!/usr/bin/env bash
 # Stub gh — handles \`gh api <path> --jq ...\` and \`gh repo view\`.
 [[ -n "\${STUB_LOG:-}" ]] && echo "$*" >> "$STUB_LOG"
@@ -75,6 +79,15 @@ if [[ "$1" == "repo" ]]; then
   echo "\${STUB_REPO:-groundnuty/macf}"; exit 0
 fi
 if [[ "$1" == "api" ]]; then
+  if [[ "$*" == */reviews* ]]; then
+    # Reviews are read as one TSV line per review (the hook passes --paginate).
+    if [[ -n "\${STUB_PAGE1:-}" ]]; then
+      printf '%b\\n' "$STUB_PAGE1"
+      [[ "$*" == *--paginate* ]] && printf '%b\\n' "\${STUB_PAGE2:-}"
+      exit 0
+    fi
+    ${reviewArm}
+  fi
   ${arm}
 fi
 echo "stub gh: unexpected subcommand: $*" >&2
@@ -501,6 +514,41 @@ describe('check-gh-attribution.sh (PostToolUse hook)', () => {
     it('review with no repo uses the repo gh would use', () => {
       const { r } = hook('gh pr review 3 --approve', USER, { ...bot, STUB_REPO: 'o/dflt' });
       expect(r.stderr).toContain('the review on o/dflt#3');
+    });
+
+    it('review with the body before the PR number still reads that PR', () => {
+      const { r, calls } = hook('gh pr review --body "LGTM" 7 --approve', USER, bot);
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain('the review on groundnuty/macf#7');
+      expect(calls).toContain('/repos/groundnuty/macf/pulls/7/reviews');
+    });
+    it('review with a quoted PR URL is parsed', () => {
+      const { r, calls } = hook('gh pr review "https://github.com/o/r/pull/9" --approve', USER, bot);
+      expect(r.stderr).toContain('the review on o/r#9');
+      expect(calls).toContain('/repos/o/r/pulls/9/reviews');
+    });
+    it('review with a quoted --repo value reads that repo', () => {
+      const { r, calls } = hook('gh pr review 5 --repo "o/r" --approve', USER, bot);
+      expect(r.stderr).toContain('the review on o/r#5');
+      expect(calls).not.toContain('repo view');
+    });
+    it('a command substitution in the body is never executed', () => {
+      const dir = mkdtempSync(join(tmpdir(), 'macf-attr-inj-'));
+      logs.push(dir);
+      const marker = join(dir, 'x');
+      const { r } = hook(`gh pr review 7 --approve --body "$(touch ${marker})"`, USER, bot);
+      expect(r.status).toBe(2);
+      expect(existsSync(marker)).toBe(false);
+    });
+    it('the latest review on a later page decides', () => {
+      const { r, calls } = hook('gh pr review 7 --approve', USER, {
+        ...bot,
+        STUB_PAGE1: `2025-01-01T00:00:00Z\\t${BOT}\\tBot`,
+        STUB_PAGE2: '2025-02-01T00:00:00Z\\torzech\\tUser',
+      });
+      expect(calls).toContain('--paginate');
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain('orzech');
     });
 
     it('merge by the bot → silent', () => {
