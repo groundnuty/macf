@@ -109,7 +109,7 @@ export interface RemainingDeployReport {
 }
 
 /** One `<role>: <PATH>` line's remedy command — never a credential value (only paths + the role name ever appear). */
-export function buildDeployCommand(manifestPath: string, role: string, flags: DeployFlagsEcho): string {
+function buildDeployCommand(manifestPath: string, role: string, flags: DeployFlagsEcho): string {
   const parts = ['macf', 'fleet', 'deploy', '--agent', role, '-f', manifestPath];
   if (flags.vaultPath !== undefined) {
     parts.push('--vault', flags.vaultPath);

@@ -141,7 +141,7 @@ export async function runApplyDeployPhase(
       results.push({
         role: agent.role,
         destDir,
-        outcome: { role: agent.role, status: 'skipped', reason: `not on this host — ${creatable.ancestor} is not writable here` },
+        outcome: { role: agent.role, status: 'skipped', reason: `this host cannot create ${destDir} (${creatable.ancestor} is not writable)` },
       });
       continue;
     }

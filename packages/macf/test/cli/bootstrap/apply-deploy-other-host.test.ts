@@ -59,14 +59,18 @@ function depsWith(
 describe('runApplyDeployPhase on a path this host cannot create', () => {
   it('skips with no deploy call, and the skip does not count as a failure', async () => {
     const deployed: string[] = [];
-    // /proc is never writable and nothing can be created under it.
-    const results = await runApplyDeployPhase(manifestAt('/proc/no-such-host/repos/x'), FLAGS, depsWith(deployed));
+    // The writability fact is injected, so the test holds on any host and as any user.
+    const results = await runApplyDeployPhase(
+      manifestAt('/vm/repos/x'),
+      FLAGS,
+      depsWith(deployed, undefined, { checkPathCreatable: () => ({ ok: false, ancestor: '/vm' }) }),
+    );
     expect(deployed).toEqual([]);
     expect(results).toHaveLength(1);
     expect(results[0]?.outcome).toEqual({
       role: 'code-agent',
       status: 'skipped',
-      reason: 'not on this host — /proc is not writable here',
+      reason: 'this host cannot create /vm/repos/x (/vm is not writable)',
     });
     expect(anyDeployFailed(results)).toBe(false);
   });

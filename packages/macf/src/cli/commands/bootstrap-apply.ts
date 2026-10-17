@@ -64,6 +64,7 @@ import type { AgentRepoDeps, RepoInitStepDeps } from '../bootstrap/apply-repo-in
 import { applyFleet } from '../bootstrap/apply-fleet.js';
 import type { ActionsPinRepoStatus, ControlRepoSyncOutcome, FleetApplyDeps, FleetApplyResult } from '../bootstrap/apply-fleet.js';
 import type { ControlRepoDeps } from '../bootstrap/control-repo.js';
+import { controlRepoFullName } from '../bootstrap/control-repo.js';
 import { checkControlRepoMeta, realControlRepoCommitAndPush, realReadControlManifestFile } from '../bootstrap/control-repo.js';
 import { realUnarchiveRepo } from '../bootstrap/repo-archive.js';
 import {
@@ -151,7 +152,7 @@ import { checkRegistryScopePreflight } from '../bootstrap/registry-scope-preflig
 import { ageRecipientsRecordAbsent, ageRecipientsRecordAbsentNotice, checkAgeRecipientsNarrowing } from '../bootstrap/age-recipients-narrowing.js';
 import { reconcileFederatedTrustVerdicts, federatedTrustNotices } from '../bootstrap/apply-federated-trust.js';
 import type { DeployFlagsEcho, RemainingDeployReport, RemainingDeployStep } from '../bootstrap/remaining-deploy.js';
-import { buildDeployCommand, computeRemainingDeploy, formatRemainingDeployLines } from '../bootstrap/remaining-deploy.js';
+import { computeRemainingDeploy, formatRemainingDeployLines } from '../bootstrap/remaining-deploy.js';
 import type { ApplyDeployPhaseDeps, DeployPhaseAgentResult } from '../bootstrap/apply-deploy.js';
 import { anyDeployFailed, runApplyDeployPhase } from '../bootstrap/apply-deploy.js';
 import { realAuthenticatedCloneRepo, realMintCloneToken, deployAgent as realDeployAgent } from '../bootstrap/fleet-deploy.js';
@@ -1850,7 +1851,11 @@ export interface DeployPhaseRenderInput {
   readonly results?: readonly DeployPhaseAgentResult[];
   readonly skipReason?: string;
   readonly checkAgentCertPresent?: (destDir: string) => boolean;
-  /** The copy-pasteable `macf fleet deploy` command for a role; names the remedy on a host-skipped agent. */
+  /**
+   * The command to run on the host that will run a host-skipped agent. It
+   * names a clone of the control repo, never this host's own paths, which
+   * do not exist there.
+   */
   readonly commandFor?: (role: string) => string;
   /**
    * The fleet name (`manifest.metadata.name`) — macf#994's first-launch
@@ -1871,6 +1876,19 @@ export interface DeployPhaseRenderInput {
  * (the "what to do now" section, requirement 5) — this section is "what
  * just happened."
  */
+/**
+ * What a host-skipped agent's operator runs on the host that will run it. The
+ * control repo carries `fleet.yaml` and `secrets/vault.age` side by side, and
+ * `fleet deploy` defaults `--vault` to that layout, so a fresh clone is all
+ * the other host needs besides the operator's age identity key.
+ */
+export function otherHostDeployCommand(controlRepo: string, role: string): string {
+  return (
+    `On the host that will run it, clone ${controlRepo}, then run: ` +
+    `macf fleet deploy --agent ${role} -f <clone>/fleet.yaml --identity-key PATH_TO_YOUR_AGE_IDENTITY_KEY`
+  );
+}
+
 function deployPhaseSummaryLines(deployPhase: DeployPhaseRenderInput): string[] {
   if (deployPhase.skipReason !== undefined) {
     return ['', `⚠ ${deployPhase.skipReason}`];
@@ -1881,10 +1899,7 @@ function deployPhaseSummaryLines(deployPhase: DeployPhaseRenderInput): string[] 
   for (const r of results) {
     if (r.outcome.status === 'skipped') {
       const cmd = deployPhase.commandFor?.(r.role);
-      lines.push(
-        `  • ${r.role}: SKIPPED — ${r.destDir} is not on this host; run on the host that owns it` +
-          (cmd === undefined ? '' : `: ${cmd}`),
-      );
+      lines.push(`  • ${r.role}: SKIPPED — ${r.outcome.reason}.` + (cmd === undefined ? '' : ` ${cmd}`));
       continue;
     }
     lines.push(
@@ -3799,7 +3814,7 @@ export async function runBootstrapApply(
               results: deployResults,
               skipReason: deploySkipReason,
               checkAgentCertPresent: resolved.checkAgentCertPresent,
-              commandFor: (role: string) => buildDeployCommand(manifestPath, role, opts),
+              commandFor: (role: string) => otherHostDeployCommand(controlRepoFullName(manifest), role),
               project: manifest.metadata.name,
             };
 
