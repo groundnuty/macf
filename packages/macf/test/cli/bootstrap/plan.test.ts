@@ -3746,3 +3746,31 @@ describe('countAppsToCreate / operatorInteractionBudget (groundnuty/macf#880)', 
     });
   });
 });
+
+describe('metered routing line (macf#1497)', () => {
+  const lines = (m: FleetManifest): string[] =>
+    formatPlanText(computePlan(m, EMPTY_OBSERVED)).split('\n').filter((l) => l.includes('routing runs on GitHub-hosted runners'));
+
+  it('a fleet with no runner declaration reports every router-carrying repo, control repo included', () => {
+    const manifest = baseManifest();
+    const out = lines(manifest);
+    const repos = routerCarryingRepos(manifest);
+    expect(out).toHaveLength(repos.length);
+    for (const repo of repos) expect(out.some((l) => l.startsWith(`${repo}: routing runs on GitHub-hosted runners`))).toBe(true);
+    expect(out[0]).toContain('declare routing.runner.runs_on: self-hosted (agent repos) or routing.control_repo_runs_on: self-hosted (control repo)');
+  });
+
+  it('self-hosted agents with a hosted control repo (the macf-trial shape) report only the control repo', () => {
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
+    const out = lines(manifest);
+    const control = routerCarryingRepos(manifest).at(-1)!;
+    expect(out).toHaveLength(1);
+    expect(out[0]!.startsWith(`${control}: `)).toBe(true);
+  });
+
+  it('a fully self-hosted fleet prints no metered line, and the plan stays informational', () => {
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 }, control_repo_runs_on: 'self-hosted' } });
+    expect(lines(manifest)).toHaveLength(0);
+    expect(computePlan(manifest, EMPTY_OBSERVED).meteredRoutingRepos).toEqual([]);
+  });
+});

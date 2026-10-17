@@ -235,17 +235,23 @@ describe('macf#980 — pull_request synchronize/ready_for_review recovery routin
     it('excludes the CURRENT run from the prior-run count (self-exclusion by RUN_ID)', () => {
       const script = gateScript();
       expect(script).toContain('--arg run_id "$RUN_ID"');
-      expect(script).toContain('(.databaseId | tostring) != $run_id');
+      expect(script).toContain('(.id | tostring) != $run_id');
     });
 
     it('queries by the committed workflow FILENAME, not the display name (survives a UI rename)', () => {
-      expect(gateScript()).toContain('gh run list --repo "$REPO" --workflow agent-router.yml');
+      expect(gateScript()).toContain('/actions/workflows/agent-router.yml/runs?');
     });
 
     it('scopes the prior-run query to pull_request-triggered runs on the PR\'s own head branch', () => {
       const script = gateScript();
-      expect(script).toContain('--branch "$HEAD_REF"');
-      expect(script).toContain('--event pull_request');
+      expect(script).toContain('--arg b "$HEAD_REF"');
+      expect(script).toContain('branch=$BRANCH_ENC&event=pull_request');
+    });
+
+    // macf#1497/#1498: self-hosted runner images may lack the GitHub CLI.
+    it('makes no GitHub CLI call — curl + jq only', () => {
+      expect(gateScript()).not.toMatch(/(^|[\s;&|(`])gh\s/m);
+      expect(gateScript()).toContain('curl -fsS');
     });
   });
 
@@ -256,6 +262,23 @@ describe('macf#980 — pull_request synchronize/ready_for_review recovery routin
   // rebase, a real GitHub Actions run), which only a live PR against real
   // GitHub proves. That live proof was explicitly out of scope for this fix
   // (no live-fleet / workflow triggering here).
+  describe('gate job runner (macf#1497)', () => {
+    const inputs = { project: 'macf', registryApiPath: '/repos/o/o' };
+    function gateRunsOn(version: string, runnerRunsOn?: string): unknown {
+      const parsed = parseYaml(generateWorkflow(version, { ...inputs, ...(runnerRunsOn ? { runnerRunsOn } : {}) })) as { jobs: Record<string, any> };
+      return parsed.jobs['gate']['runs-on'];
+    }
+
+    it('declared self-hosted: the gate runs on the self-hosted runner labels', () => {
+      expect(gateRunsOn('v3.6.1', 'self-hosted')).toEqual(['self-hosted', 'macf-vm']);
+    });
+
+    it('undeclared or hosted: the gate stays on ubuntu-latest', () => {
+      expect(gateRunsOn('v3.6.1')).toBe('ubuntu-latest');
+      expect(gateRunsOn('v3.6.1', 'ubuntu-latest')).toBe('ubuntu-latest');
+    });
+  });
+
   describe('gate step bash — executed decision logic (macf#980 ACs)', () => {
     let binDir: string;
 
@@ -269,31 +292,36 @@ describe('macf#980 — pull_request synchronize/ready_for_review recovery routin
     });
 
     /**
-     * Installs a fake `gh` on PATH ahead of the real one. Only implements
-     * `gh run list ... --json databaseId`, echoing back the FAKE_RUN_LIST_JSON
-     * env var (a JSON array of `{databaseId}` objects) set on the eventual
-     * gate-step invocation — the one subcommand the gate script actually
-     * invokes.
+     * Installs a fake `curl` on PATH ahead of the real one. It logs its
+     * arguments to $CURL_LOG and echoes FAKE_RUNS_JSON (the workflow-runs
+     * response body), or exits 22 when FAKE_CURL_FAIL=1 (an HTTP error under
+     * `curl -f`). A fake `gh` that fails on ANY call proves the gate never
+     * uses the GitHub CLI.
      */
-    function installFakeGh(): void {
-      const script = [
+    function installFakes(): void {
+      const curl = [
         '#!/usr/bin/env bash',
-        'set -euo pipefail',
-        'if [ "$1" = "run" ] && [ "$2" = "list" ]; then',
-        '  echo "$FAKE_RUN_LIST_JSON"',
-        '  exit 0',
-        'fi',
-        'echo "fake gh: unexpected invocation: $*" >&2',
-        'exit 1',
+        'echo "$*" >> "$CURL_LOG"',
+        'if [ "${FAKE_CURL_FAIL:-}" = "1" ]; then exit 22; fi',
+        'echo "$FAKE_RUNS_JSON"',
         '',
       ].join('\n');
-      const ghPath = join(binDir, 'gh');
-      writeFileSync(ghPath, script);
-      chmodSync(ghPath, 0o755);
+      writeFileSync(join(binDir, 'curl'), curl);
+      chmodSync(join(binDir, 'curl'), 0o755);
+      const gh = ['#!/usr/bin/env bash', 'echo "fake gh must never be called: $*" >&2', 'exit 1', ''].join('\n');
+      writeFileSync(join(binDir, 'gh'), gh);
+      chmodSync(join(binDir, 'gh'), 0o755);
     }
 
     function runGate(env: Record<string, string>, runListJson = '[]'): string {
-      installFakeGh();
+      return runGateFull(env, runListJson).shouldRoute;
+    }
+
+    function runGateFull(env: Record<string, string>, runListJson = '[]'): { shouldRoute: string; stdout: string; curlLog: string } {
+      installFakes();
+      const runs = (JSON.parse(runListJson) as Array<{ databaseId: number }>).map((r) => ({ id: r.databaseId }));
+      const curlLog = join(binDir, 'curl.log');
+      writeFileSync(curlLog, '');
       const yaml = generateWorkflow('v1');
       const parsed = parseYaml(yaml) as { jobs: Record<string, any> };
       const gateRun = parsed.jobs['gate'].steps[0].run as string;
@@ -308,22 +336,25 @@ describe('macf#980 — pull_request synchronize/ready_for_review recovery routin
       chmodSync(scriptPath, 0o755);
       const outputPath = join(binDir, 'github_output');
       writeFileSync(outputPath, '');
-      execFileSync('bash', [scriptPath], {
+      const stdout = execFileSync('bash', [scriptPath], {
+        encoding: 'utf-8',
         env: {
           PATH: `${binDir}:/usr/bin:/bin`,
           GITHUB_OUTPUT: outputPath,
-          FAKE_RUN_LIST_JSON: runListJson,
+          CURL_LOG: curlLog,
+          FAKE_RUNS_JSON: JSON.stringify({ workflow_runs: runs }),
           ...env,
         },
       });
       const out = readFileSync(outputPath, 'utf-8');
       const match = /should-route=(true|false)/.exec(out);
       if (!match) throw new Error(`gate script produced no should-route output. $GITHUB_OUTPUT contents: ${JSON.stringify(out)}`);
-      return match[1]!;
+      return { shouldRoute: match[1]!, stdout, curlLog: readFileSync(curlLog, 'utf-8') };
     }
 
     const baseEnv = {
       REPO: 'groundnuty/macf',
+      GH_TOKEN: 'ghs_test',
       EVENT_NAME: 'pull_request',
       ACTOR: 'macf-science-agent[bot]',
       RUN_ID: '999',
@@ -441,12 +472,22 @@ describe('macf#980 — pull_request synchronize/ready_for_review recovery routin
       expect(shouldRoute).toBe('true');
     });
 
-    it('non-pull_request events always route, without ever invoking gh', () => {
-      // FAKE_RUN_LIST_JSON left as the default '[]' is irrelevant here — the
-      // fake `gh` would exit 1 on any unexpected invocation, so a passing
-      // result also proves `gh` was never called for this event type.
-      const shouldRoute = runGate({ ...baseEnv, EVENT_NAME: 'issues', ACTION: 'labeled' });
-      expect(shouldRoute).toBe('true');
+    it('non-pull_request events always route, without ever querying runs', () => {
+      const r = runGateFull({ ...baseEnv, EVENT_NAME: 'issues', ACTION: 'labeled' });
+      expect(r.shouldRoute).toBe('true');
+      expect(r.curlLog).toBe('');
+    });
+
+    it('macf#1497: a failed prior-run query routes and logs it', () => {
+      const r = runGateFull({ ...baseEnv, ACTION: 'synchronize', FAKE_CURL_FAIL: '1' });
+      expect(r.shouldRoute).toBe('true');
+      expect(r.stdout).toContain('prior-run query failed');
+    });
+
+    it('macf#1497: the query URL-encodes the branch and sends the bearer token', () => {
+      const r = runGateFull({ ...baseEnv, ACTION: 'synchronize', HEAD_REF: 'fix/a b#1' });
+      expect(r.curlLog).toContain('branch=fix%2Fa%20b%231&event=pull_request');
+      expect(r.curlLog).toContain('Authorization: Bearer ghs_test');
     });
   });
 });
