@@ -4819,12 +4819,16 @@ describe('formatApplyResult / fleetApplyResultToJson / applyExitCode (pure)', ()
     expect(src).toContain('commandFor: (role: string) => otherHostDeployCommand(controlRepoFullName(manifest), role),');
   });
 
-  it("the other-host command names a control-repo clone, never this host's own paths", () => {
+  it("the other-host command says to copy fleet.yaml and secrets/vault.age, not to clone", () => {
     const cmd = otherHostDeployCommand('macf-experiment/macf-trial-control', 'code-agent');
     expect(cmd).toBe(
-      'On the host that will run it, clone macf-experiment/macf-trial-control, then run: '
-        + 'macf fleet deploy --agent code-agent -f <clone>/fleet.yaml --identity-key PATH_TO_YOUR_AGE_IDENTITY_KEY',
+      "On the host that will run it, put copies of the control repo's fleet.yaml and "
+        + 'secrets/vault.age side by side as <dir>/fleet.yaml and <dir>/secrets/vault.age '
+        + '(for example with scp from a clone on this machine), then run: '
+        + "macf fleet deploy --agent code-agent -f <dir>/fleet.yaml --identity-key <that host's age key>",
     );
+    expect(cmd).toContain('fleet.yaml and secrets/vault.age');
+    expect(cmd).not.toContain('clone macf-experiment/macf-trial-control');
     expect(cmd).not.toContain('--vault');
   });
 
