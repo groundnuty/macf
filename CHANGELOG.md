@@ -4,6 +4,18 @@ All notable changes to the `macf` CLI. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.75] — 2026-10-17
+
+### Fixed
+
+- **`macf fleet install-cron` installs on Ubuntu.** Ubuntu's cron rejected the 0.2.74 line as `command too long` (1024 characters against a 1000 cap), so cron recovery could not be installed.
+  - **The script:** install now writes a per-fleet script, `~/.macf/cron/<owner>__<project>.sh`, holding the PATH, the prelude, the token mint and the reconcile command. The crontab line only runs it.
+  - **Refusals:** it refuses fleet names outside `[A-Za-z0-9.-]`, so script names cannot collide, and a line over 900 bytes.
+  - **Atomic update:** a failed crontab write restores the previous script.
+  - **Verified live:** the line ran a real reconcile from `$HOME` with an empty environment, and install and uninstall left another fleet's watchdog line byte-identical (#1518).
+- **`bootstrap plan` no longer calls the trusted-actors update "NOT IMPLEMENTED BY APPLY".** apply has reconciled a diverging `MACF_TRUSTED_ACTORS` since #1319; the plan told the operator to set it by hand in the same run that apply updated it (#1519).
+- **The new-fleet walkthrough** in `design/fleet-deployment-runbook.md` targets 0.2.75, and its "what has been run end to end" box now includes the upgrade (both halves), `trusted_actors` written by apply, and `install-cron` (#1520).
+
 ## [0.2.74] — 2026-10-17
 
 The release a new fleet is set up with: `design/fleet-deployment-runbook.md` §1–§4 is now a copy-paste walkthrough for a three-agent fleet named from one `PROJECT` variable (#1516), and the fixes below came from checking every step of it against the code.
