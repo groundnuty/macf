@@ -19,7 +19,7 @@ Rules every agent in the fleet follows when working through GitHub issues and PR
 2. Discuss on issue threads, not PR comments, because issues outlive the PR.
 3. A review or close written in your reply reaches nobody; post it with `gh`. Hook `check-gh-attribution.sh` reads back who authored each comment, issue, PR or close and warns when it was the user account.
 4. Keep comments short.
-5. A review request addressed to you blocks the requester, so treat it as work. A fresh session injects the `/macf-issues` output, including the sweep; after a resume or compaction, and before declaring idle, run `/macf-issues` yourself:
+5. A review request addressed to you blocks the requester, so treat it as work. A fresh or resumed session injects the `/macf-issues` output, including the sweep; after compaction, and before declaring idle, run `/macf-issues` yourself:
    - (a) Reviewer sweep: every open PR by others with no approval yet, requested from you or not, bot-authored included. Answer with `gh pr review --approve` or `--request-changes`, because the merge gate counts only a formal approval.
    - (b) Inbound review requests and mentions: threads where you were mentioned or asked to review and have not replied.
    - (c) Gate sweep: when your next step waits on someone else's PR review, check GitHub (`gh pr view <N> --json reviews`), not a ping, because the router notifies the author, formal reviewers, requested reviewers and mentioned parties only. When you review a PR a third agent is gated on, @mention that agent in the review body.

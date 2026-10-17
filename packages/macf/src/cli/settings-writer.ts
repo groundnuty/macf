@@ -1657,7 +1657,7 @@ export function installGhTokenHook(workspaceDir: string): void {
  * `check-auditor-never-acts.sh`'s own "distribute everywhere, gate at
  * runtime" shape.
  *
- * Runs on the `SessionStart` event, registered with `matcher: "startup"`
+ * Runs on the `SessionStart` event, registered with `matcher: "startup|resume"`
  * (groundnuty/macf#930 — was matcher-less pre-#930, which meant this fired
  * on `compact`/`resume`/`clear`/`fork` too, and reached at least one
  * MACF-orchestrated worker/subagent session). The matcher is
@@ -1699,6 +1699,15 @@ export const MACF_STARTUP_PICKUP_HOOK_COMMAND = '$CLAUDE_PROJECT_DIR/.claude/scr
  */
 export const MACF_STARTUP_PICKUP_HOOK_TIMEOUT_SECONDS = 120;
 
+/**
+ * SessionStart matcher for the pickup hook: a genuine start OR a `claude -c`
+ * relaunch (every `claude.sh` relaunch is `source=resume`). Claude Code
+ * accepts `|`-separated exact values. `compact`/`clear`/`fork` stay out.
+ * One entry, replaced by basename, so an old `startup`-only entry migrates
+ * in place and never duplicates.
+ */
+export const MACF_STARTUP_PICKUP_HOOK_MATCHER = 'startup|resume';
+
 const STARTUP_PICKUP_HOOK_FILENAME = 'macf-startup-pickup.sh';
 
 /** True iff `command` invokes the startup-pickup hook script (basename match, path-agnostic). */
@@ -1716,7 +1725,7 @@ function isStartupPickupHookCommand(command: string): boolean {
  * `installGhTokenHook` writes — identified ONLY by a basename match on
  * `macf-startup-pickup.sh`, never by clearing the array.
  *
- * `matcher: "startup"` (groundnuty/macf#930) is defense-in-depth only — the
+ * `matcher: "startup|resume"` (groundnuty/macf#930) is defense-in-depth only — the
  * script itself re-checks the payload's `source` field, which is the part a
  * test can actually drive. See `MACF_STARTUP_PICKUP_HOOK_COMMAND`'s doc
  * comment for why the matcher alone isn't sufficient.
@@ -1729,7 +1738,7 @@ export function applyStartupPickupHookTransform(settings: Settings): Settings {
   );
   const macfEntries: readonly HookEntry[] = [
     {
-      matcher: 'startup',
+      matcher: MACF_STARTUP_PICKUP_HOOK_MATCHER,
       hooks: [
         {
           type: 'command',

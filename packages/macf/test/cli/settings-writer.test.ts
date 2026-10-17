@@ -872,7 +872,7 @@ describe('installStartupPickupHook (DR-026 / macf#768)', () => {
     // Defense-in-depth only; the script itself re-checks `source` on the
     // payload, since Claude Code evaluates the matcher before invoking the
     // command (see MACF_STARTUP_PICKUP_HOOK_COMMAND's doc comment).
-    expect(s.hooks.SessionStart[0].matcher).toBe('startup');
+    expect(s.hooks.SessionStart[0].matcher).toBe('startup|resume');
   });
 
   it('registers an explicit timeout comfortably above the script\'s own readiness-poll budget (macf#802)', () => {
@@ -959,6 +959,27 @@ describe('installStartupPickupHook (DR-026 / macf#768)', () => {
       e.hooks.map((h) => h.command),
     );
     expect(cmds).toEqual([MACF_STARTUP_PICKUP_HOOK_COMMAND]);
+  });
+
+  it('migrates an old startup-only entry to the startup|resume matcher without duplicating it', () => {
+    mkdirSync(join(tmpRoot, '.claude'), { recursive: true });
+    writeFileSync(settingsPath, JSON.stringify({
+      hooks: {
+        SessionStart: [
+          { matcher: 'startup', hooks: [{ type: 'command', command: MACF_STARTUP_PICKUP_HOOK_COMMAND }] },
+        ],
+      },
+    }, null, 2));
+
+    installStartupPickupHook(tmpRoot);
+    installStartupPickupHook(tmpRoot);
+
+    const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    const entries = s.hooks.SessionStart.filter((e: { hooks: { command: string }[] }) =>
+      e.hooks.some((h) => h.command === MACF_STARTUP_PICKUP_HOOK_COMMAND),
+    );
+    expect(entries).toHaveLength(1);
+    expect(entries[0].matcher).toBe('startup|resume');
   });
 
   it('preserves unrelated top-level settings keys', () => {
