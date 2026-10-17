@@ -693,10 +693,12 @@ describe('reconcileFleet — prompt guard before heal', () => {
     expect(h.calls.restarted).toEqual([]);
   });
 
-  it('a cleared pane resets the watcher grace counter', async () => {
+  it('a cleared pane resets the watcher grace counter, and the heal ladder keeps the reset', async () => {
     const h = harness({ probe: deafProbe(), panes: paneFor(fx('live-ready-pane.txt')) }, { 'devops-agent': { watcherPromptSweeps: 1 } });
     await reconcileFleet(oneDeaf, h.deps, cfg({ execute: true }));
-    expect(h.storeCalls.writes.some((w) => w.state.watcherPromptSweeps === 0)).toBe(true);
+    const last = h.storeCalls.writes.filter((w) => w.agent === 'devops-agent').at(-1)!;
+    expect(last.state.watcherPromptSweeps).toBe(0);
+    expect(last.state.deafSweeps).toBe(1);
   });
 
   it('no prompt → Tier-1 inject as before', async () => {

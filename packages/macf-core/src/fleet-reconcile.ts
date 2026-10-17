@@ -360,9 +360,10 @@ async function reconcileAgent(
 
   // Running but not reachable → HEAL ladder, unless the pane waits for an
   // answer the ladder must never type. A second instance is never launched.
-  const waiting = await promptGuard(d, state, deps, config);
-  if (waiting) return waiting;
-  await healAgent(d, state, deps, config);
+  const guard = await promptGuard(d, state, deps, config);
+  if (guard.waiting) return guard.waiting;
+  // The ladder writes on top of the guard's state, so a counter reset survives.
+  await healAgent(d, guard.state, deps, config);
   const detail = actual === 'deaf'
     ? 'registered but channel DOWN (deaf) → ladder'
     : 'session running but not registered (channel server down or not yet up) → ladder';
@@ -379,18 +380,23 @@ async function promptGuard(
   state: ReconcileAgentState,
   deps: ReconcileDeps,
   config: ReconcileConfig,
-): Promise<{ readonly row: ReconcileRow; readonly acted: boolean } | null> {
+): Promise<{
+  readonly waiting: { readonly row: ReconcileRow; readonly acted: boolean } | null;
+  readonly state: ReconcileAgentState;
+}> {
   const agent = d.agent;
   const seenBefore = state.watcherPromptSweeps ?? 0;
   let prompt: string | null;
   try {
     prompt = detectLaunchPrompt(await deps.driver.capturePane(agent));
   } catch {
-    return null;
+    return { waiting: null, state };
   }
   if (prompt === null) {
-    if (config.execute && seenBefore > 0) deps.store.write(agent, { ...state, watcherPromptSweeps: 0 });
-    return null;
+    if (seenBefore === 0) return { waiting: null, state };
+    const cleared = { ...state, watcherPromptSweeps: 0 };
+    if (config.execute) deps.store.write(agent, cleared);
+    return { waiting: null, state: cleared };
   }
   if (isWatcherAnsweredPrompt(prompt)) {
     // The watcher answers within seconds, so one sweep of grace is enough. A
@@ -399,7 +405,7 @@ async function promptGuard(
     if (seenBefore === 0) {
       if (config.execute) deps.store.write(agent, { ...state, watcherPromptSweeps: 1 });
       const detail = `waiting at a prompt (${prompt}) that the prompt watcher answers; left alone this sweep`;
-      return { row: mkRow(agent, 'SKIP', detail), acted: false };
+      return { waiting: { row: mkRow(agent, 'SKIP', detail), acted: false }, state };
     }
     prompt = `${prompt}, which the prompt watcher did not clear since the last sweep`;
   }
@@ -412,7 +418,7 @@ async function promptGuard(
   const where = project ? `tmux session ${project}@${agent}` : 'its tmux session';
   const detail = `waiting at a prompt (${prompt}) in ${where}; answer it there`;
   await raiseAlert(agent, detail, deps, config);
-  return { row: mkRow(agent, 'BLOCKED', detail), acted: true };
+  return { waiting: { row: mkRow(agent, 'BLOCKED', detail), acted: true }, state };
 }
 
 /**
