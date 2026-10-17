@@ -624,6 +624,18 @@ describe('check-mention-routing.sh (hook)', () => {
       expect(both.status).toBe(0);
     });
 
+    it('counts a human recipient in a comment chained after a close', () => {
+      const chain = (body: string): string =>
+        `gh issue close 123 --comment done && gh issue comment 123 --body "\n${body}"`;
+      expect(runHook({ command: chain('@groundnuty question') }).status).toBe(0);
+      expect(runHook({ command: chain('no recipient here') }).status).toBe(2);
+      const fence = '```';
+      expect(runHook({ command: chain(`${fence}\n@groundnuty example\n${fence}`) }).status).toBe(2);
+      const typo = runHook({ command: chain('@demo-code-agent look'), env: { MACF_PROJECT: 'demo' } });
+      expect(typo.status).toBe(2);
+      expect(typo.stderr).toContain('no [bot] suffix');
+    });
+
     it('gives no did-you-mean for a fleet name inside a fence', () => {
       const fence = '```';
       const r = runHook({
