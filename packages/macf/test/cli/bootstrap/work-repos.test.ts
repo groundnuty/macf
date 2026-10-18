@@ -41,6 +41,10 @@ describe('work_repos schema', () => {
     ['an entry equal to an agent repo', ['o/f-code']],
     ['an entry equal to the control repo', ['o/f-control']],
     ['an entry owned by another account', ['someone-else/f-experiments']],
+    // GitHub names are case-insensitive, so case variants are the same repo.
+    ['a case-variant duplicate', [WORK, 'o/F-Experiments']],
+    ['a case variant of an agent repo', ['o/F-Code']],
+    ['a case variant of the control repo', ['o/F-control']],
   ];
   for (const [label, list] of refusals) {
     it(`refuses ${label}, naming work_repos`, () => {

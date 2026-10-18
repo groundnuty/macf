@@ -614,16 +614,18 @@ export const FleetManifestSchema = z
   })
   .strict()
   .superRefine((manifest, ctx) => {
-    const controlRepoFull = `${manifest.owner.account}/${deriveControlRepoName(manifest.metadata.name)}`;
-    const homeRepos = new Set(manifest.agents.map((a) => a.repo));
+    // GitHub owner and repo names are case-insensitive, so every identity check here is too.
+    const key = (r: string): string => r.toLowerCase();
+    const controlRepoFull = key(`${manifest.owner.account}/${deriveControlRepoName(manifest.metadata.name)}`);
+    const homeRepos = new Set(manifest.agents.map((a) => key(a.repo)));
     const seenWork = new Set<string>();
     (manifest.work_repos ?? []).forEach((repo, index) => {
       const at = ['work_repos', index];
-      if (seenWork.has(repo)) {
+      if (seenWork.has(key(repo))) {
         ctx.addIssue({ code: 'custom', message: `work_repos lists "${repo}" more than once`, path: at });
       }
-      seenWork.add(repo);
-      if (homeRepos.has(repo) || repo === controlRepoFull) {
+      seenWork.add(key(repo));
+      if (homeRepos.has(key(repo)) || key(repo) === controlRepoFull) {
         ctx.addIssue({
           code: 'custom',
           message: `work_repos entry "${repo}" is already an agent home repo or the control repo; list only additional repos`,
@@ -638,7 +640,7 @@ export const FleetManifestSchema = z
         });
         return;
       }
-      if (repo.split('/')[0] !== manifest.owner.account) {
+      if (key(repo.split('/')[0]!) !== key(manifest.owner.account)) {
         ctx.addIssue({
           code: 'custom',
           message:
