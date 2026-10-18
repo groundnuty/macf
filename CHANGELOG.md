@@ -4,6 +4,28 @@ All notable changes to the `macf` CLI. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.76] — 2026-10-18
+
+### Added
+
+- **`work_repos`: shared repos the agents work in, routed exactly like their home repos (#1521).** List them in `fleet.yaml`:
+
+  ```yaml
+  work_repos:
+    - <owner>/<repo>
+  ```
+
+  For each one, apply:
+  - creates it private if it's absent;
+  - gives it the same self-hosted router caller as an agent repo, an `agent-config.json` listing every agent, and the labels;
+  - writes every routing secret, requests a runner and writes `MACF_TRUSTED_ACTORS`;
+  - adds it to every agent App's install and runner-ops'.
+
+  Issues, labels, @mentions, PR reviews and CI completion there reach the agents as in their home repos. Each agent still keeps its own home repo.
+- **Adding a work repo to an existing fleet takes one apply,** run with `--vault` and `--identity-key`. Labels, the runner and the trusted actors wait until an install covers the repo, then are retried right after the "Save" clicks. If a click is missed, apply exits 2 and says what to do.
+- **`bootstrap plan` shows each work repo on its own rows,** including its own runner and trusted-actors row. The "Operator interaction" line now also counts "Save" clicks on existing installs.
+- **Removing a work repo deletes nothing,** and teardown never archives one.
+
 ## [0.2.75] — 2026-10-17
 
 ### Fixed
