@@ -2126,7 +2126,7 @@ export async function applyFleet(
   // A work repo the runner-ops install does not cover yet cannot get a runner registered, so it
   // waits for the install widen: `runBootstrapApply` provisions it after the install-scope gate.
   const uncoveredWorkRepos =
-    !controlRepoSelfHosted(manifest) && manifest.routing?.runner?.runs_on === 'self-hosted'
+    manifest.routing?.runner?.runs_on === 'self-hosted'
       ? await workReposUncoveredByRunnerOps(confirmedWorkRepos, runnerOpsIdentity, runnerOpsResolveKeyPath, deps)
       : new Set<string>();
   for (const repo of uncoveredWorkRepos) {
@@ -2134,9 +2134,11 @@ export async function applyFleet(
     if (i >= 0) workRepoRecords[i] = { ...workRepoRecords[i]!, routingAwaitingInstall: true };
     deps.log(`Work repo "${repo}" routing: awaiting the runner-ops install to cover it.`);
   }
-  const runnerRepos: readonly string[] = controlRepoSelfHosted(manifest)
+  // Uncovered work repos wait in both modes; the control repo only joins when it is self-hosted.
+  const runnerRepos: readonly string[] = (controlRepoSelfHosted(manifest)
     ? routerCarryingRepos
-    : [...confirmedRepos, ...confirmedWorkRepos.filter((r) => !uncoveredWorkRepos.has(r))];
+    : [...confirmedRepos, ...confirmedWorkRepos]
+  ).filter((r) => !uncoveredWorkRepos.has(r));
   // A repo this run successfully told the contract to provision — excluded
   // from `justCreatedRepos`'s fast single-check path below (macf#972's own
   // doc predicted this: "at which point a fresh repo's poll becomes

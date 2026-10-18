@@ -3937,6 +3937,18 @@ agents:
             expect(result.routing[WORK]).toBeUndefined();
           });
 
+          it('also waits when the control repo routes self-hosted (control_repo_runs_on)', async () => {
+            const { manifestPath, posted, written, deps } = setup({ current: false });
+            const manifest: FleetManifest = {
+              ...routedManifest(),
+              routing: { runner: { runs_on: 'self-hosted', warm: 1 }, control_repo_runs_on: 'self-hosted' },
+            };
+            const result = await applyFleet(manifest, manifestPath, null, deps);
+            expect(posted).not.toContain(WORK);
+            expect(written).not.toContain(WORK);
+            expect(result.workRepos?.[0]).toMatchObject({ routingAwaitingInstall: true });
+          });
+
           it('after a gate that widens runner-ops, the retry provisions exactly that repo and the exit is not 2', async () => {
             const covers = { current: false };
             const { manifestPath, posted, written, deps } = setup(covers);
