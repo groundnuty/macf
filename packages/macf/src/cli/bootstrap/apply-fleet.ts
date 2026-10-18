@@ -3716,6 +3716,24 @@ export async function retryWorkRepoRouting(
     scopeValue: deps.observedRunnerPlatformEndpointScope,
   }).value;
   const leg = await provisionRunnersAndRouting(manifest, deps, result.runnerOps, resolveKeyPath, endpoint, ready);
+  // The main path's reconcile ran while these repos were excluded, so a stale value they already
+  // carry must be reconciled here too, with the same single overwrite path.
+  const alreadyPresent = Object.entries(leg.routing)
+    .filter(([, l]) => l.status === 'already-present')
+    .map(([repo]) => repo);
+  const reconciled: Readonly<Record<string, EnsureVariableOutcome>> =
+    alreadyPresent.length > 0
+      ? await reconcileTrustedActors(
+          buildTrustedActorsValue(manifest.metadata.name, manifest.agents, manifest.routing?.runner.trusted_actors ?? []),
+          alreadyPresent,
+          deps.trustDeps,
+        )
+      : {};
+  for (const [repo, l] of Object.entries(reconciled)) {
+    if (l.status === 'updated' || l.status === 'declined' || l.status === 'failed' || l.status === 'skipped') {
+      deps.log(`Routing var reconcile (${repo}): ${l.status} — ${l.reason}`);
+    }
+  }
   const done = new Set(ready);
   return {
     ...result,
@@ -3725,6 +3743,6 @@ export async function retryWorkRepoRouting(
       return rest;
     }),
     runnerProvision: { ...result.runnerProvision, ...leg.runnerProvision },
-    routing: { ...result.routing, ...leg.routing },
+    routing: { ...result.routing, ...leg.routing, ...reconciled },
   };
 }

@@ -3937,6 +3937,33 @@ agents:
             expect(result.routing[WORK]).toBeUndefined();
           });
 
+          it('the retry reconciles a stale MACF_TRUSTED_ACTORS already present on the work repo', async () => {
+            const covers = { current: false };
+            const { manifestPath, deps } = setup(covers);
+            const updated: Array<{ repo: string; value: string }> = [];
+            const staleDeps: FleetApplyDeps = {
+              ...deps,
+              trustDeps: {
+                ...deps.trustDeps!,
+                checkRepoPresence: async (_repo: string, name: string) => (name === 'MACF_TRUSTED_ACTORS' ? 'present' : 'absent'),
+                readRepoVariableValue: async () => 'stale-only[bot]',
+                updateRepoVariable: async (repo: string, _name: string, value: string) => {
+                  updated.push({ repo, value });
+                  return 'updated';
+                },
+                confirmReconciliation: async () => true,
+              },
+            };
+            const manifest = routedManifest();
+            const result = await applyFleet(manifest, manifestPath, null, staleDeps);
+            updated.length = 0;
+            covers.current = true;
+            const after = await retryWorkRepoRouting(result, manifest, staleDeps);
+            expect(updated.map((u) => u.repo)).toContain(WORK);
+            expect(updated.find((u) => u.repo === WORK)?.value).not.toBe('stale-only[bot]');
+            expect(after.routing[WORK]?.status).toBe('updated');
+          });
+
           it('also waits when the control repo routes self-hosted (control_repo_runs_on)', async () => {
             const { manifestPath, posted, written, deps } = setup({ current: false });
             const manifest: FleetManifest = {
