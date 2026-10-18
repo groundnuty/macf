@@ -208,7 +208,7 @@ import { dirname, join } from 'node:path';
 import { caCertFingerprint } from '@groundnuty/macf-core';
 import type { TokenSource } from '@groundnuty/macf-core';
 import type { FleetAgent, FleetLock, FleetLockAgent, FleetManifest } from './fleet-manifest.js';
-import { buildTrustedActorsValue, controlRepoSelfHosted, deriveAppHandle, deriveControlRepoName, effectiveFleetFingerprints } from './fleet-manifest.js';
+import { buildTrustedActorsValue, controlRepoSelfHosted, deriveAppHandle, deriveControlRepoName, effectiveFleetFingerprints, workRepos } from './fleet-manifest.js';
 import type { AgentApplyDeps, AgentApplyOutcome, InstallRejection } from './apply-agent.js';
 import { applyAgentIdentity, applyIdentity, cleanupScratchPem, writeScratchPem } from './apply-agent.js';
 import type { Presence } from './plan.js';
@@ -549,9 +549,13 @@ export interface FleetApplyDeps {
   readonly callerSecretRewrites?: Readonly<Record<string, boolean>>;
   /** Same, for the control repo's router caller. */
   readonly callerSecretRewriteControl?: boolean;
+  /** Same, per `work_repos` entry (keyed by `owner/repo`). */
+  readonly callerSecretRewriteWork?: Readonly<Record<string, boolean>>;
   readonly observedActionsPins?: {
     readonly agents: Readonly<Record<string, string | undefined>>;
     readonly controlRepo: string | undefined;
+    /** Observed router pin per `work_repos` entry (keyed by `owner/repo`). */
+    readonly workRepos?: Readonly<Record<string, string | undefined>>;
   };
   /**
    * groundnuty/macf#943 (DR-043 Amendment I2) — the TOP (`'flag'`) tier of
@@ -758,7 +762,18 @@ function actionsPinResultFor(repo: string, force: boolean, outcome: RepoInitStep
   return { repo, status: outcome.pushed ? 'reconciled' : 'already-current' };
 }
 
+/** What one `work_repos` entry came to this run: was it ensured, and did its repo-init land. */
+export interface WorkRepoRecord {
+  readonly repo: string;
+  /** `'failed'` covers a creation failure, an archived repo left archived, and an unconfirmable existence read. */
+  readonly ensure: 'created' | 'present' | 'revived' | 'failed';
+  readonly reason?: string;
+  readonly repoInit?: RepoInitStepOutcome;
+}
+
 export interface FleetApplyResult {
+  /** One record per declared `work_repos` entry. Absent when the manifest declares none. */
+  readonly workRepos?: readonly WorkRepoRecord[];
   /** DR-043 Amendment F step 0 — see `control-repo.ts`'s module doc. A `foreign`/`failed` outcome means `agents`/`vault` below are trivially empty/skipped: the run aborted before touching anything else. */
   readonly controlRepo: ControlRepoOutcome;
   /** The final push of this run's control-repo changes — see the type doc. */
@@ -1598,6 +1613,26 @@ export async function applyFleet(
   // see that function's own doc for the incident this closes.
   const registryCoverage = requiredRegistryRepoCoverage(manifest);
 
+  // `work_repos:` — shared repos the agents work in. Ensured BEFORE any consent gate so gate 2's
+  // "repositories to select" list can name a repo that exists. Absent: created private and blank
+  // (no template, like a mirror agent's repo). Present: reused. A failure is a failed leg that
+  // names the repo; it never stops the agents from being provisioned.
+  const workRepoRecords: WorkRepoRecord[] = [];
+  const confirmedWorkRepos: string[] = [];
+  for (const repo of workRepos(manifest)) {
+    const placeholder: FleetAgent = { role: 'work-repo', repo, deploy_path: '', provenance: 'mirror' };
+    const outcome = await ensureAgentRepo(placeholder, manifest, deps.agentRepoDeps, deps.agentRepoOptions);
+    if (outcome.status === 'failed' || outcome.status === 'archived' || outcome.status === 'unknown') {
+      deps.log(`Work repo "${repo}" ${outcome.status.toUpperCase()} — ${outcome.reason}`);
+      workRepoRecords.push({ repo, ensure: 'failed', reason: outcome.reason });
+      continue;
+    }
+    deps.log(`Work repo "${repo}" ${outcome.status.toUpperCase()}.`);
+    workRepoRecords.push({ repo, ensure: outcome.status });
+    confirmedWorkRepos.push(repo);
+    if (outcome.status === 'created') justCreatedRepos.add(repo);
+  }
+
   const totalAgents = manifest.agents.length;
   for (const [agentIndex, agent] of manifest.agents.entries()) {
     // Operator-facing progress context (consent-gate UX fix) — a live
@@ -1875,7 +1910,34 @@ export async function applyFleet(
   // publish section below). See
   // `apply-control-repo-init.ts::deriveRouterCarryingRepos`'s doc for the
   // fix's decisive derivation logic.
-  const routerCarryingRepos: readonly string[] = deriveRouterCarryingRepos(confirmedRepos, controlRepo, controlRepoInit);
+  // Work repos get the same repo-init agent repos get (caller, agent-config.json with every role,
+  // labels), run once the agents' Apps are installed. The label token is minted by an agent App
+  // that this run can resolve — a just-created one, else a reused one from the vault — never the
+  // operator's own token. With none resolvable, labels read 'skipped' exactly as for an agent repo.
+  if (confirmedWorkRepos.length > 0) {
+    const workToken = resolveWorkRepoTokenSource(records, deps.buildAgentDeps(deps.log).resolveKeyPath);
+    try {
+      for (const repo of confirmedWorkRepos) {
+        const placeholder: FleetAgent = { role: 'work-repo', repo, deploy_path: '', provenance: 'mirror' };
+        const pinReconcile = resolveActionsPinReconcile(manifest.versions?.actions, deps.observedActionsPins?.workRepos?.[repo]);
+        const outcome = await applyRepoInitForAgent(placeholder, manifest, deps.repoInitDeps, {
+          actionsVersion: pinReconcile.actionsVersion,
+          force: pinReconcile.force || deps.callerSecretRewriteWork?.[repo] === true,
+          ...(workToken !== undefined ? { tokenSource: workToken.tokenSource } : {}),
+        });
+        const record = workRepoRecords.find((r) => r.repo === repo);
+        if (record !== undefined) workRepoRecords[workRepoRecords.indexOf(record)] = { ...record, repoInit: outcome };
+        deps.log(
+          `Work repo "${repo}" repo-init: ${outcome.status === 'failed' ? `FAILED — ${outcome.reason}` : `applied (labels ${outcome.labels.status})`}.`,
+        );
+        if (manifest.versions) actionsPinResults.push(actionsPinResultFor(repo, pinReconcile.force, outcome));
+      }
+    } finally {
+      workToken?.cleanup();
+    }
+  }
+
+  const routerCarryingRepos: readonly string[] = deriveRouterCarryingRepos([...confirmedRepos, ...confirmedWorkRepos], controlRepo, controlRepoInit);
 
   // --- groundnuty/macf#943: the runner-ops App — a FLEET-LEVEL
   // identity (never declared in manifest.agents[]; `FleetManifestSchema` has
@@ -2045,7 +2107,7 @@ export async function applyFleet(
   // manifest opts it in AND it actually carries the router this run. The SAME
   // loop and writer agent repos use — no second path. Never in
   // `justCreatedRepos` (the control repo is made at Step 0.5, long before).
-  const runnerRepos: readonly string[] = controlRepoSelfHosted(manifest) ? routerCarryingRepos : confirmedRepos;
+  const runnerRepos: readonly string[] = controlRepoSelfHosted(manifest) ? routerCarryingRepos : [...confirmedRepos, ...confirmedWorkRepos];
   // A repo this run successfully told the contract to provision — excluded
   // from `justCreatedRepos`'s fast single-check path below (macf#972's own
   // doc predicted this: "at which point a fresh repo's poll becomes
@@ -3088,6 +3150,7 @@ export async function applyFleet(
     lockPath,
     finalLock: currentLock,
     agents: records,
+    ...(workRepoRecords.length > 0 ? { workRepos: workRepoRecords } : {}),
     runnerOps: runnerOpsIdentity,
     routerApp: routerAppIdentity,
     vault,
@@ -3452,3 +3515,27 @@ async function settleVault(
 // uses internally, without importing `vault-write.ts` AND `fleet-lock.ts`
 // separately for one helper each.
 export { vaultAgentSecretsForFingerprint };
+
+/**
+ * The App credential a work repo's repo-init mints its label token from: the first agent, in
+ * manifest order, whose credential this run can resolve — a just-created one (PEM in memory,
+ * written to a scratch file) or a reused one read from the vault. Every agent App is installed on
+ * every work repo, so any of them can mint the token. `undefined` when none resolves.
+ */
+function resolveWorkRepoTokenSource(
+  records: readonly AgentApplyRecord[],
+  resolveKeyPath: ((role: string, priorAppId: string) => string | undefined) | undefined,
+): { readonly tokenSource: TokenSource; readonly cleanup: () => void } | undefined {
+  for (const record of records) {
+    const identity = record.identity;
+    if (identity.status === 'created') {
+      const keyPath = writeScratchPem(record.role, identity.credentials.pem);
+      return { tokenSource: { appId: identity.appId, installId: identity.installId, keyPath }, cleanup: () => cleanupScratchPem(keyPath) };
+    }
+    if (identity.status === 'reused' || identity.status === 'resumed-install') {
+      const tokenSource = resolveAgentRepoInitTokenSource(record.role, identity.appId, identity.installId, resolveKeyPath);
+      if (tokenSource !== undefined) return { tokenSource, cleanup: () => undefined };
+    }
+  }
+  return undefined;
+}

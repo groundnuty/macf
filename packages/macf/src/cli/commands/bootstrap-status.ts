@@ -21,7 +21,7 @@ import type { AgentRegistryObservation } from '../bootstrap/observer.js';
 import { githubRegistryObserver, readAgentRegistryInfo, vaultAwareObserver } from '../bootstrap/observer.js';
 import { bootstrapStatusToJson, computeBootstrapStatus, formatBootstrapStatusText } from '../bootstrap/status.js';
 import type { Presence } from '../bootstrap/plan.js';
-import { computeInstallScopeCoverage, formatInstallScopeCoverageLines, installScopeCoverageEntryToJson } from '../bootstrap/install-scope-coverage.js';
+import { computeInstallScopeCoverage, formatInstallScopeCoverageLines, installScopeCoverageEntryToJson, observedWorkRepoPresence } from '../bootstrap/install-scope-coverage.js';
 import { computeControlRepoManifestDrift, controlRepoManifestDriftToJson, formatControlRepoManifestDriftLines } from '../bootstrap/control-repo-manifest-drift.js';
 import { controlRepoFullName, realReadControlManifestFile } from '../bootstrap/control-repo.js';
 
@@ -145,6 +145,7 @@ export async function runBootstrapStatus(
             Object.fromEntries(Object.entries(observed.agents).map(([role, a]) => [role, a.repo])) as Readonly<Record<string, Presence>>,
             observed.controlRepoPresence,
             { vaultPath: opts.vaultPath, identityPath: opts.identityKeyPath },
+            { workRepoPresence: observedWorkRepoPresence(observed) },
           )
         : {};
     const installScopeCoverageLines = formatInstallScopeCoverageLines(installScopeCoverage);

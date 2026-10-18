@@ -41,7 +41,7 @@ import { RUNNER_PLATFORM_ENDPOINT_ENV_VAR, registerRunnerPlatformEndpointFileTie
 import type { OperatorInputSource } from '../bootstrap/operator-secrets-file.js';
 import { formatOperatorInputProvenanceLine, readOperatorSecretsFile, resolveOperatorInput } from '../bootstrap/operator-secrets-file.js';
 import type { Presence } from '../bootstrap/plan.js';
-import { computeInstallScopeCoverage, formatInstallScopeCoverageLines, installScopeCoverageEntryToJson } from '../bootstrap/install-scope-coverage.js';
+import { computeInstallScopeCoverage, formatInstallScopeCoverageLines, installScopeCoverageEntryToJson, observedWorkRepoPresence } from '../bootstrap/install-scope-coverage.js';
 import { reconcileFederatedTrustVerdicts, federatedTrustNotices } from '../bootstrap/apply-federated-trust.js';
 
 export interface RunBootstrapPlanOptions {
@@ -281,6 +281,7 @@ export async function runBootstrapPlan(
       Object.fromEntries(Object.entries(observed.agents).map(([role, a]) => [role, a.repo])) as Readonly<Record<string, Presence>>,
       observed.controlRepoPresence,
       vaultOpts,
+      { workRepoPresence: observedWorkRepoPresence(observed) },
     );
     const plan = computePlan(manifest, observed, Object.values(installScopeCoverage));
     // groundnuty/macf#880 — the operator's consent-click budget, projected
