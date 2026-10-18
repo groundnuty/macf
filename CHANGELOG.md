@@ -4,6 +4,15 @@ All notable changes to the `macf` CLI. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.77] — 2026-10-18
+
+### Fixed
+
+- **Each agent message is delivered once.** When Claude Code has registered the channel, the channel server no longer types a second copy of every message into the agent's prompt through tmux.
+  - **Symptom:** routed issues, mentions and peer messages arrived twice. A busy agent queued the typed copies, shown as `❯ … ctrl+x ctrl+s to send now`, and processed every message again when its turn ended.
+  - **Worse:** the typed copy reached the session as if the operator had typed it.
+  - **Fix:** the copy is now skipped only when this session's own Claude Code MCP log shows the channel registered after the server started; in every other case it is still typed, so a registration failure falls back to duplication, never to an agent that hears nothing. Each delivery logs `delivery_path` in `channel.log` (#639, #1522).
+
 ## [0.2.76] — 2026-10-18
 
 ### Added
