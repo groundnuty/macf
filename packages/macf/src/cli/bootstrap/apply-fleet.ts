@@ -777,6 +777,8 @@ export interface WorkRepoRecord {
   readonly repoInit?: RepoInitStepOutcome;
   /** No agent App's install covered this repo during apply, so its labels wait for the install widen. */
   readonly labelsAwaitingInstall?: boolean;
+  /** The runner-ops install did not cover this repo during apply, so its runner and routing wait for the widen. */
+  readonly routingAwaitingInstall?: boolean;
 }
 
 export interface FleetApplyResult {
@@ -2121,7 +2123,20 @@ export async function applyFleet(
   // manifest opts it in AND it actually carries the router this run. The SAME
   // loop and writer agent repos use — no second path. Never in
   // `justCreatedRepos` (the control repo is made at Step 0.5, long before).
-  const runnerRepos: readonly string[] = controlRepoSelfHosted(manifest) ? routerCarryingRepos : [...confirmedRepos, ...confirmedWorkRepos];
+  // A work repo the runner-ops install does not cover yet cannot get a runner registered, so it
+  // waits for the install widen: `runBootstrapApply` provisions it after the install-scope gate.
+  const uncoveredWorkRepos =
+    !controlRepoSelfHosted(manifest) && manifest.routing?.runner?.runs_on === 'self-hosted'
+      ? await workReposUncoveredByRunnerOps(confirmedWorkRepos, runnerOpsIdentity, runnerOpsResolveKeyPath, deps)
+      : new Set<string>();
+  for (const repo of uncoveredWorkRepos) {
+    const i = workRepoRecords.findIndex((r) => r.repo === repo);
+    if (i >= 0) workRepoRecords[i] = { ...workRepoRecords[i]!, routingAwaitingInstall: true };
+    deps.log(`Work repo "${repo}" routing: awaiting the runner-ops install to cover it.`);
+  }
+  const runnerRepos: readonly string[] = controlRepoSelfHosted(manifest)
+    ? routerCarryingRepos
+    : [...confirmedRepos, ...confirmedWorkRepos.filter((r) => !uncoveredWorkRepos.has(r))];
   // A repo this run successfully told the contract to provision — excluded
   // from `justCreatedRepos`'s fast single-check path below (macf#972's own
   // doc predicted this: "at which point a fresh repo's poll becomes
@@ -2166,104 +2181,10 @@ export async function applyFleet(
     deps.log(`Runner platform endpoint: ${describeRunnerPlatformEndpointResolution(runnerPlatformEndpointResolution)}.`);
   }
   const runnerPlatformEndpointForWait = runnerPlatformEndpointResolution?.value;
-  if (manifest.routing?.runner !== undefined && manifest.routing.runner.runs_on === 'self-hosted') {
-    const runnerPlatformDeps = {
-      endpoint: runnerPlatformEndpointForWait,
-      fetchImpl: deps.runnerPlatformFetch,
-    };
-    // Freshly minted THIS run (`status === 'created'`) supplies the PEM
-    // in-memory, no I/O needed. A `'reused'`/`'resumed-install'` outcome
-    // falls back to `resolveRunnerOpsVaultPem` — the run-2 fix (groundnuty/
-    // macf#943 follow-up): the SAME vault-backed `resolveKeyPath` closure
-    // that already confirmed this reuse is real, re-consulted for the PEM
-    // itself. See both functions' docs for the full "why."
-    const runnerOpsCredentials = runnerPlatformCredentialsFromOutcome(runnerOpsIdentity, resolveRunnerOpsVaultPem(runnerOpsIdentity, runnerOpsResolveKeyPath, deps.log));
-    if (runnerOpsCredentials === undefined) {
-      deps.log(
-        `Runner platform: no runner-ops credential available this run (${runnerOpsIdentity.status}) — provisioning ` +
-          "call(s) below omit `credentials`, so the contract falls back to its OWN App, which only works for the " +
-          'owner it happens to be installed on. This means either no --vault/--identity-key were supplied this ' +
-          'run, or the vault does not (yet) hold this role\'s key — see the log lines above for which.',
-      );
-    }
-    const declaredLabels = manifest.routing.runner.labels;
-    const warm = manifest.routing.runner.warm;
-    for (const repo of runnerRepos) {
-      const result = await provisionRunner(runnerPlatformDeps, {
-        repo,
-        ...(declaredLabels !== undefined ? { labels: declaredLabels } : {}),
-        warm,
-        fleet: manifest.metadata.name,
-        ...(runnerOpsCredentials !== undefined ? { credentials: runnerOpsCredentials } : {}),
-      });
-      runnerProvisionResults[repo] = result;
-      deps.log(
-        `Runner platform (${repo}): ${result.status}` + (result.status === 'ok' ? '.' : ` — ${result.reason}`),
-      );
-      if (result.status === 'ok') provisionedNowRepos.add(repo);
-    }
-  }
-
-  // groundnuty/macf#1212 — operator ruling: "apply requested the runner...
-  // whether a --runner-token was supplied is irrelevant to whether the tool
-  // should wait for something it itself asked for." Every repo THIS run
-  // successfully told the contract to provision (`provisionedNowRepos`,
-  // above) gets an UNCONDITIONAL bounded wait for GitHub to confirm it
-  // usable — see `apply-routing.ts::publishTrustedActorsForProvisioned`'s
-  // doc for the full "why here, why unconditional, why pending-not-failed"
-  // narrative. Placed immediately after the POST loop (not at the later
-  // register-before-route call site) for the SAME "as early as possible"
-  // reason that block's own doc already gives the provisioning call itself
-  // — maximizing the window before this run ends.
-  //
-  // `runnerPlatformStatusCheck` is OPTIONAL and advisory-only (see that
-  // function's doc) — `undefined` when the endpoint was never configured,
-  // so a fleet with no runner-platform reachable still gets the correct
-  // GitHub-side wait, just without the platform's own progress content.
-  const runnerPlatformStatusCheck =
-    runnerPlatformEndpointForWait !== undefined ? (repo: string): Promise<RunnerPlatformStatusResult> => checkRunnerPlatformStatus({ endpoint: runnerPlatformEndpointForWait, fetchImpl: deps.runnerPlatformFetch }, repo) : undefined;
-  const provisionedWaitPollOptions: RunnerTokenPollOptions = {
-    ...deps.runnerTokenPollOptions,
-    onProgress:
-      deps.runnerTokenPollOptions?.onProgress ??
-      ((repo: string, elapsedMs: number, totalMs: number, platformStatus?: RunnerPlatformStatusResult): void => {
-        deps.log(formatProvisionedRunnerWaitProgress(repo, elapsedMs, totalMs, platformStatus));
-      }),
-  };
-  // groundnuty/macf#1212 (coordinator UX addendum) — "so each time I can
-  // see how much time it took." A per-repo tick already narrates via
-  // `provisionedWaitPollOptions.onProgress` above; this ONE line closes the
-  // loop with the number that matters most once the wait is over — the
-  // real, measured total, not the budget.
-  const provisionedWaitStartedAt = (provisionedWaitPollOptions.now ?? Date.now)();
-  const routingProvisioned: Readonly<Record<string, EnsureVariableOutcome>> =
-    provisionedNowRepos.size > 0
-      ? await publishTrustedActorsForProvisioned(
-          buildTrustedActorsValue(manifest.metadata.name, manifest.agents, manifest.routing?.runner.trusted_actors ?? []),
-          [...provisionedNowRepos],
-          {
-            ...deps.trustDeps,
-            ...(runnerPlatformStatusCheck !== undefined ? { checkRunnerPlatformStatus: runnerPlatformStatusCheck } : {}),
-          },
-          provisionedWaitPollOptions,
-        )
-      : {};
-  if (provisionedNowRepos.size > 0) {
-    const elapsedTotalS = Math.round(((provisionedWaitPollOptions.now ?? Date.now)() - provisionedWaitStartedAt) / 1000);
-    const ready = Object.values(routingProvisioned).filter((leg) => leg.status === 'created' || leg.status === 'already-present').length;
-    const pending = Object.values(routingProvisioned).filter((leg) => leg.status === 'pending').length;
-    const failed = Object.values(routingProvisioned).filter((leg) => leg.status === 'failed').length;
-    deps.log(
-      `Runner wait: ${String(provisionedNowRepos.size)} repo(s) resolved in ${String(elapsedTotalS)}s — ` +
-        `${String(ready)} ready, ${String(pending)} still pending, ${String(failed)} failed.`,
-    );
-  }
-  for (const [repo, leg] of Object.entries(routingProvisioned)) {
-    deps.log(
-      `Routing var (${repo}): ${leg.status}` +
-        (leg.status === 'failed' || leg.status === 'skipped' || leg.status === 'pending' ? ` — ${leg.reason}` : '.'),
-    );
-  }
+  const runnerLeg = await provisionRunnersAndRouting(manifest, deps, runnerOpsIdentity, runnerOpsResolveKeyPath, runnerPlatformEndpointForWait, runnerRepos);
+  Object.assign(runnerProvisionResults, runnerLeg.runnerProvision);
+  for (const r of runnerLeg.provisionedNow) provisionedNowRepos.add(r);
+  const routingProvisioned: Readonly<Record<string, EnsureVariableOutcome>> = runnerLeg.routing;
 
   // --- groundnuty/macf#1074 + groundnuty/macf#1082: the routing App —
   // a fleet-level identity (alongside the per-agent Apps and runner-ops),
@@ -3608,4 +3529,200 @@ export async function retryWorkRepoLabels(
   } finally {
     for (const c of candidates) c.cleanup();
   }
+}
+
+
+interface RunnerRoutingLeg {
+  readonly runnerProvision: Record<string, RunnerPlatformResult>;
+  readonly provisionedNow: ReadonlySet<string>;
+  readonly routing: Readonly<Record<string, EnsureVariableOutcome>>;
+}
+
+/**
+ * The runner POST, the bounded wait for GitHub to see the runner, and the `MACF_TRUSTED_ACTORS`
+ * write, for `repos`. Used by the main run for every runner repo and again, after the install-scope
+ * gate, for work repos that runner-ops did not cover until then.
+ */
+async function provisionRunnersAndRouting(
+  manifest: FleetManifest,
+  deps: Pick<
+    FleetApplyDeps,
+    'log' | 'runnerPlatformFetch' | 'runnerTokenPollOptions' | 'trustDeps'
+  >,
+  runnerOpsIdentity: RunnerOpsApplyOutcome,
+  runnerOpsResolveKeyPath: AgentApplyDeps['resolveKeyPath'],
+  runnerPlatformEndpointForWait: string | undefined,
+  repos: readonly string[],
+): Promise<RunnerRoutingLeg> {
+  const runnerProvisionResults: Record<string, RunnerPlatformResult> = {};
+  const provisionedNowRepos = new Set<string>();
+  if (manifest.routing?.runner !== undefined && manifest.routing.runner.runs_on === 'self-hosted') {
+    const runnerPlatformDeps = {
+      endpoint: runnerPlatformEndpointForWait,
+      fetchImpl: deps.runnerPlatformFetch,
+    };
+    // Freshly minted THIS run (`status === 'created'`) supplies the PEM
+    // in-memory, no I/O needed. A `'reused'`/`'resumed-install'` outcome
+    // falls back to `resolveRunnerOpsVaultPem` — the run-2 fix (groundnuty/
+    // macf#943 follow-up): the SAME vault-backed `resolveKeyPath` closure
+    // that already confirmed this reuse is real, re-consulted for the PEM
+    // itself. See both functions' docs for the full "why."
+    const runnerOpsCredentials = runnerPlatformCredentialsFromOutcome(runnerOpsIdentity, resolveRunnerOpsVaultPem(runnerOpsIdentity, runnerOpsResolveKeyPath, deps.log));
+    if (runnerOpsCredentials === undefined) {
+      deps.log(
+        `Runner platform: no runner-ops credential available this run (${runnerOpsIdentity.status}) — provisioning ` +
+          "call(s) below omit `credentials`, so the contract falls back to its OWN App, which only works for the " +
+          'owner it happens to be installed on. This means either no --vault/--identity-key were supplied this ' +
+          'run, or the vault does not (yet) hold this role\'s key — see the log lines above for which.',
+      );
+    }
+    const declaredLabels = manifest.routing.runner.labels;
+    const warm = manifest.routing.runner.warm;
+    for (const repo of repos) {
+      const result = await provisionRunner(runnerPlatformDeps, {
+        repo,
+        ...(declaredLabels !== undefined ? { labels: declaredLabels } : {}),
+        warm,
+        fleet: manifest.metadata.name,
+        ...(runnerOpsCredentials !== undefined ? { credentials: runnerOpsCredentials } : {}),
+      });
+      runnerProvisionResults[repo] = result;
+      deps.log(
+        `Runner platform (${repo}): ${result.status}` + (result.status === 'ok' ? '.' : ` — ${result.reason}`),
+      );
+      if (result.status === 'ok') provisionedNowRepos.add(repo);
+    }
+  }
+
+  // groundnuty/macf#1212 — operator ruling: "apply requested the runner...
+  // whether a --runner-token was supplied is irrelevant to whether the tool
+  // should wait for something it itself asked for." Every repo THIS run
+  // successfully told the contract to provision (`provisionedNowRepos`,
+  // above) gets an UNCONDITIONAL bounded wait for GitHub to confirm it
+  // usable — see `apply-routing.ts::publishTrustedActorsForProvisioned`'s
+  // doc for the full "why here, why unconditional, why pending-not-failed"
+  // narrative. Placed immediately after the POST loop (not at the later
+  // register-before-route call site) for the SAME "as early as possible"
+  // reason that block's own doc already gives the provisioning call itself
+  // — maximizing the window before this run ends.
+  //
+  // `runnerPlatformStatusCheck` is OPTIONAL and advisory-only (see that
+  // function's doc) — `undefined` when the endpoint was never configured,
+  // so a fleet with no runner-platform reachable still gets the correct
+  // GitHub-side wait, just without the platform's own progress content.
+  const runnerPlatformStatusCheck =
+    runnerPlatformEndpointForWait !== undefined ? (repo: string): Promise<RunnerPlatformStatusResult> => checkRunnerPlatformStatus({ endpoint: runnerPlatformEndpointForWait, fetchImpl: deps.runnerPlatformFetch }, repo) : undefined;
+  const provisionedWaitPollOptions: RunnerTokenPollOptions = {
+    ...deps.runnerTokenPollOptions,
+    onProgress:
+      deps.runnerTokenPollOptions?.onProgress ??
+      ((repo: string, elapsedMs: number, totalMs: number, platformStatus?: RunnerPlatformStatusResult): void => {
+        deps.log(formatProvisionedRunnerWaitProgress(repo, elapsedMs, totalMs, platformStatus));
+      }),
+  };
+  // groundnuty/macf#1212 (coordinator UX addendum) — "so each time I can
+  // see how much time it took." A per-repo tick already narrates via
+  // `provisionedWaitPollOptions.onProgress` above; this ONE line closes the
+  // loop with the number that matters most once the wait is over — the
+  // real, measured total, not the budget.
+  const provisionedWaitStartedAt = (provisionedWaitPollOptions.now ?? Date.now)();
+  const routingProvisioned: Readonly<Record<string, EnsureVariableOutcome>> =
+    provisionedNowRepos.size > 0
+      ? await publishTrustedActorsForProvisioned(
+          buildTrustedActorsValue(manifest.metadata.name, manifest.agents, manifest.routing?.runner.trusted_actors ?? []),
+          [...provisionedNowRepos],
+          {
+            ...deps.trustDeps,
+            ...(runnerPlatformStatusCheck !== undefined ? { checkRunnerPlatformStatus: runnerPlatformStatusCheck } : {}),
+          },
+          provisionedWaitPollOptions,
+        )
+      : {};
+  if (provisionedNowRepos.size > 0) {
+    const elapsedTotalS = Math.round(((provisionedWaitPollOptions.now ?? Date.now)() - provisionedWaitStartedAt) / 1000);
+    const ready = Object.values(routingProvisioned).filter((leg) => leg.status === 'created' || leg.status === 'already-present').length;
+    const pending = Object.values(routingProvisioned).filter((leg) => leg.status === 'pending').length;
+    const failed = Object.values(routingProvisioned).filter((leg) => leg.status === 'failed').length;
+    deps.log(
+      `Runner wait: ${String(provisionedNowRepos.size)} repo(s) resolved in ${String(elapsedTotalS)}s — ` +
+        `${String(ready)} ready, ${String(pending)} still pending, ${String(failed)} failed.`,
+    );
+  }
+  for (const [repo, leg] of Object.entries(routingProvisioned)) {
+    deps.log(
+      `Routing var (${repo}): ${leg.status}` +
+        (leg.status === 'failed' || leg.status === 'skipped' || leg.status === 'pending' ? ` — ${leg.reason}` : '.'),
+    );
+  }
+  return { runnerProvision: runnerProvisionResults, provisionedNow: provisionedNowRepos, routing: routingProvisioned };
+}
+
+/** Work repos the runner-ops App's install does not cover yet. Without a probe or a credential: none. */
+async function workReposUncoveredByRunnerOps(
+  repos: readonly string[],
+  runnerOpsIdentity: RunnerOpsApplyOutcome,
+  resolveKeyPath: AgentApplyDeps['resolveKeyPath'],
+  deps: Pick<FleetApplyDeps, 'installationCoversRepo' | 'log'>,
+): Promise<Set<string>> {
+  const out = new Set<string>();
+  const covers = deps.installationCoversRepo;
+  if (covers === undefined || repos.length === 0) return out;
+  if (runnerOpsIdentity.status !== 'created' && runnerOpsIdentity.status !== 'reused' && runnerOpsIdentity.status !== 'resumed-install') return out;
+  const pem = runnerOpsIdentity.status === 'created' ? runnerOpsIdentity.credentials.pem : resolveRunnerOpsVaultPem(runnerOpsIdentity, resolveKeyPath, deps.log);
+  if (pem === undefined) return out;
+  const keyPath = writeScratchPem(RUNNER_OPS_ROLE, pem);
+  try {
+    const source: TokenSource = { appId: runnerOpsIdentity.appId, installId: runnerOpsIdentity.installId, keyPath };
+    for (const repo of repos) {
+      if (!(await covers(source, repo))) out.add(repo);
+    }
+  } finally {
+    cleanupScratchPem(keyPath);
+  }
+  return out;
+}
+
+/**
+ * After the install-scope gate: give every work repo that waited for runner-ops coverage its runner,
+ * its wait and its `MACF_TRUSTED_ACTORS`, through the same function the main run uses, once the
+ * runner-ops install covers it. A repo still uncovered stays `routingAwaitingInstall`.
+ */
+export async function retryWorkRepoRouting(
+  result: FleetApplyResult,
+  manifest: FleetManifest,
+  deps: Pick<
+    FleetApplyDeps,
+    | 'buildAgentDeps'
+    | 'installationCoversRepo'
+    | 'log'
+    | 'runnerPlatformFetch'
+    | 'runnerTokenPollOptions'
+    | 'trustDeps'
+    | 'runnerPlatformEndpoint'
+    | 'observedRunnerPlatformEndpointScope'
+  >,
+): Promise<FleetApplyResult> {
+  const waiting = (result.workRepos ?? []).filter((w) => w.routingAwaitingInstall === true).map((w) => w.repo);
+  if (waiting.length === 0) return result;
+  const resolveKeyPath = deps.buildAgentDeps(deps.log).resolveKeyPath;
+  const stillUncovered = await workReposUncoveredByRunnerOps(waiting, result.runnerOps, resolveKeyPath, deps);
+  const ready = waiting.filter((r) => !stillUncovered.has(r));
+  if (ready.length === 0) return result;
+  const endpoint = resolveRunnerPlatformEndpointWithProvenance({
+    explicit: deps.runnerPlatformEndpoint,
+    manifestValue: manifest.transport.runner_platform_endpoint,
+    scopeValue: deps.observedRunnerPlatformEndpointScope,
+  }).value;
+  const leg = await provisionRunnersAndRouting(manifest, deps, result.runnerOps, resolveKeyPath, endpoint, ready);
+  const done = new Set(ready);
+  return {
+    ...result,
+    workRepos: (result.workRepos ?? []).map((w) => {
+      if (!done.has(w.repo)) return w;
+      const { routingAwaitingInstall: _done, ...rest } = w;
+      return rest;
+    }),
+    runnerProvision: { ...result.runnerProvision, ...leg.runnerProvision },
+    routing: { ...result.routing, ...leg.routing },
+  };
 }

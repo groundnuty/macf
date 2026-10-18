@@ -61,7 +61,7 @@ import {
 import type { CreateGuardDecision, CreateGuardDeps } from '../bootstrap/apply-agent.js';
 import { realCloneRepo, realCommitAndPush } from '../bootstrap/apply-repo-init.js';
 import type { AgentRepoDeps, RepoInitStepDeps } from '../bootstrap/apply-repo-init.js';
-import { applyFleet, retryWorkRepoLabels } from '../bootstrap/apply-fleet.js';
+import { applyFleet, retryWorkRepoLabels, retryWorkRepoRouting } from '../bootstrap/apply-fleet.js';
 import { realInstallationCoversRepo } from '../bootstrap/installation-covers-repo.js';
 import type { ActionsPinRepoStatus, ControlRepoSyncOutcome, FleetApplyDeps, FleetApplyResult } from '../bootstrap/apply-fleet.js';
 import type { ControlRepoDeps } from '../bootstrap/control-repo.js';
@@ -2209,6 +2209,9 @@ function runnerOpsSummaryLines(result: FleetApplyResult): string[] {
   return [`Runner-ops App:`, formatIdentityLine('runner-ops', result.runnerOps)];
 }
 
+export const WORK_REPO_ROUTING_AWAITING_INSTALL =
+  'routing not set up: the runner-ops App\'s install does not cover this repo yet. Click "Save" on its install page and re-run apply.';
+
 export const WORK_REPO_LABELS_AWAITING_INSTALL =
   'labels not created: no agent App\'s install covers this repo yet. Click "Save" on the install page and re-run apply.';
 
@@ -2219,6 +2222,10 @@ function workRepoSummaryLines(result: FleetApplyResult): string[] {
   for (const w of result.workRepos) {
     if (w.ensure === 'failed') {
       lines.push(`  ${w.repo}: FAILED — ${w.reason ?? 'could not be ensured'}`);
+      continue;
+    }
+    if (w.routingAwaitingInstall === true) {
+      lines.push(`  ${w.repo}: ${w.ensure.toUpperCase()}; ${WORK_REPO_ROUTING_AWAITING_INSTALL}`);
       continue;
     }
     if (w.labelsAwaitingInstall === true) {
@@ -2764,7 +2771,7 @@ export function fleetApplyResultToJson(
     agents: result.agents.map((rec) => ({ role: rec.role, identity: redactIdentity(rec.identity), repo_init: rec.repoInit ?? null })),
     // Additive key (same unbumped precedent as `install_scope_coverage`): omitted when the manifest declares no work repos.
     ...(result.workRepos !== undefined
-      ? { work_repos: result.workRepos.map((w) => ({ repo: w.repo, ensure: w.ensure, reason: w.reason ?? null, repo_init: w.repoInit ?? null, labels_awaiting_install: w.labelsAwaitingInstall === true })) }
+      ? { work_repos: result.workRepos.map((w) => ({ repo: w.repo, ensure: w.ensure, reason: w.reason ?? null, repo_init: w.repoInit ?? null, labels_awaiting_install: w.labelsAwaitingInstall === true, routing_awaiting_install: w.routingAwaitingInstall === true })) }
       : {}),
     vault: result.vault,
     lock_path: result.lockPath,
@@ -3182,7 +3189,7 @@ export function applyExitCode(
     result.controlRepoInit.status === 'written' && result.controlRepoInit.labels.status !== 'ok' && result.controlRepoInit.labelsGoodEnough;
   // A routing leg left `'pending'` means a runner the platform accepted never
   // became visible within the wait: that repo cannot route yet.
-  const workRepoLabelsPending = (result.workRepos ?? []).some((w) => w.labelsAwaitingInstall === true);
+  const workRepoLabelsPending = (result.workRepos ?? []).some((w) => w.labelsAwaitingInstall === true || w.routingAwaitingInstall === true);
   return versionPartial || controlRepoLabelsPending || workRepoLabelsPending || pendingRoutingRepos(result).length > 0 ? 2 : 0;
 }
 
@@ -4007,6 +4014,7 @@ export async function runBootstrapApply(
       // The gate above may have widened an agent App's install over a work repo whose labels waited
       // for it; create them now, in this run, so the summary and exit code show the final state.
       result = await retryWorkRepoLabels(result, manifest, mutate);
+      result = await retryWorkRepoRouting(result, manifest, mutate);
       const installScopeCoverageLines = formatInstallScopeCoverageLines(installScopeCoverage);
 
       // groundnuty/macf#1241 — resolve org-inherited routing-secret

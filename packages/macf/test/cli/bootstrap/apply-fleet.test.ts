@@ -19,7 +19,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { applyFleet, retryWorkRepoLabels, shouldWriteBatchedFleetLock, type FleetApplyDeps, type VaultApplyOutcome } from '../../../src/cli/bootstrap/apply-fleet.js';
+import { applyFleet, retryWorkRepoLabels, retryWorkRepoRouting, shouldWriteBatchedFleetLock, type FleetApplyDeps, type VaultApplyOutcome } from '../../../src/cli/bootstrap/apply-fleet.js';
 import type { FleetAgent, FleetLock, FleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import { parseFleetLock, parseFleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import { secretFingerprint } from '../../../src/cli/bootstrap/fleet-lock.js';
@@ -3884,6 +3884,88 @@ agents:
             expect(applyExitCode(after)).toBe(2);
             expect(formatApplyResult(after)).toContain(
               'labels not created: no agent App\'s install covers this repo yet. Click "Save" on the install page and re-run apply.',
+            );
+          });
+        });
+
+        describe('runner and trusted actors wait for runner-ops coverage', () => {
+          const routedManifest = (): FleetManifest => ({
+            ...manifestWith([CODE_AGENT]),
+            work_repos: [WORK],
+            routing: { runner: { runs_on: 'self-hosted', warm: 1 } },
+          });
+          const setup = (covers: { current: boolean }) => {
+            const manifestPath = manifestPathIn();
+            const posted: string[] = [];
+            const written: string[] = [];
+            const base = trustDepsFor({ checkRunnerUsableByRepo: async () => ({ presence: 'present' }) });
+            const deps: FleetApplyDeps = {
+              ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath, OK_LABELS_REPO_INIT),
+              installationCoversRepo: async () => covers.current,
+              trustDeps: {
+                ...base,
+                createRepoVariable: async (repo: string, name: string, value: string) => {
+                  if (name === 'MACF_TRUSTED_ACTORS') written.push(repo);
+                  return base.createRepoVariable(repo, name, value);
+                },
+              },
+              runnerPlatformEndpoint: 'http://fake-runner-platform:8088',
+              runnerPlatformFetch: (async (_url: string | URL, init?: RequestInit) => {
+                posted.push((JSON.parse(String(init?.body)) as { repo: string }).repo);
+                return new Response(JSON.stringify({ ok: true, applied: ['RunnerDeployment'] }), { status: 200 });
+              }) as typeof fetch,
+            };
+            return { manifestPath, posted, written, deps };
+          };
+
+          it('a work repo that runner-ops covers is provisioned in applyFleet', async () => {
+            const { manifestPath, posted, written, deps } = setup({ current: true });
+            const result = await applyFleet(routedManifest(), manifestPath, null, deps);
+            expect(posted).toContain(WORK);
+            expect(written).toContain(WORK);
+            expect(result.workRepos?.[0]?.routingAwaitingInstall).toBeUndefined();
+          });
+
+          it('a work repo that runner-ops does not cover gets no runner and no trusted actors yet', async () => {
+            const { manifestPath, posted, written, deps } = setup({ current: false });
+            const result = await applyFleet(routedManifest(), manifestPath, null, deps);
+            expect(posted).not.toContain(WORK);
+            expect(written).not.toContain(WORK);
+            expect(posted).toContain('groundnuty/demo-code');
+            expect(result.workRepos?.[0]).toMatchObject({ routingAwaitingInstall: true });
+            expect(result.runnerProvision[WORK]).toBeUndefined();
+            expect(result.routing[WORK]).toBeUndefined();
+          });
+
+          it('after a gate that widens runner-ops, the retry provisions exactly that repo and the exit is not 2', async () => {
+            const covers = { current: false };
+            const { manifestPath, posted, written, deps } = setup(covers);
+            const manifest = routedManifest();
+            const result = await applyFleet(manifest, manifestPath, null, deps);
+            expect(applyExitCode(result)).toBe(2);
+            posted.length = 0;
+            written.length = 0;
+            covers.current = true;
+            const after = await retryWorkRepoRouting(await retryWorkRepoLabels(result, manifest, deps), manifest, deps);
+            expect(posted).toEqual([WORK]);
+            expect(written).toEqual([WORK]);
+            expect(after.workRepos?.[0]?.routingAwaitingInstall).toBeUndefined();
+            expect(after.runnerProvision[WORK]?.status).toBe('ok');
+            expect(after.routing[WORK]?.status).toBe('created');
+            expect(applyExitCode(after)).not.toBe(2);
+            expect(formatApplyResult(after)).not.toContain('routing not set up');
+          });
+
+          it('if the gate widens nothing, the exit is 2 and the summary says to click Save and re-run', async () => {
+            const { manifestPath, posted, deps } = setup({ current: false });
+            const manifest = routedManifest();
+            const result = await applyFleet(manifest, manifestPath, null, deps);
+            posted.length = 0;
+            const after = await retryWorkRepoRouting(result, manifest, deps);
+            expect(posted).toEqual([]);
+            expect(applyExitCode(after)).toBe(2);
+            expect(formatApplyResult(after)).toContain(
+              'routing not set up: the runner-ops App\'s install does not cover this repo yet. Click "Save" on its install page and re-run apply.',
             );
           });
         });
