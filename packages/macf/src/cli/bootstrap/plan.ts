@@ -134,7 +134,7 @@ import type { FleetAgent, FleetLock, FleetManifest } from './fleet-manifest.js';
 import { effectiveFleetFingerprints } from './fleet-manifest.js';
 import { secretFingerprint } from './fleet-lock.js';
 import { controlRepoRunnerItem } from './control-repo-runner.js';
-import { buildTrustedActorsValue, controlRepoSelfHosted, deriveAppHandle, deriveControlRepoName, routerCarryingRepos } from './fleet-manifest.js';
+import { buildTrustedActorsValue, controlRepoSelfHosted, deriveAppHandle, deriveControlRepoName, routerCarryingRepos, workRepos } from './fleet-manifest.js';
 import { formatTable } from '../commands/ps.js';
 import type { VaultAgentObservation, VaultCaObservation, VaultRecipientsObservation, VaultRouterAppObservation, VaultTsOauthObservation } from './vault-read.js';
 import { countVaultAgentPresence, countVaultCaPresence } from './vault-read.js';
@@ -225,6 +225,21 @@ import { appSettingsAdvancedUrl } from './app-identity-removal.js';
 
 /** Tri-state existence signal — `'unknown'` means "not observable at plan time," NOT "absent." */
 export type Presence = 'present' | 'absent' | 'unknown';
+
+/** One `work_repos` entry as observed live. Mirrors the per-agent / control-repo router facts. */
+export interface ObservedWorkRepoState {
+  readonly presence: Presence;
+  readonly archived?: boolean;
+  readonly actionsPin?: string;
+  readonly callerSecrets?: CallerSecrets;
+  readonly callerRunsOn?: string;
+  readonly callerReadable?: boolean;
+  readonly agentConfigRoles?: readonly string[];
+  readonly trustedActors?: string;
+  readonly runnerRegistered?: Presence;
+  readonly runnerHandover?: string;
+  readonly runnerDetail?: string;
+}
 
 /** One agent's observed provisioning state. */
 export interface ObservedAgentState {
@@ -482,6 +497,11 @@ export interface ObservedState {
   readonly controlRepoRunnerRegistered?: Presence;
   readonly controlRepoRunnerHandover?: string;
   readonly controlRepoRunnerDetail?: string;
+  /**
+   * Live observation of each `work_repos` entry, keyed by `owner/repo`. Absent when the
+   * manifest declares none. Same facts the per-agent and control-repo reads carry, per repo.
+   */
+  readonly workRepos?: Readonly<Record<string, ObservedWorkRepoState>>;
   /**
    * Vault-derived per-project CA key/cert presence (DR-043 Amendment D phase
    * 3) — same undefined-vs-observed convention as {@link ObservedAgentState.vault}.
@@ -2873,6 +2893,57 @@ function macfVersionItem(agent: FleetAgent, desired: string, obs: ObservedAgentS
   };
 }
 
+
+/**
+ * The plan rows for every `work_repos:` entry: the repo itself, its routing table, its router
+ * caller's secrets, and (self-hosted fleets) its runner and trusted actors. Each row is per
+ * repo, so a gap on one work repo is never hidden behind another repo's state.
+ */
+function workRepoItems(manifest: FleetManifest, observed: ObservedState, declaredRoles: readonly string[]): readonly PlanItem[] {
+  const out: PlanItem[] = [];
+  const selfHosted = manifest.routing?.runner?.runs_on === 'self-hosted';
+  for (const repo of workRepos(manifest)) {
+    const obs = observed.workRepos?.[repo];
+    const { verb, reasonSuffix } = presenceVerb(obs?.presence ?? 'unknown', UNKNOWN_REASONS.repo);
+    out.push({ kind: 'repo', target: `work_repo:${repo}:repo`, verb, reason: `work repo "${repo}" ${reasonSuffix}`, confirm_required: false });
+    // An archived work repo is revived by apply, so the plan must show it for approval, exactly as for an agent repo.
+    if (obs?.presence === 'present' && obs.archived === true) {
+      out.push({
+        kind: 'agent_repo_archived',
+        target: `work_repo:${repo}:repo:archived`,
+        verb: 'update',
+        reason: AGENT_REPO_ARCHIVED_REASON(repo),
+        confirm_required: true,
+      });
+    }
+    // `agentConfigItem` only reads `agent.repo` for its text; the role is a placeholder.
+    const placeholder = { role: 'work-repo', repo, deploy_path: '' } as FleetAgent;
+    out.push({ ...agentConfigItem(placeholder, declaredRoles, obs?.agentConfigRoles), target: `work_repo:${repo}:agent_config` });
+    out.push(
+      routerCallerSecretsItem(repo, `work_repo:${repo}:router_caller_secrets`, obs?.callerSecrets, observed.routingSecretRepos?.[repo], observed.orgSecretRepos?.[repo], selfHosted),
+    );
+    if (selfHosted) {
+      out.push(
+        controlRepoRunnerItem(
+          manifest.metadata.name,
+          repo,
+          buildTrustedActorsValue(manifest.metadata.name, manifest.agents, manifest.routing?.runner.trusted_actors ?? []),
+          {
+            callerRunsOn: obs?.callerRunsOn,
+            callerReadable: obs?.callerReadable ?? false,
+            trustedActors: obs?.trustedActors,
+            runnerPresence: obs?.runnerRegistered,
+            runnerHandover: obs?.runnerHandover,
+            runnerDetail: obs?.runnerDetail,
+          },
+          { target: `routing:${manifest.metadata.name}:work-runner:${repo}`, label: 'Work repo' },
+        ),
+      );
+    }
+  }
+  return out;
+}
+
 /**
  * DR-043 §D6 GitOps version steering — the OTHER `versions:` field
  * (`versions.actions`): one caller repo's committed macf-actions router pin
@@ -3111,6 +3182,10 @@ export function computePlan(
     }
   }
 
+  // Work repos (`work_repos:`) — each is routed like a home repo, so it gets its own rows
+  // (never folded into the one representative row used for the fleet-level runner read).
+  for (const row of workRepoItems(manifest, observed, declaredRoles)) items.push(row);
+
   items.push(caRegistryItem(seg, observed.caRegistry, observed.vaultCa));
   for (const agent of manifest.agents) {
     items.push(caRepoItem(seg, agent.repo, observed.caRepos[agent.repo] ?? 'unknown'));
@@ -3199,6 +3274,9 @@ export function computePlan(
     // in lockstep with `apply-fleet.ts`'s reconcile enumeration of the
     // SAME function.
     items.push(actionsVersionItem(routerCarryingRepos(manifest).at(-1)!, desiredActions, observed.controlRepoActionsPin));
+    for (const repo of workRepos(manifest)) {
+      items.push(actionsVersionItem(repo, desiredActions, observed.workRepos?.[repo]?.actionsPin));
+    }
   }
 
   // groundnuty/macf#1229 / DR-043 Amendment P3 — row 4 of the reconciler
@@ -3834,11 +3912,31 @@ export function operatorInteractionBudget(gate1Clicks: number, gate2Flows: numbe
  * — that shape gets its own wording naming both counts directly, since
  * "Apps to create" would misdescribe a role whose App already exists.
  */
-export function formatOperatorInteractionLine(budget: OperatorInteractionBudget): string {
-  const { gate1Clicks, gate2Flows, bound } = budget;
+export function formatOperatorInteractionLine(budget: OperatorInteractionBudget, widenApps: readonly string[] = []): string {
+  const widen = formatWidenSaves(widenApps);
+  const { gate1Clicks, gate2Flows } = budget;
   if (gate1Clicks === 0 && gate2Flows === 0) {
-    return 'Operator interaction: none — no consent gates this run.';
+    return widen === '' ? 'Operator interaction: none — no consent gates this run.' : `Operator interaction: none to create; ${widen}.`;
   }
+  const base = formatOperatorInteractionBase(budget);
+  return widen === '' ? base : `${base} Also ${widen}.`;
+}
+
+/** The Apps whose existing install a plan's `install_scope` UPDATE rows say must grow: one "Save" click each. */
+export function installScopeWidenApps(items: readonly PlanItem[]): readonly string[] {
+  return items
+    .filter((i) => i.kind === 'install_scope' && i.verb === 'update')
+    .map((i) => i.target.split(':install_scope:')[1] ?? i.target);
+}
+
+function formatWidenSaves(apps: readonly string[]): string {
+  if (apps.length === 0) return '';
+  const n = apps.length;
+  return `${String(n)} "Save" click${n === 1 ? '' : 's'} to widen ${n === 1 ? 'an existing install' : 'existing installs'} (${apps.join(', ')})`;
+}
+
+function formatOperatorInteractionBase(budget: OperatorInteractionBudget): string {
+  const { gate1Clicks, gate2Flows, bound } = budget;
   const qualifier = bound === 'maximum' ? 'up to ' : '';
   const ceilingNote =
     bound === 'maximum'

@@ -72,8 +72,8 @@
  * unrelated reasons, never a new existence probe of its own.
  */
 import type { FleetLock, FleetManifest } from './fleet-manifest.js';
-import { deriveControlRepoName } from './fleet-manifest.js';
-import type { Presence } from './plan.js';
+import { deriveAppHandle, deriveControlRepoName, workRepos } from './fleet-manifest.js';
+import type { ObservedState, Presence } from './plan.js';
 import { installReposForIdentity, writeScratchPem, cleanupScratchPem } from './apply-agent.js';
 import { RUNNER_OPS_ROLE, deriveRunnerOpsHandle, runnerOpsNeeded } from './apply-runner-ops.js';
 import { ROUTER_APP_ROLE, deriveRouterAppHandle, routerAppInstallRepos } from './apply-router-app.js';
@@ -81,7 +81,7 @@ import type { RouterAppScope } from './apply-router-app.js';
 import { checkRepoInAppInstallation } from './registry-repo-coverage.js';
 import { splitOwnerRepo } from './observer.js';
 import type { VaultReadOptions } from './vault-read.js';
-import { readVault, vaultRouterAppId, vaultRouterAppKeyPem, vaultRunnerOpsPrivateKeyPem } from './vault-read.js';
+import { readVault, vaultAgentPrivateKeyPem, vaultRouterAppId, vaultRouterAppKeyPem, vaultRunnerOpsPrivateKeyPem } from './vault-read.js';
 import { VaultError } from './vault-write.js';
 
 // --- Declared side (pure, manifest-derived — never a second hand-typed list) ---
@@ -111,6 +111,18 @@ export function installScopeCoverageTargets(manifest: FleetManifest): readonly I
       appHandle: deriveRunnerOpsHandle(fleetName),
       expectedRepos: installReposForIdentity(RUNNER_OPS_ROLE, manifest),
     });
+  }
+  // Work repos: an agent App's set grows when a work repo is added to a fleet that already
+  // exists, so (only then) each agent App is re-checked like runner-ops. A fleet with no work
+  // repos adds no agent targets.
+  if (workRepos(manifest).length > 0) {
+    for (const agent of manifest.agents) {
+      targets.push({
+        role: agent.role,
+        appHandle: deriveAppHandle(fleetName, agent.role),
+        expectedRepos: installReposForIdentity(agent.role, manifest),
+      });
+    }
   }
   const routerRepos = routerAppInstallRepos(manifest);
   if (routerRepos.length > 0) {
@@ -198,11 +210,18 @@ export function repoExistencePresence(
   agentRepoPresence: Readonly<Record<string, Presence>>,
   controlRepoPresence: Presence,
   fullRepoName: string,
+  workRepoPresence?: Readonly<Record<string, Presence>>,
 ): Presence {
   const controlRepoFullName = `${manifest.owner.account}/${deriveControlRepoName(manifest.metadata.name)}`;
   if (fullRepoName === controlRepoFullName) return controlRepoPresence;
+  if (workRepos(manifest).includes(fullRepoName)) return workRepoPresence?.[fullRepoName] ?? 'unknown';
   const owningAgent = manifest.agents.find((a) => a.repo === fullRepoName);
   return owningAgent === undefined ? 'unknown' : (agentRepoPresence[owningAgent.role] ?? 'unknown');
+}
+
+/** Presence of each observed `work_repos` entry — the existence disambiguator `plan` and `status` hand to the coverage check. */
+export function observedWorkRepoPresence(observed: Pick<ObservedState, 'workRepos'>): Readonly<Record<string, Presence>> {
+  return Object.fromEntries(Object.entries(observed.workRepos ?? {}).map(([repo, o]) => [repo, o.presence]));
 }
 
 // --- Live probe (the real I/O leaf) ---
@@ -231,6 +250,8 @@ export async function probeInstallScopeCoverage(
 // --- Orchestration — vault read + credential resolution + probe + evaluate ---
 
 export interface InstallScopeCoverageDeps {
+  /** Observed presence of each `work_repos` entry — the existence disambiguator for those repos. */
+  readonly workRepoPresence?: Readonly<Record<string, Presence>>;
   readonly probeFn?: (appId: string, keyPath: string, owner: string, repo: string) => Promise<Presence>;
   readonly readVaultFn?: (opts: VaultReadOptions) => Promise<Readonly<Record<string, string>>>;
   /**
@@ -272,7 +293,12 @@ export interface InstallScopeCoverageDeps {
 function resolveCoverageCredential(role: string, fleetName: string, lock: FleetLock | null, raw: Readonly<Record<string, string>>): { readonly appId: string; readonly pem: string } | undefined {
   const lockAppId = lock?.agents.find((a) => a.role === role)?.app_id;
   const appId = lockAppId ?? (role === ROUTER_APP_ROLE ? vaultRouterAppId(raw) : undefined);
-  const pem = role === RUNNER_OPS_ROLE ? vaultRunnerOpsPrivateKeyPem(raw, fleetName) : role === ROUTER_APP_ROLE ? vaultRouterAppKeyPem(raw) : undefined;
+  const pem =
+    role === RUNNER_OPS_ROLE
+      ? vaultRunnerOpsPrivateKeyPem(raw, fleetName)
+      : role === ROUTER_APP_ROLE
+        ? vaultRouterAppKeyPem(raw)
+        : vaultAgentPrivateKeyPem(raw, fleetName, role);
   return appId === undefined || pem === undefined ? undefined : { appId, pem };
 }
 
@@ -344,7 +370,7 @@ export async function computeInstallScopeCoverage(
     const keyPath = writeScratchPem(target.role, credential.pem);
     try {
       const probed = await probeInstallScopeCoverage(credential.appId, keyPath, target.expectedRepos, probeFn);
-      const existence = (repo: string): Presence => repoExistencePresence(manifest, agentRepoPresence, controlRepoPresence, repo);
+      const existence = (repo: string): Presence => repoExistencePresence(manifest, agentRepoPresence, controlRepoPresence, repo, deps?.workRepoPresence);
       let result = evaluateInstallScopeCoverage(target, existence, probed);
       // groundnuty/macf#1220 — the ACT half, gated on this run's OWN
       // just-confirmed 'drift' (never 'covered'/'unknown' — see

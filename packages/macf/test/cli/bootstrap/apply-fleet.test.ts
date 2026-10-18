@@ -19,7 +19,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { applyFleet, shouldWriteBatchedFleetLock, type FleetApplyDeps, type VaultApplyOutcome } from '../../../src/cli/bootstrap/apply-fleet.js';
+import { applyFleet, retryWorkRepoLabels, retryWorkRepoRouting, shouldWriteBatchedFleetLock, type FleetApplyDeps, type VaultApplyOutcome } from '../../../src/cli/bootstrap/apply-fleet.js';
 import type { FleetAgent, FleetLock, FleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import { parseFleetLock, parseFleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import { secretFingerprint } from '../../../src/cli/bootstrap/fleet-lock.js';
@@ -3712,6 +3712,324 @@ agents:
           }
         });
       }
+
+      // --- `work_repos:` — shared repos routed exactly like a home repo. ---
+      describe('work_repos', () => {
+        const WORK = 'groundnuty/demo-experiments';
+        const workManifest = (): FleetManifest => ({
+          ...manifestWith([CODE_AGENT, SCI_AGENT]),
+          routing: { runner: { runs_on: 'self-hosted', warm: 1 } },
+          work_repos: [WORK],
+        });
+
+        it('a declared work repo gets repo-init (self-hosted, all roles, a created App’s token), the routing secrets, a runner POST and MACF_TRUSTED_ACTORS', async () => {
+          const manifestPath = manifestPathIn();
+          const manifest = workManifest();
+          const provisioned: string[] = [];
+          const trusted: Record<string, string> = {};
+          const initCalls: { repo: string | undefined; agents: string | undefined; runsOn: string | undefined; appId: string | undefined; pem: string | undefined }[] = [];
+          const repoInitDeps: RepoInitStepDeps = {
+            cloneRepo: async () => {},
+            commitAndPush: async () => 'pushed',
+            repoInit: async (_dir, opts) => {
+              initCalls.push({
+                repo: opts.repo,
+                agents: opts.agents,
+                runsOn: opts.routingRunnerRunsOn,
+                appId: opts.tokenSource?.appId,
+                pem: opts.tokenSource !== undefined ? readFileSync(opts.tokenSource.keyPath, 'utf-8') : undefined,
+              });
+              return { workflow: 'created', config: 'created', labels: { status: 'ok', created: [], existed: [] } };
+            },
+          };
+          const base = trustDepsFor({ checkRunnerUsableByRepo: async () => ({ presence: 'present' }) });
+          const deps: FleetApplyDeps = {
+            ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath, repoInitDeps),
+            trustDeps: {
+              ...base,
+              createRepoVariable: async (repo: string, name: string, value: string) => {
+                if (name === 'MACF_TRUSTED_ACTORS') trusted[repo] = value;
+                return base.createRepoVariable(repo, name, value);
+              },
+            },
+            runnerPlatformEndpoint: 'http://fake-runner-platform:8088',
+            runnerPlatformFetch: (async (_url: string | URL, init?: RequestInit) => {
+              provisioned.push((JSON.parse(String(init?.body)) as { repo: string }).repo);
+              return new Response(JSON.stringify({ ok: true, applied: [] }), { status: 200 });
+            }) as typeof fetch,
+          };
+
+          const result = await applyFleet(manifest, manifestPath, null, deps);
+
+          const call = initCalls.find((c) => c.repo === WORK);
+          expect(call?.agents).toBe('code-agent,science-agent');
+          expect(call?.runsOn).toBe('self-hosted');
+          // The label token comes from an agent App this run created — never the operator's own.
+          expect(call?.appId).toBe('app-code-agent');
+          expect(call?.pem).toBe('SENTINEL-PEM-code-agent');
+          expect(result.workRepos?.[0]).toMatchObject({ repo: WORK, ensure: 'created', repoInit: { status: 'applied' } });
+          expect(provisioned).toContain(WORK);
+          expect(trusted[WORK]).toBe(trusted['groundnuty/demo-code']);
+          expect(trusted[WORK]).toContain('demo-fleet-code-agent[bot]');
+          for (const name of ALL_ROUTING_SECRET_NAMES) {
+            expect(Object.keys(result.routingSecrets[name] ?? {}), name).toContain(WORK);
+          }
+          expect(Object.keys(result.routingBundle)).toContain(WORK);
+          expect(applyExitCode(result)).not.toBe(1);
+        });
+
+        it('an absent work repo is created private and blank (no template); a present one is reused', async () => {
+          const manifestPath = manifestPathIn();
+          const created: { repo: string; template: string | undefined }[] = [];
+          const deps = (present: boolean): FleetApplyDeps => ({
+            ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath, OK_LABELS_REPO_INIT),
+            agentRepoDeps: {
+              ...agentRepoDepsFor(),
+              checkMeta: async (repo: string) => (present && repo === WORK ? { presence: 'present', archived: false } : { presence: 'absent' }),
+              createRepo: async (repo, opts) => {
+                created.push({ repo, template: opts?.template });
+              },
+            },
+          });
+          const first = await applyFleet(workManifest(), manifestPath, null, deps(false));
+          expect(created.find((c) => c.repo === WORK)).toEqual({ repo: WORK, template: undefined });
+          expect(first.workRepos?.[0]?.ensure).toBe('created');
+          created.length = 0;
+          const second = await applyFleet(workManifest(), manifestPath, null, deps(true));
+          expect(created.find((c) => c.repo === WORK)).toBeUndefined();
+          expect(second.workRepos?.[0]?.ensure).toBe('present');
+        });
+
+        it('a work repo that cannot be created is a failed leg naming the repo, exit 1, and agents still provision', async () => {
+          const manifestPath = manifestPathIn();
+          const logs: string[] = [];
+          const deps: FleetApplyDeps = {
+            ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath, OK_LABELS_REPO_INIT),
+            log: (line: string) => logs.push(line),
+            agentRepoDeps: {
+              ...agentRepoDepsFor(),
+              createRepo: async (repo: string) => {
+                if (repo === WORK) throw new Error('gh: HTTP 403 creating repo');
+              },
+            },
+          };
+          const result = await applyFleet(workManifest(), manifestPath, null, deps);
+          expect(result.workRepos?.[0]).toMatchObject({ repo: WORK, ensure: 'failed' });
+          expect(result.workRepos?.[0]?.reason).toContain('403');
+          expect(logs.some((l) => l.includes(WORK) && l.includes('FAILED'))).toBe(true);
+          expect(result.agents.every((a) => a.identity.status === 'created')).toBe(true);
+          expect(applyExitCode(result)).toBe(1);
+          expect(formatApplyResult(result)).toContain(WORK);
+        });
+
+        describe('labels and the install widen', () => {
+          const plainManifest = (): FleetManifest => ({ ...manifestWith([CODE_AGENT]), work_repos: [WORK] });
+          const setup = (covers: { current: boolean }) => {
+            const manifestPath = manifestPathIn();
+            const inits: { repo: string | undefined; appId: string | undefined }[] = [];
+            const repoInitDeps: RepoInitStepDeps = {
+              cloneRepo: async () => {},
+              commitAndPush: async () => 'pushed',
+              repoInit: async (_dir, opts) => {
+                inits.push({ repo: opts.repo, appId: opts.tokenSource?.appId });
+                return {
+                  workflow: 'created',
+                  config: 'created',
+                  labels: opts.tokenSource !== undefined ? { status: 'ok', created: [], existed: [] } : { status: 'skipped', reason: 'no token' },
+                };
+              },
+            };
+            const deps: FleetApplyDeps = {
+              ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath, repoInitDeps),
+              installationCoversRepo: async () => covers.current,
+            };
+            return { manifestPath, inits, deps };
+          };
+
+          it('an App whose install already covers the work repo makes its labels during applyFleet', async () => {
+            const { manifestPath, inits, deps } = setup({ current: true });
+            const result = await applyFleet(plainManifest(), manifestPath, null, deps);
+            expect(inits.find((c) => c.repo === WORK)?.appId).toBe('app-code-agent');
+            expect(result.workRepos?.[0]?.labelsAwaitingInstall).toBeUndefined();
+          });
+
+          it('with no covering App the labels are awaiting-install and not attempted', async () => {
+            const { manifestPath, inits, deps } = setup({ current: false });
+            const result = await applyFleet(plainManifest(), manifestPath, null, deps);
+            expect(inits.find((c) => c.repo === WORK)?.appId).toBeUndefined();
+            expect(result.workRepos?.[0]).toMatchObject({ labelsAwaitingInstall: true });
+            expect(result.workRepos?.[0]?.repoInit?.status).toBe('applied');
+          });
+
+          it('after a gate that widens an App, the retry creates the labels and the exit is not 2', async () => {
+            const covers = { current: false };
+            const { manifestPath, inits, deps } = setup(covers);
+            const manifest = plainManifest();
+            const result = await applyFleet(manifest, manifestPath, null, deps);
+            expect(applyExitCode(result)).toBe(2);
+            covers.current = true;
+            const after = await retryWorkRepoLabels(result, manifest, deps);
+            expect(inits.filter((c) => c.repo === WORK).at(-1)?.appId).toBe('app-code-agent');
+            expect(after.workRepos?.[0]?.labelsAwaitingInstall).toBeUndefined();
+            expect(after.workRepos?.[0]?.repoInit).toMatchObject({ status: 'applied', labels: { status: 'ok' } });
+            expect(applyExitCode(after)).not.toBe(2);
+            expect(formatApplyResult(after)).not.toContain('labels not created');
+          });
+
+          it('if the gate widens nothing, the exit is 2 and the summary says to click Save and re-run', async () => {
+            const { manifestPath, deps } = setup({ current: false });
+            const manifest = plainManifest();
+            const result = await applyFleet(manifest, manifestPath, null, deps);
+            const after = await retryWorkRepoLabels(result, manifest, deps);
+            expect(applyExitCode(after)).toBe(2);
+            expect(formatApplyResult(after)).toContain(
+              'labels not created: no agent App\'s install covers this repo yet. Click "Save" on the install page and re-run apply.',
+            );
+          });
+        });
+
+        describe('runner and trusted actors wait for runner-ops coverage', () => {
+          const routedManifest = (): FleetManifest => ({
+            ...manifestWith([CODE_AGENT]),
+            work_repos: [WORK],
+            routing: { runner: { runs_on: 'self-hosted', warm: 1 } },
+          });
+          const setup = (covers: { current: boolean }) => {
+            const manifestPath = manifestPathIn();
+            const posted: string[] = [];
+            const written: string[] = [];
+            const base = trustDepsFor({ checkRunnerUsableByRepo: async () => ({ presence: 'present' }) });
+            const deps: FleetApplyDeps = {
+              ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath, OK_LABELS_REPO_INIT),
+              installationCoversRepo: async () => covers.current,
+              trustDeps: {
+                ...base,
+                createRepoVariable: async (repo: string, name: string, value: string) => {
+                  if (name === 'MACF_TRUSTED_ACTORS') written.push(repo);
+                  return base.createRepoVariable(repo, name, value);
+                },
+              },
+              runnerPlatformEndpoint: 'http://fake-runner-platform:8088',
+              runnerPlatformFetch: (async (_url: string | URL, init?: RequestInit) => {
+                posted.push((JSON.parse(String(init?.body)) as { repo: string }).repo);
+                return new Response(JSON.stringify({ ok: true, applied: ['RunnerDeployment'] }), { status: 200 });
+              }) as typeof fetch,
+            };
+            return { manifestPath, posted, written, deps };
+          };
+
+          it('a work repo that runner-ops covers is provisioned in applyFleet', async () => {
+            const { manifestPath, posted, written, deps } = setup({ current: true });
+            const result = await applyFleet(routedManifest(), manifestPath, null, deps);
+            expect(posted).toContain(WORK);
+            expect(written).toContain(WORK);
+            expect(result.workRepos?.[0]?.routingAwaitingInstall).toBeUndefined();
+          });
+
+          it('a work repo that runner-ops does not cover gets no runner and no trusted actors yet', async () => {
+            const { manifestPath, posted, written, deps } = setup({ current: false });
+            const result = await applyFleet(routedManifest(), manifestPath, null, deps);
+            expect(posted).not.toContain(WORK);
+            expect(written).not.toContain(WORK);
+            expect(posted).toContain('groundnuty/demo-code');
+            expect(result.workRepos?.[0]).toMatchObject({ routingAwaitingInstall: true });
+            expect(result.runnerProvision[WORK]).toBeUndefined();
+            expect(result.routing[WORK]).toBeUndefined();
+          });
+
+          it('the retry reconciles a stale MACF_TRUSTED_ACTORS already present on the work repo', async () => {
+            const covers = { current: false };
+            const { manifestPath, deps } = setup(covers);
+            const updated: Array<{ repo: string; value: string }> = [];
+            const staleDeps: FleetApplyDeps = {
+              ...deps,
+              trustDeps: {
+                ...deps.trustDeps!,
+                checkRepoPresence: async (_repo: string, name: string) => (name === 'MACF_TRUSTED_ACTORS' ? 'present' : 'absent'),
+                readRepoVariableValue: async () => 'stale-only[bot]',
+                updateRepoVariable: async (repo: string, _name: string, value: string) => {
+                  updated.push({ repo, value });
+                  return 'updated';
+                },
+                confirmReconciliation: async () => true,
+              },
+            };
+            const manifest = routedManifest();
+            const result = await applyFleet(manifest, manifestPath, null, staleDeps);
+            updated.length = 0;
+            covers.current = true;
+            const after = await retryWorkRepoRouting(result, manifest, staleDeps);
+            expect(updated.map((u) => u.repo)).toContain(WORK);
+            expect(updated.find((u) => u.repo === WORK)?.value).not.toBe('stale-only[bot]');
+            expect(after.routing[WORK]?.status).toBe('updated');
+          });
+
+          it('with no runner platform configured, the retry still writes MACF_TRUSTED_ACTORS for an existing usable runner', async () => {
+            const covers = { current: false };
+            const { manifestPath, written, deps } = setup(covers);
+            const noPlatform: FleetApplyDeps = { ...deps, runnerPlatformEndpoint: undefined };
+            const manifest = routedManifest();
+            const result = await applyFleet(manifest, manifestPath, null, noPlatform);
+            expect(result.workRepos?.[0]).toMatchObject({ routingAwaitingInstall: true });
+            written.length = 0;
+            covers.current = true;
+            const after = await retryWorkRepoRouting(result, manifest, noPlatform);
+            expect(written).toContain(WORK);
+            expect(after.routing[WORK]?.status).toBe('created');
+            expect(after.workRepos?.[0]?.routingAwaitingInstall).toBeUndefined();
+          });
+
+          it('also waits when the control repo routes self-hosted (control_repo_runs_on)', async () => {
+            const { manifestPath, posted, written, deps } = setup({ current: false });
+            const manifest: FleetManifest = {
+              ...routedManifest(),
+              routing: { runner: { runs_on: 'self-hosted', warm: 1 }, control_repo_runs_on: 'self-hosted' },
+            };
+            const result = await applyFleet(manifest, manifestPath, null, deps);
+            expect(posted).not.toContain(WORK);
+            expect(written).not.toContain(WORK);
+            expect(result.workRepos?.[0]).toMatchObject({ routingAwaitingInstall: true });
+          });
+
+          it('after a gate that widens runner-ops, the retry provisions exactly that repo and the exit is not 2', async () => {
+            const covers = { current: false };
+            const { manifestPath, posted, written, deps } = setup(covers);
+            const manifest = routedManifest();
+            const result = await applyFleet(manifest, manifestPath, null, deps);
+            expect(applyExitCode(result)).toBe(2);
+            posted.length = 0;
+            written.length = 0;
+            covers.current = true;
+            const after = await retryWorkRepoRouting(await retryWorkRepoLabels(result, manifest, deps), manifest, deps);
+            expect(posted).toEqual([WORK]);
+            expect(written).toEqual([WORK]);
+            expect(after.workRepos?.[0]?.routingAwaitingInstall).toBeUndefined();
+            expect(after.runnerProvision[WORK]?.status).toBe('ok');
+            expect(after.routing[WORK]?.status).toBe('created');
+            expect(applyExitCode(after)).not.toBe(2);
+            expect(formatApplyResult(after)).not.toContain('routing not set up');
+          });
+
+          it('if the gate widens nothing, the exit is 2 and the summary says to click Save and re-run', async () => {
+            const { manifestPath, posted, deps } = setup({ current: false });
+            const manifest = routedManifest();
+            const result = await applyFleet(manifest, manifestPath, null, deps);
+            posted.length = 0;
+            const after = await retryWorkRepoRouting(result, manifest, deps);
+            expect(posted).toEqual([]);
+            expect(applyExitCode(after)).toBe(2);
+            expect(formatApplyResult(after)).toContain(
+              'routing not set up: the runner-ops App\'s install does not cover this repo yet. Click "Save" on its install page and re-run apply.',
+            );
+          });
+        });
+
+        it('a fleet without work_repos reports no work-repo record and provisions exactly as before', async () => {
+          const manifestPath = manifestPathIn();
+          const result = await applyFleet(manifestWith([CODE_AGENT]), manifestPath, null, baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath, OK_LABELS_REPO_INIT));
+          expect(result.workRepos).toBeUndefined();
+        });
+      });
 
       it('DECISIVE run-2: a REUSED runner-ops outcome still POSTs WITH credentials, sourced from the vault-backed resolveKeyPath fallback (groundnuty/macf#943 follow-up — the run-2 credential-less-POST regression)', async () => {
         const manifestPath = manifestPathIn();

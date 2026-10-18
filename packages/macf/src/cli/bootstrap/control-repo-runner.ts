@@ -47,8 +47,11 @@ export function controlRepoRunnerItem(
   controlRepo: string,
   desiredTrustedActors: string,
   obs: ControlRepoRunnerObservation,
+  /** A work repo reuses this row under its own target and label. */
+  naming?: { readonly target: string; readonly label: string },
 ): PlanItem {
-  const target = `routing:${fleetName}:control-runner`;
+  const target = naming?.target ?? `routing:${fleetName}:control-runner`;
+  const label = naming?.label ?? 'Control repo';
   const gaps: string[] = [];
   if (!obs.callerReadable) {
     gaps.push(`the installed router caller on "${controlRepo}" could not be read, so "runner-runs-on: self-hosted" is unconfirmed`);
@@ -76,7 +79,7 @@ export function controlRepoRunnerItem(
       kind: 'routing',
       target,
       verb: 'noop',
-      reason: `Control repo "${controlRepo}" runner class: self-hosted — caller, MACF_TRUSTED_ACTORS and a usable runner are all in place.`,
+      reason: `${label} "${controlRepo}" runner class: self-hosted — caller, MACF_TRUSTED_ACTORS and a usable runner are all in place.`,
       confirm_required: false,
     };
   }
@@ -85,8 +88,8 @@ export function controlRepoRunnerItem(
     target,
     verb: 'update',
     reason:
-      `Control repo "${controlRepo}" is declared self-hosted but is not ready: ${gaps.join('; ')}. ` +
-      'Until all three exist, routing through the control repo FAILS or queues — it does not fall back to a hosted runner.',
+      `${label} "${controlRepo}" is declared self-hosted but is not ready: ${gaps.join('; ')}. ` +
+      'Until all three exist, routing through this repo FAILS or queues — it does not fall back to a hosted runner.',
     confirm_required: varDiffers,
   };
 }

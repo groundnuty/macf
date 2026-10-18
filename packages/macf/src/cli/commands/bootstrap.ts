@@ -25,6 +25,7 @@ import {
   formatOperatorInteractionLine,
   formatPlanText,
   operatorInteractionBudget,
+  installScopeWidenApps,
   operatorInteractionToJson,
 } from '../bootstrap/plan.js';
 import type { AgentRegistryObservation } from '../bootstrap/observer.js';
@@ -41,7 +42,7 @@ import { RUNNER_PLATFORM_ENDPOINT_ENV_VAR, registerRunnerPlatformEndpointFileTie
 import type { OperatorInputSource } from '../bootstrap/operator-secrets-file.js';
 import { formatOperatorInputProvenanceLine, readOperatorSecretsFile, resolveOperatorInput } from '../bootstrap/operator-secrets-file.js';
 import type { Presence } from '../bootstrap/plan.js';
-import { computeInstallScopeCoverage, formatInstallScopeCoverageLines, installScopeCoverageEntryToJson } from '../bootstrap/install-scope-coverage.js';
+import { computeInstallScopeCoverage, formatInstallScopeCoverageLines, installScopeCoverageEntryToJson, observedWorkRepoPresence } from '../bootstrap/install-scope-coverage.js';
 import { reconcileFederatedTrustVerdicts, federatedTrustNotices } from '../bootstrap/apply-federated-trust.js';
 
 export interface RunBootstrapPlanOptions {
@@ -281,6 +282,7 @@ export async function runBootstrapPlan(
       Object.fromEntries(Object.entries(observed.agents).map(([role, a]) => [role, a.repo])) as Readonly<Record<string, Presence>>,
       observed.controlRepoPresence,
       vaultOpts,
+      { workRepoPresence: observedWorkRepoPresence(observed) },
     );
     const plan = computePlan(manifest, observed, Object.values(installScopeCoverage));
     // groundnuty/macf#880 — the operator's consent-click budget, projected
@@ -358,7 +360,11 @@ export async function runBootstrapPlan(
         JSON.stringify(
           {
             ...(fleetPlanToJson(plan) as Record<string, unknown>),
-            operator_interaction: operatorInteractionToJson(budget),
+            operator_interaction: {
+              ...(operatorInteractionToJson(budget) as Record<string, unknown>),
+              // Additive: Apps whose existing install needs one "Save" click to widen. Omitted when none.
+              ...(installScopeWidenApps(plan.items).length > 0 ? { widen_installs: installScopeWidenApps(plan.items) } : {}),
+            },
             advertise_host_drift: advertiseHostDrift.map(advertiseHostDriftEntryToJson),
             operator_inputs: operatorInputs,
             // groundnuty/macf#1309 — `lock === null` alone can't tell
@@ -378,7 +384,7 @@ export async function runBootstrapPlan(
     } else {
       console.log(formatPlanText(plan));
       console.log('');
-      console.log(formatOperatorInteractionLine(budget));
+      console.log(formatOperatorInteractionLine(budget, installScopeWidenApps(plan.items)));
       console.log('');
       console.log(`fleet.lock source: ${observed.lockSource ?? 'unreadable'}`);
       console.log('');

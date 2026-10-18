@@ -29,7 +29,7 @@ import { promisify } from 'node:util';
 import { createInterface } from 'node:readline';
 import { join, resolve as resolvePath } from 'node:path';
 import type { FleetManifest } from '../bootstrap/fleet-manifest.js';
-import { controlRepoSelfHosted, deriveAppHandle, deriveControlRepoName, parseFleetManifest } from '../bootstrap/fleet-manifest.js';
+import { controlRepoSelfHosted, deriveAppHandle, deriveControlRepoName, parseFleetManifest, workRepos } from '../bootstrap/fleet-manifest.js';
 import type { FleetObserverFn, FleetPlan, FleetPlanFailure, ObservedState, OperatorInteractionBound, Presence, UnimplementedApplyItem } from '../bootstrap/plan.js';
 import { computeInstallScopeCoverage, formatInstallScopeCoverageLines, hasInstallScopeCoverageDrift, installScopeCoverageEntryToJson } from '../bootstrap/install-scope-coverage.js';
 import type { InstallScopeCoverageEntry, InstallScopeCoverageTarget } from '../bootstrap/install-scope-coverage.js';
@@ -61,7 +61,8 @@ import {
 import type { CreateGuardDecision, CreateGuardDeps } from '../bootstrap/apply-agent.js';
 import { realCloneRepo, realCommitAndPush } from '../bootstrap/apply-repo-init.js';
 import type { AgentRepoDeps, RepoInitStepDeps } from '../bootstrap/apply-repo-init.js';
-import { applyFleet } from '../bootstrap/apply-fleet.js';
+import { applyFleet, retryWorkRepoLabels, retryWorkRepoRouting } from '../bootstrap/apply-fleet.js';
+import { realInstallationCoversRepo } from '../bootstrap/installation-covers-repo.js';
 import type { ActionsPinRepoStatus, ControlRepoSyncOutcome, FleetApplyDeps, FleetApplyResult } from '../bootstrap/apply-fleet.js';
 import type { ControlRepoDeps } from '../bootstrap/control-repo.js';
 import { controlRepoFullName } from '../bootstrap/control-repo.js';
@@ -1269,12 +1270,31 @@ const REAL_ROUTING_SECRETS_PUBLISH_DEPS: RoutingSecretsPublishDeps = {
 function actionsPinsFromObserved(
   manifest: FleetManifest,
   observed: ObservedState,
-): { readonly agents: Readonly<Record<string, string | undefined>>; readonly controlRepo: string | undefined } {
+): {
+  readonly agents: Readonly<Record<string, string | undefined>>;
+  readonly controlRepo: string | undefined;
+  readonly workRepos: Readonly<Record<string, string | undefined>>;
+} {
   const agents: Record<string, string | undefined> = {};
   for (const agent of manifest.agents) {
     agents[agent.role] = observed.agents[agent.role]?.actionsPin;
   }
-  return { agents, controlRepo: observed.controlRepoActionsPin };
+  const work: Record<string, string | undefined> = {};
+  for (const repo of workRepos(manifest)) work[repo] = observed.workRepos?.[repo]?.actionsPin;
+  return { agents, controlRepo: observed.controlRepoActionsPin, workRepos: work };
+}
+
+/** Work repos whose installed router caller must be rewritten (a secrets gap, or the runner input drifted). Pure projection of the observed state. */
+export function callerSecretRewritesForWorkRepos(manifest: FleetManifest, observed: ObservedState): Readonly<Record<string, boolean>> {
+  const selfHosted = manifest.routing?.runner?.runs_on === 'self-hosted';
+  const out: Record<string, boolean> = {};
+  for (const repo of workRepos(manifest)) {
+    const obs = observed.workRepos?.[repo];
+    if (obs === undefined || obs.presence !== 'present') continue;
+    const verdict = evaluateCallerRoutingForm(obs.callerSecrets, observed.routingSecretRepos?.[repo], selfHosted, observed.orgSecretRepos?.[repo], repo.split('/')[0]);
+    out[repo] = (verdict.status === 'incomplete' && verdict.callerRewriteFixes) || runnerInputDrift(selfHosted, obs.callerReadable === true, obs.callerRunsOn);
+  }
+  return out;
 }
 
 /**
@@ -2189,6 +2209,36 @@ function runnerOpsSummaryLines(result: FleetApplyResult): string[] {
   return [`Runner-ops App:`, formatIdentityLine('runner-ops', result.runnerOps)];
 }
 
+export const WORK_REPO_ROUTING_AWAITING_INSTALL =
+  'routing not set up: the runner-ops App\'s install does not cover this repo yet. Click "Save" on its install page and re-run apply.';
+
+export const WORK_REPO_LABELS_AWAITING_INSTALL =
+  'labels not created: no agent App\'s install covers this repo yet. Click "Save" on the install page and re-run apply.';
+
+/** One line per `work_repos` entry: ensured or not, and the repo-init outcome. `[]` when none are declared. */
+function workRepoSummaryLines(result: FleetApplyResult): string[] {
+  if (result.workRepos === undefined) return [];
+  const lines = ['Work repos:'];
+  for (const w of result.workRepos) {
+    if (w.ensure === 'failed') {
+      lines.push(`  ${w.repo}: FAILED — ${w.reason ?? 'could not be ensured'}`);
+      continue;
+    }
+    if (w.routingAwaitingInstall === true) {
+      lines.push(`  ${w.repo}: ${w.ensure.toUpperCase()}; ${WORK_REPO_ROUTING_AWAITING_INSTALL}`);
+      continue;
+    }
+    if (w.labelsAwaitingInstall === true) {
+      lines.push(`  ${w.repo}: ${w.ensure.toUpperCase()}; ${WORK_REPO_LABELS_AWAITING_INSTALL}`);
+      continue;
+    }
+    const init =
+      w.repoInit === undefined ? 'repo-init not run' : w.repoInit.status === 'failed' ? `repo-init FAILED — ${w.repoInit.reason}` : `repo-init applied (labels ${w.repoInit.labels.status})`;
+    lines.push(`  ${w.repo}: ${w.ensure.toUpperCase()}; ${init}`);
+  }
+  return lines;
+}
+
 function agentSummaryLines(result: FleetApplyResult): string[] {
   const lines: string[] = [];
   for (const rec of result.agents) {
@@ -2460,6 +2510,7 @@ export function formatApplyResult(
     '',
     'Agent identities:',
     ...agentSummaryLines(result),
+    ...workRepoSummaryLines(result),
     '',
   ];
   switch (result.vault.status) {
@@ -2718,6 +2769,10 @@ export function fleetApplyResultToJson(
     // `FleetApplyResult.runnerOps` being its own field.
     runner_ops: redactIdentity(result.runnerOps),
     agents: result.agents.map((rec) => ({ role: rec.role, identity: redactIdentity(rec.identity), repo_init: rec.repoInit ?? null })),
+    // Additive key (same unbumped precedent as `install_scope_coverage`): omitted when the manifest declares no work repos.
+    ...(result.workRepos !== undefined
+      ? { work_repos: result.workRepos.map((w) => ({ repo: w.repo, ensure: w.ensure, reason: w.reason ?? null, repo_init: w.repoInit ?? null, labels_awaiting_install: w.labelsAwaitingInstall === true, routing_awaiting_install: w.routingAwaitingInstall === true })) }
+      : {}),
     vault: result.vault,
     lock_path: result.lockPath,
     identity_changes: result.identityChanges.map((c) => ({ ...c })),
@@ -2967,6 +3022,9 @@ export function applyExitCode(
   const controlRepoInitBad =
     result.controlRepoInit.status === 'failed' ||
     (result.controlRepoInit.status === 'written' && !result.controlRepoInit.labelsGoodEnough);
+  // A work repo that could not be ensured, or whose repo-init failed, leaves a place the agents
+  // work in unroutable — a failed leg that names the repo (see the apply log).
+  const workRepoBad = (result.workRepos ?? []).some((w) => w.ensure === 'failed' || w.repoInit?.status === 'failed');
   const agentBad = result.agents.some(
     (rec) =>
       rec.identity.status === 'failed' ||
@@ -3089,6 +3147,7 @@ export function applyExitCode(
     controlRepoSyncBad ||
     controlRepoInitBad ||
     agentBad ||
+    workRepoBad ||
     runnerOpsBad ||
     routerAppBad ||
     result.vault.status === 'failed' ||
@@ -3130,7 +3189,8 @@ export function applyExitCode(
     result.controlRepoInit.status === 'written' && result.controlRepoInit.labels.status !== 'ok' && result.controlRepoInit.labelsGoodEnough;
   // A routing leg left `'pending'` means a runner the platform accepted never
   // became visible within the wait: that repo cannot route yet.
-  return versionPartial || controlRepoLabelsPending || pendingRoutingRepos(result).length > 0 ? 2 : 0;
+  const workRepoLabelsPending = (result.workRepos ?? []).some((w) => w.labelsAwaitingInstall === true || w.routingAwaitingInstall === true);
+  return versionPartial || controlRepoLabelsPending || workRepoLabelsPending || pendingRoutingRepos(result).length > 0 ? 2 : 0;
 }
 
 /** Repos whose `MACF_TRUSTED_ACTORS` leg ended `'pending'` (runner not visible yet). */
@@ -3657,6 +3717,9 @@ export async function runBootstrapApply(
       observedActionsPins: mutateDeps?.observedActionsPins ?? actionsPinsFromObserved(manifest, observed),
       callerSecretRewrites: mutateDeps?.callerSecretRewrites ?? callerSecretRewritesFromObserved(manifest, observed),
       callerSecretRewriteControl: mutateDeps?.callerSecretRewriteControl ?? controlCallerSecretRewriteFromObserved(manifest, observed),
+      callerSecretRewriteWork: mutateDeps?.callerSecretRewriteWork ?? callerSecretRewritesForWorkRepos(manifest, observed),
+      // Tests that inject their own mutate deps leave the probe absent; production gets the real one.
+      installationCoversRepo: mutateDeps !== undefined ? mutateDeps.installationCoversRepo : realInstallationCoversRepo,
       // groundnuty/macf#1211 — same "merged on TOP, never through
       // resolveMutateDeps's own param list" precedent as observedActionsPins
       // immediately above: the RAW scope-variable value, already read once
@@ -3684,7 +3747,7 @@ export async function runBootstrapApply(
       }
 
       const priorLock = mutate.readPriorLock(manifestPath);
-      const result = await applyFleet(manifest, manifestPath, priorLock, mutate);
+      let result = await applyFleet(manifest, manifestPath, priorLock, mutate);
 
       // groundnuty/macf#1272 (DR-043 Amendment P3 execution wiring) — runs
       // right after the GitHub phase above (`applyFleet`), on the SAME
@@ -3940,8 +4003,18 @@ export async function runBootstrapApply(
         // it) via the live per-repo probe, which itself only runs when
         // `vaultOpts !== undefined` — so this is inert on the vault-absent
         // path, identical to the pre-#1268 behavior on that path.
-        { onDrift: onInstallScopeDrift },
+        // `workRepoPresence`: what THIS run just confirmed, never the pre-run observation.
+        {
+          onDrift: onInstallScopeDrift,
+          workRepoPresence: Object.fromEntries(
+            (result.workRepos ?? []).map((w) => [w.repo, w.ensure === 'failed' ? 'unknown' : 'present']),
+          ) as Readonly<Record<string, Presence>>,
+        },
       );
+      // The gate above may have widened an agent App's install over a work repo whose labels waited
+      // for it; create them now, in this run, so the summary and exit code show the final state.
+      result = await retryWorkRepoLabels(result, manifest, mutate);
+      result = await retryWorkRepoRouting(result, manifest, mutate);
       const installScopeCoverageLines = formatInstallScopeCoverageLines(installScopeCoverage);
 
       // groundnuty/macf#1241 — resolve org-inherited routing-secret

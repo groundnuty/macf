@@ -207,6 +207,7 @@ EOF
 - **`routing.runner`.** Every routing job on the agent repos runs on the fleet's own runner, never on GitHub-hosted minutes. A job with no runner waits; it never falls back (§6.5).
 - **`trusted_actors: [$OPERATOR]`** (new in 0.2.74). On a self-hosted repo, the router acts only for listed actors. Without your login there, your own labels, comments and reviews on the agent repos reach no agent, because only the agent bots are listed by default. List every human who will give the agents work.
 - **`role_template`.** Each agent repo is created from this template. Its `CLAUDE.md` is a stub that you fill in at §3.4.
+- **`work_repos`.** Optional `work_repos:` lists shared repos where the agents do the work. Each is routed exactly like a home repo (caller, labels, routing secrets, runner, trusted actors), and every agent's App is installed on it.
 - **`writing-agent` is the paper agent.** A role name is free-form: it sets the App, bot, label and session names, and nothing else. No role selects a persona; the agent's job comes from its `CLAUDE.md`. `writing-agent` is the paper role exercised end to end. `role: paper-agent` behaves identically, apart from the names and one informational line in `macf doctor`.
 - **`deploy_path` under `~/repos`.** `fleet reconcile` looks for workspaces under `~/repos`, down to four levels deep.
 - **`versions`.** It pins every workspace to `macf` 0.2.75 and every router caller to `macf-actions` v3.6.2.
@@ -505,6 +506,10 @@ whole missing set. **Because the router App is shared across every fleet in
 an owner scope by default (§6.5, `transport.router_app_scope: 'shared'`),
 that scope-wide install set only grows — the next fleet you scale in the
 same scope inherits whatever coverage already exists, not a clean slate.**
+
+### Adding a work repo later
+
+Adding a `work_repos:` entry is one more run of apply with `--vault` and `--identity-key`, plus one "Save" click on the install page of each agent App whose install must grow to cover it. One run completes it when you click the "Save" pages while apply waits; otherwise re-run apply.
 
 ### The procedure
 
@@ -805,6 +810,7 @@ silently-dropped typo.
 | `defaults.role_template` | required | — | the GitHub template repo new agent repos are cloned from |
 | `defaults.app_manifest` | optional | — | **accepted by the schema but UNCONSUMED anywhere downstream today** (verified: zero non-schema, non-fixture references in source). Every real fleet uses the literal `dr-019` by convention; the DR-019 permission set is hardcoded in `app-manifest.ts` regardless of what this field says. Write `dr-019`; nothing currently reads it. |
 | `agents[]` | required, `.min(1)` | — | see §6.3 |
+| `work_repos[]` | optional | omitted → no work repos | `owner/repo` entries for shared repos the agents work in. Each owner must be `owner.account` (a private App installs only on the account that owns it); an entry equal to an agent repo or the control repo, or listed twice, is refused at parse time. `apply` creates an absent one private and blank, reuses a present one, routes it like a home repo, and adds it to every agent App's install set. Not a workspace: no deploy, no `fleet.lock` entry. Removing one from the manifest deletes nothing. |
 | `routing.runner` | optional (whole `routing:` block) | **omitted → routing runs on GitHub-hosted runners and `MACF_TRUSTED_ACTORS` is never written** | §7.1; `plan` prints a per-repo line saying so. See §6.5 for the sub-fields. |
 | `collaborators[]` | optional | omitted → no cross-fleet federation | DR-036/DR-041 cross-fleet guest trust. **Parsed but not reconciled** by `apply` today (day-2, per DR-043's use-case catalog) |
 | `shared` | optional | omitted | `.strict()`, requires **both** `routing_app` and `ts_oauth` together. **Currently unconsumed** anywhere in the codebase — `transport.router_app_scope` is the field that actually carries the shared-vs-per-fleet choice (§6.5); this field predates that decision and is not wired to anything |
@@ -1236,8 +1242,8 @@ something tries to actually read the registry through it.
 | Code | Meaning |
 |---|---|
 | **0** | Every hard-failure predicate is false, **and** the version-reconcile phase (if attempted) left nobody behind. |
-| **1** | A **hard failure** needing operator attention: the control repo couldn't be provisioned or synced, any agent identity needs attention (`failed`/`drift`/`skipped-unverified`), the runner-ops or router App needs attention, the vault write failed, any CA leg failed, any of the six routing-secret legs `failed` (not merely `skipped`), a `MACF_TRUSTED_ACTORS` leg or the routing bundle `failed`, any routing-client leg failed, the control repo is missing labels it needs to route, an `actions_pin` that `could-not-attempt` (e.g. a re-run without the vault flags while `versions:` is declared), any deploy-phase `failed`, or the version-reconcile phase **halted** (a confirmed-or-unconfirmable bad release). Checked first — a halt always reports `1` even if something else in the same run is *also* merely partial. |
-| **2** | **Not** a hard failure, but the run is unfinished: the version-reconcile phase left at least one discovered fleet member un-rolled (busy / config-dirty / off-branch / stale-pin / not-yet-serving), the control repo's labels are usable but not all confirmed yet, or a repo's `MACF_TRUSTED_ACTORS` leg ended `pending` because its runner is not visible yet (the summary prints a `Not finished:` line naming the repos). Distinguishes "this needs a look, but nothing is broken" from a genuine `1`. |
+| **1** | A **hard failure** needing operator attention: the control repo couldn't be provisioned or synced, any agent identity needs attention (`failed`/`drift`/`skipped-unverified`), the runner-ops or router App needs attention, the vault write failed, any CA leg failed, any of the six routing-secret legs `failed` (not merely `skipped`), a `MACF_TRUSTED_ACTORS` leg or the routing bundle `failed`, any routing-client leg failed, the control repo is missing labels it needs to route, an `actions_pin` that `could-not-attempt` (e.g. a re-run without the vault flags while `versions:` is declared), any deploy-phase `failed`, a work repo that could not be created or initialised (`Work repos:` in the summary names it), or the version-reconcile phase **halted** (a confirmed-or-unconfirmable bad release). Checked first — a halt always reports `1` even if something else in the same run is *also* merely partial. |
+| **2** | **Not** a hard failure, but the run is unfinished: the version-reconcile phase left at least one discovered fleet member un-rolled (busy / config-dirty / off-branch / stale-pin / not-yet-serving), the control repo's labels are usable but not all confirmed yet, a work repo's labels are still waiting for an agent App's install to cover it, or its runner and routing for the runner-ops App's install to cover it (click "Save" on the install page and re-run), or a repo's `MACF_TRUSTED_ACTORS` leg ended `pending` because its runner is not visible yet (the summary prints a `Not finished:` line naming the repos). Distinguishes "this needs a look, but nothing is broken" from a genuine `1`. |
 
 ### `macf fleet upgrade --execute`
 

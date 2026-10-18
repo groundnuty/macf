@@ -21,8 +21,8 @@ import { dirname, join } from 'node:path';
 import { toVariableSegment, AgentInfoSchema } from '@groundnuty/macf-core';
 import type { AgentInfo, RegistryConfig } from '@groundnuty/macf-core';
 import type { FleetLock, FleetManifest } from './fleet-manifest.js';
-import { deriveAppHandle, deriveControlRepoName, parseFleetLock, ROUTER_EMITTED_LABELS } from './fleet-manifest.js';
-import type { FleetObserverFn, FleetLockSource, ObservedAgentState, ObservedState, Presence } from './plan.js';
+import { deriveAppHandle, deriveControlRepoName, parseFleetLock, ROUTER_EMITTED_LABELS, workRepos } from './fleet-manifest.js';
+import type { FleetObserverFn, FleetLockSource, ObservedAgentState, ObservedState, ObservedWorkRepoState, Presence } from './plan.js';
 import { readFleetLockFile, secretFingerprint } from './fleet-lock.js';
 import { tsPairEncoding } from './apply-routing-secrets.js';
 import { registryPathPrefix } from '../registry-helper.js';
@@ -1853,10 +1853,45 @@ export async function githubRegistryObserver(manifest: FleetManifest, manifestPa
   const controlRunnerUsability = controlSelfHosted ? await checkRunnerUsableByRepo(controlRepoFullNameHere) : undefined;
   const controlRepoTrustedActors = controlSelfHosted ? await readRepoVariable(controlRepoFullNameHere, 'MACF_TRUSTED_ACTORS') : undefined;
 
+  // `work_repos:` — each is routed like a home repo, so observe the same router facts per repo.
+  // Reads only when declared, so a fleet without work repos makes no extra calls.
+  const workRepoStates: Record<string, ObservedWorkRepoState> = {};
+  const workSelfHosted = manifest.routing?.runner?.runs_on === 'self-hosted';
+  for (const repo of workRepos(manifest)) {
+    const meta = await checkRepoArchivedState(repo);
+    const unconfirmed: RepoSecretNamesObservation = { status: 'unknown', reason: `work repo "${repo}" presence unconfirmed this run` };
+    if (meta.presence !== 'present') {
+      workRepoStates[repo] = { presence: meta.presence, ...(meta.archived !== undefined ? { archived: meta.archived } : {}) };
+      routingSecretRepos[repo] = unconfirmed;
+      orgSecretRepos[repo] = unconfirmed;
+      continue;
+    }
+    const content = await readInstalledRouterWorkflow(repo);
+    const usability = workSelfHosted ? await checkRunnerUsableByRepo(repo) : undefined;
+    const trusted = workSelfHosted ? await readRepoVariable(repo, 'MACF_TRUSTED_ACTORS') : undefined;
+    const agentConfigRoles = await readInstalledAgentConfigRoles(repo);
+    workRepoStates[repo] = {
+      presence: 'present',
+      ...(meta.archived !== undefined ? { archived: meta.archived } : {}),
+      actionsPin: content === undefined ? undefined : extractActionsPin(content),
+      callerSecrets: content === undefined ? undefined : extractCallerSecrets(content),
+      ...(content !== undefined ? { callerRunsOn: extractRunnerRunsOnInput(content) } : {}),
+      callerReadable: content !== undefined,
+      agentConfigRoles,
+      trustedActors: trusted,
+      runnerRegistered: usability?.presence,
+      runnerHandover: usability?.handover,
+      runnerDetail: usability?.detail,
+    };
+    routingSecretRepos[repo] = await listRepoSecretNames(repo);
+    orgSecretRepos[repo] = await readOrgSecrets(repo);
+  }
+
   return {
     lock,
     lockSource,
     agents,
+    ...(Object.keys(workRepoStates).length > 0 ? { workRepos: workRepoStates } : {}),
     caRegistry,
     caRepos,
     federatedCaRegistry,

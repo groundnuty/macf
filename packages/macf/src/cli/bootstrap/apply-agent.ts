@@ -129,7 +129,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { FleetAgent, FleetLockAgent, FleetManifest } from './fleet-manifest.js';
-import { deriveAppHandle } from './fleet-manifest.js';
+import { deriveAppHandle, workRepos } from './fleet-manifest.js';
 import { buildAppManifest, repoHomepageUrl } from './app-manifest.js';
 import {
   CANCEL_LABEL,
@@ -795,8 +795,11 @@ function registryControlRepoFor(role: string, manifest: FleetManifest): string |
  */
 export function installReposForIdentity(role: string, manifest: FleetManifest): readonly string[] {
   const match = manifest.agents.find((a) => a.role === role);
-  if (match === undefined) return manifest.agents.map((a) => a.repo);
-  const own = [match.repo];
+  // Work repos (`work_repos:`) are routed like home repos, so every App — runner-ops
+  // included — must be installed on them too.
+  const work = workRepos(manifest);
+  if (match === undefined) return [...manifest.agents.map((a) => a.repo), ...work];
+  const own = [match.repo, ...work];
   const controlRepo = registryControlRepoFor(role, manifest);
   return controlRepo === undefined || own.includes(controlRepo) ? own : [...own, controlRepo];
 }

@@ -604,9 +604,53 @@ export const FleetManifestSchema = z
     collaborators: z.array(FleetCollaboratorSchema).optional(),
     shared: FleetSharedSchema.optional(),
     trust: FleetTrustSchema.optional(),
+    /**
+     * Shared repos where the agents do the work (`owner/repo`). Each is routed exactly like an
+     * agent home repo (caller, labels, routing secrets, runner, trusted actors) and every agent
+     * App is installed on it. Not workspaces: no deploy, no fleet.lock entry. Undeclaring one
+     * deletes nothing (DR-043 §D3 no-prune).
+     */
+    work_repos: z.array(z.string().min(1)).optional(),
   })
   .strict()
   .superRefine((manifest, ctx) => {
+    // GitHub owner and repo names are case-insensitive, so every identity check here is too.
+    const key = (r: string): string => r.toLowerCase();
+    const controlRepoFull = key(`${manifest.owner.account}/${deriveControlRepoName(manifest.metadata.name)}`);
+    const homeRepos = new Set(manifest.agents.map((a) => key(a.repo)));
+    const seenWork = new Set<string>();
+    (manifest.work_repos ?? []).forEach((repo, index) => {
+      const at = ['work_repos', index];
+      if (seenWork.has(key(repo))) {
+        ctx.addIssue({ code: 'custom', message: `work_repos lists "${repo}" more than once`, path: at });
+      }
+      seenWork.add(key(repo));
+      if (homeRepos.has(key(repo)) || key(repo) === controlRepoFull) {
+        ctx.addIssue({
+          code: 'custom',
+          message: `work_repos entry "${repo}" is already an agent home repo or the control repo; list only additional repos`,
+          path: at,
+        });
+      }
+      if (!isOwnerRepo(repo)) {
+        ctx.addIssue({
+          code: 'custom',
+          message: `work_repos entry "${repo}" must be exactly owner/repo: two non-empty parts, a GitHub login for the owner, and letters, digits, ".", "_" or "-" for the repo`,
+          path: at,
+        });
+        return;
+      }
+      if (key(repo.split('/')[0]!) !== key(manifest.owner.account)) {
+        ctx.addIssue({
+          code: 'custom',
+          message:
+            `work_repos entry "${repo}" is not owned by owner.account "${manifest.owner.account}"; ` +
+            'a private GitHub App can only be installed on the account that owns it',
+          path: at,
+        });
+      }
+    });
+
     // macf#839 review [BLOCKING] 1 + 2: the #791 front door (role mis-written
     // as the prefixed App handle) + role/repo uniqueness. One pass over
     // `agents[]` since both checks need per-agent context; `rolePrefix` needs
@@ -1257,6 +1301,19 @@ export function deriveControlRepoName(fleetName: string): string {
  * router added to a THIRD kind of repo in the future is a one-line change
  * here, never a two-place drift risk between plan and apply.
  */
+const GITHUB_LOGIN_RE = /^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$/;
+const GITHUB_REPO_NAME_RE = /^[A-Za-z0-9._-]+$/;
+
+/** Exactly `owner/repo`: a GitHub login, one slash, a repo name. */
+function isOwnerRepo(full: string): boolean {
+  const parts = full.split('/');
+  return parts.length === 2 && GITHUB_LOGIN_RE.test(parts[0] ?? '') && GITHUB_REPO_NAME_RE.test(parts[1] ?? '');
+}
+
+export function workRepos(manifest: Pick<FleetManifest, 'work_repos'>): readonly string[] {
+  return manifest.work_repos ?? [];
+}
+
 export function routerCarryingRepos(manifest: FleetManifest): readonly string[] {
-  return [...manifest.agents.map((a) => a.repo), `${manifest.owner.account}/${deriveControlRepoName(manifest.metadata.name)}`];
+  return [...manifest.agents.map((a) => a.repo), ...workRepos(manifest), `${manifest.owner.account}/${deriveControlRepoName(manifest.metadata.name)}`];
 }
