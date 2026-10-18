@@ -25,6 +25,7 @@ import {
   formatOperatorInteractionLine,
   formatPlanText,
   operatorInteractionBudget,
+  installScopeWidenApps,
   operatorInteractionToJson,
 } from '../bootstrap/plan.js';
 import type { AgentRegistryObservation } from '../bootstrap/observer.js';
@@ -359,7 +360,11 @@ export async function runBootstrapPlan(
         JSON.stringify(
           {
             ...(fleetPlanToJson(plan) as Record<string, unknown>),
-            operator_interaction: operatorInteractionToJson(budget),
+            operator_interaction: {
+              ...(operatorInteractionToJson(budget) as Record<string, unknown>),
+              // Additive: Apps whose existing install needs one "Save" click to widen. Omitted when none.
+              ...(installScopeWidenApps(plan.items).length > 0 ? { widen_installs: installScopeWidenApps(plan.items) } : {}),
+            },
             advertise_host_drift: advertiseHostDrift.map(advertiseHostDriftEntryToJson),
             operator_inputs: operatorInputs,
             // groundnuty/macf#1309 — `lock === null` alone can't tell
@@ -379,7 +384,7 @@ export async function runBootstrapPlan(
     } else {
       console.log(formatPlanText(plan));
       console.log('');
-      console.log(formatOperatorInteractionLine(budget));
+      console.log(formatOperatorInteractionLine(budget, installScopeWidenApps(plan.items)));
       console.log('');
       console.log(`fleet.lock source: ${observed.lockSource ?? 'unreadable'}`);
       console.log('');

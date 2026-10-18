@@ -3902,11 +3902,31 @@ export function operatorInteractionBudget(gate1Clicks: number, gate2Flows: numbe
  * — that shape gets its own wording naming both counts directly, since
  * "Apps to create" would misdescribe a role whose App already exists.
  */
-export function formatOperatorInteractionLine(budget: OperatorInteractionBudget): string {
-  const { gate1Clicks, gate2Flows, bound } = budget;
+export function formatOperatorInteractionLine(budget: OperatorInteractionBudget, widenApps: readonly string[] = []): string {
+  const widen = formatWidenSaves(widenApps);
+  const { gate1Clicks, gate2Flows } = budget;
   if (gate1Clicks === 0 && gate2Flows === 0) {
-    return 'Operator interaction: none — no consent gates this run.';
+    return widen === '' ? 'Operator interaction: none — no consent gates this run.' : `Operator interaction: none to create; ${widen}.`;
   }
+  const base = formatOperatorInteractionBase(budget);
+  return widen === '' ? base : `${base} Also ${widen}.`;
+}
+
+/** The Apps whose existing install a plan's `install_scope` UPDATE rows say must grow: one "Save" click each. */
+export function installScopeWidenApps(items: readonly PlanItem[]): readonly string[] {
+  return items
+    .filter((i) => i.kind === 'install_scope' && i.verb === 'update')
+    .map((i) => i.target.split(':install_scope:')[1] ?? i.target);
+}
+
+function formatWidenSaves(apps: readonly string[]): string {
+  if (apps.length === 0) return '';
+  const n = apps.length;
+  return `${String(n)} "Save" click${n === 1 ? '' : 's'} to widen ${n === 1 ? 'an existing install' : 'existing installs'} (${apps.join(', ')})`;
+}
+
+function formatOperatorInteractionBase(budget: OperatorInteractionBudget): string {
+  const { gate1Clicks, gate2Flows, bound } = budget;
   const qualifier = bound === 'maximum' ? 'up to ' : '';
   const ceilingNote =
     bound === 'maximum'

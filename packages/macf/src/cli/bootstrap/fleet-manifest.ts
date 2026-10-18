@@ -630,6 +630,14 @@ export const FleetManifestSchema = z
           path: at,
         });
       }
+      if (!isOwnerRepo(repo)) {
+        ctx.addIssue({
+          code: 'custom',
+          message: `work_repos entry "${repo}" must be exactly owner/repo: two non-empty parts, a GitHub login for the owner, and letters, digits, ".", "_" or "-" for the repo`,
+          path: at,
+        });
+        return;
+      }
       if (repo.split('/')[0] !== manifest.owner.account) {
         ctx.addIssue({
           code: 'custom',
@@ -1291,6 +1299,15 @@ export function deriveControlRepoName(fleetName: string): string {
  * router added to a THIRD kind of repo in the future is a one-line change
  * here, never a two-place drift risk between plan and apply.
  */
+const GITHUB_LOGIN_RE = /^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$/;
+const GITHUB_REPO_NAME_RE = /^[A-Za-z0-9._-]+$/;
+
+/** Exactly `owner/repo`: a GitHub login, one slash, a repo name. */
+function isOwnerRepo(full: string): boolean {
+  const parts = full.split('/');
+  return parts.length === 2 && GITHUB_LOGIN_RE.test(parts[0] ?? '') && GITHUB_REPO_NAME_RE.test(parts[1] ?? '');
+}
+
 export function workRepos(manifest: Pick<FleetManifest, 'work_repos'>): readonly string[] {
   return manifest.work_repos ?? [];
 }

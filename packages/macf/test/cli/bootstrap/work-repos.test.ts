@@ -5,7 +5,7 @@ import type { FleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js
 import { installReposForIdentity } from '../../../src/cli/bootstrap/apply-agent.js';
 import { RUNNER_OPS_ROLE } from '../../../src/cli/bootstrap/apply-runner-ops.js';
 import { computeInstallScopeCoverage, installScopeCoverageTargets } from '../../../src/cli/bootstrap/install-scope-coverage.js';
-import { computePlan } from '../../../src/cli/bootstrap/plan.js';
+import { computePlan, formatOperatorInteractionLine, installScopeWidenApps, operatorInteractionBudget } from '../../../src/cli/bootstrap/plan.js';
 import type { ObservedState } from '../../../src/cli/bootstrap/plan.js';
 
 const WORK = 'o/f-experiments';
@@ -47,6 +47,16 @@ describe('work_repos schema', () => {
       const r = FleetManifestSchema.safeParse({ ...rawManifest(), work_repos: list });
       expect(r.success).toBe(false);
       expect(JSON.stringify(r.error?.issues)).toContain('work_repos');
+    });
+  }
+  for (const bad of ['o', 'o/', '/x', 'a/b/c', 'o/ok name']) {
+    it(`refuses the malformed entry "${bad}", naming work_repos and the entry`, () => {
+      const r = FleetManifestSchema.safeParse({ ...rawManifest(), work_repos: [bad] });
+      expect(r.success).toBe(false);
+      const text = r.error?.issues.map((x) => `${x.path.join('.')} ${x.message}`).join('\n') ?? '';
+      expect(text).toContain('work_repos');
+      expect(text).toContain(`"${bad}"`);
+      expect(text).toContain('exactly owner/repo');
     });
   }
   it('explains why another owner is refused', () => {
@@ -156,5 +166,30 @@ describe('plan rows', () => {
   it('emits no work-repo rows when none are declared', () => {
     const none = computePlan(manifest(), { ...observed, workRepos: undefined }).items;
     expect(none.some((i) => i.target.startsWith('work_repo:') || i.target.includes(':work-runner:'))).toBe(false);
+  });
+});
+
+describe('operator interaction line counts "Save" clicks', () => {
+  const none = operatorInteractionBudget(0);
+  const widen = {
+    kind: 'install_scope' as const,
+    target: 'runner-ops:install_scope:f-runner-ops',
+    verb: 'update' as const,
+    reason: 'x',
+    confirm_required: true,
+  };
+  it('without an install-scope UPDATE the line is what it was', () => {
+    expect(formatOperatorInteractionLine(none, installScopeWidenApps([{ ...widen, verb: 'noop' }]))).toBe('Operator interaction: none — no consent gates this run.');
+    expect(formatOperatorInteractionLine(none)).toBe('Operator interaction: none — no consent gates this run.');
+  });
+  it('with one install-scope UPDATE it names the Save click and the App', () => {
+    expect(formatOperatorInteractionLine(none, installScopeWidenApps([widen]))).toBe(
+      'Operator interaction: none to create; 1 "Save" click to widen an existing install (f-runner-ops).',
+    );
+  });
+  it('alongside creations it appends the Save clicks', () => {
+    const line = formatOperatorInteractionLine(operatorInteractionBudget(1), ['a', 'b']);
+    expect(line).toContain('1 App to create');
+    expect(line).toContain('Also 2 "Save" clicks to widen existing installs (a, b).');
   });
 });
