@@ -17,6 +17,11 @@ export interface RegistrationFs {
 export interface ReadChannelRegistrationOpts {
   readonly candidateDirs: readonly string[];
   readonly homeDir: string;
+  /**
+   * When this server PROCESS started. Evidence must be strictly newer: Claude Code
+   * cannot register a connection before the process exists, and a previous
+   * process's line in the same session (a reconnect) is always older.
+   */
   readonly serverStartedAtMs: number;
   /** This server's Claude Code session id (CLAUDE_CODE_SESSION_ID). */
   readonly sessionId: string | undefined;
@@ -25,7 +30,6 @@ export interface ReadChannelRegistrationOpts {
 
 const REGISTERED = 'Channel notifications registered';
 const SKIPPED = 'Channel notifications skipped';
-const SLACK_MS = 5000;
 
 /** Claude Code names its per-project cache dir by replacing `/` and `.` with `-`. */
 export function encodeWorkspace(path: string): string {
@@ -57,7 +61,7 @@ export function readChannelRegistration(opts: ReadChannelRegistrationOpts): Chan
         // path may not resolve; the plain form is still a candidate
       }
     }
-    const since = opts.serverStartedAtMs - SLACK_MS;
+    const since = opts.serverStartedAtMs;
     let sawDir = false;
     let best: { ts: number; state: 'registered' | 'skipped'; file: string } | undefined;
     for (const p of paths) {

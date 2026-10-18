@@ -222,8 +222,9 @@ async function main(): Promise<void> {
 
   // macf#639: the tmux copy is sent only when Claude Code's own MCP log shows
   // this server's session (CLAUDE_CODE_SESSION_ID) registered the channel after
-  // this server started; the timestamp excludes an earlier launch of a resumed session.
-  const serverStartedAtMs = Date.now();
+  // this server PROCESS started. Process start, with no slack, excludes an earlier
+  // launch of a resumed session and a previous server process after a reconnect.
+  const serverStartedAtMs = Date.now() - process.uptime() * 1000;
   const routeWake = createWakeRouter({
     logger,
     read: () =>

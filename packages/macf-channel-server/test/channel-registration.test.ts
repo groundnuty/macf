@@ -66,6 +66,10 @@ describe('readChannelRegistration', () => {
     writeLog(WS, ln(REG, START + 5000, 'sess-other'), START + 5000, 'other.jsonl');
     expect(read()).toMatchObject({ state: 'unknown', reason: expect.stringContaining('no registration line') });
   });
+  it('unknown: a previous server process registered 2 s before this one started (reconnect)', () => {
+    writeLog(WS, ln(REG, START - 2000), START + 1000);
+    expect(read()).toMatchObject({ state: 'unknown', reason: expect.stringContaining('no registration line') });
+  });
   it('unknown: same session id but registration before server start (resumed session)', () => {
     writeLog(WS, ln(REG, START - 60_000), START + 1000);
     expect(read()).toMatchObject({ state: 'unknown', reason: expect.stringContaining('no registration line') });
