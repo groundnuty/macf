@@ -18,12 +18,14 @@ export interface ReadChannelRegistrationOpts {
   readonly candidateDirs: readonly string[];
   readonly homeDir: string;
   readonly serverStartedAtMs: number;
+  /** This server's Claude Code session id (CLAUDE_CODE_SESSION_ID). */
+  readonly sessionId: string | undefined;
   readonly fs?: RegistrationFs;
 }
 
 const REGISTERED = 'Channel notifications registered';
 const SKIPPED = 'Channel notifications skipped';
-const MTIME_SLACK_MS = 5000;
+const SLACK_MS = 5000;
 
 /** Claude Code names its per-project cache dir by replacing `/` and `.` with `-`. */
 export function encodeWorkspace(path: string): string {
@@ -35,11 +37,15 @@ function unknown(reason: string): ChannelRegistration {
 }
 
 /**
- * Read Claude Code's own MCP log for this session and report whether the
- * channel was registered. Looks only in dirs derived from this workspace's
- * identity, never in other projects' dirs. Never throws.
+ * Read Claude Code's own MCP log lines and report whether this server's own
+ * connection registered the channel. The session id (CLAUDE_CODE_SESSION_ID)
+ * identifies this server's Claude Code process, so another session in the same
+ * workspace cannot answer for it. The line timestamp excludes an earlier launch
+ * of a resumed session, which keeps its session id. Looks only in dirs derived
+ * from this workspace's identity. Never throws.
  */
 export function readChannelRegistration(opts: ReadChannelRegistrationOpts): ChannelRegistration {
+  if (opts.sessionId === undefined || opts.sessionId === '') return unknown('no CLAUDE_CODE_SESSION_ID');
   const fs: RegistrationFs = opts.fs ?? nodeFs;
   try {
     const paths = new Set<string>();
@@ -51,8 +57,9 @@ export function readChannelRegistration(opts: ReadChannelRegistrationOpts): Chan
         // path may not resolve; the plain form is still a candidate
       }
     }
-    let newest: { file: string; mtimeMs: number } | undefined;
+    const since = opts.serverStartedAtMs - SLACK_MS;
     let sawDir = false;
+    let best: { ts: number; state: 'registered' | 'skipped'; file: string } | undefined;
     for (const p of paths) {
       const logDir = join(opts.homeDir, '.cache', 'claude-cli-nodejs', encodeWorkspace(p), 'mcp-logs-macf-agent');
       let names: string[];
@@ -64,35 +71,48 @@ export function readChannelRegistration(opts: ReadChannelRegistrationOpts): Chan
       sawDir = true;
       for (const name of names) {
         const file = join(logDir, name);
+        let text: string;
         try {
           const st = fs.statSync(file);
-          if (!st.isFile()) continue;
-          if (newest === undefined || st.mtimeMs > newest.mtimeMs) newest = { file, mtimeMs: st.mtimeMs };
+          if (!st.isFile() || st.mtimeMs < since) continue;
+          text = fs.readFileSync(file, 'utf-8');
         } catch {
-          // unreadable entry; skip
+          continue;
         }
+        const hit = latestCountingLine(text, opts.sessionId, since);
+        if (hit !== undefined && (best === undefined || hit.ts >= best.ts)) best = { ...hit, file };
       }
     }
     if (!sawDir) return unknown('no mcp-logs-macf-agent dir for this workspace');
-    if (newest === undefined) return unknown('mcp log dir has no files');
-    if (newest.mtimeMs < opts.serverStartedAtMs - MTIME_SLACK_MS) {
-      return unknown('newest mcp log is older than this server start');
-    }
-    let text: string;
-    try {
-      text = fs.readFileSync(newest.file, 'utf-8');
-    } catch {
-      return unknown('mcp log unreadable');
-    }
-    const reg = text.lastIndexOf(REGISTERED);
-    const skip = text.lastIndexOf(SKIPPED);
-    if (reg === -1 && skip === -1) return unknown('mcp log has no channel registration marker');
-    return reg > skip
-      ? { state: 'registered', logFile: newest.file }
-      : { state: 'skipped', logFile: newest.file };
+    if (best === undefined) return unknown('no registration line for this session since server start');
+    return { state: best.state, logFile: best.file };
   } catch (err) {
     return unknown(`registration read failed: ${err instanceof Error ? err.message : String(err)}`);
   }
+}
+
+function latestCountingLine(
+  text: string,
+  sessionId: string,
+  since: number,
+): { ts: number; state: 'registered' | 'skipped' } | undefined {
+  let best: { ts: number; state: 'registered' | 'skipped' } | undefined;
+  for (const raw of text.split('\n')) {
+    let line: unknown;
+    try {
+      line = JSON.parse(raw);
+    } catch {
+      continue;
+    }
+    if (typeof line !== 'object' || line === null) continue;
+    const l = line as { sessionId?: unknown; timestamp?: unknown; debug?: unknown };
+    if (l.sessionId !== sessionId || typeof l.debug !== 'string' || typeof l.timestamp !== 'string') continue;
+    const ts = Date.parse(l.timestamp);
+    if (Number.isNaN(ts) || ts < since) continue;
+    const state = l.debug.startsWith(REGISTERED) ? 'registered' : l.debug.startsWith(SKIPPED) ? 'skipped' : undefined;
+    if (state !== undefined && (best === undefined || ts >= best.ts)) best = { ts, state };
+  }
+  return best;
 }
 
 export interface WakeRouterOpts {

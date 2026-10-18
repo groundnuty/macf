@@ -26,8 +26,14 @@ function writeLog(ws: string, text: string, mtimeMs: number, name = 'a.jsonl'): 
   utimesSync(f, mtimeMs / 1000, mtimeMs / 1000);
   return f;
 }
-const read = (dirs: string[] = [WS]) =>
-  readChannelRegistration({ candidateDirs: dirs, homeDir: home, serverStartedAtMs: START });
+const SID = 'sess-own';
+function ln(debug: string, tsMs: number, sessionId = SID): string {
+  return JSON.stringify({ debug, timestamp: new Date(tsMs).toISOString(), sessionId, cwd: WS });
+}
+const REG = 'Channel notifications registered';
+const SKIP = 'Channel notifications skipped: not in list';
+const read = (dirs: string[] = [WS], sessionId: string | undefined = SID) =>
+  readChannelRegistration({ candidateDirs: dirs, homeDir: home, serverStartedAtMs: START, sessionId });
 
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), 'macf-639-'));
@@ -41,33 +47,60 @@ describe('encodeWorkspace', () => {
 });
 
 describe('readChannelRegistration', () => {
-  it('registered', () => {
-    const f = writeLog(WS, 'x Channel notifications registered y', START + 1000);
+  it('registered: matching session id, timestamp after start', () => {
+    const f = writeLog(WS, ln(REG, START + 1000), START + 1000);
     expect(read()).toEqual({ state: 'registered', logFile: f });
   });
   it('skipped', () => {
-    writeLog(WS, 'Channel notifications skipped: not in list', START + 1000);
+    writeLog(WS, ln(SKIP, START + 1000), START + 1000);
     expect(read().state).toBe('skipped');
   });
-  it('last marker wins', () => {
-    writeLog(WS, 'Channel notifications skipped\nChannel notifications registered', START + 1000);
+  it('latest line wins when both markers appear', () => {
+    writeLog(WS, [ln(SKIP, START + 1000), ln(REG, START + 2000)].join('\n'), START + 2000);
     expect(read().state).toBe('registered');
-    writeLog(WS, 'Channel notifications registered\nChannel notifications skipped', START + 1000);
+    writeLog(WS, [ln(REG, START + 1000), ln(SKIP, START + 2000)].join('\n'), START + 2000);
     expect(read().state).toBe('skipped');
+  });
+  it('unknown: another session in the same dir says registered (newest file)', () => {
+    writeLog(WS, ln('unrelated', START + 1000), START + 1000, 'mine.jsonl');
+    writeLog(WS, ln(REG, START + 5000, 'sess-other'), START + 5000, 'other.jsonl');
+    expect(read()).toMatchObject({ state: 'unknown', reason: expect.stringContaining('no registration line') });
+  });
+  it('unknown: same session id but registration before server start (resumed session)', () => {
+    writeLog(WS, ln(REG, START - 60_000), START + 1000);
+    expect(read()).toMatchObject({ state: 'unknown', reason: expect.stringContaining('no registration line') });
+  });
+  it('skipped: own session skipped while another session registered', () => {
+    writeLog(WS, ln(SKIP, START + 1000), START + 1000, 'mine.jsonl');
+    writeLog(WS, ln(REG, START + 5000, 'sess-other'), START + 5000, 'other.jsonl');
+    expect(read().state).toBe('skipped');
+  });
+  it('unknown without CLAUDE_CODE_SESSION_ID, and reads no files', () => {
+    const boom = (): never => {
+      throw new Error('fs must not be touched');
+    };
+    const fs: RegistrationFs = { readdirSync: boom, statSync: boom, readFileSync: boom, realpathSync: boom };
+    for (const sessionId of [undefined, '']) {
+      const r = readChannelRegistration({ candidateDirs: [WS], homeDir: home, serverStartedAtMs: START, sessionId, fs });
+      expect(r).toEqual({ state: 'unknown', reason: 'no CLAUDE_CODE_SESSION_ID' });
+    }
+  });
+  it('skips malformed JSON lines and bad timestamps', () => {
+    const bad = JSON.stringify({ debug: REG, timestamp: 'not-a-date', sessionId: SID });
+    writeLog(WS, ['{oops', bad, '', ln(REG, START + 1000)].join('\n'), START + 1000);
+    expect(read().state).toBe('registered');
+    writeLog(WS, ['{oops', bad].join('\n'), START + 1000);
+    expect(read().state).toBe('unknown');
   });
   it('unknown: missing dir', () => {
     expect(read()).toMatchObject({ state: 'unknown', reason: expect.stringContaining('no mcp-logs') });
   });
-  it('unknown: no marker', () => {
-    writeLog(WS, 'nothing here', START + 1000);
-    expect(read()).toMatchObject({ state: 'unknown', reason: expect.stringContaining('no channel registration marker') });
-  });
-  it('unknown: stale file from a previous session', () => {
-    writeLog(WS, 'Channel notifications registered', START - 60_000);
-    expect(read()).toMatchObject({ state: 'unknown', reason: expect.stringContaining('older') });
+  it('unknown: stale file mtime before server start', () => {
+    writeLog(WS, ln(REG, START + 1000), START - 60_000);
+    expect(read().state).toBe('unknown');
   });
   it('unknown: unreadable file, never throws', () => {
-    writeLog(WS, 'Channel notifications registered', START + 1000);
+    writeLog(WS, ln(REG, START + 1000), START + 1000);
     const fs: RegistrationFs = {
       ...(nodeFs as unknown as RegistrationFs),
       readdirSync: nodeFs.readdirSync as unknown as RegistrationFs['readdirSync'],
@@ -77,11 +110,11 @@ describe('readChannelRegistration', () => {
         throw new Error('EACCES');
       },
     };
-    const r = readChannelRegistration({ candidateDirs: [WS], homeDir: home, serverStartedAtMs: START, fs });
-    expect(r).toMatchObject({ state: 'unknown', reason: 'mcp log unreadable' });
+    const r = readChannelRegistration({ candidateDirs: [WS], homeDir: home, serverStartedAtMs: START, sessionId: SID, fs });
+    expect(r.state).toBe('unknown');
   });
   it('never reads another project dir (decoy says registered)', () => {
-    writeLog('/other/project', 'Channel notifications registered', START + 1000);
+    writeLog('/other/project', ln(REG, START + 1000), START + 1000);
     expect(read()).toMatchObject({ state: 'unknown' });
   });
 });

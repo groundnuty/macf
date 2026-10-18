@@ -220,8 +220,9 @@ async function main(): Promise<void> {
     }
   };
 
-  // macf#639: the tmux copy is sent only when Claude Code's own MCP log does
-  // not show the channel registered.
+  // macf#639: the tmux copy is sent only when Claude Code's own MCP log shows
+  // this server's session (CLAUDE_CODE_SESSION_ID) registered the channel after
+  // this server started; the timestamp excludes an earlier launch of a resumed session.
   const serverStartedAtMs = Date.now();
   const routeWake = createWakeRouter({
     logger,
@@ -230,6 +231,7 @@ async function main(): Promise<void> {
         candidateDirs: [config.workspaceDir, process.cwd()].filter((d): d is string => d !== undefined),
         homeDir: homedir(),
         serverStartedAtMs,
+        sessionId: process.env['CLAUDE_CODE_SESSION_ID'],
       }),
   });
 
