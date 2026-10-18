@@ -3964,6 +3964,21 @@ agents:
             expect(after.routing[WORK]?.status).toBe('updated');
           });
 
+          it('with no runner platform configured, the retry still writes MACF_TRUSTED_ACTORS for an existing usable runner', async () => {
+            const covers = { current: false };
+            const { manifestPath, written, deps } = setup(covers);
+            const noPlatform: FleetApplyDeps = { ...deps, runnerPlatformEndpoint: undefined };
+            const manifest = routedManifest();
+            const result = await applyFleet(manifest, manifestPath, null, noPlatform);
+            expect(result.workRepos?.[0]).toMatchObject({ routingAwaitingInstall: true });
+            written.length = 0;
+            covers.current = true;
+            const after = await retryWorkRepoRouting(result, manifest, noPlatform);
+            expect(written).toContain(WORK);
+            expect(after.routing[WORK]?.status).toBe('created');
+            expect(after.workRepos?.[0]?.routingAwaitingInstall).toBeUndefined();
+          });
+
           it('also waits when the control repo routes self-hosted (control_repo_runs_on)', async () => {
             const { manifestPath, posted, written, deps } = setup({ current: false });
             const manifest: FleetManifest = {

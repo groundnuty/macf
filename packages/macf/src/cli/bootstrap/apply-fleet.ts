@@ -3702,6 +3702,7 @@ export async function retryWorkRepoRouting(
     | 'trustDeps'
     | 'runnerPlatformEndpoint'
     | 'observedRunnerPlatformEndpointScope'
+    | 'runnerToken'
   >,
 ): Promise<FleetApplyResult> {
   const waiting = (result.workRepos ?? []).filter((w) => w.routingAwaitingInstall === true).map((w) => w.repo);
@@ -3716,25 +3717,34 @@ export async function retryWorkRepoRouting(
     scopeValue: deps.observedRunnerPlatformEndpointScope,
   }).value;
   const leg = await provisionRunnersAndRouting(manifest, deps, result.runnerOps, resolveKeyPath, endpoint, ready);
+  const trustedValue = buildTrustedActorsValue(manifest.metadata.name, manifest.agents, manifest.routing?.runner.trusted_actors ?? []);
+  // Same fallback as the main path: a repo the platform did not provision this run (endpoint unset
+  // or unreachable) still gets the gated publish, so an existing usable runner is honoured.
+  const notProvisioned = ready.filter((r) => leg.routing[r] === undefined);
+  const restRouting: Readonly<Record<string, EnsureVariableOutcome>> =
+    notProvisioned.length > 0 && manifest.routing?.runner?.runs_on === 'self-hosted'
+      ? await publishTrustedActorsGated(trustedValue, notProvisioned, deps.trustDeps, deps.runnerToken, deps.runnerTokenPollOptions ?? {}, new Set<string>())
+      : {};
+  for (const [repo, l] of Object.entries<EnsureVariableOutcome>(restRouting)) {
+    deps.log(`Routing var (${repo}): ${l.status}` + (l.status === 'failed' || l.status === 'skipped' || l.status === 'pending' ? ` — ${l.reason}` : '.'));
+  }
+  const legRouting: Readonly<Record<string, EnsureVariableOutcome>> = { ...leg.routing, ...restRouting };
   // The main path's reconcile ran while these repos were excluded, so a stale value they already
   // carry must be reconciled here too, with the same single overwrite path.
-  const alreadyPresent = Object.entries(leg.routing)
+  const alreadyPresent = Object.entries(legRouting)
     .filter(([, l]) => l.status === 'already-present')
     .map(([repo]) => repo);
   const reconciled: Readonly<Record<string, EnsureVariableOutcome>> =
     alreadyPresent.length > 0
-      ? await reconcileTrustedActors(
-          buildTrustedActorsValue(manifest.metadata.name, manifest.agents, manifest.routing?.runner.trusted_actors ?? []),
-          alreadyPresent,
-          deps.trustDeps,
-        )
+      ? await reconcileTrustedActors(trustedValue, alreadyPresent, deps.trustDeps)
       : {};
   for (const [repo, l] of Object.entries(reconciled)) {
     if (l.status === 'updated' || l.status === 'declined' || l.status === 'failed' || l.status === 'skipped') {
       deps.log(`Routing var reconcile (${repo}): ${l.status} — ${l.reason}`);
     }
   }
-  const done = new Set(ready);
+  // Only a repo that now has a routing outcome stops waiting.
+  const done = new Set(ready.filter((r) => legRouting[r] !== undefined));
   return {
     ...result,
     workRepos: (result.workRepos ?? []).map((w) => {
@@ -3743,6 +3753,6 @@ export async function retryWorkRepoRouting(
       return rest;
     }),
     runnerProvision: { ...result.runnerProvision, ...leg.runnerProvision },
-    routing: { ...result.routing, ...leg.routing, ...reconciled },
+    routing: { ...result.routing, ...legRouting, ...reconciled },
   };
 }
