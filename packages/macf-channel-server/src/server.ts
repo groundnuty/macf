@@ -35,6 +35,8 @@ import { loadCA } from '@groundnuty/macf-core';
 import { HttpError } from '@groundnuty/macf-core';
 import { formatNotifyContent } from './notify-formatter.js';
 import { wakeViaTmux } from './tmux-wake.js';
+import { readChannelRegistration, createWakeRouter } from './channel-registration.js';
+import { homedir } from 'node:os';
 import { decideWake } from './wake-decision.js';
 import { createCommsLedger } from './comms-ledger.js';
 import { recordEdge } from './comms-ledger-record.js';
@@ -218,6 +220,22 @@ async function main(): Promise<void> {
     }
   };
 
+  // macf#639: the tmux copy is sent only when Claude Code's own MCP log shows
+  // this server's session (CLAUDE_CODE_SESSION_ID) registered the channel after
+  // this server PROCESS started. Process start, with no slack, excludes an earlier
+  // launch of a resumed session and a previous server process after a reconnect.
+  const serverStartedAtMs = Date.now() - process.uptime() * 1000;
+  const routeWake = createWakeRouter({
+    logger,
+    read: () =>
+      readChannelRegistration({
+        candidateDirs: [config.workspaceDir, process.cwd()].filter((d): d is string => d !== undefined),
+        homeDir: homedir(),
+        serverStartedAtMs,
+        sessionId: process.env['CLAUDE_CODE_SESSION_ID'],
+      }),
+  });
+
   async function deliverNotification(payload: NotifyPayload): Promise<void> {
     const meta: Record<string, string> = { type: payload.type };
     if (payload.issue_number !== undefined) {
@@ -321,11 +339,20 @@ async function main(): Promise<void> {
       // macf#1491: not awaited — the wake takes seconds and /notify must
       // answer once the message is pushed. wakeViaTmux never rejects and
       // logs its own outcome.
-      void wakeViaTmux(content, {
-        workspaceDir: config.workspaceDir,
-        session: config.tmuxSession,
-        window: config.tmuxWindow,
-        logger,
+      //
+      // macf#639: when Claude Code's MCP log shows the channel registered,
+      // the push above already started the turn, so no tmux copy is typed
+      // (it would arrive as human-origin and be processed twice). In every
+      // other case the copy is still typed, so a registration failure falls
+      // back to duplication, never to silence.
+      const workspaceDir = config.workspaceDir;
+      routeWake(() => {
+        void wakeViaTmux(content, {
+          workspaceDir,
+          session: config.tmuxSession,
+          window: config.tmuxWindow,
+          logger,
+        });
       });
     } else {
       logger.info('tmux_wake_skipped', {
