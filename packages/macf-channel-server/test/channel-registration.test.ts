@@ -47,6 +47,22 @@ describe('encodeWorkspace', () => {
 });
 
 describe('readChannelRegistration', () => {
+  it('registered: a plugin-mounted log dir in the same workspace counts too', () => {
+    const d = join(home, '.cache', 'claude-cli-nodejs', encodeWorkspace(WS), 'mcp-logs-plugin-macf-agent-macf-agent');
+    mkdirSync(d, { recursive: true });
+    const f = join(d, 'p.jsonl');
+    writeFileSync(f, ln(REG, START + 1000));
+    utimesSync(f, (START + 1000) / 1000, (START + 1000) / 1000);
+    expect(read()).toMatchObject({ state: 'registered', logFile: f });
+  });
+  it('unknown: an unrelated server log dir in the same workspace is never read', () => {
+    const d = join(home, '.cache', 'claude-cli-nodejs', encodeWorkspace(WS), 'mcp-logs-other-server');
+    mkdirSync(d, { recursive: true });
+    const f = join(d, 'o.jsonl');
+    writeFileSync(f, ln(REG, START + 1000));
+    utimesSync(f, (START + 1000) / 1000, (START + 1000) / 1000);
+    expect(read()).toMatchObject({ state: 'unknown' });
+  });
   it('registered: matching session id, timestamp after start', () => {
     const f = writeLog(WS, ln(REG, START + 1000), START + 1000);
     expect(read()).toEqual({ state: 'registered', logFile: f });

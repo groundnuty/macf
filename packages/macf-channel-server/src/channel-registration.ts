@@ -64,8 +64,7 @@ export function readChannelRegistration(opts: ReadChannelRegistrationOpts): Chan
     const since = opts.serverStartedAtMs;
     let sawDir = false;
     let best: { ts: number; state: 'registered' | 'skipped'; file: string } | undefined;
-    for (const p of paths) {
-      const logDir = join(opts.homeDir, '.cache', 'claude-cli-nodejs', encodeWorkspace(p), 'mcp-logs-macf-agent');
+    for (const logDir of macfLogDirs(opts.homeDir, paths, fs)) {
       let names: string[];
       try {
         names = fs.readdirSync(logDir);
@@ -93,6 +92,29 @@ export function readChannelRegistration(opts: ReadChannelRegistrationOpts): Chan
   } catch (err) {
     return unknown(`registration read failed: ${err instanceof Error ? err.message : String(err)}`);
   }
+}
+
+/**
+ * This workspace's macf-agent MCP log dirs, inside its OWN encoded cache dir only
+ * (never another project's). The name depends on the mount: `.mcp.json` gives
+ * `mcp-logs-macf-agent`; a plugin mount gives `mcp-logs-plugin-<plugin>-macf-agent`.
+ * Same set as check-channels-enabled.sh's `mcp-logs-*macf-agent` glob.
+ */
+function macfLogDirs(homeDir: string, paths: ReadonlySet<string>, fs: RegistrationFs): string[] {
+  const dirs: string[] = [];
+  for (const p of paths) {
+    const projectDir = join(homeDir, '.cache', 'claude-cli-nodejs', encodeWorkspace(p));
+    let entries: string[];
+    try {
+      entries = fs.readdirSync(projectDir);
+    } catch {
+      continue;
+    }
+    for (const e of entries) {
+      if (e.startsWith('mcp-logs-') && e.endsWith('macf-agent')) dirs.push(join(projectDir, e));
+    }
+  }
+  return dirs;
 }
 
 function latestCountingLine(
