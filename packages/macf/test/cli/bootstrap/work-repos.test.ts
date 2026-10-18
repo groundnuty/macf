@@ -163,6 +163,14 @@ describe('plan rows', () => {
     expect(b?.reason).toContain('o/f-more');
     expect(a?.target).not.toBe(b?.target);
   });
+  it('an archived work repo gives a confirmation-required update naming the revival, not only NOOP', () => {
+    const archivedObserved: ObservedState = { ...observed, workRepos: { ...observed.workRepos, [WORK]: { ...observed.workRepos![WORK]!, archived: true } } };
+    const row = computePlan(m, archivedObserved).items.find((i) => i.target === `work_repo:${WORK}:repo:archived`);
+    expect(row).toMatchObject({ verb: 'update', confirm_required: true });
+    expect(row?.reason).toContain('un-archive');
+    expect(row?.reason).toContain(WORK);
+    expect(find(`work_repo:${WORK}:repo:archived`)).toBeUndefined();
+  });
   it('emits no work-repo rows when none are declared', () => {
     const none = computePlan(manifest(), { ...observed, workRepos: undefined }).items;
     expect(none.some((i) => i.target.startsWith('work_repo:') || i.target.includes(':work-runner:'))).toBe(false);

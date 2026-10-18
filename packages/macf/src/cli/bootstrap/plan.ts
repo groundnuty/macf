@@ -2906,6 +2906,16 @@ function workRepoItems(manifest: FleetManifest, observed: ObservedState, declare
     const obs = observed.workRepos?.[repo];
     const { verb, reasonSuffix } = presenceVerb(obs?.presence ?? 'unknown', UNKNOWN_REASONS.repo);
     out.push({ kind: 'repo', target: `work_repo:${repo}:repo`, verb, reason: `work repo "${repo}" ${reasonSuffix}`, confirm_required: false });
+    // An archived work repo is revived by apply, so the plan must show it for approval, exactly as for an agent repo.
+    if (obs?.presence === 'present' && obs.archived === true) {
+      out.push({
+        kind: 'agent_repo_archived',
+        target: `work_repo:${repo}:repo:archived`,
+        verb: 'update',
+        reason: AGENT_REPO_ARCHIVED_REASON(repo),
+        confirm_required: true,
+      });
+    }
     // `agentConfigItem` only reads `agent.repo` for its text; the role is a placeholder.
     const placeholder = { role: 'work-repo', repo, deploy_path: '' } as FleetAgent;
     out.push({ ...agentConfigItem(placeholder, declaredRoles, obs?.agentConfigRoles), target: `work_repo:${repo}:agent_config` });

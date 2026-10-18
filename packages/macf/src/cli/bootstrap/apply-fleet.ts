@@ -217,6 +217,7 @@ import { buildInstallScopeValidator } from './install-scope.js';
 import type { ConfirmedInstall } from './identity-confirm.js';
 import type { AppCredentials } from './manifest-exchange.js';
 import type { AgentRepoDeps, AgentRepoOptions, RepoInitStepDeps, RepoInitStepOutcome } from './apply-repo-init.js';
+import type { InstallationCoversRepo } from './installation-covers-repo.js';
 import { applyRepoInitForAgent, ensureAgentRepo, resolveActionsPinReconcile, resolveAgentRepoInitTokenSource } from './apply-repo-init.js';
 import { repoHomepageUrl } from './app-manifest.js';
 import type { ControlRepoDeps, ControlRepoOptions, ControlRepoOutcome } from './control-repo.js';
@@ -333,6 +334,11 @@ export interface FleetApplyDeps {
    */
   readonly buildAgentDeps: (log: (line: string) => void) => Omit<AgentApplyDeps, 'writeRecoveryArtifact'>;
   readonly repoInitDeps: RepoInitStepDeps;
+  /**
+   * Whether an App's installation already covers a repo. Picks the App whose token creates a work
+   * repo's labels. Absent: the first App this run can resolve is used without asking.
+   */
+  readonly installationCoversRepo?: InstallationCoversRepo;
   readonly vaultDeps: WriteVaultDeps;
   /** DR-043 Amendment F (macf#857) — provisions/reuses `<fleet>-control`; see `control-repo.ts`'s module doc. */
   readonly controlRepoDeps: ControlRepoDeps;
@@ -769,6 +775,8 @@ export interface WorkRepoRecord {
   readonly ensure: 'created' | 'present' | 'revived' | 'failed';
   readonly reason?: string;
   readonly repoInit?: RepoInitStepOutcome;
+  /** No agent App's install covered this repo during apply, so its labels wait for the install widen. */
+  readonly labelsAwaitingInstall?: boolean;
 }
 
 export interface FleetApplyResult {
@@ -1915,25 +1923,31 @@ export async function applyFleet(
   // that this run can resolve — a just-created one, else a reused one from the vault — never the
   // operator's own token. With none resolvable, labels read 'skipped' exactly as for an agent repo.
   if (confirmedWorkRepos.length > 0) {
-    const workToken = resolveWorkRepoTokenSource(records, deps.buildAgentDeps(deps.log).resolveKeyPath);
+    const candidates = resolveWorkRepoTokenSources(records, deps.buildAgentDeps(deps.log).resolveKeyPath);
     try {
       for (const repo of confirmedWorkRepos) {
         const placeholder: FleetAgent = { role: 'work-repo', repo, deploy_path: '', provenance: 'mirror' };
         const pinReconcile = resolveActionsPinReconcile(manifest.versions?.actions, deps.observedActionsPins?.workRepos?.[repo]);
+        // An App that can already see the repo makes the labels. When none can yet, the labels
+        // wait for the install widen; workflow and config are still pushed.
+        const covering = await pickCoveringSource(candidates, repo, deps.installationCoversRepo);
+        const awaiting = candidates.length > 0 && covering === undefined;
         const outcome = await applyRepoInitForAgent(placeholder, manifest, deps.repoInitDeps, {
           actionsVersion: pinReconcile.actionsVersion,
           force: pinReconcile.force || deps.callerSecretRewriteWork?.[repo] === true,
-          ...(workToken !== undefined ? { tokenSource: workToken.tokenSource } : {}),
+          ...(covering !== undefined ? { tokenSource: covering } : {}),
         });
         const record = workRepoRecords.find((r) => r.repo === repo);
-        if (record !== undefined) workRepoRecords[workRepoRecords.indexOf(record)] = { ...record, repoInit: outcome };
+        if (record !== undefined) {
+          workRepoRecords[workRepoRecords.indexOf(record)] = { ...record, repoInit: outcome, ...(awaiting ? { labelsAwaitingInstall: true } : {}) };
+        }
         deps.log(
-          `Work repo "${repo}" repo-init: ${outcome.status === 'failed' ? `FAILED — ${outcome.reason}` : `applied (labels ${outcome.labels.status})`}.`,
+          `Work repo "${repo}" repo-init: ${outcome.status === 'failed' ? `FAILED — ${outcome.reason}` : `applied (labels ${awaiting ? 'awaiting-install' : outcome.labels.status})`}.`,
         );
         if (manifest.versions) actionsPinResults.push(actionsPinResultFor(repo, pinReconcile.force, outcome));
       }
     } finally {
-      workToken?.cleanup();
+      for (const c of candidates) c.cleanup();
     }
   }
 
@@ -3517,25 +3531,81 @@ async function settleVault(
 export { vaultAgentSecretsForFingerprint };
 
 /**
- * The App credential a work repo's repo-init mints its label token from: the first agent, in
- * manifest order, whose credential this run can resolve — a just-created one (PEM in memory,
- * written to a scratch file) or a reused one read from the vault. Every agent App is installed on
- * every work repo, so any of them can mint the token. `undefined` when none resolves.
+ * Every agent App credential this run can resolve, in manifest order: a just-created one (PEM in
+ * memory, written to a scratch file) or a reused one read from the vault. Callers `cleanup()` each.
  */
-function resolveWorkRepoTokenSource(
+interface WorkRepoTokenCandidate {
+  readonly tokenSource: TokenSource;
+  readonly cleanup: () => void;
+}
+
+function resolveWorkRepoTokenSources(
   records: readonly AgentApplyRecord[],
   resolveKeyPath: ((role: string, priorAppId: string) => string | undefined) | undefined,
-): { readonly tokenSource: TokenSource; readonly cleanup: () => void } | undefined {
+): WorkRepoTokenCandidate[] {
+  const out: WorkRepoTokenCandidate[] = [];
   for (const record of records) {
     const identity = record.identity;
     if (identity.status === 'created') {
       const keyPath = writeScratchPem(record.role, identity.credentials.pem);
-      return { tokenSource: { appId: identity.appId, installId: identity.installId, keyPath }, cleanup: () => cleanupScratchPem(keyPath) };
-    }
-    if (identity.status === 'reused' || identity.status === 'resumed-install') {
+      out.push({ tokenSource: { appId: identity.appId, installId: identity.installId, keyPath }, cleanup: () => cleanupScratchPem(keyPath) });
+    } else if (identity.status === 'reused' || identity.status === 'resumed-install') {
       const tokenSource = resolveAgentRepoInitTokenSource(record.role, identity.appId, identity.installId, resolveKeyPath);
-      if (tokenSource !== undefined) return { tokenSource, cleanup: () => undefined };
+      if (tokenSource !== undefined) out.push({ tokenSource, cleanup: () => undefined });
     }
   }
+  return out;
+}
+
+/** The first candidate whose install covers `repo`. Without a probe, the first candidate. */
+async function pickCoveringSource(
+  candidates: readonly WorkRepoTokenCandidate[],
+  repo: string,
+  covers: InstallationCoversRepo | undefined,
+): Promise<TokenSource | undefined> {
+  if (covers === undefined) return candidates[0]?.tokenSource;
+  for (const c of candidates) {
+    if (await covers(c.tokenSource, repo)) return c.tokenSource;
+  }
   return undefined;
+}
+
+/**
+ * After the install-scope gate: create the labels of every work repo that was waiting for an
+ * install to cover it, with the token of an App that covers it now. A repo still uncovered stays
+ * `labelsAwaitingInstall`. Re-running repo-init is safe: its workflow and config files already exist.
+ */
+export async function retryWorkRepoLabels(
+  result: FleetApplyResult,
+  manifest: FleetManifest,
+  deps: Pick<FleetApplyDeps, 'buildAgentDeps' | 'repoInitDeps' | 'installationCoversRepo' | 'log'>,
+): Promise<FleetApplyResult> {
+  const waiting = (result.workRepos ?? []).filter((w) => w.labelsAwaitingInstall === true);
+  if (waiting.length === 0) return result;
+  const candidates = resolveWorkRepoTokenSources(result.agents, deps.buildAgentDeps(deps.log).resolveKeyPath);
+  try {
+    const updated: WorkRepoRecord[] = [];
+    for (const w of result.workRepos ?? []) {
+      if (w.labelsAwaitingInstall !== true) {
+        updated.push(w);
+        continue;
+      }
+      const covering = await pickCoveringSource(candidates, w.repo, deps.installationCoversRepo);
+      if (covering === undefined) {
+        updated.push(w);
+        continue;
+      }
+      const placeholder: FleetAgent = { role: 'work-repo', repo: w.repo, deploy_path: '', provenance: 'mirror' };
+      const outcome = await applyRepoInitForAgent(placeholder, manifest, deps.repoInitDeps, {
+        actionsVersion: manifest.versions?.actions,
+        tokenSource: covering,
+      });
+      deps.log(`Work repo "${w.repo}" labels after install widen: ${outcome.status === 'failed' ? `FAILED — ${outcome.reason}` : outcome.labels.status}.`);
+      const { labelsAwaitingInstall: _done, ...rest } = w;
+      updated.push({ ...rest, repoInit: outcome });
+    }
+    return { ...result, workRepos: updated };
+  } finally {
+    for (const c of candidates) c.cleanup();
+  }
 }

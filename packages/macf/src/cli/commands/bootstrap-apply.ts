@@ -61,7 +61,8 @@ import {
 import type { CreateGuardDecision, CreateGuardDeps } from '../bootstrap/apply-agent.js';
 import { realCloneRepo, realCommitAndPush } from '../bootstrap/apply-repo-init.js';
 import type { AgentRepoDeps, RepoInitStepDeps } from '../bootstrap/apply-repo-init.js';
-import { applyFleet } from '../bootstrap/apply-fleet.js';
+import { applyFleet, retryWorkRepoLabels } from '../bootstrap/apply-fleet.js';
+import { realInstallationCoversRepo } from '../bootstrap/installation-covers-repo.js';
 import type { ActionsPinRepoStatus, ControlRepoSyncOutcome, FleetApplyDeps, FleetApplyResult } from '../bootstrap/apply-fleet.js';
 import type { ControlRepoDeps } from '../bootstrap/control-repo.js';
 import { controlRepoFullName } from '../bootstrap/control-repo.js';
@@ -2208,6 +2209,9 @@ function runnerOpsSummaryLines(result: FleetApplyResult): string[] {
   return [`Runner-ops App:`, formatIdentityLine('runner-ops', result.runnerOps)];
 }
 
+export const WORK_REPO_LABELS_AWAITING_INSTALL =
+  'labels not created: no agent App\'s install covers this repo yet. Click "Save" on the install page and re-run apply.';
+
 /** One line per `work_repos` entry: ensured or not, and the repo-init outcome. `[]` when none are declared. */
 function workRepoSummaryLines(result: FleetApplyResult): string[] {
   if (result.workRepos === undefined) return [];
@@ -2215,6 +2219,10 @@ function workRepoSummaryLines(result: FleetApplyResult): string[] {
   for (const w of result.workRepos) {
     if (w.ensure === 'failed') {
       lines.push(`  ${w.repo}: FAILED — ${w.reason ?? 'could not be ensured'}`);
+      continue;
+    }
+    if (w.labelsAwaitingInstall === true) {
+      lines.push(`  ${w.repo}: ${w.ensure.toUpperCase()}; ${WORK_REPO_LABELS_AWAITING_INSTALL}`);
       continue;
     }
     const init =
@@ -2756,7 +2764,7 @@ export function fleetApplyResultToJson(
     agents: result.agents.map((rec) => ({ role: rec.role, identity: redactIdentity(rec.identity), repo_init: rec.repoInit ?? null })),
     // Additive key (same unbumped precedent as `install_scope_coverage`): omitted when the manifest declares no work repos.
     ...(result.workRepos !== undefined
-      ? { work_repos: result.workRepos.map((w) => ({ repo: w.repo, ensure: w.ensure, reason: w.reason ?? null, repo_init: w.repoInit ?? null })) }
+      ? { work_repos: result.workRepos.map((w) => ({ repo: w.repo, ensure: w.ensure, reason: w.reason ?? null, repo_init: w.repoInit ?? null, labels_awaiting_install: w.labelsAwaitingInstall === true })) }
       : {}),
     vault: result.vault,
     lock_path: result.lockPath,
@@ -3174,7 +3182,8 @@ export function applyExitCode(
     result.controlRepoInit.status === 'written' && result.controlRepoInit.labels.status !== 'ok' && result.controlRepoInit.labelsGoodEnough;
   // A routing leg left `'pending'` means a runner the platform accepted never
   // became visible within the wait: that repo cannot route yet.
-  return versionPartial || controlRepoLabelsPending || pendingRoutingRepos(result).length > 0 ? 2 : 0;
+  const workRepoLabelsPending = (result.workRepos ?? []).some((w) => w.labelsAwaitingInstall === true);
+  return versionPartial || controlRepoLabelsPending || workRepoLabelsPending || pendingRoutingRepos(result).length > 0 ? 2 : 0;
 }
 
 /** Repos whose `MACF_TRUSTED_ACTORS` leg ended `'pending'` (runner not visible yet). */
@@ -3702,6 +3711,8 @@ export async function runBootstrapApply(
       callerSecretRewrites: mutateDeps?.callerSecretRewrites ?? callerSecretRewritesFromObserved(manifest, observed),
       callerSecretRewriteControl: mutateDeps?.callerSecretRewriteControl ?? controlCallerSecretRewriteFromObserved(manifest, observed),
       callerSecretRewriteWork: mutateDeps?.callerSecretRewriteWork ?? callerSecretRewritesForWorkRepos(manifest, observed),
+      // Tests that inject their own mutate deps leave the probe absent; production gets the real one.
+      installationCoversRepo: mutateDeps !== undefined ? mutateDeps.installationCoversRepo : realInstallationCoversRepo,
       // groundnuty/macf#1211 — same "merged on TOP, never through
       // resolveMutateDeps's own param list" precedent as observedActionsPins
       // immediately above: the RAW scope-variable value, already read once
@@ -3729,7 +3740,7 @@ export async function runBootstrapApply(
       }
 
       const priorLock = mutate.readPriorLock(manifestPath);
-      const result = await applyFleet(manifest, manifestPath, priorLock, mutate);
+      let result = await applyFleet(manifest, manifestPath, priorLock, mutate);
 
       // groundnuty/macf#1272 (DR-043 Amendment P3 execution wiring) — runs
       // right after the GitHub phase above (`applyFleet`), on the SAME
@@ -3993,6 +4004,9 @@ export async function runBootstrapApply(
           ) as Readonly<Record<string, Presence>>,
         },
       );
+      // The gate above may have widened an agent App's install over a work repo whose labels waited
+      // for it; create them now, in this run, so the summary and exit code show the final state.
+      result = await retryWorkRepoLabels(result, manifest, mutate);
       const installScopeCoverageLines = formatInstallScopeCoverageLines(installScopeCoverage);
 
       // groundnuty/macf#1241 — resolve org-inherited routing-secret

@@ -19,7 +19,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { applyFleet, shouldWriteBatchedFleetLock, type FleetApplyDeps, type VaultApplyOutcome } from '../../../src/cli/bootstrap/apply-fleet.js';
+import { applyFleet, retryWorkRepoLabels, shouldWriteBatchedFleetLock, type FleetApplyDeps, type VaultApplyOutcome } from '../../../src/cli/bootstrap/apply-fleet.js';
 import type { FleetAgent, FleetLock, FleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import { parseFleetLock, parseFleetManifest } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import { secretFingerprint } from '../../../src/cli/bootstrap/fleet-lock.js';
@@ -3820,6 +3820,72 @@ agents:
           expect(result.agents.every((a) => a.identity.status === 'created')).toBe(true);
           expect(applyExitCode(result)).toBe(1);
           expect(formatApplyResult(result)).toContain(WORK);
+        });
+
+        describe('labels and the install widen', () => {
+          const plainManifest = (): FleetManifest => ({ ...manifestWith([CODE_AGENT]), work_repos: [WORK] });
+          const setup = (covers: { current: boolean }) => {
+            const manifestPath = manifestPathIn();
+            const inits: { repo: string | undefined; appId: string | undefined }[] = [];
+            const repoInitDeps: RepoInitStepDeps = {
+              cloneRepo: async () => {},
+              commitAndPush: async () => 'pushed',
+              repoInit: async (_dir, opts) => {
+                inits.push({ repo: opts.repo, appId: opts.tokenSource?.appId });
+                return {
+                  workflow: 'created',
+                  config: 'created',
+                  labels: opts.tokenSource !== undefined ? { status: 'ok', created: [], existed: [] } : { status: 'skipped', reason: 'no token' },
+                };
+              },
+            };
+            const deps: FleetApplyDeps = {
+              ...baseDeps(agentDepsFor('code-agent', 'created', 'app-code-agent', 'install-1'), manifestPath, repoInitDeps),
+              installationCoversRepo: async () => covers.current,
+            };
+            return { manifestPath, inits, deps };
+          };
+
+          it('an App whose install already covers the work repo makes its labels during applyFleet', async () => {
+            const { manifestPath, inits, deps } = setup({ current: true });
+            const result = await applyFleet(plainManifest(), manifestPath, null, deps);
+            expect(inits.find((c) => c.repo === WORK)?.appId).toBe('app-code-agent');
+            expect(result.workRepos?.[0]?.labelsAwaitingInstall).toBeUndefined();
+          });
+
+          it('with no covering App the labels are awaiting-install and not attempted', async () => {
+            const { manifestPath, inits, deps } = setup({ current: false });
+            const result = await applyFleet(plainManifest(), manifestPath, null, deps);
+            expect(inits.find((c) => c.repo === WORK)?.appId).toBeUndefined();
+            expect(result.workRepos?.[0]).toMatchObject({ labelsAwaitingInstall: true });
+            expect(result.workRepos?.[0]?.repoInit?.status).toBe('applied');
+          });
+
+          it('after a gate that widens an App, the retry creates the labels and the exit is not 2', async () => {
+            const covers = { current: false };
+            const { manifestPath, inits, deps } = setup(covers);
+            const manifest = plainManifest();
+            const result = await applyFleet(manifest, manifestPath, null, deps);
+            expect(applyExitCode(result)).toBe(2);
+            covers.current = true;
+            const after = await retryWorkRepoLabels(result, manifest, deps);
+            expect(inits.filter((c) => c.repo === WORK).at(-1)?.appId).toBe('app-code-agent');
+            expect(after.workRepos?.[0]?.labelsAwaitingInstall).toBeUndefined();
+            expect(after.workRepos?.[0]?.repoInit).toMatchObject({ status: 'applied', labels: { status: 'ok' } });
+            expect(applyExitCode(after)).not.toBe(2);
+            expect(formatApplyResult(after)).not.toContain('labels not created');
+          });
+
+          it('if the gate widens nothing, the exit is 2 and the summary says to click Save and re-run', async () => {
+            const { manifestPath, deps } = setup({ current: false });
+            const manifest = plainManifest();
+            const result = await applyFleet(manifest, manifestPath, null, deps);
+            const after = await retryWorkRepoLabels(result, manifest, deps);
+            expect(applyExitCode(after)).toBe(2);
+            expect(formatApplyResult(after)).toContain(
+              'labels not created: no agent App\'s install covers this repo yet. Click "Save" on the install page and re-run apply.',
+            );
+          });
         });
 
         it('a fleet without work_repos reports no work-repo record and provisions exactly as before', async () => {
