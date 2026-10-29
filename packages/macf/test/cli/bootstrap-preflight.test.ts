@@ -339,6 +339,30 @@ describe('agent host over ssh', () => {
   });
 });
 
+describe('agent-host version floors', () => {
+  const vmDeps = (probe: ExecResult): PreflightDeps =>
+    makeDeps({ exec: (c, a, input) => (c === 'ssh' ? (a.includes('true') ? ok() : input !== undefined ? probe : undefined) : undefined) }).deps;
+  const run = async (probe: string) => {
+    const checks = await agentHostChecks(vmDeps(ok(probe)), 'ubuntu@vm');
+    return Object.fromEntries(checks.map((c) => [c.id, c]));
+  };
+  it('an old Claude Code on the agent host is wrong (below 2.1.80 the agents get no channel notifications)', async () => {
+    const r = await run(PROBE_OK.replace('claude|login|2.1.300', 'claude|login|2.1.79 (Claude Code)'));
+    expect(r['agent-host-claude']?.status).toBe('wrong');
+    expect(r['agent-host-claude']?.detail).toContain('older than 2.1.80');
+  });
+  it('an old node on the agent host is wrong', async () => {
+    const r = await run(PROBE_OK.replace('node|login|v22.14.0', 'node|login|v20.11.1'));
+    expect(r['agent-host-node']?.status).toBe('wrong');
+  });
+  it('an unreadable version is unknown, current versions are ok', async () => {
+    expect((await run(PROBE_OK.replace('claude|login|2.1.300', 'claude|login|weird')))['agent-host-claude']?.status).toBe('unknown');
+    const fine = await run(PROBE_OK);
+    expect(fine['agent-host-claude']?.status).toBe('ok');
+    expect(fine['agent-host-node']?.status).toBe('ok');
+  });
+});
+
 describe('the agent-host probe script', () => {
   it('reads crontab in the same login shell that found it', async () => {
     const { readFileSync } = await import('node:fs');

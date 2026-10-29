@@ -4,11 +4,21 @@
  * Are the tools the agents need on the PATH of a non-interactive login shell
  * (the shell cron and `fleet install-cron` use)? Read-only.
  */
+import { compareSemver } from '@groundnuty/macf-core';
 import type { ExecResult, PreflightCheck, PreflightDeps } from './preflight.js';
 
 const AGENT_HOST_TOOLS = ['node', 'claude', 'tmux', 'crontab', 'gh', 'macf'] as const;
 
 const SSH_OPTS = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10'] as const;
+
+/**
+ * Minimum versions on the agent host. Below Claude Code 2.1.80, claude.sh drops the
+ * channel flags and the agents get no routed notifications.
+ */
+const AGENT_HOST_MINIMUMS: Readonly<Partial<Record<string, { readonly min: string; readonly fix: string }>>> = {
+  node: { min: '22.12.0', fix: 'install Node.js 22.12 or later on the agent host' },
+  claude: { min: '2.1.80', fix: 'update Claude Code on the agent host (claude update)' },
+};
 
 /** One shell script, sent over stdin so no quoting survives the remote login shell. */
 const PROBE_SCRIPT = `for t in ${AGENT_HOST_TOOLS.join(' ')}; do
@@ -67,6 +77,16 @@ function toolCheck(tool: string, mode: string, version: string, skipCron = false
   const id = `agent-host-${tool}`;
   if (tool === 'crontab' && !skipCron) return crontabCheck(id, mode, version);
   if (mode === 'login') {
+    const floor = AGENT_HOST_MINIMUMS[tool];
+    if (floor !== undefined) {
+      const have = /(\d+\.\d+\.\d+)/.exec(version)?.[1];
+      if (have === undefined) {
+        return { id, group: 'agent-host', status: 'unknown', detail: `could not read the ${tool} version on the agent host ("${version}"); it needs ${floor.min} or later` };
+      }
+      if (compareSemver(have, floor.min) < 0) {
+        return { id, group: 'agent-host', status: 'wrong', detail: `${tool} ${have} on the agent host is older than ${floor.min}`, fix: floor.fix };
+      }
+    }
     return { id, group: 'agent-host', status: 'ok', detail: `${tool} on the agent host (non-interactive login PATH): ${version || 'version unknown'}` };
   }
   if (mode === 'interactive') {
