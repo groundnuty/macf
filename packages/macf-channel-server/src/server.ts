@@ -39,6 +39,7 @@ import { wakeViaTmux } from './tmux-wake.js';
 import { readChannelRegistration, createWakeRouter } from './channel-registration.js';
 import { homedir } from 'node:os';
 import { decideWake } from './wake-decision.js';
+import { isAutonomousPeerLifecycle, pushUnlessLifecycle } from './peer-lifecycle.js';
 import { createCommsLedger } from './comms-ledger.js';
 import { recordEdge } from './comms-ledger-record.js';
 import type { CommsLedgerEdge } from './comms-ledger.js';
@@ -280,7 +281,12 @@ async function main(): Promise<void> {
       { kind: SpanKind.INTERNAL },
       async (span) => {
         try {
-          await mcp.pushNotification(content, meta);
+          const pushed = await pushUnlessLifecycle(
+            payload,
+            () => mcp.pushNotification(content, meta),
+            logger,
+          );
+          span.setAttribute('macf.mcp.pushed', pushed);
           span.setStatus({ code: SpanStatusCode.OK });
         } catch (err) {
           span.recordException(err as Error);
@@ -296,10 +302,12 @@ async function main(): Promise<void> {
     );
     health.recordNotification();
 
-    logger.info('mcp_pushed', {
-      type: payload.type,
-      issue: payload.issue_number,
-    });
+    if (!isAutonomousPeerLifecycle(payload)) {
+      logger.info('mcp_pushed', {
+        type: payload.type,
+        issue: payload.issue_number,
+      });
+    }
 
     // macf#185: sidecar wake via tmux-send-to-claude.sh. The MCP push
     // above deposits the notification in the channel-server's
@@ -310,9 +318,9 @@ async function main(): Promise<void> {
     // path where tmux isn't available (no workspace dir, no tmux
     // session, helper missing, tmux command errors).
     //
-    // macf#267 Finding 2 (Option d): peer_notification is observational
-    // only by default — MCP push deposits the notification in channel
-    // state for /macf-status visibility, but tmux wake is suppressed.
+    // macf#267 Finding 2 (Option d): autonomous peer_notification events are
+    // observational only: no MCP push (it would start a turn on a registered
+    // channel, macf#1525) and no tmux wake. The ledger and /health still record them.
     // This stops the cross-agent Stop-hook ping-pong loop: peer
     // notifications don't trigger fresh turns on receivers, so receivers
     // don't fire their own Stop hooks in response. SessionStart polling-

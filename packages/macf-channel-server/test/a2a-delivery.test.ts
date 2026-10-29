@@ -33,7 +33,7 @@ describe('a2aMessageToNotifyPayload (macf#428)', () => {
   });
 
   it('carries an autonomous event from metadata (→ decideWake will SKIP wake, Pattern E)', () => {
-    for (const ev of ['turn-complete', 'session-end', 'error'] as const) {
+    for (const ev of ['turn-complete', 'session-end', 'session-compact', 'error'] as const) {
       const p = a2aMessageToNotifyPayload(msg([{ text: 'x' }], { event: ev, source: 's' }));
       expect(p.event).toBe(ev);
     }

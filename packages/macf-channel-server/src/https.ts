@@ -235,6 +235,8 @@ export function a2aMetadataToCommsEvent(message: Message): CommsEvent {
   switch (ev) {
     case 'session-end':
       return 'session-end';
+    case 'session-compact':
+      return 'session-compact';
     case 'turn-complete':
       return 'turn-complete';
     case 'error':
