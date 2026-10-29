@@ -951,3 +951,69 @@ describe('launcher warns when the channel server is turned off in settings (#152
     expect(at).toBeLessThan(text.lastIndexOf('exec claude'));
   });
 });
+
+describe('session env for teammate panes (#1525)', () => {
+  const script = generateClaudeSh(sampleConfig);
+  const start = script.indexOf('macf_session_env_lines() {');
+  const endMarker = script.indexOf('# Channel notifications enablement');
+  // helper + wrap block + set-environment block
+  const frag = script.slice(start, endMarker);
+
+  function run(extraEnv: Record<string, string>, setEnvExit = 0): string[] {
+    const dir = mkdtempSync(join(tmpdir(), 'sessenv-'));
+    try {
+      mkdirSync(join(dir, 'bin'));
+      const log = join(dir, 'tmux.log');
+      writeFileSync(
+        join(dir, 'bin', 'tmux'),
+        `#!/bin/sh\nif [ "$1" = display-message ]; then echo agent-sess; exit 0; fi\n` +
+          `echo "$@" >> "${log}"\nif [ "$1" = set-environment ]; then exit ${setEnvExit}; fi\nexit 0\n`,
+        { mode: 0o755 },
+      );
+      const r = spawnSync('bash', ['-c', `set -euo pipefail\nSCRIPT_DIR="${dir}"\n${frag}\necho done`], {
+        encoding: 'utf8',
+        env: {
+          PATH: `${join(dir, 'bin')}:/usr/bin:/bin`,
+          MACF_NO_TMUX_WRAP: '1',
+          MACF_PROJECT: 'p',
+          MACF_ROUTING_LABEL: 'a',
+          ...extraEnv,
+        },
+      });
+      expect(r.stdout).toContain('done');
+      return existsSync(log) ? readFileSync(log, 'utf8').split('\n').filter(Boolean) : [];
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  const creds = {
+    APP_ID: '1', INSTALL_ID: '2', KEY_PATH: '/k.pem',
+    GIT_AUTHOR_NAME: 'n', GIT_AUTHOR_EMAIL: 'e', GIT_COMMITTER_NAME: 'n', GIT_COMMITTER_EMAIL: 'e',
+    GH_TOKEN: 'ghs_secret',
+  };
+
+  it('inside tmux, sets credentials and MACF_* on the session, never GH_TOKEN', () => {
+    const calls = run({ TMUX: '/tmp/t,1,0', ...creds });
+    const names = calls.filter((c) => c.startsWith('set-environment -t agent-sess ')).map((c) => c.split(' ')[3]);
+    for (const n of ['APP_ID', 'INSTALL_ID', 'KEY_PATH', 'GIT_AUTHOR_NAME', 'GIT_COMMITTER_EMAIL', 'MACF_PROJECT']) {
+      expect(names).toContain(n);
+    }
+    expect(names).not.toContain('GH_TOKEN');
+    expect(calls.join('\n')).not.toContain('ghs_secret');
+  });
+
+  it('does not fail the launch when set-environment fails', () => {
+    expect(run({ TMUX: '/tmp/t,1,0', ...creds }, 1).length).toBeGreaterThan(0);
+  });
+
+  it('outside tmux makes no set-environment calls', () => {
+    const calls = run({ ...creds });
+    expect(calls.filter((c) => c.startsWith('set-environment'))).toEqual([]);
+  });
+
+  it('the -e loop and the set-environment loop read the same list', () => {
+    expect(script.match(/done < <\(macf_session_env_lines\)/g)).toHaveLength(2);
+    expect(script.match(/grep -E "\^\(APP_ID\|/g)).toHaveLength(1);
+  });
+});

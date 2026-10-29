@@ -37,7 +37,8 @@ describe('tmux wrap passes credentials, never GH_TOKEN', () => {
     const out = generateClaudeSh(config);
     const start = out.indexOf('if [ -z "${TMUX:-}" ]');
     const end = out.indexOf('\nfi\n', start) + 4;
-    const fragment = out.slice(start, end);
+    const helper = out.slice(out.indexOf('macf_session_env_lines() {'), out.indexOf('\n}\n', out.indexOf('macf_session_env_lines() {')) + 3);
+    const fragment = helper + '\n' + out.slice(start, end);
     const dir = tmp();
     mkdirSync(join(dir, 'bin'));
     const argvFile = join(dir, 'argv');
