@@ -9,6 +9,37 @@ export interface PendingIssue {
   readonly title: string;
   /** Which repo this issue lives in. Set when checked across the App install-set. */
   readonly repo?: string;
+  /** Label names, when the source returned them (the `involves:` leg does). */
+  readonly labels?: readonly string[];
+  /** Author login, when the source returned it (the `involves:` leg does). */
+  readonly author?: string;
+}
+
+const BACKLOG_LABEL = 'backlog';
+
+/** A label that routes work to some agent: `<name>-agent` or `<name>-architect`. */
+function isAgentLabel(label: string): boolean {
+  return /-(agent|architect)$/.test(label);
+}
+
+function normalizeLogin(login: string): string {
+  return login.replace(/^app\//, '').replace(/\[bot\]$/, '');
+}
+
+/**
+ * Keep an `involves:` hit only when it is work for THIS agent: not authored by
+ * it (`involves:` includes authorship, so a coordinator would get everything
+ * it filed), not labelled for another agent, and not parked as backlog.
+ */
+export function isPickupForSelf(
+  issue: PendingIssue,
+  selfLogin: string,
+  ownLabel?: string,
+): boolean {
+  if (issue.author && normalizeLogin(issue.author) === normalizeLogin(selfLogin)) return false;
+  const labels = issue.labels ?? [];
+  if (labels.includes(BACKLOG_LABEL)) return false;
+  return !labels.some((l) => l !== ownLabel && isAgentLabel(l));
 }
 
 /**
@@ -169,7 +200,9 @@ export function resolveSelfLogin(env: NodeJS.ProcessEnv = process.env): string |
  * socially-active bot account. `gh search issues -L` paginates internally
  * up to this count in a single command — no manual page-loop needed.
  */
-const INVOLVES_SEARCH_LIMIT = 100;
+// 1000 is gh's maximum. The author and other-agent filters run after the search
+// (macf#1525), so a small cap could fill with excluded issues and hide real work.
+const INVOLVES_SEARCH_LIMIT = 1000;
 
 /**
  * Default `involves:` search — `gh search issues --involves <login>`.
@@ -185,8 +218,10 @@ async function defaultListSearch(
     'search', 'issues',
     '--involves', login,
     '--state', 'open',
-    '--json', 'number,title,repository',
+    '--json', 'number,title,repository,labels,author',
     '-L', String(INVOLVES_SEARCH_LIMIT),
+    // Exclude backlog in the query itself, so it never uses up the cap.
+    '--', '-label:backlog',
   ], {
     encoding: 'utf-8',
     env: { ...process.env, GH_TOKEN: token },
@@ -197,11 +232,15 @@ async function defaultListSearch(
     readonly number: number;
     readonly title: string;
     readonly repository: { readonly nameWithOwner: string };
+    readonly labels?: ReadonlyArray<{ readonly name: string }>;
+    readonly author?: { readonly login: string };
   }>;
   return parsed.map((issue) => ({
     number: issue.number,
     title: issue.title,
     repo: issue.repository.nameWithOwner,
+    labels: (issue.labels ?? []).map((l) => l.name),
+    ...(issue.author ? { author: issue.author.login } : {}),
   }));
 }
 
@@ -244,6 +283,8 @@ async function defaultListSearch(
 export async function searchInvolvesIssues(config: {
   readonly selfLogin: string;
   readonly token: string;
+  /** This agent's own routing label; it is never treated as another agent's. */
+  readonly ownLabel?: string;
   /** Override for tests; defaults to `gh search issues --involves`. */
   readonly listSearch?: (
     login: string,
@@ -258,7 +299,8 @@ export async function searchInvolvesIssues(config: {
   const login = `${selfLogin}[bot]`;
 
   try {
-    return await listSearch(login, token);
+    const hits = await listSearch(login, token);
+    return hits.filter((i) => isPickupForSelf(i, selfLogin, config.ownLabel));
   } catch (err) {
     process.stderr.write(
       `Warning: failed to search involves:${login} issues: ${err instanceof Error ? err.message : String(err)}\n`,
@@ -324,6 +366,7 @@ export async function checkAllPendingWork(config: {
   readonly searchInvolves?: (config: {
     readonly selfLogin: string;
     readonly token: string;
+    readonly ownLabel?: string;
   }) => Promise<readonly PendingIssue[]>;
 }): Promise<readonly PendingIssue[]> {
   const { label, token, selfLogin } = config;
@@ -337,7 +380,7 @@ export async function checkAllPendingWork(config: {
       checkOneRepo: config.checkOneRepo,
     }),
     selfLogin
-      ? searchInvolves({ selfLogin, token })
+      ? searchInvolves({ selfLogin, token, ownLabel: label })
       : Promise.resolve<readonly PendingIssue[]>([]),
   ]);
 

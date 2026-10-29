@@ -273,6 +273,10 @@ describe('searchInvolvesIssues (macf#816)', () => {
     expect(args).toContain('--involves');
     expect(args[args.indexOf('--involves') + 1]).toBe('macf-code-agent[bot]');
     expect(args).not.toContain('--label');
+    // backlog is excluded in the query, and the cap is gh's maximum, so post-search
+    // filtering cannot hide real work behind excluded results (macf#1525).
+    expect(args.slice(args.indexOf('--'))).toEqual(['--', '-label:backlog']);
+    expect(args[args.indexOf('-L') + 1]).toBe('1000');
   });
 
   it('the default query maps gh search issues --json output (number,title,repository.nameWithOwner)', async () => {
@@ -290,13 +294,54 @@ describe('searchInvolvesIssues (macf#816)', () => {
 
     const result = await searchInvolvesIssues({ selfLogin: 'macf-code-agent', token: 'test-token' });
 
-    expect(result).toEqual([{ number: 3, title: 'guest task', repo: 'other-org/other-repo' }]);
+    expect(result).toEqual([{ number: 3, title: 'guest task', repo: 'other-org/other-repo', labels: [] }]);
   });
 });
 
 // macf#816: the generic, non-hardwired work-discovery union. The devops
 // review criterion was explicit: EITHER leg throwing must not blank the
 // OTHER leg's results.
+describe('searchInvolvesIssues pickup scope (#1525)', () => {
+  const hit = (n: number, extra: object) => ({ number: n, title: `t${n}`, repo: 'o/r', ...extra });
+  const run = (hits: object[]) =>
+    searchInvolvesIssues({
+      selfLogin: 'macf-science-agent',
+      token: 't',
+      ownLabel: 'science-agent',
+      listSearch: async () => hits as any,
+    });
+
+  it('drops an issue the agent authored that is labelled for another agent', async () => {
+    const r = await run([hit(1, { author: 'macf-science-agent[bot]', labels: ['code-agent'] })]);
+    expect(r).toEqual([]);
+  });
+
+  it('drops a backlog issue the agent authored', async () => {
+    const r = await run([hit(2, { author: 'app/macf-science-agent', labels: ['backlog'] })]);
+    expect(r).toEqual([]);
+  });
+
+  it('drops an unlabelled issue the agent merely authored', async () => {
+    const r = await run([hit(6, { author: 'macf-science-agent[bot]', labels: [] })]);
+    expect(r).toEqual([]);
+  });
+
+  it('drops a mention that carries another agent label', async () => {
+    const r = await run([hit(3, { author: 'someone', labels: ['writing-agent'] })]);
+    expect(r).toEqual([]);
+  });
+
+  it('keeps an issue labelled for this agent that someone else filed', async () => {
+    const r = await run([hit(4, { author: 'someone', labels: ['science-agent'] })]);
+    expect(r.map((i) => i.number)).toEqual([4]);
+  });
+
+  it('keeps a mention with no other agent label', async () => {
+    const r = await run([hit(5, { author: 'someone', labels: ['bug'] })]);
+    expect(r.map((i) => i.number)).toEqual([5]);
+  });
+});
+
 describe('checkAllPendingWork (macf#816)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
