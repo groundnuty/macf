@@ -12,6 +12,10 @@ import type { FleetLock, FleetManifest } from '../../../src/cli/bootstrap/fleet-
 import type { Presence } from '../../../src/cli/bootstrap/plan.js';
 import {
   computeInstallScopeCoverage,
+  computeInstallScopeExtras,
+  formatInstallScopeExtrasLines,
+  installScopeExtrasTargets,
+  type InstallScopeExtrasEntry,
   evaluateInstallScopeCoverage,
   hasInstallScopeCoverageDrift,
   installScopeCoverageDriftMessage,
@@ -22,6 +26,8 @@ import {
   type InstallScopeCoverageEntry,
   type InstallScopeCoverageTarget,
 } from '../../../src/cli/bootstrap/install-scope-coverage.js';
+import { toVariableSegment } from '@groundnuty/macf-core';
+import { deriveAppHandle } from '../../../src/cli/bootstrap/fleet-manifest.js';
 import { RUNNER_OPS_ROLE } from '../../../src/cli/bootstrap/apply-runner-ops.js';
 import { ROUTER_APP_ROLE } from '../../../src/cli/bootstrap/apply-router-app.js';
 
@@ -377,5 +383,67 @@ describe('installScopeCoverageEntryToJson', () => {
     expect(json['app_handle']).toBe(RUNNER_OPS_TARGET.appHandle);
     expect(json['missing_repos']).toEqual([]);
     expect('message' in json).toBe(false);
+  });
+});
+
+// --- Wider-than-declared advisory (per-agent Apps only) ---
+
+describe('computeInstallScopeExtras — a per-agent App installed beyond its declared repos is advisory (setup review S13)', () => {
+  const VAULT = { vaultPath: '/v', identityPath: '/k' };
+  const pem = Buffer.from('FAKE PEM CONTENT').toString('base64');
+  const CODE = 'macf-experiment/trial-code-agent';
+  const SCIENCE = 'macf-experiment/trial-science-agent';
+  const WRITING = 'macf-experiment/trial-writing-agent';
+  const agentKey = (role: string): string => `MACF_AGENT_${toVariableSegment(deriveAppHandle('trial', role))}_PRIVATE_KEY_B64`;
+  const lockFor = (...roles: string[]): FleetLock => ({
+    schema_version: 1,
+    fleet: 'trial',
+    agents: roles.map((role, i) => ({ role, app_id: `${100 + i}`, install_id: `${200 + i}` })),
+  });
+  const vaultFor = (...roles: string[]): Record<string, string> => Object.fromEntries(roles.map((r) => [agentKey(r), pem]));
+
+  it('an extra repo on a per-agent App gives the advisory naming that repo', async () => {
+    const probeFn = vi.fn(async (_appId: string, _key: string, owner: string, repo: string): Promise<Presence> => (`${owner}/${repo}` === SCIENCE ? 'present' : 'absent'));
+    const result = await computeInstallScopeExtras(fleet(), lockFor('code-agent'), VAULT, { probeFn, readVaultFn: async () => vaultFor('code-agent') });
+    const code = result['code-agent'];
+    expect(code?.status).toBe('wider');
+    expect(code?.extraRepos).toEqual([SCIENCE]);
+    expect(formatInstallScopeExtrasLines(result)).toContain(`install_scope: wider than declared (${SCIENCE}) [code-agent]`);
+  });
+
+  it('an extra repo on the router App gives nothing: it is never a target and is never probed', async () => {
+    const probeFn = vi.fn(async (): Promise<Presence> => 'present');
+    const lock: FleetLock = { schema_version: 1, fleet: 'trial', agents: [{ role: ROUTER_APP_ROLE, app_id: '900', install_id: '901' }] };
+    const readVaultFn = async (): Promise<Record<string, string>> => ({ MACF_ROUTING_APP_ID: '900', MACF_ROUTING_APP_KEY_B64: pem });
+    const result = await computeInstallScopeExtras(fleet(), lock, VAULT, { probeFn, readVaultFn });
+    expect(result[ROUTER_APP_ROLE]).toBeUndefined();
+    expect(result[RUNNER_OPS_ROLE]).toBeUndefined();
+    expect(probeFn.mock.calls.some((c) => c[0] === '900')).toBe(false);
+    expect(installScopeExtrasTargets(fleet()).map((t) => t.role)).toEqual(['code-agent', 'science-agent', 'writing-agent']);
+  });
+
+  it('exact coverage gives nothing', async () => {
+    const probeFn = vi.fn(async (): Promise<Presence> => 'absent');
+    const result = await computeInstallScopeExtras(fleet(), lockFor('code-agent'), VAULT, { probeFn, readVaultFn: async () => vaultFor('code-agent') });
+    expect(result['code-agent']?.status).toBe('exact');
+    expect(probeFn.mock.calls.map((c) => `${c[2]}/${c[3]}`).sort()).toEqual([SCIENCE, WRITING]);
+    expect(formatInstallScopeExtrasLines({ 'code-agent': result['code-agent'] as InstallScopeExtrasEntry })).toEqual([]);
+  });
+
+  it('an unreadable list says unknown, never exact', async () => {
+    const probeFn = vi.fn(async (): Promise<Presence> => 'unknown');
+    const probed = await computeInstallScopeExtras(fleet(), lockFor('code-agent'), VAULT, { probeFn, readVaultFn: async () => vaultFor('code-agent') });
+    expect(probed['code-agent']?.status).toBe('unknown');
+    expect(formatInstallScopeExtrasLines(probed)[0]).toContain('install_scope: unknown');
+
+    const noVault = await computeInstallScopeExtras(fleet(), lockFor('code-agent'), undefined);
+    expect(Object.values(noVault).every((e) => e.status === 'unknown')).toBe(true);
+
+    const badVault = await computeInstallScopeExtras(fleet(), lockFor('code-agent'), VAULT, {
+      readVaultFn: async () => {
+        throw new Error('bad age identity key');
+      },
+    });
+    expect(Object.values(badVault).every((e) => e.status === 'unknown' && e.message?.includes('bad age identity key'))).toBe(true);
   });
 });

@@ -401,6 +401,148 @@ export async function computeInstallScopeCoverage(
   return out;
 }
 
+// --- Wider-than-declared advisory (per-agent Apps only) ---
+
+/**
+ * A per-agent App belongs to one fleet, so an install that reaches a PEER
+ * agent's repo is wider than declared and gives that App write on the peer's
+ * `contents`, `workflows` and `actions_variables`. The shared router App and
+ * runner-ops are deliberately not checked here: the router App legitimately
+ * covers other fleets' repos, and runner-ops is installed on every repo.
+ *
+ * This reuses the per-repo JWT probe, so it can only see the repos this fleet
+ * declares (the peers' repos). It cannot see an install that reaches repos
+ * outside the fleet; that needs an installation token this tool does not hold.
+ */
+export interface InstallScopeExtrasTarget {
+  readonly role: string;
+  readonly appHandle: string;
+  readonly declaredRepos: readonly string[];
+  /** Peer agents' repos the App is not declared for — the only repos this check can probe. */
+  readonly candidateRepos: readonly string[];
+}
+
+export type InstallScopeExtrasStatus = 'exact' | 'wider' | 'unknown';
+
+export interface InstallScopeExtrasEntry extends InstallScopeExtrasTarget {
+  readonly status: InstallScopeExtrasStatus;
+  /** Candidate repos the probe confirmed the App's installation covers. */
+  readonly extraRepos: readonly string[];
+  /** Candidate repos the probe could not answer for. */
+  readonly unverifiedRepos: readonly string[];
+  readonly message?: string;
+}
+
+/** One target per declared agent App (never runner-ops, never the router App). Pure. */
+export function installScopeExtrasTargets(manifest: FleetManifest): readonly InstallScopeExtrasTarget[] {
+  return manifest.agents.map((agent) => {
+    const declaredRepos = installReposForIdentity(agent.role, manifest);
+    const candidateRepos = [...new Set(manifest.agents.map((a) => a.repo))].filter((r) => !declaredRepos.includes(r));
+    return { role: agent.role, appHandle: deriveAppHandle(manifest.metadata.name, agent.role), declaredRepos, candidateRepos };
+  });
+}
+
+export function installScopeExtrasWiderMessage(extraRepos: readonly string[]): string {
+  return `install_scope: wider than declared (${extraRepos.join(', ')})`;
+}
+
+export function installScopeExtrasUnknownMessage(appHandle: string, unverifiedRepos: readonly string[]): string {
+  return `install_scope: unknown — could not confirm whether App "${appHandle}" is installed on ${unverifiedRepos.join(', ')}`;
+}
+
+/** Pure diff over the probe results. `present` is an extra, `unknown` is unverified, `absent` is fine. */
+export function evaluateInstallScopeExtras(target: InstallScopeExtrasTarget, probed: Readonly<Record<string, Presence>>): InstallScopeExtrasEntry {
+  const extraRepos: string[] = [];
+  const unverifiedRepos: string[] = [];
+  for (const repo of target.candidateRepos) {
+    const presence = probed[repo] ?? 'unknown';
+    if (presence === 'present') extraRepos.push(repo);
+    else if (presence === 'unknown') unverifiedRepos.push(repo);
+  }
+  if (extraRepos.length > 0) {
+    return { ...target, status: 'wider', extraRepos, unverifiedRepos, message: installScopeExtrasWiderMessage(extraRepos) };
+  }
+  if (unverifiedRepos.length > 0) {
+    return { ...target, status: 'unknown', extraRepos: [], unverifiedRepos, message: installScopeExtrasUnknownMessage(target.appHandle, unverifiedRepos) };
+  }
+  return { ...target, status: 'exact', extraRepos: [], unverifiedRepos: [] };
+}
+
+function extrasAllUnknown(targets: readonly InstallScopeExtrasTarget[], reason: string): Readonly<Record<string, InstallScopeExtrasEntry>> {
+  const out: Record<string, InstallScopeExtrasEntry> = {};
+  for (const t of targets) {
+    out[t.role] = { ...t, status: 'unknown', extraRepos: [], unverifiedRepos: t.candidateRepos, message: `install_scope: unknown — ${reason}` };
+  }
+  return out;
+}
+
+export interface InstallScopeExtrasDeps {
+  readonly probeFn?: (appId: string, keyPath: string, owner: string, repo: string) => Promise<Presence>;
+  readonly readVaultFn?: (opts: VaultReadOptions) => Promise<Readonly<Record<string, string>>>;
+}
+
+/**
+ * Per-agent wider-than-declared observation, keyed by role. Read-only; never
+ * throws. No vault, an unreadable vault, or no credential for a role reads
+ * `unknown`, never `exact`. A fleet with a single agent has no candidates and
+ * returns `{}`.
+ */
+export async function computeInstallScopeExtras(
+  manifest: FleetManifest,
+  lock: FleetLock | null,
+  vaultOpts: VaultReadOptions | undefined,
+  deps?: InstallScopeExtrasDeps,
+): Promise<Readonly<Record<string, InstallScopeExtrasEntry>>> {
+  const targets = installScopeExtrasTargets(manifest).filter((t) => t.candidateRepos.length > 0);
+  if (targets.length === 0) return {};
+  if (vaultOpts === undefined) return extrasAllUnknown(targets, 'not checked this run — no --vault/--identity-key given.');
+
+  let raw: Readonly<Record<string, string>>;
+  try {
+    raw = await (deps?.readVaultFn ?? readVault)(vaultOpts);
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    return extrasAllUnknown(targets, `not checked this run — the vault could not be read (${reason}).`);
+  }
+
+  const probeFn = deps?.probeFn ?? checkRepoInAppInstallation;
+  const out: Record<string, InstallScopeExtrasEntry> = {};
+  for (const target of targets) {
+    const credential = resolveCoverageCredential(target.role, manifest.metadata.name, lock, raw);
+    if (credential === undefined) {
+      out[target.role] = extrasAllUnknown([target], 'no App credential for this role in the lock and vault.')[target.role] as InstallScopeExtrasEntry;
+      continue;
+    }
+    const keyPath = writeScratchPem(target.role, credential.pem);
+    try {
+      const probed = await probeInstallScopeCoverage(credential.appId, keyPath, target.candidateRepos, probeFn);
+      out[target.role] = evaluateInstallScopeExtras(target, probed);
+    } finally {
+      cleanupScratchPem(keyPath);
+    }
+  }
+  return out;
+}
+
+/** One line per entry that is not `exact`. */
+export function formatInstallScopeExtrasLines(entries: Readonly<Record<string, InstallScopeExtrasEntry>>): readonly string[] {
+  return Object.values(entries)
+    .filter((e) => e.status !== 'exact')
+    .map((e) => `${e.message ?? ''} [${e.role}]`);
+}
+
+export function installScopeExtrasEntryToJson(entry: InstallScopeExtrasEntry): unknown {
+  return {
+    role: entry.role,
+    app_handle: entry.appHandle,
+    declared_repos: entry.declaredRepos,
+    status: entry.status,
+    extra_repos: entry.extraRepos,
+    unverified_repos: entry.unverifiedRepos,
+    ...(entry.message !== undefined ? { message: entry.message } : {}),
+  };
+}
+
 // --- Formatting ---
 
 /** `true` when ANY target is confirmed drift — the incomplete-fleet verdict this module exists to surface. */

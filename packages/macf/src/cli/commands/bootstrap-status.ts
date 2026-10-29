@@ -21,7 +21,15 @@ import type { AgentRegistryObservation } from '../bootstrap/observer.js';
 import { githubRegistryObserver, readAgentRegistryInfo, vaultAwareObserver } from '../bootstrap/observer.js';
 import { bootstrapStatusToJson, computeBootstrapStatus, formatBootstrapStatusText } from '../bootstrap/status.js';
 import type { Presence } from '../bootstrap/plan.js';
-import { computeInstallScopeCoverage, formatInstallScopeCoverageLines, installScopeCoverageEntryToJson, observedWorkRepoPresence } from '../bootstrap/install-scope-coverage.js';
+import {
+  computeInstallScopeCoverage,
+  computeInstallScopeExtras,
+  formatInstallScopeCoverageLines,
+  formatInstallScopeExtrasLines,
+  installScopeCoverageEntryToJson,
+  installScopeExtrasEntryToJson,
+  observedWorkRepoPresence,
+} from '../bootstrap/install-scope-coverage.js';
 import { computeControlRepoManifestDrift, controlRepoManifestDriftToJson, formatControlRepoManifestDriftLines } from '../bootstrap/control-repo-manifest-drift.js';
 import { controlRepoFullName, realReadControlManifestFile } from '../bootstrap/control-repo.js';
 
@@ -149,6 +157,13 @@ export async function runBootstrapStatus(
           )
         : {};
     const installScopeCoverageLines = formatInstallScopeCoverageLines(installScopeCoverage);
+    // Advisory only: a per-agent App installed on a peer agent's repo. Never changes the exit code.
+    const installScopeExtras = await computeInstallScopeExtras(
+      manifest,
+      observed.lock,
+      opts.vaultPath !== undefined && opts.identityKeyPath !== undefined ? { vaultPath: opts.vaultPath, identityPath: opts.identityKeyPath } : undefined,
+    );
+    const installScopeExtrasLines = formatInstallScopeExtrasLines(installScopeExtras);
 
     // groundnuty/macf#1249 — the committed-vs-local `fleet.yaml` drift
     // check. Unlike `installScopeCoverage` above, this needs NO vault gate
@@ -173,6 +188,9 @@ export async function runBootstrapStatus(
             ...(Object.keys(installScopeCoverage).length > 0
               ? { install_scope_coverage: Object.values(installScopeCoverage).map(installScopeCoverageEntryToJson) }
               : {}),
+            ...(Object.keys(installScopeExtras).length > 0
+              ? { install_scope_extras: Object.values(installScopeExtras).map(installScopeExtrasEntryToJson) }
+              : {}),
             control_repo_manifest_drift: controlRepoManifestDriftToJson(controlRepoManifestDrift),
           },
           null,
@@ -184,6 +202,10 @@ export async function runBootstrapStatus(
       if (installScopeCoverageLines.length > 0) {
         console.log('');
         console.log(installScopeCoverageLines.join('\n'));
+      }
+      if (installScopeExtrasLines.length > 0) {
+        console.log('');
+        console.log(installScopeExtrasLines.join('\n'));
       }
       if (controlRepoManifestDriftLines.length > 0) {
         console.log('');

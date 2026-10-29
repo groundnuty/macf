@@ -42,7 +42,15 @@ import { RUNNER_PLATFORM_ENDPOINT_ENV_VAR, registerRunnerPlatformEndpointFileTie
 import type { OperatorInputSource } from '../bootstrap/operator-secrets-file.js';
 import { formatOperatorInputProvenanceLine, readOperatorSecretsFile, resolveOperatorInput } from '../bootstrap/operator-secrets-file.js';
 import type { Presence } from '../bootstrap/plan.js';
-import { computeInstallScopeCoverage, formatInstallScopeCoverageLines, installScopeCoverageEntryToJson, observedWorkRepoPresence } from '../bootstrap/install-scope-coverage.js';
+import {
+  computeInstallScopeCoverage,
+  computeInstallScopeExtras,
+  formatInstallScopeCoverageLines,
+  formatInstallScopeExtrasLines,
+  installScopeCoverageEntryToJson,
+  installScopeExtrasEntryToJson,
+  observedWorkRepoPresence,
+} from '../bootstrap/install-scope-coverage.js';
 import { reconcileFederatedTrustVerdicts, federatedTrustNotices } from '../bootstrap/apply-federated-trust.js';
 
 export interface RunBootstrapPlanOptions {
@@ -338,6 +346,9 @@ export async function runBootstrapPlan(
     // whenever the manifest declares a fleet-level App target, independent
     // of whether the flags were given.
     const installScopeCoverageLines = formatInstallScopeCoverageLines(installScopeCoverage);
+    // Advisory only: a per-agent App installed on a peer agent's repo. Never changes the exit code.
+    const installScopeExtras = await computeInstallScopeExtras(manifest, observed.lock, vaultOpts);
+    const installScopeExtrasLines = formatInstallScopeExtrasLines(installScopeExtras);
 
     // groundnuty/macf#1389 — the `#1330`-shaped federated-CA-trust
     // enumerate-and-name consent notices. `plan` is the OTHER read-only
@@ -375,6 +386,9 @@ export async function runBootstrapPlan(
             ...(Object.keys(installScopeCoverage).length > 0
               ? { install_scope_coverage: Object.values(installScopeCoverage).map(installScopeCoverageEntryToJson) }
               : {}),
+            ...(Object.keys(installScopeExtras).length > 0
+              ? { install_scope_extras: Object.values(installScopeExtras).map(installScopeExtrasEntryToJson) }
+              : {}),
             ...(federatedCaTrustNotices.length > 0 ? { federated_ca_trust_notices: federatedCaTrustNotices } : {}),
           },
           null,
@@ -399,6 +413,10 @@ export async function runBootstrapPlan(
       if (installScopeCoverageLines.length > 0) {
         console.log('');
         console.log(installScopeCoverageLines.join('\n'));
+      }
+      if (installScopeExtrasLines.length > 0) {
+        console.log('');
+        console.log(installScopeExtrasLines.join('\n'));
       }
       if (federatedCaTrustNotices.length > 0) {
         console.log('');
