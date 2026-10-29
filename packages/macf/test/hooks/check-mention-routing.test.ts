@@ -1555,6 +1555,32 @@ describe('check-mention-routing.sh (hook)', () => {
         expect(r.status).toBe(2);
         expect(String(r.stderr)).toContain('describing-context');
       });
+
+      it('treats an escaped backslash before n as literal text, not a line break', () => {
+        const r = runHook({ command: `${GH} --body "$(printf 'see \\\\n@macf-science-agent[bot] reply')"` });
+        expect(r.status).toBe(2);
+        expect(String(r.stderr)).toContain('describing-context');
+      });
+
+      it('allows an ordinary \\n line break in a single-quoted format', () => {
+        const r = runHook({ command: `${GH} --body "$(printf 'a\\n@macf-science-agent[bot] b')"` });
+        expect(r.status).toBe(0);
+      });
+
+      it('allows an escaped backslash followed by a real \\n', () => {
+        const r = runHook({ command: `${GH} --body "$(printf 'a\\\\\\n@macf-science-agent[bot] b')"` });
+        expect(r.status).toBe(0);
+      });
+    });
+
+    describe('a stdin heredoc binds to the gh segment', () => {
+      it('ignores an unrelated tool heredoc after a gh --body on the same line', () => {
+        const r = runHook({
+          command: `${GH} --body "no mention"; other-tool -F - <<EOF\n@macf-science-agent[bot] hi\nEOF`,
+        });
+        expect(r.status).toBe(2);
+        expect(String(r.stderr)).toContain('zero');
+      });
     });
   });
 });

@@ -776,12 +776,18 @@ macf_extract_stdin_heredoc() {
     lines+=("$line")
   done <<<"$cmd"
 
-  local match_idx=-1 count=0 delimiter="" strip_tabs=false i=0 rest between frag
+  local match_idx=-1 count=0 delimiter="" strip_tabs=false i=0 rest between frag pre
   while [[ "$i" -lt "${#lines[@]}" ]]; do
     line="${lines[$i]}"
     if [[ "$line" =~ $arg_re ]]; then
       rest="${line#*"${BASH_REMATCH[0]}"}"
-      if [[ "$rest" == *"<<"* ]]; then
+      # The flag must belong to a gh segment: no separator between that gh
+      # and the flag, and no --body of its own (a --body wins).
+      pre="${line%%"${BASH_REMATCH[0]}"*}"
+      pre="$(sed -E "s/\"[^\"]*\"//g; s/'[^']*'//g" <<<"$pre")"
+      pre="${pre##*[;&|]}"
+      if [[ "$rest" == *"<<"* ]] && [[ "$pre" =~ (^|[[:space:]])gh[[:space:]] ]] \
+         && [[ "$pre" != *"--body "* && "$pre" != *"--body="* && "$pre" != *" -b "* ]]; then
         between="${rest%%<<*}"
         frag="${rest#*<<}"
         count=$((count + 1))
@@ -818,6 +824,53 @@ macf_extract_stdin_heredoc() {
   return 0
 }
 
+# Drops the body of a heredoc whose opener sits in a non-gh segment of the
+# command (`gh ... --body "x"; other-tool <<EOF`): that text is not the comment.
+macf_strip_foreign_heredocs() {
+  local line pre delim skip="" re="<<-?[[:space:]]*['\"]?([A-Za-z_][A-Za-z0-9_]*)"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ -n "$skip" ]]; then
+      [[ "${line#"${line%%[!$'\t']*}"}" == "$skip" ]] && skip=""
+      continue
+    fi
+    printf '%s\n' "$line"
+    if [[ "$line" == *"<<"* && "$line" =~ $re ]]; then
+      delim="${BASH_REMATCH[1]}"
+      pre="${line%%<<*}"
+      pre="$(sed -E "s/\"[^\"]*\"//g; s/'[^']*'//g" <<<"$pre")"
+      if [[ "$pre" == *[\;\&\|]* ]]; then
+        pre="${pre##*[;&|]}"
+        [[ "$pre" =~ (^|[[:space:]])gh[[:space:]] ]] || skip="$delim"
+      fi
+    fi
+  done <<<"$1"
+}
+
+# printf format escapes, left to right: \\ is one backslash, \n a newline.
+# A double-quoted format is first reduced by the shell (\\ \" \$ \`), then
+# read by printf, so "\\n" there is a newline and "\\\\n" is not.
+macf_printf_unescape() {
+  local f="$1" out="" c n i=0
+  if [[ "$f" == \"* ]]; then
+    f="${f:1:${#f}-2}"
+    local sh="" 
+    while [[ "$i" -lt "${#f}" ]]; do
+      c="${f:$i:1}"; n="${f:$((i+1)):1}"
+      if [[ "$c" == "\\" && "$n" == [\\\"\$\`] ]]; then sh+="$n"; i=$((i+2)); else sh+="$c"; i=$((i+1)); fi
+    done
+    f="$sh"; i=0
+  else
+    f="${f:1:${#f}-2}"
+  fi
+  while [[ "$i" -lt "${#f}" ]]; do
+    c="${f:$i:1}"; n="${f:$((i+1)):1}"
+    if [[ "$c" == "\\" && "$n" == "\\" ]]; then out+="\\"; i=$((i+2))
+    elif [[ "$c" == "\\" && "$n" == "n" ]]; then out+=$'\n'; i=$((i+2))
+    else out+="$c"; i=$((i+1)); fi
+  done
+  printf '%s' "$out"
+}
+
 # Inside a printf format argument, a literal \n is a line break at runtime.
 # Expands it for the line-start rule; other text is left as written.
 macf_expand_printf_newlines() {
@@ -830,7 +883,7 @@ macf_expand_printf_newlines() {
     [[ "$rest" =~ $re ]] || break
     m="${BASH_REMATCH[0]}"; fmt="${BASH_REMATCH[2]}"
     local head="${rest%%"$m"*}"
-    out+="${head}${m%"$fmt"}${fmt//\\n/$'\n'}"
+    out+="${head}${m%"$fmt"}$(macf_printf_unescape "$fmt")"
     rest="${rest#*"$m"}"
   done
   printf '%s' "${out}${rest}"
@@ -1092,6 +1145,7 @@ WARNERR
 fi
 
 if [[ "$LINT_TARGET" == "$COMMAND" ]]; then
+  LINT_TARGET="$(macf_strip_foreign_heredocs "$LINT_TARGET")"
   LINT_TARGET="$(macf_expand_printf_newlines "$LINT_TARGET")"
 fi
 
