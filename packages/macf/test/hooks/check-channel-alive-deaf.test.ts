@@ -43,6 +43,10 @@ interface Opts {
   /** Run twice in the same workspace; returns the second run. */
   readonly runs?: number;
   readonly noNode?: boolean;
+  /** Write this as ~/.claude/settings.json (the user layer). */
+  readonly userSettings?: Json;
+  /** Known identity (MACF_PROJECT/MACF_AGENT_NAME) whose channel.log does not exist. */
+  readonly identityNoLog?: boolean;
 }
 
 function run(opts: Opts): { stdout: string; ws: string } {
@@ -56,6 +60,10 @@ function run(opts: Opts): { stdout: string; ws: string } {
   };
   put('settings.json', opts.settings);
   put('settings.local.json', opts.settingsLocal);
+  if (opts.userSettings !== undefined) {
+    mkdirSync(join(home, '.claude'), { recursive: true });
+    writeFileSync(join(home, '.claude', 'settings.json'), JSON.stringify(opts.userSettings));
+  }
 
   const sid = opts.sessionId ?? 'sess-1';
   const now = Math.floor(Date.now() / 1000);
@@ -82,6 +90,10 @@ function run(opts: Opts): { stdout: string; ws: string } {
     env['PATH'] = bin;
     const probe = spawnSync(join(bin, 'bash'), ['-c', 'command -v node'], { env: { PATH: bin }, encoding: 'utf-8' });
     if (probe.stdout.trim()) throw new Error('node still resolvable; cannot simulate its absence');
+  }
+  if (opts.identityNoLog) {
+    env['MACF_PROJECT'] = 'p';
+    env['MACF_AGENT_NAME'] = 'a';
   }
   if (opts.serverPid !== undefined) {
     const dir = join(home, '.local', 'state', 'macf', 'p@a');
@@ -180,6 +192,12 @@ describe('settings check (#1525)', () => {
     expect(stdout).toContain(UNCHECKED);
   });
 
+  it('an approval in the user layer (~/.claude/settings.json) counts → quiet', () => {
+    const { stdout, ws } = run({ settings: REWRITTEN, settingsLocal: {}, userSettings: HEALTHY });
+    clean(ws);
+    expect(stdout).not.toContain(SETTINGS_ALARM);
+  });
+
   it('never edits settings', () => {
     const { ws } = run({ settings: REWRITTEN, settingsLocal: DISABLED_LOCAL });
     
@@ -196,6 +214,19 @@ describe('no running channel server past the grace period (#1525)', () => {
     expect(stdout).toContain(NOLIVE_ALARM);
     expect(stdout).toContain('last one exited 2026-10-01T09:00:00.000Z');
     expect(stdout).toContain('relaunch with ./claude.sh');
+  });
+
+  it('a known agent with no channel.log at all past 120 s → alarm (a server that never started)', () => {
+    const { stdout, ws } = run({ settings: HEALTHY, identityNoLog: true, sessionAgeSecs: 600 });
+    clean(ws);
+    expect(stdout).toContain(NOLIVE_ALARM);
+    expect(stdout).toContain('none has started for this agent');
+  });
+
+  it('a known agent with no channel.log within the grace period → quiet', () => {
+    const { stdout, ws } = run({ settings: HEALTHY, identityNoLog: true, sessionAgeSecs: 30 });
+    clean(ws);
+    expect(stdout).toBe('');
   });
 
   it('dead pid within the grace period → quiet', () => {

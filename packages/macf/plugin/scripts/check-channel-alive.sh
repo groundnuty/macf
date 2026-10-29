@@ -186,12 +186,17 @@ if command -v node >/dev/null 2>&1; then
       try { const o = JSON.parse(raw); if (o === null || typeof o !== "object" || Array.isArray(o)) throw 0; layers.push(o); }
       catch (e) { console.log("UNCHECKED"); process.exit(0); }
     }
+    // The user layer also counts (an approval may live there); unreadable is skipped.
+    try {
+      const u = JSON.parse(fs.readFileSync(process.argv[2] + "/.claude/settings.json", "utf8"));
+      if (u !== null && typeof u === "object" && !Array.isArray(u)) layers.push(u);
+    } catch (e) { /* no user settings */ }
     // Neither file exists: not an initialised workspace, nothing to judge.
     if (missing === 2) { console.log("OK"); process.exit(0); }
     const has = (k) => layers.some((o) => Array.isArray(o[k]) && o[k].includes(server));
     const all = layers.some((o) => o.enableAllProjectMcpServers === true);
     console.log(has("disabledMcpjsonServers") || (!has("enabledMcpjsonServers") && !all) ? "OFF" : "OK");
-  ' "$WORKSPACE" 2>/dev/null || true)"
+  ' "$WORKSPACE" "$HOME_DIR" 2>/dev/null || true)"
   [ -n "$SETTINGS_VERDICT" ] || SETTINGS_VERDICT="UNCHECKED"
 fi
 
@@ -271,7 +276,8 @@ restore this check. Silence: MACF_SKIP_CHANNEL_ALIVE_CHECK=1.
 IDUNKNOWN
   exit 0
 fi
-[ -n "$CHANNEL_LOG" ] && [ -r "$CHANNEL_LOG" ] || exit 0
+NO_OWN_LOG=""
+[ -n "$CHANNEL_LOG" ] && [ -r "$CHANNEL_LOG" ] || NO_OWN_LOG=1
 
 # ── Read back this agent's own {host, port} — NOT simply from the NEWEST
 # `server_started` log line (macf#760). channel.log is append-only across
@@ -330,11 +336,19 @@ no_live_server_alarm() {
   fi
   mkdir -p "$THROTTLE_DIR" 2>/dev/null || true
   printf '%s' "$NOW_EPOCH" >"$alarm_file" 2>/dev/null || true
-  last_ts="$(tail -n 1 "$CHANNEL_LOG" 2>/dev/null | sed -n 's/.*"ts":"\([^"]*\)".*/\1/p' || true)"
-  [ -n "$last_ts" ] || last_ts="at an unknown time"
-  echo "MACF: this agent has no running channel server (last one exited ${last_ts}), so it receives no routed work. Tell the operator; relaunch with ./claude.sh."
+  last_ts=""
+  [ -n "$CHANNEL_LOG" ] && last_ts="$(tail -n 1 "$CHANNEL_LOG" 2>/dev/null | sed -n 's/.*"ts":"\([^"]*\)".*/\1/p' || true)"
+  if [ -n "$last_ts" ]; then
+    echo "MACF: this agent has no running channel server (last one exited ${last_ts}), so it receives no routed work. Tell the operator; relaunch with ./claude.sh."
+  else
+    echo "MACF: this agent has no running channel server (none has started for this agent), so it receives no routed work. Tell the operator; relaunch with ./claude.sh."
+  fi
 }
 
+if [ -n "$NO_OWN_LOG" ]; then
+  no_live_server_alarm
+  exit 0
+fi
 ALL_STARTS="$(grep '"event":"server_started"' "$CHANNEL_LOG" 2>/dev/null || true)"
 if [ -z "$ALL_STARTS" ]; then
   no_live_server_alarm
