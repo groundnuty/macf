@@ -1001,6 +1001,66 @@ describe('check-gh-token.sh (hook)', () => {
       });
     });
 
+    describe('round 2 — export required, synchronous only, removal order', () => {
+      const mint =
+        'GH_TOKEN=$("$MACF_WORKSPACE_DIR/.claude/scripts/macf-gh-token.sh" ' +
+        '--app-id "$APP_ID" --install-id "$INSTALL_ID" --key "$KEY_PATH") || exit 1';
+
+      it('blocks a mint followed by gh with no export', () => {
+        expect(runHook({ command: `${mint}; gh issue list`, env: {} }).status).toBe(2);
+      });
+
+      it('allows `; export GH_TOKEN;`', () => {
+        const command = `${mint}; export GH_TOKEN; gh issue list`;
+        expect(runHook({ command, env: {} }).status).toBe(0);
+      });
+
+      it('allows `&& export GH_TOKEN &&`', () => {
+        const command = `${mint} && export GH_TOKEN && gh issue list`;
+        expect(runHook({ command, env: {} }).status).toBe(0);
+      });
+
+      it('allows a newline between the mint, the export and gh', () => {
+        const command = `${mint}\nexport GH_TOKEN\ngh issue list`;
+        expect(runHook({ command, env: {} }).status).toBe(0);
+      });
+
+      it('blocks a backgrounded mint (lone &)', () => {
+        const command = `${mint} & gh issue list`;
+        expect(runHook({ command, env: {} }).status).toBe(2);
+      });
+
+      it('blocks a backgrounded mint even when an export follows', () => {
+        const command = `${mint} & export GH_TOKEN; gh issue list`;
+        expect(runHook({ command, env: {} }).status).toBe(2);
+      });
+
+      it('blocks a lone & after the export', () => {
+        const command = `${mint}; export GH_TOKEN & gh issue list`;
+        expect(runHook({ command, env: {} }).status).toBe(2);
+      });
+
+      it('blocks a mint piped into gh', () => {
+        const command = `${mint} | gh issue list`;
+        expect(runHook({ command, env: {} }).status).toBe(2);
+      });
+
+      it('allows removal as cleanup AFTER gh', () => {
+        const command = 'gh issue list; unset GH_TOKEN';
+        expect(runHook({ command, env: VALID }).status).toBe(0);
+      });
+
+      it('blocks removal BEFORE gh', () => {
+        const command = 'unset GH_TOKEN; gh issue list';
+        expect(runHook({ command, env: VALID }).status).toBe(2);
+      });
+
+      it('still blocks env -u before gh', () => {
+        const command = 'env -u GH_TOKEN gh issue list';
+        expect(runHook({ command, env: VALID }).status).toBe(2);
+      });
+    });
+
     it('missing-token message gives the in-command mint remedy', () => {
       const r = runHook({ command: 'gh issue list', env: {} });
       expect(r.stderr).toContain(

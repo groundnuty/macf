@@ -72,14 +72,25 @@ fi
 # Identity bypass (#1525): these forms run `gh` as the stored user login even
 # when the ambient token is valid, because they remove or empty GH_TOKEN
 # inside the command, after this hook has read the ambient value.
-_ws='[[:space:];|&(]'
+_ws='[[:space:];|&("'"'"']'
 _dq='"'
 _sq="'"
 BYPASS_ENV_U='(^|'"$_ws"')env[[:space:]]+[^;|&]*(-u[[:space:]]*|--unset[=[:space:]]+)GH_TOKEN([[:space:]]|$)'
 BYPASS_EMPTY='(^|'"$_ws"')GH_TOKEN=('"$_dq$_dq|$_sq$_sq"')?([[:space:];|&]|$)'
 BYPASS_UNSET='(^|'"$_ws"')unset[[:space:]]+([^;|&]*[[:space:]])?GH_TOKEN([[:space:];|&]|$)'
-if [[ "$COMMAND" =~ $BYPASS_ENV_U ]] || [[ "$COMMAND" =~ $BYPASS_EMPTY ]] \
-  || [[ "$COMMAND" =~ $BYPASS_UNSET ]]; then
+
+# True when REGEX matches and a gh / git push comes AFTER the first match.
+# `gh issue list; unset GH_TOKEN` is cleanup after gh and stays allowed.
+bypass_before_gh() {
+  local m before rest
+  [[ "$COMMAND" =~ $1 ]] || return 1
+  m="${BASH_REMATCH[0]}"
+  before="${COMMAND%%"$m"*}"
+  rest="${COMMAND#"$before$m"}"
+  [[ "$rest" =~ $GH_PATTERN ]] || [[ "$rest" =~ $SHELL_C_PATTERN ]]
+}
+if bypass_before_gh "$BYPASS_ENV_U" || bypass_before_gh "$BYPASS_EMPTY" \
+  || bypass_before_gh "$BYPASS_UNSET"; then
   cat >&2 <<'ERR'
 BLOCKED by MACF attribution-trap hook: this command removes or empties GH_TOKEN before gh, so gh would act as the stored user login. Mint a bot token instead (see gh-token-refresh.md).
 ERR
@@ -88,14 +99,19 @@ fi
 
 # Canonical inline mint (#1525): in a session with no ambient GH_TOKEN the
 # rule's own recipe would be blocked, because this hook judges only the
-# ambient token. Allow exactly this form as the command's FIRST statement:
-#   GH_TOKEN=$("<...>/.claude/scripts/macf-gh-token.sh" <args>) || exit 1
+# ambient token. Allow exactly this form at the start of the command:
+#   GH_TOKEN=$("<...>/.claude/scripts/macf-gh-token.sh" <args>) || exit 1; export GH_TOKEN
 # The helper fails loud and validates the ghs_ prefix, and `|| exit 1` aborts
-# before any later gh runs. This is an exact allowlist, NOT general parsing of
-# inline GH_TOKEN assignments (rejected in silent-fallback-hazards Instance
-# 12). No variants: `export GH_TOKEN=$(...)` masks the failure, and without
-# `|| exit 1` a failed mint would let gh run on the stored user login.
-CANON_MINT='^[[:space:]]*GH_TOKEN=\$\("?[^"[:space:]]*\.claude/scripts/macf-gh-token\.sh"?[^)|;&]*\)[[:space:]]*\|\|[[:space:]]*exit[[:space:]]+1([[:space:];&]|$)'
+# before any later gh runs. The export must follow as its own statement, or gh
+# would not inherit the token. Statements are joined only by `;`, `&&` or a
+# newline: a lone `&` backgrounds the mint and `|` pipes it. This is an exact
+# allowlist, NOT general parsing of inline GH_TOKEN assignments (rejected in
+# silent-fallback-hazards Instance 12). No variants: `export GH_TOKEN=$(...)`
+# masks the failure, and without `|| exit 1` a failed mint would let gh run on
+# the stored user login.
+_nl=$'\n'
+_sep='[[:blank:]]*(;|&&|'"$_nl"')[[:blank:]]*'
+CANON_MINT='^[[:space:]]*GH_TOKEN=\$\("?[^"[:space:]]*\.claude/scripts/macf-gh-token\.sh"?[^)|;&]*\)[[:blank:]]*\|\|[[:blank:]]*exit[[:blank:]]+1'"$_sep"'export[[:blank:]]+GH_TOKEN[[:blank:]]*(;|&&|'"$_nl"'|$)'
 if [[ "$COMMAND" =~ $CANON_MINT ]]; then
   exit 0
 fi
