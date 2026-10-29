@@ -144,6 +144,17 @@ export async function main(): Promise<void> {
       );
       console.log(formatPeerTable(peersWithHealth));
 
+      // Self row (groundnuty/macf#1525): a listing of peers that never says
+      // whether THIS agent is registered hides a dead channel server. Look up
+      // the own key the way `status` does and say so when it is missing.
+      const ownRegistration = await getOwnRegistration(agentName, registry);
+      if (!ownRegistration) {
+        console.log('');
+        console.log(
+          `this agent (${agentName}): NOT REGISTERED — its channel server is not running`,
+        );
+      }
+
       // GUEST / external collaborators block (DR-036 Amendment A, macf#679) —
       // cross-fleet guests the consumer DEPENDS on but does NOT supervise. Same
       // block `macf fleet status` renders. Additive + best-effort: any failure

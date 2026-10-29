@@ -475,6 +475,46 @@ export function launchTokenValidationLines(config: MacfAgentConfig): string[] {
 }
 
 /**
+ * Warn, before `exec claude`, when Claude Code settings turn the `macf-agent`
+ * channel server off (groundnuty/macf#1525). A workspace template can rewrite
+ * `.claude/settings.json` without `macf-agent` in `enabledMcpjsonServers`, and
+ * `settings.local.json` can list it in `disabledMcpjsonServers`; Claude Code
+ * then never starts the server and the agent runs deaf.
+ *
+ * Warns on stderr and never blocks: inside the tmux self-wrap a refusal would
+ * kill the pane and lose the message. Plain grep/tr, no jq or node, so it runs
+ * wherever the launcher does. Both files are flattened first so the match does
+ * not depend on JSON whitespace. It never edits settings.
+ *
+ * Exported for unit tests.
+ */
+export function channelServerSettingsWarningLines(): string[] {
+  return [
+    '',
+    '# Channel-server settings check (macf#1525) — warn, never block.',
+    '_macf_settings_flat() {',
+    '  tr -d \'[:space:]\' <"$SCRIPT_DIR/.claude/$1" 2>/dev/null || true',
+    '}',
+    'if [ -f "$SCRIPT_DIR/.claude/settings.json" ] || [ -f "$SCRIPT_DIR/.claude/settings.local.json" ]; then',
+    '  _macf_off=""',
+    '  _macf_cs_json="$(_macf_settings_flat settings.json)"',
+    '  _macf_cs_local="$(_macf_settings_flat settings.local.json)"',
+    '  if printf \'%s\\n%s\' "$_macf_cs_json" "$_macf_cs_local" | grep -q \'"disabledMcpjsonServers":\\[[^]]*"macf-agent"\'; then',
+    '    _macf_off=1',
+    '  elif ! printf \'%s\\n%s\' "$_macf_cs_json" "$_macf_cs_local" | grep -q \'"enabledMcpjsonServers":\\[[^]]*"macf-agent"\' \\',
+    '    && ! printf \'%s\\n%s\' "$_macf_cs_json" "$_macf_cs_local" | grep -q \'"enableAllProjectMcpServers":true\'; then',
+    '    _macf_off=1',
+    '  fi',
+    '  if [ -n "$_macf_off" ]; then',
+    '    echo "WARNING: this agent\'s channel server is turned off in Claude Code settings, so it receives no routed issues, mentions or peer messages." >&2',
+    '    echo "WARNING: Fix: remove \\"macf-agent\\" from disabledMcpjsonServers in .claude/settings.local.json, add it to enabledMcpjsonServers in .claude/settings.json, then relaunch with ./claude.sh." >&2',
+    '  fi',
+    '  unset _macf_off _macf_cs_json _macf_cs_local',
+    'fi',
+  ];
+}
+
+/**
  * Emit the Claude Code native OTEL telemetry env block into the
  * generated `claude.sh`. Three mandatory gates per Claude Code docs
  * — missing any one of them → zero traces emit:
@@ -933,6 +973,7 @@ export function generateClaudeSh(config: MacfAgentConfig): string {
     ...channelNotificationsLines(),
     ...promptWatcherLines(),
     ...launchTokenValidationLines(config),
+    ...channelServerSettingsWarningLines(),
     '',
     // --plugin-dir loads the pinned macf-agent plugin from this workspace
     // (per DR-013). Additive — user-scope plugins still load alongside.
