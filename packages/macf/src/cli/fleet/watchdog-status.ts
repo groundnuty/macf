@@ -50,7 +50,10 @@ export function checkWatchdog(fleet: WatchdogFleet, deps: WatchdogStatusDeps): W
   const read = deps.readCrontab();
   if (read.kind === 'unreadable') return { kind: 'unreadable', reason: read.reason };
   const marker = watchdogMarker(fleet.owner, fleet.project);
-  const line = read.content.split('\n').find((l) => isOwnedLine(l, marker, fleet.workspaceDir));
+  // A commented-out line is a disabled watchdog: cron never runs it.
+  const line = read.content
+    .split('\n')
+    .find((l) => !l.trimStart().startsWith('#') && isOwnedLine(l, marker, fleet.workspaceDir));
   if (line === undefined) return { kind: 'missing' };
   const script = deps.readScript(cronScriptPath(deps.scriptDir(), fleet.owner, fleet.project));
   return { kind: 'installed', schedule: scheduleOf(line), mode: modeOf(script) };

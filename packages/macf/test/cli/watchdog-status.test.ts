@@ -24,6 +24,10 @@ describe('checkWatchdog', () => {
       kind: 'installed', schedule: '*/5 * * * *', mode: 'mode unknown',
     });
   });
+  it('missing: a commented-out line for this fleet is a disabled watchdog', () => {
+    const c = '# ' + line('# macf-watchdog (DR-006) [fleet=acme/demo]');
+    expect(checkWatchdog(fleet, deps({ kind: 'ok', content: c })).kind).toBe('missing');
+  });
   it('unreadable carries its reason into the line', () => {
     const s = checkWatchdog(fleet, deps({ kind: 'unreadable', reason: 'boom' }));
     expect(watchdogVerdictLine(s)).toBe('Watchdog: could not check (boom).');
