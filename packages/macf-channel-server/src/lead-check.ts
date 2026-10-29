@@ -20,6 +20,8 @@ export const MAX_ANCESTOR_DEPTH = 8;
 export interface ProcInfo {
   readonly ppid: number;
   readonly comm: string;
+  /** Process start time (opaque string); null when it cannot be read. */
+  readonly startTime?: string | null;
 }
 
 export interface LeadCheckDeps {
@@ -41,10 +43,13 @@ export function checkIsLead(workspaceDir: string | undefined, deps: LeadCheckDep
     return { action: 'run', reason: 'workspace_dir_unknown' };
   }
   let leadPid: number;
+  let recordedStart: string | null;
   try {
     const raw = deps.readFile(join(workspaceDir, LEAD_PID_RELATIVE_PATH)).trim();
-    if (!/^\d+$/.test(raw)) return { action: 'run', reason: 'pid_file_malformed' };
-    leadPid = Number(raw);
+    const m = /^(\d+)(?:\s+(.+))?$/.exec(raw);
+    if (m === null) return { action: 'run', reason: 'pid_file_malformed' };
+    leadPid = Number(m[1]);
+    recordedStart = m[2] === undefined ? null : m[2].replace(/\s+/g, ' ');
   } catch {
     return { action: 'run', reason: 'pid_file_unreadable' };
   }
@@ -53,6 +58,13 @@ export function checkIsLead(workspaceDir: string | undefined, deps: LeadCheckDep
 
   const lead = safeLookup(deps, leadPid);
   if (lead === null) return { action: 'run', reason: 'lead_dead' };
+  // No recorded start time means we cannot rule out pid reuse: run as today.
+  if (recordedStart === null) return { action: 'run', reason: 'no_start_time' };
+  const liveStart = lead.startTime === undefined || lead.startTime === null
+    ? null
+    : lead.startTime.replace(/\s+/g, ' ');
+  if (liveStart === null) return { action: 'run', reason: 'start_time_unreadable' };
+  if (liveStart !== recordedStart) return { action: 'run', reason: 'lead_dead' };
   if (!LEAD_COMM.test(lead.comm)) return { action: 'run', reason: 'lead_not_claude' };
 
   const ancestors: number[] = [];
@@ -91,7 +103,8 @@ export function systemLookup(pid: number): ProcInfo | null {
     const rest = stat.slice(close + 2).split(' ');
     const ppid = Number(rest[1]);
     if (!Number.isInteger(ppid)) return null;
-    return { ppid, comm: stat.slice(open + 1, close) };
+    const startTime = rest[19] !== undefined && /^\d+$/.test(rest[19]) ? rest[19] : null;
+    return { ppid, comm: stat.slice(open + 1, close), startTime };
   } catch {
     // fall through to ps
   }
@@ -103,7 +116,17 @@ export function systemLookup(pid: number): ProcInfo | null {
     const m = /^(\d+)\s+(.+)$/.exec(out);
     if (m === null) return null;
     const base = (m[2] ?? '').split('/').pop() ?? '';
-    return { ppid: Number(m[1]), comm: base };
+    let startTime: string | null = null;
+    try {
+      const l = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim().replace(/\s+/g, ' ');
+      startTime = l === '' ? null : l;
+    } catch {
+      startTime = null;
+    }
+    return { ppid: Number(m[1]), comm: base, startTime };
   } catch {
     return null;
   }

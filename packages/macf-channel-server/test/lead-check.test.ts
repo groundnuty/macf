@@ -18,7 +18,7 @@ function deps(table: Record<number, ProcInfo>, files: Record<string, string>, se
 
 // 100 = lead claude, 200 = lead's mcp child chain, 300 = teammate claude
 const table: Record<number, ProcInfo> = {
-  100: { ppid: 50, comm: 'claude' },
+  100: { ppid: 50, comm: 'claude', startTime: '777' },
   50: { ppid: 1, comm: 'tmux: server' },
   150: { ppid: 100, comm: 'npm' },
   200: { ppid: 150, comm: 'node' },
@@ -29,17 +29,32 @@ const table: Record<number, ProcInfo> = {
 
 describe('checkIsLead', () => {
   it('runs when the lead pid is an ancestor', () => {
-    const r = checkIsLead(WS, deps(table, { [PIDFILE]: '100\n' }, 200));
+    const r = checkIsLead(WS, deps(table, { [PIDFILE]: '100 777\n' }, 200));
     expect(r).toEqual({ action: 'run', reason: 'lead_is_ancestor' });
   });
 
   it('skips when the lead is alive, is claude, and is not an ancestor', () => {
-    const r = checkIsLead(WS, deps(table, { [PIDFILE]: '100\n' }, 400));
+    const r = checkIsLead(WS, deps(table, { [PIDFILE]: '100 777\n' }, 400));
     expect(r.action).toBe('skip');
     if (r.action === 'skip') {
       expect(r.leadPid).toBe(100);
       expect(r.ancestors).toEqual([350, 300, 50]);
     }
+  });
+
+  it('runs when the start time differs (pid reuse)', () => {
+    const r = checkIsLead(WS, deps(table, { [PIDFILE]: '100 888' }, 400));
+    expect(r).toEqual({ action: 'run', reason: 'lead_dead' });
+  });
+
+  it('runs on a pid-only file (no start time, no skip)', () => {
+    const r = checkIsLead(WS, deps(table, { [PIDFILE]: '100\n' }, 400));
+    expect(r).toEqual({ action: 'run', reason: 'no_start_time' });
+  });
+
+  it('runs when the live start time is unreadable', () => {
+    const t = { ...table, 100: { ppid: 50, comm: 'claude' } };
+    expect(checkIsLead(WS, deps(t, { [PIDFILE]: '100 777' }, 400)).action).toBe('run');
   });
 
   it('runs when there is no pid file', () => {
@@ -51,29 +66,29 @@ describe('checkIsLead', () => {
   });
 
   it('runs when the lead is dead', () => {
-    const r = checkIsLead(WS, deps(table, { [PIDFILE]: '999' }, 400));
+    const r = checkIsLead(WS, deps(table, { [PIDFILE]: '999 1' }, 400));
     expect(r).toEqual({ action: 'run', reason: 'lead_dead' });
   });
 
   it('runs when the lead pid is not a claude process', () => {
-    const t = { ...table, 100: { ppid: 50, comm: 'vim' } };
-    const r = checkIsLead(WS, deps(t, { [PIDFILE]: '100' }, 400));
+    const t = { ...table, 100: { ppid: 50, comm: 'vim', startTime: '777' } };
+    const r = checkIsLead(WS, deps(t, { [PIDFILE]: '100 777' }, 400));
     expect(r).toEqual({ action: 'run', reason: 'lead_not_claude' });
   });
 
   it('runs when ancestry is unreadable', () => {
     const t = { ...table };
     delete t[350];
-    const r = checkIsLead(WS, deps(t, { [PIDFILE]: '100' }, 400));
+    const r = checkIsLead(WS, deps(t, { [PIDFILE]: '100 777' }, 400));
     expect(r).toEqual({ action: 'run', reason: 'ancestry_unreadable' });
   });
 
   it('runs when the workspace dir is unknown', () => {
-    expect(checkIsLead(undefined, deps(table, { [PIDFILE]: '100' }, 400)).action).toBe('run');
+    expect(checkIsLead(undefined, deps(table, { [PIDFILE]: '100 777' }, 400)).action).toBe('run');
   });
 
   it('runs when a lookup throws', () => {
-    const d: LeadCheckDeps = { ...deps(table, { [PIDFILE]: '100' }, 400), lookup: () => { throw new Error('x'); } };
+    const d: LeadCheckDeps = { ...deps(table, { [PIDFILE]: '100 777' }, 400), lookup: () => { throw new Error('x'); } };
     expect(checkIsLead(WS, d).action).toBe('run');
   });
 });

@@ -871,8 +871,11 @@ describe('generateClaudeSh lead pid (#1525)', () => {
       const stubPid = /stub:(\d+)/.exec(r.stdout)?.[1];
       const filePid = readFileSync(join(dir, '.claude', '.macf', 'lead-claude.pid'), 'utf8').trim();
       expect(stubPid).toBeDefined();
-      expect(filePid).toBe(stubPid);
-      expect(existsSync(join(dir, '.claude', '.macf', `lead-claude.pid.tmp.${filePid}`))).toBe(false);
+      expect(filePid.split(' ')[0]).toBe(stubPid);
+      if (existsSync(`/proc/${stubPid}`) || process.platform === 'linux') {
+        expect(filePid).toMatch(/^\d+ \d+$/);
+      }
+      expect(existsSync(join(dir, '.claude', '.macf', `lead-claude.pid.tmp.${stubPid}`))).toBe(false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
