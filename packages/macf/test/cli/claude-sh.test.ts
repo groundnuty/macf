@@ -23,7 +23,8 @@
  * still tested in this file.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -32,6 +33,7 @@ import {
   otelTelemetryLines,
   hasManagedHeader,
   launchTokenValidationLines,
+  channelServerSettingsWarningLines,
 } from '../../src/cli/claude-sh.js';
 import type { MacfAgentConfig } from '../../src/cli/config.js';
 
@@ -879,5 +881,73 @@ describe('generateClaudeSh lead pid (#1525)', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('launcher warns when the channel server is turned off in settings (#1525)', () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'macf-launch-settings-'));
+    mkdirSync(join(dir, '.claude'), { recursive: true });
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  const FIX = 'Fix: remove \\"macf-agent\\" from disabledMcpjsonServers'.replace(/\\/g, '');
+
+  /** Runs the generated warning block under bash against the fixture dir. */
+  function runBlock(settings?: string, local?: string): { status: number | null; stderr: string; stdout: string } {
+    if (settings !== undefined) writeFileSync(join(dir, '.claude', 'settings.json'), settings);
+    if (local !== undefined) writeFileSync(join(dir, '.claude', 'settings.local.json'), local);
+    const script = ['set -euo pipefail', `SCRIPT_DIR=${JSON.stringify(dir)}`, ...channelServerSettingsWarningLines(), 'echo launched'].join('\n');
+    const r = spawnSync('bash', ['-c', script], { encoding: 'utf-8', env: { PATH: '/usr/bin:/bin' } });
+    return { status: r.status, stderr: r.stderr, stdout: r.stdout };
+  }
+
+  it('the real shape (rewritten settings.json + disabled settings.local.json) warns on stderr and does not block', () => {
+    const r = runBlock(
+      JSON.stringify({ enabledMcpjsonServers: ['other'] }, null, 2),
+      JSON.stringify({ disabledMcpjsonServers: ['macf-agent'] }, null, 2),
+    );
+    expect(r.stderr).toContain("WARNING: this agent's channel server is turned off in Claude Code settings");
+    expect(r.stderr).toContain(FIX);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('launched');
+  });
+
+  it('not-enabled-only warns; enableAllProjectMcpServers and a healthy pair do not', () => {
+    expect(runBlock('{"enabledMcpjsonServers":["other"]}', '{}').stderr).toContain('WARNING');
+    expect(runBlock('{"enableAllProjectMcpServers": true}', '{}').stderr).toBe('');
+    expect(runBlock('{"enabledMcpjsonServers": [ "macf-agent" ]}', '{}').stderr).toBe('');
+  });
+
+  it('an approval in the user layer (~/.claude/settings.json) counts, so no warning', () => {
+    const home = join(dir, 'home');
+    mkdirSync(join(home, '.claude'), { recursive: true });
+    writeFileSync(join(home, '.claude', 'settings.json'), '{"enabledMcpjsonServers":["macf-agent"]}');
+    writeFileSync(join(dir, '.claude', 'settings.json'), '{"enabledMcpjsonServers":["other"]}');
+    writeFileSync(join(dir, '.claude', 'settings.local.json'), '{}');
+    const script = ['set -euo pipefail', `SCRIPT_DIR=${JSON.stringify(dir)}`, ...channelServerSettingsWarningLines(), 'echo launched'].join('\n');
+    const r = spawnSync('bash', ['-c', script], { encoding: 'utf-8', env: { PATH: '/usr/bin:/bin', HOME: home } });
+    expect(r.status).toBe(0);
+    expect(r.stderr).toBe('');
+  });
+
+  it('enableAllProjectMcpServers follows precedence: a project false overrides a user true, so it warns', () => {
+    const home = join(dir, 'home2');
+    mkdirSync(join(home, '.claude'), { recursive: true });
+    writeFileSync(join(home, '.claude', 'settings.json'), '{"enableAllProjectMcpServers":true}');
+    writeFileSync(join(dir, '.claude', 'settings.json'), '{"enabledMcpjsonServers":["other"],"enableAllProjectMcpServers":false}');
+    writeFileSync(join(dir, '.claude', 'settings.local.json'), '{}');
+    const script = ['set -euo pipefail', `SCRIPT_DIR=${JSON.stringify(dir)}`, ...channelServerSettingsWarningLines(), 'echo launched'].join('\n');
+    const r = spawnSync('bash', ['-c', script], { encoding: 'utf-8', env: { PATH: '/usr/bin:/bin', HOME: home } });
+    expect(r.status).toBe(0);
+    expect(r.stderr).toContain('WARNING');
+  });
+
+  it('is part of the generated claude.sh, before the exec', () => {
+    const text = generateClaudeSh(sampleConfig);
+    const at = text.indexOf('Channel-server settings check (macf#1525)');
+    expect(at).toBeGreaterThan(-1);
+    expect(at).toBeLessThan(text.lastIndexOf('exec claude'));
   });
 });

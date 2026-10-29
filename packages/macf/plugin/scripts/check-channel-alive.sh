@@ -104,6 +104,10 @@ fi
 # false alarm).
 INPUT_JSON="$(cat 2>/dev/null || echo '')"
 HOOK_EVENT="$(printf '%s' "$INPUT_JSON" | sed -n 's/.*"hook_event_name":"\([^"]*\)".*/\1/p' 2>/dev/null || true)"
+SESSION_ID="$(printf '%s' "$INPUT_JSON" | sed -n 's/.*"session_id":"\([^"]*\)".*/\1/p' 2>/dev/null || true)"
+# The id names a file below, so keep only filename-safe characters.
+SESSION_KEY="$(printf '%s' "$SESSION_ID" | tr -c 'A-Za-z0-9_-' '_' 2>/dev/null || true)"
+[ -n "$SESSION_KEY" ] || SESSION_KEY="unknown"
 
 # Resolve the workspace dir the same way check-channels-enabled.sh does.
 WORKSPACE="${CLAUDE_PROJECT_DIR:-${PWD:-}}"
@@ -124,6 +128,26 @@ THROTTLE_DIR="$WORKSPACE/.claude/.macf"
 THROTTLE_FILE="$THROTTLE_DIR/.channel-alive-last-check"
 NOW_EPOCH="$(date +%s 2>/dev/null || true)"
 
+# ── Session-start stamp (groundnuty/macf#1525) ───────────────────────────────
+# The "no running channel server" alarm below waits out a grace period after
+# the session began, because a fresh session's server starts asynchronously.
+# The session's age comes from a per-session stamp this hook owns: SessionStart
+# (re)writes it, and any other event that finds none creates it now, so the
+# grace window then starts at the first prompt and never makes the alarm louder
+# than the evidence allows. Old stamps are pruned on SessionStart.
+SESSION_STAMP="$THROTTLE_DIR/.channel-alive-session-$SESSION_KEY"
+if [ -n "$NOW_EPOCH" ]; then
+  if [ "$HOOK_EVENT" = "SessionStart" ]; then
+    mkdir -p "$THROTTLE_DIR" 2>/dev/null || true
+    printf '%s' "$NOW_EPOCH" >"$SESSION_STAMP" 2>/dev/null || true
+    find "$THROTTLE_DIR" -maxdepth 1 -name '.channel-alive-session-*' -mtime +7 -delete 2>/dev/null || true
+    find "$THROTTLE_DIR" -maxdepth 1 -name '.channel-settings-uncheckable-*' -mtime +7 -delete 2>/dev/null || true
+  elif [ ! -r "$SESSION_STAMP" ]; then
+    mkdir -p "$THROTTLE_DIR" 2>/dev/null || true
+    printf '%s' "$NOW_EPOCH" >"$SESSION_STAMP" 2>/dev/null || true
+  fi
+fi
+
 # SessionStart always probes (HOOK_EVENT == "SessionStart" skips this gate
 # entirely). Every other event (UserPromptSubmit) is throttled.
 if [ "$HOOK_EVENT" != "SessionStart" ] && [ -n "$NOW_EPOCH" ] && [ -r "$THROTTLE_FILE" ]; then
@@ -138,6 +162,69 @@ if [ "$HOOK_EVENT" != "SessionStart" ] && [ -n "$NOW_EPOCH" ] && [ -r "$THROTTLE
     fi
   fi
 fi
+
+# ── Is the channel server turned off in Claude Code settings? (#1525) ───────
+# A workspace template can rewrite .claude/settings.json and drop
+# `macf-agent` from enabledMcpjsonServers, and settings.local.json can carry
+# it in disabledMcpjsonServers. Claude Code then never starts the server, so
+# there is no process to probe below and every liveness check passes. This
+# reads both settings layers directly. It never edits them: the disable may be
+# someone's choice. JSON is parsed with node (present wherever Claude Code is),
+# not jq. Anything unparseable is reported once per session, never ignored.
+SETTINGS_VERDICT="UNCHECKED"
+if command -v node >/dev/null 2>&1; then
+  SETTINGS_VERDICT="$(node -e '
+    const fs = require("fs");
+    const dir = process.argv[1];
+    const server = "macf-agent";
+    const layers = [];
+    const byName = {};
+    let missing = 0;
+    for (const f of ["settings.json", "settings.local.json"]) {
+      let raw;
+      try { raw = fs.readFileSync(dir + "/.claude/" + f, "utf8"); }
+      catch (e) { if (e && e.code === "ENOENT") { missing++; continue; } console.log("UNCHECKED"); process.exit(0); }
+      try { const o = JSON.parse(raw); if (o === null || typeof o !== "object" || Array.isArray(o)) throw 0; layers.push(o); byName[f] = o; }
+      catch (e) { console.log("UNCHECKED"); process.exit(0); }
+    }
+    // The user layer also counts (an approval may live there); unreadable is skipped.
+    try {
+      const u = JSON.parse(fs.readFileSync(process.argv[2] + "/.claude/settings.json", "utf8"));
+      if (u !== null && typeof u === "object" && !Array.isArray(u)) { layers.push(u); byName.user = u; }
+    } catch (e) { /* no user settings */ }
+    // Neither file exists: not an initialised workspace, nothing to judge.
+    if (missing === 2) { console.log("OK"); process.exit(0); }
+    const has = (k) => layers.some((o) => Array.isArray(o[k]) && o[k].includes(server));
+    // A scalar: the highest-precedence layer that sets it wins (local > project > user).
+    const owner = [byName["settings.local.json"], byName["settings.json"], byName.user]
+      .find((o) => o && typeof o.enableAllProjectMcpServers === "boolean");
+    const all = owner ? owner.enableAllProjectMcpServers === true : false;
+    console.log(has("disabledMcpjsonServers") || (!has("enabledMcpjsonServers") && !all) ? "OFF" : "OK");
+  ' "$WORKSPACE" "$HOME_DIR" 2>/dev/null || true)"
+  [ -n "$SETTINGS_VERDICT" ] || SETTINGS_VERDICT="UNCHECKED"
+fi
+
+case "$SETTINGS_VERDICT" in
+  OFF)
+    mkdir -p "$THROTTLE_DIR" 2>/dev/null || true
+    if [ -n "$NOW_EPOCH" ]; then
+      printf '%s' "$NOW_EPOCH" >"$THROTTLE_FILE" 2>/dev/null || true
+    fi
+    cat <<'SETTINGSOFF'
+MACF: this agent's channel server is turned off in Claude Code settings, so it receives no routed issues, mentions or peer messages.
+Fix: remove "macf-agent" from disabledMcpjsonServers in .claude/settings.local.json, add it to enabledMcpjsonServers in .claude/settings.json, then relaunch with ./claude.sh.
+Tell the operator now.
+SETTINGSOFF
+    ;;
+  UNCHECKED)
+    UNCHECKED_MARK="$THROTTLE_DIR/.channel-settings-uncheckable-$SESSION_KEY"
+    if [ ! -e "$UNCHECKED_MARK" ]; then
+      mkdir -p "$THROTTLE_DIR" 2>/dev/null || true
+      : >"$UNCHECKED_MARK" 2>/dev/null || true
+      echo "MACF: could not check whether this agent's channel server is enabled in Claude Code settings (node missing, or .claude/settings*.json unreadable or not valid JSON). Check that \"macf-agent\" is in enabledMcpjsonServers and not in disabledMcpjsonServers."
+    fi
+    ;;
+esac
 
 # ── Locate THIS agent's channel-server log (same locator as #633) ───────────
 # macf#887: this used to fall back to `ls -t .../macf/*/channel.log | head
@@ -193,7 +280,8 @@ restore this check. Silence: MACF_SKIP_CHANNEL_ALIVE_CHECK=1.
 IDUNKNOWN
   exit 0
 fi
-[ -n "$CHANNEL_LOG" ] && [ -r "$CHANNEL_LOG" ] || exit 0
+NO_OWN_LOG=""
+[ -n "$CHANNEL_LOG" ] && [ -r "$CHANNEL_LOG" ] || NO_OWN_LOG=1
 
 # ── Read back this agent's own {host, port} — NOT simply from the NEWEST
 # `server_started` log line (macf#760). channel.log is append-only across
@@ -226,8 +314,50 @@ fi
 # alarm this fix removes. The LOUD alarm below stays reserved for the
 # genuine hazard this hook exists to catch: a LIVE-pid server that still
 # won't answer `/health` (process up, endpoint deaf).
+# ── No running channel server → alarm once past a grace period (#1525) ──────
+# Having no live server_started pid used to mean "exit 0": right after
+# SessionStart that is the normal async-startup shape, and it must stay quiet.
+# But a session that has run past the grace period with no live server is a
+# deaf agent, so say so (at most once per 10 minutes). The session's age comes
+# from the per-session stamp written above.
+no_live_server_alarm() {
+  [ -n "$NOW_EPOCH" ] || return 0
+  [ -r "$SESSION_STAMP" ] || return 0
+  local started grace age last_alarm alarm_file last_ts
+  started="$(cat "$SESSION_STAMP" 2>/dev/null || true)"
+  case "$started" in '' | *[!0-9]*) return 0 ;; esac
+  grace="${MACF_CHANNEL_ALIVE_GRACE_SECS:-120}"
+  case "$grace" in '' | *[!0-9]*) grace=120 ;; esac
+  age=$((NOW_EPOCH - started))
+  [ "$age" -gt "$grace" ] || return 0
+  alarm_file="$THROTTLE_DIR/.channel-alive-nolive-last-alarm"
+  if [ -r "$alarm_file" ]; then
+    last_alarm="$(cat "$alarm_file" 2>/dev/null || true)"
+    case "$last_alarm" in '' | *[!0-9]*) last_alarm="" ;; esac
+    if [ -n "$last_alarm" ] && [ $((NOW_EPOCH - last_alarm)) -ge 0 ] && [ $((NOW_EPOCH - last_alarm)) -lt 600 ]; then
+      return 0
+    fi
+  fi
+  mkdir -p "$THROTTLE_DIR" 2>/dev/null || true
+  printf '%s' "$NOW_EPOCH" >"$alarm_file" 2>/dev/null || true
+  last_ts=""
+  [ -n "$CHANNEL_LOG" ] && last_ts="$(tail -n 1 "$CHANNEL_LOG" 2>/dev/null | sed -n 's/.*"ts":"\([^"]*\)".*/\1/p' || true)"
+  if [ -n "$last_ts" ]; then
+    echo "MACF: this agent has no running channel server (last one exited ${last_ts}), so it receives no routed work. Tell the operator; relaunch with ./claude.sh."
+  else
+    echo "MACF: this agent has no running channel server (none has started for this agent), so it receives no routed work. Tell the operator; relaunch with ./claude.sh."
+  fi
+}
+
+if [ -n "$NO_OWN_LOG" ]; then
+  no_live_server_alarm
+  exit 0
+fi
 ALL_STARTS="$(grep '"event":"server_started"' "$CHANNEL_LOG" 2>/dev/null || true)"
-[ -n "$ALL_STARTS" ] || exit 0
+if [ -z "$ALL_STARTS" ]; then
+  no_live_server_alarm
+  exit 0
+fi
 
 PORT=""
 HOST=""
@@ -250,7 +380,10 @@ STARTLINES
 
 # No `server_started` line had a confirmable-live pid → fail open (see the
 # comment above — this is the expected transient shape, not a hazard).
-[ -n "$PORT" ] && [ -n "$HOST" ] || exit 0
+if [ -z "$PORT" ] || [ -z "$HOST" ]; then
+  no_live_server_alarm
+  exit 0
+fi
 
 # ── mTLS cert paths (claude.sh's env.certs exports these; see
 # plugin/lib/probe-peer-health.ts for the identical peer-ping usage).

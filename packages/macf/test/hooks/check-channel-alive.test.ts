@@ -573,7 +573,7 @@ describe('check-channel-alive.sh (SessionStart + UserPromptSubmit guard)', () =>
       // `tr` on PATH that guard would spuriously reject a genuinely-alive,
       // correctly-shaped pid and fail open before this test's intended
       // curl-missing path is reached.
-      for (const bin of ['bash', 'sh', 'cat', 'sed', 'grep', 'tail', 'date', 'ls', 'mkdir', 'mktemp', 'rm', 'tr']) {
+      for (const bin of ['bash', 'sh', 'cat', 'sed', 'grep', 'tail', 'date', 'ls', 'mkdir', 'mktemp', 'rm', 'tr', 'node']) {
         const resolved = spawnSync('bash', ['-lc', `command -v ${bin}`], { encoding: 'utf-8' }).stdout.trim();
         if (resolved) {
           try {

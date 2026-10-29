@@ -1091,7 +1091,7 @@ describe('plugin hooks.json single-source (DR-039 Decision 2)', () => {
   // drop a hook back to "all sources" (the issue's own acceptance
   // criterion). Pre-#930 all 4 SessionStart entries below were
   // matcher-less.
-  it('narrows the freshness-check + work-pickup-pointer + check-channel-alive.sh SessionStart entries to matcher "startup" (groundnuty/macf#930)', () => {
+  it('narrows the freshness-check + work-pickup-pointer SessionStart entries to matcher "startup" (check-channel-alive.sh to "startup|resume") (groundnuty/macf#930)', () => {
     const parsed = readPluginHooksJson();
     const sessionStart = parsed.hooks['SessionStart'] ?? [];
 
@@ -1108,7 +1108,9 @@ describe('plugin hooks.json single-source (DR-039 Decision 2)', () => {
     const channelAliveEntry = sessionStart.find((e) =>
       e.hooks.some((h) => h.command === pluginRootHookCommand('check-channel-alive.sh')),
     );
-    expect(channelAliveEntry?.matcher).toBe('startup');
+    // Widened to resume by groundnuty/macf#1525: a resumed session must also
+    // re-run the settings check, or a deaf agent stays silent after `claude -c`.
+    expect(channelAliveEntry?.matcher).toBe('startup|resume');
   });
 
   it('leaves check-framework-surface.sh matcher-less on SessionStart DELIBERATELY (groundnuty/macf#930 audit — sweep detection needs every resumption chance, not just startup)', () => {
