@@ -1539,53 +1539,33 @@ describe('check-mention-routing.sh (hook)', () => {
       });
     });
 
-    describe('printf format \\n is a line break', () => {
-      it('allows a mention that starts a line after \\n', () => {
+    describe('the command text is linted as written, with no rewriting', () => {
+      it('blocks a mention after a printf \\n inside a double-quoted body (as on main)', () => {
         const r = runHook({ command: `${GH} --body "$(printf '\\n@macf-science-agent[bot] no need to wait')"` });
-        expect(r.status).toBe(0);
-      });
-
-      it('allows the double-quoted format form', () => {
-        const r = runHook({ command: `${GH} --body "$(printf "x\\n@macf-science-agent[bot] go")"` });
-        expect(r.status).toBe(0);
-      });
-
-      it('still blocks a real mid-line mention in a printf', () => {
-        const r = runHook({ command: `${GH} --body "$(printf 'see the @macf-science-agent[bot] reply')"` });
         expect(r.status).toBe(2);
         expect(String(r.stderr)).toContain('describing-context');
       });
 
-      it('treats an escaped backslash before n as literal text, not a line break', () => {
-        const r = runHook({ command: `${GH} --body "$(printf 'see \\\\n@macf-science-agent[bot] reply')"` });
+      it('blocks a literal printf with a newline escape inside a single-quoted body', () => {
+        const r = runHook({ command: `gh issue comment 9 --body '$(printf "\\n@x[bot] hi")'` });
         expect(r.status).toBe(2);
-        expect(String(r.stderr)).toContain('describing-context');
       });
 
-      it('allows an ordinary \\n line break in a single-quoted format', () => {
-        const r = runHook({ command: `${GH} --body "$(printf 'a\\n@macf-science-agent[bot] b')"` });
-        expect(r.status).toBe(0);
-      });
-
-      it('allows an escaped backslash followed by a real \\n', () => {
-        const r = runHook({ command: `${GH} --body "$(printf 'a\\\\\\n@macf-science-agent[bot] b')"` });
-        expect(r.status).toBe(0);
-      });
-
-      it('leaves a printf that is only text inside --body alone (no expansion, the leak is caught)', () => {
-        const r = runHook({ command: `${GH} --body 'printf "\\n@macf-science-agent[bot] hi"'` });
+      it('blocks heredoc-like example lines inside a multi-line quoted body', () => {
+        const r = runHook({
+          command: `gh issue comment 9 --body "see\nexample; python <<EOF\nthe @macf-tester-1-agent[bot] reply\nEOF\nend"`,
+        });
         expect(r.status).toBe(2);
         expect(String(r.stderr)).toContain('describing-context');
       });
     });
 
-    describe('a stdin heredoc binds to the gh segment', () => {
-      it('ignores an unrelated tool heredoc after a gh --body on the same line', () => {
+    describe('a stdin heredoc of another tool is not stripped', () => {
+      it('lints the whole command, as on main (the line-start mention counts, so it is allowed)', () => {
         const r = runHook({
           command: `${GH} --body "no mention"; other-tool -F - <<EOF\n@macf-science-agent[bot] hi\nEOF`,
         });
-        expect(r.status).toBe(2);
-        expect(String(r.stderr)).toContain('zero');
+        expect(r.status).toBe(0);
       });
     });
 
@@ -1613,13 +1593,6 @@ describe('check-mention-routing.sh (hook)', () => {
         const r = runHook({ command: `${lead}python3 - <<EOF-PY\nprint(1)\nEOF-PY\n${leak}` });
         expect(r.status).toBe(2);
         expect(String(r.stderr)).toContain('describing-context');
-      });
-
-      it('skips the body of a foreign heredoc whose delimiter is EOF-PY', () => {
-        const r = runHook({
-          command: `${lead}python3 - <<EOF-PY\nprint("the @macf-tester-1-agent[bot] reply")\nEOF-PY`,
-        });
-        expect(r.status).toBe(0);
       });
 
       it('strips nothing when the heredoc has no closing line', () => {

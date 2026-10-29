@@ -843,87 +843,6 @@ macf_extract_stdin_heredoc() {
   return 0
 }
 
-# Drops the body of a heredoc whose opener sits in a non-gh segment of the
-# command (`gh ... --body "x"; other-tool <<EOF`): that text is not the comment.
-macf_strip_foreign_heredocs() {
-  # Strips only when the opener parses cleanly (one `<<` on the line, full
-  # delimiter word) AND a matching closing line exists. Any doubt leaves the
-  # text exactly as it was.
-  local -a lines=()
-  local line pre rest cmp i=0 j n
-  while IFS= read -r line || [[ -n "$line" ]]; do lines+=("$line"); done <<<"$1"
-  n="${#lines[@]}"
-  while [[ "$i" -lt "$n" ]]; do
-    line="${lines[$i]}"
-    printf '%s\n' "$line"
-    i=$((i + 1))
-    [[ "$line" == *"<<"* ]] || continue
-    rest="${line#*<<}"
-    [[ "$rest" != *"<<"* ]] || continue
-    macf_parse_heredoc_opener "$rest" || continue
-    pre="${line%%<<*}"
-    pre="$(sed -E "s/\"[^\"]*\"//g; s/'[^']*'//g" <<<"$pre")"
-    [[ "$pre" == *[\;\&\|]* ]] || continue
-    pre="${pre##*[;&|]}"
-    if [[ "$pre" =~ (^|[[:space:]])gh[[:space:]] ]]; then continue; fi
-    j="$i"
-    while [[ "$j" -lt "$n" ]]; do
-      cmp="${lines[$j]}"
-      if [[ "$HD_TABS" == "true" ]]; then
-        while [[ "$cmp" == $'\t'* ]]; do cmp="${cmp#$'\t'}"; done
-      fi
-      [[ "$cmp" == "$HD_DELIM" ]] && break
-      j=$((j + 1))
-    done
-    if [[ "$j" -lt "$n" ]]; then i=$((j + 1)); fi
-  done
-}
-
-# printf format escapes, left to right: \\ is one backslash, \n a newline.
-# A double-quoted format is first reduced by the shell (\\ \" \$ \`), then
-# read by printf, so "\\n" there is a newline and "\\\\n" is not.
-macf_printf_unescape() {
-  local f="$1" out="" c n i=0
-  if [[ "$f" == \"* ]]; then
-    f="${f:1:${#f}-2}"
-    local sh="" 
-    while [[ "$i" -lt "${#f}" ]]; do
-      c="${f:$i:1}"; n="${f:$((i+1)):1}"
-      if [[ "$c" == "\\" && "$n" == [\\\"\$\`] ]]; then sh+="$n"; i=$((i+2)); else sh+="$c"; i=$((i+1)); fi
-    done
-    f="$sh"; i=0
-  else
-    f="${f:1:${#f}-2}"
-  fi
-  while [[ "$i" -lt "${#f}" ]]; do
-    c="${f:$i:1}"; n="${f:$((i+1)):1}"
-    if [[ "$c" == "\\" && "$n" == "\\" ]]; then out+="\\"; i=$((i+2))
-    elif [[ "$c" == "\\" && "$n" == "n" ]]; then out+=$'\n'; i=$((i+2))
-    else out+="$c"; i=$((i+1)); fi
-  done
-  printf '%s' "$out"
-}
-
-# Inside a printf format argument, a literal \n is a line break at runtime.
-# Expands it for the line-start rule; other text is left as written.
-macf_expand_printf_newlines() {
-  local rest="$1" out="" fmt
-  # Only an executed printf: the format directly inside $( printf … ). A printf
-  # that is merely text inside a --body string is left alone.
-  local re_sq="(\\\$\\([[:space:]]*)printf[[:space:]]+('[^']*')"
-  local re_dq='(\$\([[:space:]]*)printf[[:space:]]+("([^"\\]|\\.)*")'
-  local re m
-  while :; do
-    if [[ "$rest" =~ $re_sq ]]; then re="$re_sq"; elif [[ "$rest" =~ $re_dq ]]; then re="$re_dq"; else break; fi
-    [[ "$rest" =~ $re ]] || break
-    m="${BASH_REMATCH[0]}"; fmt="${BASH_REMATCH[2]}"
-    local head="${rest%%"$m"*}"
-    out+="${head}${m%"$fmt"}$(macf_printf_unescape "$fmt")"
-    rest="${rest#*"$m"}"
-  done
-  printf '%s' "${out}${rest}"
-}
-
 macf_extract_heredoc_body() {
   local target="$1" cmd="$2"
   if [[ -z "$target" ]]; then
@@ -1181,8 +1100,6 @@ WARNERR
 fi
 
 if [[ "$LINT_TARGET" == "$COMMAND" ]]; then
-  LINT_TARGET="$(macf_strip_foreign_heredocs "$LINT_TARGET")"
-  LINT_TARGET="$(macf_expand_printf_newlines "$LINT_TARGET")"
   if [[ -n "$STDIN_EXTRA" ]]; then LINT_TARGET+=$'\n'"$STDIN_EXTRA"; fi
 fi
 
