@@ -115,8 +115,32 @@ _nl=$'\n'
 _sep='[[:blank:]]*(;|&&|'"$_nl"')[[:blank:]]*'
 _b='[[:blank:]]+'
 CANON_MINT='^[[:space:]]*GH_TOKEN=\$\("\$MACF_WORKSPACE_DIR/\.claude/scripts/macf-gh-token\.sh"'"$_b"'--app-id'"$_b"'"\$APP_ID"'"$_b"'--install-id'"$_b"'"\$INSTALL_ID"'"$_b"'--key'"$_b"'"\$KEY_PATH"\)'"$_b"'\|\|'"$_b"'exit'"$_b"'1'"$_sep"'export'"$_b"'GH_TOKEN[[:blank:]]*(;|&&|'"$_nl"'|$)'
+# A literal user token assigned to GH_TOKEN / GITHUB_TOKEN before gh acts as that user.
+_USER_TOKEN_ASSIGN='(^|'"$_ws"')(GH_TOKEN|GITHUB_TOKEN)=["'"'"']?(ghp_|gho_|ghu_|ghr_|github_pat_)'
+BLOCK_IDENTITY_MSG='BLOCKED by MACF attribution-trap hook: this command removes or empties GH_TOKEN before gh, or sets it to a user token, so gh would act as the stored user login. Mint a bot token instead (see gh-token-refresh.md).'
+if bypass_before_gh "$_USER_TOKEN_ASSIGN"; then
+  echo "$BLOCK_IDENTITY_MSG" >&2
+  exit 2
+fi
+
+MINT_PRESENT=0
 if [[ "$COMMAND" =~ $CANON_MINT ]]; then
-  exit 0
+  MINT_PRESENT=1
+  # After the mint, the rest of the command must not reassign the token.
+  # Only $GH_TOKEN, "$GH_TOKEN" and ${GH_TOKEN} are allowed as values.
+  _rest="${COMMAND#"${BASH_REMATCH[0]}"}"
+  _assign='(^|'"$_ws"')(GH_TOKEN|GITHUB_TOKEN)=([^[:space:];|&]*)'
+  while [[ "$_rest" =~ $_assign ]]; do
+    _val="${BASH_REMATCH[3]}"
+    case "$_val" in
+      '$GH_TOKEN'|'"$GH_TOKEN"'|'${GH_TOKEN}'|'"${GH_TOKEN}"') ;;
+      *)
+        echo "$BLOCK_IDENTITY_MSG" >&2
+        exit 2
+        ;;
+    esac
+    _rest="${_rest#*"${BASH_REMATCH[0]}"}"
+  done
 fi
 
 # Check GH_TOKEN: must be present AND match the bot-token shape
@@ -143,7 +167,9 @@ fi
 # is unset, which is exactly the case we need to handle.
 GH_TOKEN_VALUE="${GH_TOKEN:-}"
 TOKEN_PREFIX="${GH_TOKEN_VALUE:0:4}"
-if [[ -z "$GH_TOKEN_VALUE" ]] || [[ ! "$GH_TOKEN_VALUE" =~ ^ghs_[A-Za-z0-9._-]+$ ]]; then
+# With the canonical mint present the ambient token is not what gh will use,
+# so only this validation is skipped; the audit path below still runs.
+if [[ "$MINT_PRESENT" != 1 ]] && { [[ -z "$GH_TOKEN_VALUE" ]] || [[ ! "$GH_TOKEN_VALUE" =~ ^ghs_[A-Za-z0-9._-]+$ ]]; }; then
   # groundnuty/macf#1360 — branch on the discriminator this hook ALREADY has.
   # A `ghs_` prefix that fails the full-shape check is almost never an
   # attribution trap: `ghs_` IS a bot installation token by definition. It is

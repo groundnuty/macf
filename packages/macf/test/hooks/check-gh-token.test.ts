@@ -14,6 +14,8 @@
 import { describe, it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
+import { mkdtempSync, writeFileSync, chmodSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { findCliPackageRoot } from '../../src/cli/rules.js';
 
 const HOOK_SCRIPT = join(findCliPackageRoot(), 'plugin', 'scripts', 'check-gh-token.sh');
@@ -1110,6 +1112,69 @@ describe('check-gh-token.sh (hook)', () => {
           expect(runHook({ command, env: {} }).status).toBe(2);
         });
       }
+    });
+
+    describe('round 4 — no identity override after the mint, audit path kept', () => {
+      const mint =
+        'GH_TOKEN=$("$MACF_WORKSPACE_DIR/.claude/scripts/macf-gh-token.sh" ' +
+        '--app-id "$APP_ID" --install-id "$INSTALL_ID" --key "$KEY_PATH") || exit 1; export GH_TOKEN';
+
+      const blockedAfterMint = [
+        'GH_TOKEN=ghp_user gh issue list',
+        'GITHUB_TOKEN=gho_x gh issue list',
+        'GH_TOKEN=other gh issue list',
+        'GH_TOKEN= gh issue list',
+        'unset GH_TOKEN; gh issue list',
+        'env -u GH_TOKEN gh issue list',
+      ];
+      for (const rest of blockedAfterMint) {
+        it(`blocks after a mint: ${rest}`, () => {
+          const r = runHook({ command: `${mint}; ${rest}`, env: {} });
+          expect(r.status).toBe(2);
+        });
+      }
+
+      it('allows GH_TOKEN=$GH_TOKEN after a mint', () => {
+        const command = `${mint}; GH_TOKEN=$GH_TOKEN gh issue list`;
+        expect(runHook({ command, env: {} }).status).toBe(0);
+      });
+
+      it('allows GH_TOKEN="$GH_TOKEN" after a mint', () => {
+        const command = `${mint}; GH_TOKEN="$GH_TOKEN" gh issue list`;
+        expect(runHook({ command, env: {} }).status).toBe(0);
+      });
+
+      it('blocks a literal user token with a valid ambient token', () => {
+        const r = runHook({ command: 'GH_TOKEN=ghp_user gh issue list', env: VALID });
+        expect(r.status).toBe(2);
+        expect(r.stderr).toMatch(/removes or empties GH_TOKEN/);
+      });
+
+      it('allows GH_TOKEN=$GH_TOKEN with a valid ambient token', () => {
+        const r = runHook({ command: 'GH_TOKEN=$GH_TOKEN gh issue list', env: VALID });
+        expect(r.status).toBe(0);
+      });
+
+      it('takes the audit path for a mint plus gh workflow run', () => {
+        const dir = mkdtempSync(join(tmpdir(), 'hook-audit-'));
+        try {
+          const log = join(dir, 'curl.log');
+          const fake = join(dir, 'curl');
+          writeFileSync(fake, `#!/bin/sh\necho "$@" >> "${log}"\n`);
+          chmodSync(fake, 0o755);
+          const r = runHook({
+            command: `${mint}; gh workflow run ci.yml --repo groundnuty/macf`,
+            env: {
+              PATH: `${dir}:${process.env['PATH'] ?? ''}`,
+              OTEL_EXPORTER_OTLP_ENDPOINT: 'http://127.0.0.1:1',
+            },
+          });
+          expect(r.status).toBe(0);
+          expect(readFileSync(log, 'utf-8')).toContain('/v1/traces');
+        } finally {
+          rmSync(dir, { recursive: true, force: true });
+        }
+      });
     });
 
     it('missing-token message gives the in-command mint remedy', () => {
