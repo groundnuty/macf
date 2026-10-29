@@ -1031,15 +1031,16 @@ LINT_TARGET="$COMMAND"
 BODY_FILE_ARG_PATTERN='--body-file(=|[[:space:]]+)([^[:space:]]+)'
 STDIN_HEREDOC_BODY=""
 STDIN_EXTRA=""
+FILE_SEARCH="$COMMAND"
 if STDIN_HEREDOC_BODY="$(macf_extract_stdin_heredoc "$COMMAND")"; then
-  # The comment body is a heredoc on the gh command's own stdin.
-  BODY_FILE_MODE=true
-  BODY_FILE_RESOLVED=true
-  # The resolved body is ADDED to the command text, never swapped for it, so
-  # a leak elsewhere in the command is still seen.
-  LINT_TARGET="$COMMAND"
+  # The comment body is a heredoc on the gh command's own stdin. It is ADDED to
+  # whatever else is linted, never swapped for it, so a leak elsewhere is seen.
   STDIN_EXTRA="$STDIN_HEREDOC_BODY"
-elif [[ "$COMMAND" =~ $BODY_FILE_ARG_PATTERN ]]; then
+  # A file-backed comment chained in the same command is still resolved below:
+  # hide only the stdin form so the path search finds the real path.
+  FILE_SEARCH="$(printf '%s' "$COMMAND" | sed -E 's/--body-file(=|[[:space:]]+)-([[:space:]]|$)/\2/g')"
+fi
+if [[ "$FILE_SEARCH" =~ $BODY_FILE_ARG_PATTERN ]]; then
   BODY_FILE_MODE=true
   BODY_FILE_RAW="${BASH_REMATCH[2]}"
   # A path token ends at a shell separator: `--body-file f; next` is the path f.
@@ -1072,8 +1073,9 @@ elif [[ "$COMMAND" =~ $BODY_FILE_ARG_PATTERN ]]; then
   fi
 fi
 
-# Branch 3: neither resolvable.
-if [[ "$BODY_FILE_MODE" == "true" ]] && [[ "$BODY_FILE_RESOLVED" == "false" ]]; then
+# Branch 3: neither resolvable. With a resolved stdin body there is still text
+# to lint, so fall through and lint the command plus that body.
+if [[ "$BODY_FILE_MODE" == "true" ]] && [[ "$BODY_FILE_RESOLVED" == "false" ]] && [[ -z "$STDIN_EXTRA" ]]; then
   # Check B: nothing lintable — same silent allow as pre-#944 (no leak
   # check possible without content; operator discipline covers the gap).
   # Check A: WARN (do not block) — unlike Check B, a missing mention is
@@ -1099,9 +1101,10 @@ WARNERR
   exit 0
 fi
 
-if [[ "$LINT_TARGET" == "$COMMAND" ]]; then
-  if [[ -n "$STDIN_EXTRA" ]]; then LINT_TARGET+=$'\n'"$STDIN_EXTRA"; fi
+if [[ "$BODY_FILE_MODE" == "true" ]] && [[ "$BODY_FILE_RESOLVED" == "false" ]]; then
+  LINT_TARGET="$COMMAND"
 fi
+if [[ -n "$STDIN_EXTRA" ]]; then LINT_TARGET+=$'\n'"$STDIN_EXTRA"; fi
 
 # Per-occurrence scan for raw @macf-<role>-agent[bot] patterns in the lint
 # target (LINT_TARGET — the command string for a plain `--body`/`--comment`

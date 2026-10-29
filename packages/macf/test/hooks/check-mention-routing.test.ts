@@ -1539,6 +1539,37 @@ describe('check-mention-routing.sh (hook)', () => {
       });
     });
 
+    describe('a stdin heredoc does not hide a chained file-backed comment', () => {
+      it('blocks a describing leak in the file when another comment uses --body-file - <<EOF', () => {
+        const dir = mkdtempSync(join(tmpdir(), 'macf1525-chain-'));
+        try {
+          const f = join(dir, 'body.md');
+          writeFileSync(f, 'see the @macf-tester-1-agent[bot] reply\n');
+          const r = runHook({
+            command: `gh issue comment 9 --body-file ${f}; gh issue comment 10 --body-file - <<'EOF'\n@macf-science-agent[bot] ok\nEOF`,
+          });
+          expect(r.status).toBe(2);
+          expect(String(r.stderr)).toContain('describing-context');
+        } finally {
+          rmSync(dir, { recursive: true, force: true });
+        }
+      });
+
+      it('allows the same chain when the file addresses at line start', () => {
+        const dir = mkdtempSync(join(tmpdir(), 'macf1525-chain-'));
+        try {
+          const f = join(dir, 'body.md');
+          writeFileSync(f, '@macf-tester-1-agent[bot] please look\n');
+          const r = runHook({
+            command: `gh issue comment 9 --body-file ${f}; gh issue comment 10 --body-file - <<'EOF'\n@macf-science-agent[bot] ok\nEOF`,
+          });
+          expect(r.status).toBe(0);
+        } finally {
+          rmSync(dir, { recursive: true, force: true });
+        }
+      });
+    });
+
     describe('the command text is linted as written, with no rewriting', () => {
       it('blocks a mention after a printf \\n inside a double-quoted body (as on main)', () => {
         const r = runHook({ command: `${GH} --body "$(printf '\\n@macf-science-agent[bot] no need to wait')"` });
