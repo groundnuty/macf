@@ -24,6 +24,7 @@ import { runBootstrapApply } from './commands/bootstrap-apply.js';
 import { runnerTokenHowTo } from './bootstrap/apply-routing.js';
 import { writeOperatorSecretsFileTemplate } from './bootstrap/operator-secrets-file.js';
 import { runBootstrapStatus } from './commands/bootstrap-status.js';
+import { runBootstrapPreflight } from './commands/bootstrap-preflight.js';
 import { runBootstrapControlRepoInit } from './commands/bootstrap-control-repo-init.js';
 import { runManifestScaffold } from './commands/bootstrap-manifest-scaffold.js';
 import { runRoutingDoctor } from './commands/routing-doctor.js';
@@ -792,6 +793,29 @@ bootstrap
       identityKeyPath: opts.identityKey,
     });
     process.exitCode = code;
+  });
+
+bootstrap
+  .command('preflight')
+  .description(
+    'READ-ONLY: check this machine is ready for `bootstrap apply` and say exactly what is missing: tools ' +
+    '(node, macf, gh login and scopes, age, tailscale), the manifest, the secrets file (mode 600, required keys, ' +
+    'values never printed), the runner platform endpoint (by name, then by tailnet IP), the age identity key, and ' +
+    'with --vm the ssh login and the VM tools on a non-interactive PATH. Exit 0 when ready, 1 otherwise.',
+  )
+  .requiredOption('-f, --file <path>', 'Path to the fleet.yaml manifest')
+  .option('--secrets <path>', 'Operator secrets file (plain KEY=value) to check')
+  .option('--identity-key <path>', 'age identity file; shows its recipient and whether the manifest lists it')
+  .option('--vm <ssh-target>', 'ssh target of the VM that runs the agents, e.g. ubuntu@host')
+  .option('--json', 'Emit the checks as JSON (with schema_version)', false)
+  .action(async (opts) => {
+    process.exitCode = await runBootstrapPreflight({
+      file: opts.file,
+      json: opts.json,
+      secretsPath: opts.secrets,
+      identityKeyPath: opts.identityKey,
+      vm: opts.vm,
+    });
   });
 
 bootstrap

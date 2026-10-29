@@ -110,6 +110,8 @@ describe('deploy keeps nothing of the runner half (groundnuty/macf#943, DR-043 A
       join(BOOTSTRAP_DIR, 'observer.ts'),
       join(BOOTSTRAP_DIR, 'operator-secrets-file.ts'),
       join(BOOTSTRAP_DIR, 'plan.ts'),
+      // `preflight` reads only the endpoint's env-var NAME; it is a pre-apply check, never a deploy path.
+      join(BOOTSTRAP_DIR, 'preflight.ts'),
     ];
     expect([...importers].sort()).toEqual([...knownProvisioningPhaseImporters].sort());
   });

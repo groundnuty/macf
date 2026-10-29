@@ -97,7 +97,7 @@ This section and the next three are one worked example, meant to be followed top
 | `tmux`, `bash` 4 or later, `crontab` | — | ✓ |
 | `claude` 2.1.277 or later, logged in once (run `claude`, log in, exit). The template's `init.sh` names 2.1.277 as the first version that reads `AGENTS.md`, the agents' role file | — | ✓ |
 
-Nothing checks these up front. A missing tool fails at the step that needs it, for example `Failed to spawn "age" — is it on PATH?`.
+Run `macf bootstrap preflight -f fleet.yaml --vm <ssh-target>` first: it checks the tools, the secrets file and the VM, and lists everything that is missing. Without it, a missing tool fails at the step that needs it, for example `Failed to spawn "age" — is it on PATH?`.
 
 **The machine that runs `apply` must resolve tailnet names.** `apply` calls the runner platform at a `*.ts.net` name. Either turn MagicDNS on for that machine, or set `MACF_RUNNER_PLATFORM_ENDPOINT=http://<tailnet-IP>:8088` (§1.3; keep `http://` and the port; `tailscale status` shows the IP). To tell which you need, run `curl -sS -m 10 -o /dev/null -w '%{http_code}\n' <endpoint>` once with the name and once with the IP. A failure by name (a timeout or `Could not resolve host`) and `200` by IP means names do not resolve there. Check this before §3.3: an unreachable platform does not stop apply, it only creates no runners.
 
