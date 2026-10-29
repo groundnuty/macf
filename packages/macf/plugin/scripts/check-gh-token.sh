@@ -100,7 +100,9 @@ fi
 # Canonical inline mint (#1525): in a session with no ambient GH_TOKEN the
 # rule's own recipe would be blocked, because this hook judges only the
 # ambient token. Allow exactly this form at the start of the command:
-#   GH_TOKEN=$("<...>/.claude/scripts/macf-gh-token.sh" <args>) || exit 1; export GH_TOKEN
+#   GH_TOKEN=$("$MACF_WORKSPACE_DIR/.claude/scripts/macf-gh-token.sh" --app-id "$APP_ID" --install-id "$INSTALL_ID" --key "$KEY_PATH") || exit 1; export GH_TOKEN
+# Only this literal recipe matches (whitespace may vary): no other path, argument
+# order, extra argument, redirect or quoting, since each loose form had a hole.
 # The helper fails loud and validates the ghs_ prefix, and `|| exit 1` aborts
 # before any later gh runs. The export must follow as its own statement, or gh
 # would not inherit the token. Statements are joined only by `;`, `&&` or a
@@ -111,7 +113,8 @@ fi
 # the stored user login.
 _nl=$'\n'
 _sep='[[:blank:]]*(;|&&|'"$_nl"')[[:blank:]]*'
-CANON_MINT='^[[:space:]]*GH_TOKEN=\$\("?[^"[:space:]]*\.claude/scripts/macf-gh-token\.sh"?[^)|;&]*\)[[:blank:]]*\|\|[[:blank:]]*exit[[:blank:]]+1'"$_sep"'export[[:blank:]]+GH_TOKEN[[:blank:]]*(;|&&|'"$_nl"'|$)'
+_b='[[:blank:]]+'
+CANON_MINT='^[[:space:]]*GH_TOKEN=\$\("\$MACF_WORKSPACE_DIR/\.claude/scripts/macf-gh-token\.sh"'"$_b"'--app-id'"$_b"'"\$APP_ID"'"$_b"'--install-id'"$_b"'"\$INSTALL_ID"'"$_b"'--key'"$_b"'"\$KEY_PATH"\)'"$_b"'\|\|'"$_b"'exit'"$_b"'1'"$_sep"'export'"$_b"'GH_TOKEN[[:blank:]]*(;|&&|'"$_nl"'|$)'
 if [[ "$COMMAND" =~ $CANON_MINT ]]; then
   exit 0
 fi

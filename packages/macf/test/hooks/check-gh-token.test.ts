@@ -1061,6 +1061,57 @@ describe('check-gh-token.sh (hook)', () => {
       });
     });
 
+    describe('round 3 — only the literal canonical recipe', () => {
+      const helper = '"$MACF_WORKSPACE_DIR/.claude/scripts/macf-gh-token.sh"';
+      const args = '--app-id "$APP_ID" --install-id "$INSTALL_ID" --key "$KEY_PATH"';
+      const tail = ' || exit 1; export GH_TOKEN; gh issue list';
+      const mintWith = (h: string, a: string) => `GH_TOKEN=$(${h} ${a})${tail}`;
+
+      it('allows the exact recipe', () => {
+        expect(runHook({ command: mintWith(helper, args), env: {} }).status).toBe(0);
+      });
+
+      it('allows the exact recipe with extra spaces', () => {
+        const command =
+          `GH_TOKEN=$(${helper}   --app-id  "$APP_ID"\t--install-id "$INSTALL_ID"  ` +
+          '--key   "$KEY_PATH")  ||   exit   1 ;  export   GH_TOKEN ;  gh issue list';
+        expect(runHook({ command, env: {} }).status).toBe(0);
+      });
+
+      it('allows the exact recipe with && separators', () => {
+        const command =
+          `GH_TOKEN=$(${helper} ${args}) || exit 1 && export GH_TOKEN && gh issue list`;
+        expect(runHook({ command, env: {} }).status).toBe(0);
+      });
+
+      const blocked: Array<[string, string]> = [
+        ['a redirect inside $( )', mintWith(helper, args + ' > /dev/null')],
+        [
+          'a .sh.fake executable',
+          `GH_TOKEN=$("$MACF_WORKSPACE_DIR/.claude/scripts/macf-gh-token.sh.fake" ${args})${tail}`,
+        ],
+        ['a relative path', mintWith('.claude/scripts/macf-gh-token.sh', args)],
+        [
+          'reordered flags',
+          mintWith(helper, '--install-id "$INSTALL_ID" --app-id "$APP_ID" --key "$KEY_PATH"'),
+        ],
+        ['an extra flag', mintWith(helper, args + ' --extra')],
+        [
+          'a different key variable',
+          mintWith(helper, '--app-id "$APP_ID" --install-id "$INSTALL_ID" --key "$OTHER"'),
+        ],
+        [
+          'single-quoted arguments',
+          mintWith(helper, "--app-id '$APP_ID' --install-id '$INSTALL_ID' --key '$KEY_PATH'"),
+        ],
+      ];
+      for (const [name, command] of blocked) {
+        it(`blocks ${name}`, () => {
+          expect(runHook({ command, env: {} }).status).toBe(2);
+        });
+      }
+    });
+
     it('missing-token message gives the in-command mint remedy', () => {
       const r = runHook({ command: 'gh issue list', env: {} });
       expect(r.stderr).toContain(
