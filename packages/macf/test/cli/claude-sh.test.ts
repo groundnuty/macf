@@ -844,3 +844,37 @@ describe('hasManagedHeader (DR-029 / macf#623)', () => {
     expect(hasManagedHeader(content)).toBe(true);
   });
 });
+
+describe('generateClaudeSh lead pid (#1525)', () => {
+  it('writes the lead pid file right before exec claude, under bash', async () => {
+    const { spawnSync } = await import('node:child_process');
+    const { mkdirSync, writeFileSync, chmodSync } = await import('node:fs');
+    const dir = mkdtempSync(join(tmpdir(), 'leadpid-'));
+    try {
+      mkdirSync(join(dir, '.claude', '.macf'), { recursive: true });
+      mkdirSync(join(dir, 'bin'));
+      // stub claude prints its own pid so we can compare with the file
+      writeFileSync(join(dir, 'bin', 'claude'), '#!/bin/sh\necho "stub:$$"\n');
+      chmodSync(join(dir, 'bin', 'claude'), 0o755);
+      const script = generateClaudeSh(sampleConfig);
+      const idx = script.indexOf('# Record the lead pid');
+      expect(idx).toBeGreaterThan(-1);
+      expect(script.indexOf('exec claude', idx)).toBeGreaterThan(idx);
+      // fragment: the pid block through the MACF_TEST exec
+      const end = script.indexOf('# shellcheck disable=SC2086', idx);
+      expect(script.slice(end)).toContain('exec claude');
+      const frag = script.slice(idx, end) + 'exec claude\n';
+      const r = spawnSync('bash', ['-c', `SCRIPT_DIR="${dir}"\n${frag}`], {
+        env: { ...process.env, PATH: `${join(dir, 'bin')}:${process.env['PATH'] ?? ''}` },
+        encoding: 'utf8',
+      });
+      const stubPid = /stub:(\d+)/.exec(r.stdout)?.[1];
+      const filePid = readFileSync(join(dir, '.claude', '.macf', 'lead-claude.pid'), 'utf8').trim();
+      expect(stubPid).toBeDefined();
+      expect(filePid).toBe(stubPid);
+      expect(existsSync(join(dir, '.claude', '.macf', `lead-claude.pid.tmp.${filePid}`))).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
