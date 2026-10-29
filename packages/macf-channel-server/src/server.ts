@@ -618,7 +618,7 @@ async function main(): Promise<void> {
   // Per Option A (impl-time refinement to DR-023 §UC-1, approved on
   // macf#256): `to` field is OPTIONAL — when absent, broadcasts to all
   // peers in the project registry (excluding self).
-  const { notifyPeer, NotifyPeerInputSchema, NotifyPeerOutputSchema, createNotifyOutboxSend } =
+  const { notifyPeer, NotifyPeerInputSchema, NotifyPeerOutputSchema, createNotifyOutboxSend, deadLetterReason } =
     await import('./notify-peer.js');
   // macf#396 Phase 3: outbound A2A client for protocol-selection.
   // Shared across notify_peer invocations so the AgentCard cache is
@@ -692,8 +692,9 @@ async function main(): Promise<void> {
   // below), not this wiring slice.
   const { send: outboxSend, lastAttempts: outboxAttempts } = createNotifyOutboxSend(notifyDispatchDeps);
   const onOutboxDeadLetter = (entry: OutboxEntry): void => {
-    logger.error('outbox_dead_letter', {
+    logger.error('outbox_dead_lettered', {
       id: entry.id,
+      reason: deadLetterReason(outboxAttempts, entry.id),
       target: entry.target,
       enqueued_at: new Date(entry.enqueuedAt).toISOString(),
       attempt_count: entry.attemptCount,
@@ -754,7 +755,9 @@ async function main(): Promise<void> {
         'on the fleet\'s `federated_cas` trust bundle. Failure semantics are ' +
         'observational + non-blocking per DR-023 §"Failure-mode contract" — `isError: true` ' +
         'when peers were attempted but none delivered, OR when a guest `to` fails the DR-041 ' +
-        'addressing ladder (see the `error` field), signaling LLM self-correction; ' +
+        'addressing ladder (see the `error` field), signaling LLM self-correction. ' +
+        'A named peer that is not registered returns `channel_state: "queued_not_registered"` ' +
+        '(queued, sent when it registers, lost if this server restarts); ' +
         'the triggering Stop event proceeds regardless.',
       inputSchema: NotifyPeerInputSchema,
       outputSchema: NotifyPeerOutputSchema,
@@ -771,7 +774,7 @@ async function main(): Promise<void> {
         // DR-041 Amendment A (macf#786): a guest-addressing ladder failure
         // (`result.error` set) is ALSO an error result, not just the
         // pre-#786 attempted-but-undelivered case.
-        isError: result.error !== undefined || (result.peers_attempted > 0 && result.peers_delivered === 0),
+        isError: result.error !== undefined || result.queued === true || (result.peers_attempted > 0 && result.peers_delivered === 0),
       };
     },
   );
