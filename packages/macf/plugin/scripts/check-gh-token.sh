@@ -78,6 +78,8 @@ _sq="'"
 BYPASS_ENV_U='(^|'"$_ws"')env[[:space:]]+[^;|&]*(-u[[:space:]]*|--unset[=[:space:]]+)["'"'"']?GH_TOKEN["'"'"']?([[:space:]]|$)'
 BYPASS_EMPTY='(^|'"$_ws"')GH_TOKEN=('"$_dq$_dq|$_sq$_sq"')?([[:space:];|&]|$)'
 BYPASS_UNSET='(^|'"$_ws"')unset[[:space:]]+([^;|&]*[[:space:]])?["'"'"']?GH_TOKEN["'"'"']?([[:space:];|&]|$)'
+# Clearing the whole environment (env -i / --ignore-environment) drops the token too.
+BYPASS_ENV_I='(^|'"$_ws"')env[[:space:]]+([^;|&]*[[:space:]])?(-i|--ignore-environment|-)([[:space:]]|$)'
 # Removing only the export attribute (export -n, declare +x, typeset +x) has the same effect.
 BYPASS_UNEXPORT='(^|'"$_ws"')(export[[:space:]]+-n|declare[[:space:]]+\+x|typeset[[:space:]]+\+x)[[:space:]]+([^;|&]*[[:space:]])?["'"'"']?GH_TOKEN["'"'"']?([[:space:];|&=]|$)'
 
@@ -92,7 +94,8 @@ bypass_before_gh() {
   [[ "$rest" =~ $GH_PATTERN ]] || [[ "$rest" =~ $SHELL_C_PATTERN ]]
 }
 if bypass_before_gh "$BYPASS_ENV_U" || bypass_before_gh "$BYPASS_EMPTY" \
-  || bypass_before_gh "$BYPASS_UNSET" || bypass_before_gh "$BYPASS_UNEXPORT"; then
+  || bypass_before_gh "$BYPASS_UNSET" || bypass_before_gh "$BYPASS_UNEXPORT" \
+  || bypass_before_gh "$BYPASS_ENV_I"; then
   cat >&2 <<'ERR'
 BLOCKED by MACF attribution-trap hook: this command removes or empties GH_TOKEN before gh, so gh would act as the stored user login. Mint a bot token instead (see gh-token-refresh.md).
 ERR

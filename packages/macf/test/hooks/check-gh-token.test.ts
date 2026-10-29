@@ -1133,6 +1133,8 @@ describe('check-gh-token.sh (hook)', () => {
         "unset 'GH_TOKEN'; gh issue list",
         'env -u "GH_TOKEN" gh issue list',
         'export -n "GH_TOKEN"; gh issue list',
+        'env -i HOME="$HOME" PATH="$PATH" gh issue list',
+        'env --ignore-environment PATH="$PATH" gh issue list',
       ];
       for (const rest of blockedAfterMint) {
         it(`blocks after a mint: ${rest}`, () => {
@@ -1149,6 +1151,10 @@ describe('check-gh-token.sh (hook)', () => {
       it('allows GH_TOKEN="$GH_TOKEN" after a mint', () => {
         const command = `${mint}; GH_TOKEN="$GH_TOKEN" gh issue list`;
         expect(runHook({ command, env: {} }).status).toBe(0);
+      });
+
+      it('blocks env -i before gh with a valid ambient token', () => {
+        expect(runHook({ command: 'env -i PATH="$PATH" gh issue list', env: VALID }).status).toBe(2);
       });
 
       it('blocks a literal user token with a valid ambient token', () => {
