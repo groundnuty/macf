@@ -15,7 +15,7 @@ const PROBE_SCRIPT = `for t in ${AGENT_HOST_TOOLS.join(' ')}; do
   p=$(bash -lc "command -v $t" 2>/dev/null)
   if [ -n "$p" ]; then
     if [ "$t" = crontab ]; then
-      out=$(crontab -l 2>&1); rc=$?
+      out=$(bash -lc "crontab -l" 2>&1); rc=$?
       if [ $rc -eq 0 ]; then v=present
       elif echo "$out" | grep -qi 'no crontab'; then v=empty
       else v="error: $(echo "$out" | head -n 1)"; fi

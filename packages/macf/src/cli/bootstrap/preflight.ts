@@ -295,9 +295,12 @@ export function secretsChecks(deps: PreflightDeps, manifest: FleetManifest | und
 // --- 4. The runner platform endpoint ---
 
 function endpointValue(values: Readonly<Record<string, string>> | undefined, env: PreflightDeps['env']): string | undefined {
-  const raw = env[RUNNER_PLATFORM_ENDPOINT_ENV_VAR] ?? values?.[RUNNER_PLATFORM_ENDPOINT_ENV_VAR];
-  if (raw === undefined || raw.trim().length === 0) return undefined;
-  return raw.trim().replace(/\/+$/, '');
+  // Like apply's resolver: an empty value does not count, so an exported-but-empty
+  // env var falls back to the secrets file.
+  for (const raw of [env[RUNNER_PLATFORM_ENDPOINT_ENV_VAR], values?.[RUNNER_PLATFORM_ENDPOINT_ENV_VAR]]) {
+    if (raw !== undefined && raw.trim().length > 0) return raw.trim().replace(/\/+$/, '');
+  }
+  return undefined;
 }
 
 async function resolveTailnetIp(deps: PreflightDeps, host: string): Promise<string | undefined> {

@@ -245,6 +245,12 @@ describe('runner platform endpoint', () => {
     expect(noTs['runner-endpoint']?.detail).toMatch(/^runner endpoint unreachable by name \(/);
   });
 
+  it('an exported but empty env var falls back to the secrets file, as apply does', async () => {
+    const { deps, fetchCalls } = makeDeps({ files: baseFiles(), env: { MACF_RUNNER_PLATFORM_ENDPOINT: '' } });
+    expect((await byId(deps))['runner-endpoint']?.status).toBe('ok');
+    expect(fetchCalls).toEqual([`${ENDPOINT}/`]);
+  });
+
   it('does nothing when no endpoint is declared', async () => {
     const files = { [MANIFEST_PATH]: fleetYaml({ selfHosted: false }), [SECRETS_PATH]: '' };
     const { deps, fetchCalls } = makeDeps({ files });
@@ -330,6 +336,16 @@ describe('agent host over ssh', () => {
     expect((await cron('crontab|login|present\n'))?.status).toBe('ok');
     expect((await cron('crontab|login|error: Operation not permitted\n'))?.status).toBe('wrong');
     expect((await cron('crontab|none|\n'))?.status).toBe('missing');
+  });
+});
+
+describe('the agent-host probe script', () => {
+  it('reads crontab in the same login shell that found it', async () => {
+    const { readFileSync } = await import('node:fs');
+    const { resolve } = await import('node:path');
+    const src = readFileSync(resolve(__dirname, '../../src/cli/bootstrap/preflight-agent-host.ts'), 'utf-8');
+    expect(src).toContain('out=$(bash -lc "crontab -l" 2>&1)');
+    expect(src).not.toMatch(/out=\$\(crontab -l/);
   });
 });
 
