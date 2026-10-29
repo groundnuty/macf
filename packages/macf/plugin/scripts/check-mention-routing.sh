@@ -762,6 +762,27 @@ macf_line_writes_path() {
   return 1
 }
 
+# Parses the text after a `<<` into HD_DELIM (the full delimiter word, quotes
+# removed), HD_QUOTED and HD_TABS (`<<-`). The word is any run of characters
+# other than blanks and ;&|<>() and quotes. Returns 1 on anything else (a
+# here-string, mismatched quotes, a backslash, text glued to the word) so each
+# caller falls back to what it did before.
+macf_parse_heredoc_opener() {
+  local frag="$1" re="^(['\"]?)([^[:space:];&|<>()'\"]+)(['\"]?)" rest
+  HD_DELIM=""; HD_QUOTED=false; HD_TABS=false
+  [[ "$frag" == "<"* ]] && return 1
+  if [[ "$frag" == "-"* ]]; then HD_TABS=true; frag="${frag#-}"; fi
+  frag="${frag#"${frag%%[![:space:]]*}"}"
+  [[ "$frag" =~ $re ]] || return 1
+  [[ "${BASH_REMATCH[1]}" == "${BASH_REMATCH[3]}" ]] || return 1
+  [[ "${BASH_REMATCH[2]}" != *\\* ]] || return 1
+  HD_DELIM="${BASH_REMATCH[2]}"
+  [[ -n "${BASH_REMATCH[1]}" ]] && HD_QUOTED=true
+  rest="${frag#"${BASH_REMATCH[0]}"}"
+  if [[ -n "$rest" && "$rest" != [[:space:]\;\&\|\<\>\(\)]* ]]; then return 1; fi
+  return 0
+}
+
 # Heredoc body fed to the gh command's own stdin: `--body-file -` (or `-F -`)
 # followed on the same line by `<<DELIM`, `<<'DELIM'` or `<<-DELIM`. Prints
 # the body and returns 0 only when exactly one such line exists; anything
@@ -769,7 +790,6 @@ macf_line_writes_path() {
 macf_extract_stdin_heredoc() {
   local cmd="$1"
   local arg_re='(--body-file|-F)(=|[[:space:]]+)-([[:space:]]|$)'
-  local open_re="^-?[[:space:]]*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)(['\"]?)"
   local -a lines=()
   local line
   while IFS= read -r line || [[ -n "$line" ]]; do
@@ -791,11 +811,10 @@ macf_extract_stdin_heredoc() {
         between="${rest%%<<*}"
         frag="${rest#*<<}"
         count=$((count + 1))
-        if [[ "$between" != *[\;\&\|]* ]] && [[ "$frag" != "<"* ]] \
-           && [[ "$frag" =~ $open_re ]] && [[ "${BASH_REMATCH[1]}" == "${BASH_REMATCH[3]}" ]]; then
-          delimiter="${BASH_REMATCH[2]}"
+        if [[ "$between" != *[\;\&\|]* ]] && macf_parse_heredoc_opener "$frag"; then
+          delimiter="$HD_DELIM"
           match_idx="$i"
-          if [[ "$frag" == "-"* ]]; then strip_tabs=true; else strip_tabs=false; fi
+          strip_tabs="$HD_TABS"
         else
           delimiter=""
         fi
@@ -827,23 +846,37 @@ macf_extract_stdin_heredoc() {
 # Drops the body of a heredoc whose opener sits in a non-gh segment of the
 # command (`gh ... --body "x"; other-tool <<EOF`): that text is not the comment.
 macf_strip_foreign_heredocs() {
-  local line pre delim skip="" re="<<-?[[:space:]]*['\"]?([A-Za-z_][A-Za-z0-9_]*)"
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    if [[ -n "$skip" ]]; then
-      [[ "${line#"${line%%[!$'\t']*}"}" == "$skip" ]] && skip=""
-      continue
-    fi
+  # Strips only when the opener parses cleanly (one `<<` on the line, full
+  # delimiter word) AND a matching closing line exists. Any doubt leaves the
+  # text exactly as it was.
+  local -a lines=()
+  local line pre rest cmp i=0 j n
+  while IFS= read -r line || [[ -n "$line" ]]; do lines+=("$line"); done <<<"$1"
+  n="${#lines[@]}"
+  while [[ "$i" -lt "$n" ]]; do
+    line="${lines[$i]}"
     printf '%s\n' "$line"
-    if [[ "$line" == *"<<"* && "$line" =~ $re ]]; then
-      delim="${BASH_REMATCH[1]}"
-      pre="${line%%<<*}"
-      pre="$(sed -E "s/\"[^\"]*\"//g; s/'[^']*'//g" <<<"$pre")"
-      if [[ "$pre" == *[\;\&\|]* ]]; then
-        pre="${pre##*[;&|]}"
-        [[ "$pre" =~ (^|[[:space:]])gh[[:space:]] ]] || skip="$delim"
+    i=$((i + 1))
+    [[ "$line" == *"<<"* ]] || continue
+    rest="${line#*<<}"
+    [[ "$rest" != *"<<"* ]] || continue
+    macf_parse_heredoc_opener "$rest" || continue
+    pre="${line%%<<*}"
+    pre="$(sed -E "s/\"[^\"]*\"//g; s/'[^']*'//g" <<<"$pre")"
+    [[ "$pre" == *[\;\&\|]* ]] || continue
+    pre="${pre##*[;&|]}"
+    if [[ "$pre" =~ (^|[[:space:]])gh[[:space:]] ]]; then continue; fi
+    j="$i"
+    while [[ "$j" -lt "$n" ]]; do
+      cmp="${lines[$j]}"
+      if [[ "$HD_TABS" == "true" ]]; then
+        while [[ "$cmp" == $'\t'* ]]; do cmp="${cmp#$'\t'}"; done
       fi
-    fi
-  done <<<"$1"
+      [[ "$cmp" == "$HD_DELIM" ]] && break
+      j=$((j + 1))
+    done
+    if [[ "$j" -lt "$n" ]]; then i=$((j + 1)); fi
+  done
 }
 
 # printf format escapes, left to right: \\ is one backslash, \n a newline.
@@ -895,9 +928,6 @@ macf_extract_heredoc_body() {
     return 1
   fi
 
-  local heredoc_open_sq_pattern="^-?[[:space:]]*'([A-Za-z_][A-Za-z0-9_]*)'"
-  local heredoc_open_dq_pattern='^-?[[:space:]]*"([A-Za-z_][A-Za-z0-9_]*)"'
-
   local -a lines=()
   local line
   while IFS= read -r line || [[ -n "$line" ]]; do
@@ -910,11 +940,11 @@ macf_extract_heredoc_body() {
     line="${lines[$i]}"
     if [[ "$line" == *"<<"* ]] && macf_line_writes_path "$line" "$target"; then
       local frag="${line#*<<}"
-      if [[ "$frag" =~ $heredoc_open_sq_pattern ]] || [[ "$frag" =~ $heredoc_open_dq_pattern ]]; then
+      if macf_parse_heredoc_opener "$frag" && [[ "$HD_QUOTED" == "true" ]]; then
         match_count=$((match_count + 1))
-        delimiter="${BASH_REMATCH[1]}"
+        delimiter="$HD_DELIM"
         match_idx="$i"
-        if [[ "$frag" == "-"* ]]; then strip_tabs=true; else strip_tabs=false; fi
+        strip_tabs="$HD_TABS"
       else
         # Candidate line targets our path but has no safely-literal
         # (quoted) delimiter — unsafe to treat as this heredoc's body.
@@ -1079,11 +1109,15 @@ LINT_TARGET="$COMMAND"
 
 BODY_FILE_ARG_PATTERN='--body-file(=|[[:space:]]+)([^[:space:]]+)'
 STDIN_HEREDOC_BODY=""
+STDIN_EXTRA=""
 if STDIN_HEREDOC_BODY="$(macf_extract_stdin_heredoc "$COMMAND")"; then
   # The comment body is a heredoc on the gh command's own stdin.
   BODY_FILE_MODE=true
   BODY_FILE_RESOLVED=true
-  LINT_TARGET="$STDIN_HEREDOC_BODY"
+  # The resolved body is ADDED to the command text, never swapped for it, so
+  # a leak elsewhere in the command is still seen.
+  LINT_TARGET="$COMMAND"
+  STDIN_EXTRA="$STDIN_HEREDOC_BODY"
 elif [[ "$COMMAND" =~ $BODY_FILE_ARG_PATTERN ]]; then
   BODY_FILE_MODE=true
   BODY_FILE_RAW="${BASH_REMATCH[2]}"
@@ -1147,6 +1181,7 @@ fi
 if [[ "$LINT_TARGET" == "$COMMAND" ]]; then
   LINT_TARGET="$(macf_strip_foreign_heredocs "$LINT_TARGET")"
   LINT_TARGET="$(macf_expand_printf_newlines "$LINT_TARGET")"
+  if [[ -n "$STDIN_EXTRA" ]]; then LINT_TARGET+=$'\n'"$STDIN_EXTRA"; fi
 fi
 
 # Per-occurrence scan for raw @macf-<role>-agent[bot] patterns in the lint

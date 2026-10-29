@@ -1582,5 +1582,51 @@ describe('check-mention-routing.sh (hook)', () => {
         expect(String(r.stderr)).toContain('zero');
       });
     });
+
+    describe('a resolved stdin body is added to the command text, not swapped for it', () => {
+      const first = (text: string): string => `gh issue comment 9 --body "${text}"; `;
+      const second = `gh issue comment 10 --repo o/r --body-file - <<EOF\n@macf-science-agent[bot] hi\nEOF`;
+
+      it('blocks a describing leak in the first comment', () => {
+        const r = runHook({ command: first('see @macf-tester-1-agent[bot] reply') + second });
+        expect(r.status).toBe(2);
+        expect(String(r.stderr)).toContain('describing-context');
+      });
+
+      it('allows the same command once the first comment is fixed', () => {
+        const r = runHook({ command: first('ok\n@macf-tester-1-agent[bot] reply') + second });
+        expect(r.status).toBe(0);
+      });
+    });
+
+    describe('heredoc delimiters are read as whole words', () => {
+      const lead = `${GH} --body "ok\n@macf-science-agent[bot] ok"; `;
+      const leak = `${GH} --body "see @macf-tester-1-agent[bot] reply"`;
+
+      it('keeps checking after a foreign heredoc closed by EOF-PY', () => {
+        const r = runHook({ command: `${lead}python3 - <<EOF-PY\nprint(1)\nEOF-PY\n${leak}` });
+        expect(r.status).toBe(2);
+        expect(String(r.stderr)).toContain('describing-context');
+      });
+
+      it('skips the body of a foreign heredoc whose delimiter is EOF-PY', () => {
+        const r = runHook({
+          command: `${lead}python3 - <<EOF-PY\nprint("the @macf-tester-1-agent[bot] reply")\nEOF-PY`,
+        });
+        expect(r.status).toBe(0);
+      });
+
+      it('strips nothing when the heredoc has no closing line', () => {
+        const r = runHook({ command: `${lead}python3 - <<EOF-PY\nprint(1)\n${leak}` });
+        expect(r.status).toBe(2);
+        expect(String(r.stderr)).toContain('describing-context');
+      });
+
+      it('reads a quoted word delimiter on a stdin body', () => {
+        const r = runHook({ command: `${GH} --body-file - <<'EOF-PY'\n@macf-science-agent[bot] hi\nEOF-PY` });
+        expect(r.status).toBe(0);
+        expect(String(r.stderr)).not.toContain('could not resolve');
+      });
+    });
   });
 });
