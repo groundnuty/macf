@@ -200,7 +200,9 @@ export function resolveSelfLogin(env: NodeJS.ProcessEnv = process.env): string |
  * socially-active bot account. `gh search issues -L` paginates internally
  * up to this count in a single command — no manual page-loop needed.
  */
-const INVOLVES_SEARCH_LIMIT = 100;
+// 1000 is gh's maximum. The author and other-agent filters run after the search
+// (macf#1525), so a small cap could fill with excluded issues and hide real work.
+const INVOLVES_SEARCH_LIMIT = 1000;
 
 /**
  * Default `involves:` search — `gh search issues --involves <login>`.
@@ -218,6 +220,8 @@ async function defaultListSearch(
     '--state', 'open',
     '--json', 'number,title,repository,labels,author',
     '-L', String(INVOLVES_SEARCH_LIMIT),
+    // Exclude backlog in the query itself, so it never uses up the cap.
+    '--', '-label:backlog',
   ], {
     encoding: 'utf-8',
     env: { ...process.env, GH_TOKEN: token },

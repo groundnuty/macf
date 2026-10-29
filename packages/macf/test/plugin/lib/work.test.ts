@@ -273,6 +273,10 @@ describe('searchInvolvesIssues (macf#816)', () => {
     expect(args).toContain('--involves');
     expect(args[args.indexOf('--involves') + 1]).toBe('macf-code-agent[bot]');
     expect(args).not.toContain('--label');
+    // backlog is excluded in the query, and the cap is gh's maximum, so post-search
+    // filtering cannot hide real work behind excluded results (macf#1525).
+    expect(args.slice(args.indexOf('--'))).toEqual(['--', '-label:backlog']);
+    expect(args[args.indexOf('-L') + 1]).toBe('1000');
   });
 
   it('the default query maps gh search issues --json output (number,title,repository.nameWithOwner)', async () => {
