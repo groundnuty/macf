@@ -908,8 +908,10 @@ macf_printf_unescape() {
 # Expands it for the line-start rule; other text is left as written.
 macf_expand_printf_newlines() {
   local rest="$1" out="" fmt
-  local re_sq="(^|[^[:alnum:]_])printf[[:space:]]+('[^']*')"
-  local re_dq='(^|[^[:alnum:]_])printf[[:space:]]+("([^"\\]|\\.)*")'
+  # Only an executed printf: the format directly inside $( printf … ). A printf
+  # that is merely text inside a --body string is left alone.
+  local re_sq="(\\\$\\([[:space:]]*)printf[[:space:]]+('[^']*')"
+  local re_dq='(\$\([[:space:]]*)printf[[:space:]]+("([^"\\]|\\.)*")'
   local re m
   while :; do
     if [[ "$rest" =~ $re_sq ]]; then re="$re_sq"; elif [[ "$rest" =~ $re_dq ]]; then re="$re_dq"; else break; fi

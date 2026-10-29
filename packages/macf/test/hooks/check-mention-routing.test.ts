@@ -1571,6 +1571,12 @@ describe('check-mention-routing.sh (hook)', () => {
         const r = runHook({ command: `${GH} --body "$(printf 'a\\\\\\n@macf-science-agent[bot] b')"` });
         expect(r.status).toBe(0);
       });
+
+      it('leaves a printf that is only text inside --body alone (no expansion, the leak is caught)', () => {
+        const r = runHook({ command: `${GH} --body 'printf "\\n@macf-science-agent[bot] hi"'` });
+        expect(r.status).toBe(2);
+        expect(String(r.stderr)).toContain('describing-context');
+      });
     });
 
     describe('a stdin heredoc binds to the gh segment', () => {
