@@ -120,6 +120,12 @@ function depsFor(overrides: Partial<FleetDeployCommandDeps> = {}): FleetDeployCo
     },
     checkAgentCertPresent: () => true,
     keyPathFor: () => join(scratchDir(), 'scratch-agent-key.pem'),
+    // Hermetic: never read the host's real crontab (#1525 watchdog verdict).
+    watchdogDeps: {
+      readCrontab: () => ({ kind: 'unreadable', reason: 'test: no crontab' }),
+      readScript: () => null,
+      scriptDir: () => '/nowhere',
+    },
     ...overrides,
   };
 }
