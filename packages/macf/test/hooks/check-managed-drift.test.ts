@@ -52,15 +52,16 @@ describe('check-managed-drift.sh (#1525)', () => {
     const r = runHook(ws);
     expect(r.status).toBe(0);
     expect(r.stdout).toBe(
-      'MACF: 1 managed files are missing or changed (.claude/rules/a.md). Run macf update to restore them, and tell the operator.\n',
+      'MACF: 1 managed files are missing (.claude/rules/a.md). Run macf update to restore them, and tell the operator.\n',
     );
   });
 
-  it('reports a modified managed rule', () => {
+  it('is quiet about a changed file (an operator edit macf update keeps)', () => {
     writeManaged(['a.md', 'b.md']);
     writeFileSync(join(ws, rule('b.md')), 'edited\n');
     const r = runHook(ws);
-    expect(r.stdout).toContain('1 managed files are missing or changed (.claude/rules/b.md)');
+    expect(r.status).toBe(0);
+    expect(r.stdout).toBe('');
   });
 
   it('is quiet when there is no managed-hashes.json', () => {
@@ -81,7 +82,7 @@ describe('check-managed-drift.sh (#1525)', () => {
     writeManaged(names);
     for (const n of names) unlinkSync(join(ws, rule(n)));
     const r = runHook(ws);
-    expect(r.stdout).toContain('7 managed files are missing or changed (');
+    expect(r.stdout).toContain('7 managed files are missing (');
     expect(r.stdout).toContain('.claude/rules/f5.md, and 2 more)');
     expect(r.stdout).not.toContain('f6.md');
   });
@@ -89,9 +90,11 @@ describe('check-managed-drift.sh (#1525)', () => {
   it('findManagedDrift (macf doctor) agrees with the hook', () => {
     expect(findManagedDrift(ws)).toBeNull();
     writeManaged(['a.md', 'b.md']);
-    expect(findManagedDrift(ws)).toEqual([]);
+    expect(findManagedDrift(ws)).toEqual({ missing: [], changed: [] });
     unlinkSync(join(ws, rule('a.md')));
     writeFileSync(join(ws, rule('b.md')), 'edited\n');
-    expect(findManagedDrift(ws)?.sort()).toEqual([rule('a.md'), rule('b.md')]);
+    expect(findManagedDrift(ws)).toEqual({ missing: [rule('a.md')], changed: [rule('b.md')] });
+    expect(runHook(ws).stdout).toContain(`(${rule('a.md')})`);
+    expect(runHook(ws).stdout).not.toContain('b.md');
   });
 });

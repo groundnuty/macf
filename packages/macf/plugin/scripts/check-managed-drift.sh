@@ -32,11 +32,9 @@ drifted=()
 while IFS=$'\t' read -r want rel; do
   [ -n "$rel" ] || continue
   case "$rel" in /*|..|../*|*/../*) continue ;; esac
-  if [ ! -f "$root/$rel" ]; then
-    drifted+=("$rel")
-  elif [ "$(hash_of "$root/$rel")" != "$want" ]; then
-    drifted+=("$rel")
-  fi
+  # Only a missing file is reported: a changed one may be an operator edit that
+  # macf update deliberately keeps (its record keeps macf's last-written hash).
+  [ -f "$root/$rel" ] || drifted+=("$rel")
 done <<< "$entries"
 
 n=${#drifted[@]}
@@ -51,5 +49,5 @@ for p in "${drifted[@]}"; do
 done
 [ "$n" -gt 5 ] && shown="$shown, and $((n - 5)) more"
 
-echo "MACF: $n managed files are missing or changed ($shown). Run macf update to restore them, and tell the operator."
+echo "MACF: $n managed files are missing ($shown). Run macf update to restore them, and tell the operator."
 exit 0

@@ -15,7 +15,7 @@
  * for the attribution-trap class this prevents).
  */
 import { execFileSync } from 'node:child_process';
-import { findManagedDrift } from '../managed-hashes.js';
+import { findManagedDrift, type ManagedDrift } from '../managed-hashes.js';
 import { existsSync, lstatSync, readdirSync, readFileSync, statfsSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { createInterface } from 'node:readline';
@@ -3200,19 +3200,27 @@ function printBotLoginSection(check: BotLoginCheckResult): void {
 }
 
 /** Print the managed-files drift row (groundnuty/macf#1525). */
-function printManagedDriftSection(drifted: readonly string[] | null): void {
-  if (drifted === null) {
+function printManagedDriftSection(drift: ManagedDrift | null): void {
+  if (drift === null) {
     console.log('  ℹ no .macf/managed-hashes.json — nothing recorded to check  [INFO]');
     return;
   }
-  if (drifted.length === 0) {
+  const list = (paths: readonly string[]): string =>
+    paths.slice(0, 5).join(', ') + (paths.length > 5 ? `, and ${paths.length - 5} more` : '');
+  if (drift.missing.length === 0 && drift.changed.length === 0) {
     console.log('  ✓ managed files match what macf last wrote  [PASS]');
     return;
   }
-  const shown = drifted.slice(0, 5).join(', ');
-  const more = drifted.length > 5 ? `, and ${drifted.length - 5} more` : '';
-  console.log(`  ⚠ ${drifted.length} managed files are missing or changed (${shown}${more})  [WARN]`);
-  console.log('    Fix: run `macf update` to restore them, and tell the operator.');
+  if (drift.missing.length > 0) {
+    console.log(`  ⚠ ${drift.missing.length} managed files are missing (${list(drift.missing)})  [WARN]`);
+    console.log('    Fix: run `macf update` to restore them, and tell the operator.');
+  }
+  if (drift.changed.length > 0) {
+    console.log(
+      `  ℹ ${drift.changed.length} managed files differ from what macf last wrote (${list(drift.changed)}): ` +
+        'an operator edit, or another tool  [INFO]',
+    );
+  }
 }
 
 /** Print the DR-039 load-bearing-hook-set report section for `check`. */
