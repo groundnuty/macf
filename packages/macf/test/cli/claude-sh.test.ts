@@ -932,6 +932,18 @@ describe('launcher warns when the channel server is turned off in settings (#152
     expect(r.stderr).toBe('');
   });
 
+  it('enableAllProjectMcpServers follows precedence: a project false overrides a user true, so it warns', () => {
+    const home = join(dir, 'home2');
+    mkdirSync(join(home, '.claude'), { recursive: true });
+    writeFileSync(join(home, '.claude', 'settings.json'), '{"enableAllProjectMcpServers":true}');
+    writeFileSync(join(dir, '.claude', 'settings.json'), '{"enabledMcpjsonServers":["other"],"enableAllProjectMcpServers":false}');
+    writeFileSync(join(dir, '.claude', 'settings.local.json'), '{}');
+    const script = ['set -euo pipefail', `SCRIPT_DIR=${JSON.stringify(dir)}`, ...channelServerSettingsWarningLines(), 'echo launched'].join('\n');
+    const r = spawnSync('bash', ['-c', script], { encoding: 'utf-8', env: { PATH: '/usr/bin:/bin', HOME: home } });
+    expect(r.status).toBe(0);
+    expect(r.stderr).toContain('WARNING');
+  });
+
   it('is part of the generated claude.sh, before the exec', () => {
     const text = generateClaudeSh(sampleConfig);
     const at = text.indexOf('Channel-server settings check (macf#1525)');

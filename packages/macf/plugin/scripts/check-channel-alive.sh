@@ -178,23 +178,27 @@ if command -v node >/dev/null 2>&1; then
     const dir = process.argv[1];
     const server = "macf-agent";
     const layers = [];
+    const byName = {};
     let missing = 0;
     for (const f of ["settings.json", "settings.local.json"]) {
       let raw;
       try { raw = fs.readFileSync(dir + "/.claude/" + f, "utf8"); }
       catch (e) { if (e && e.code === "ENOENT") { missing++; continue; } console.log("UNCHECKED"); process.exit(0); }
-      try { const o = JSON.parse(raw); if (o === null || typeof o !== "object" || Array.isArray(o)) throw 0; layers.push(o); }
+      try { const o = JSON.parse(raw); if (o === null || typeof o !== "object" || Array.isArray(o)) throw 0; layers.push(o); byName[f] = o; }
       catch (e) { console.log("UNCHECKED"); process.exit(0); }
     }
     // The user layer also counts (an approval may live there); unreadable is skipped.
     try {
       const u = JSON.parse(fs.readFileSync(process.argv[2] + "/.claude/settings.json", "utf8"));
-      if (u !== null && typeof u === "object" && !Array.isArray(u)) layers.push(u);
+      if (u !== null && typeof u === "object" && !Array.isArray(u)) { layers.push(u); byName.user = u; }
     } catch (e) { /* no user settings */ }
     // Neither file exists: not an initialised workspace, nothing to judge.
     if (missing === 2) { console.log("OK"); process.exit(0); }
     const has = (k) => layers.some((o) => Array.isArray(o[k]) && o[k].includes(server));
-    const all = layers.some((o) => o.enableAllProjectMcpServers === true);
+    // A scalar: the highest-precedence layer that sets it wins (local > project > user).
+    const owner = [byName["settings.local.json"], byName["settings.json"], byName.user]
+      .find((o) => o && typeof o.enableAllProjectMcpServers === "boolean");
+    const all = owner ? owner.enableAllProjectMcpServers === true : false;
     console.log(has("disabledMcpjsonServers") || (!has("enabledMcpjsonServers") && !all) ? "OFF" : "OK");
   ' "$WORKSPACE" "$HOME_DIR" 2>/dev/null || true)"
   [ -n "$SETTINGS_VERDICT" ] || SETTINGS_VERDICT="UNCHECKED"

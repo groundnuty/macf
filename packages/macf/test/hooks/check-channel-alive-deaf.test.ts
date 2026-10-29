@@ -198,6 +198,25 @@ describe('settings check (#1525)', () => {
     expect(stdout).not.toContain(SETTINGS_ALARM);
   });
 
+  it('enableAllProjectMcpServers follows precedence: a project false overrides a user true → alarm', () => {
+    const { stdout, ws } = run({
+      settings: { enabledMcpjsonServers: ['other'], enableAllProjectMcpServers: false },
+      settingsLocal: {},
+      userSettings: { enableAllProjectMcpServers: true },
+    });
+    clean(ws);
+    expect(stdout).toContain(SETTINGS_ALARM);
+  });
+
+  it('enableAllProjectMcpServers: a local true overrides a project false → quiet', () => {
+    const { stdout, ws } = run({
+      settings: { enableAllProjectMcpServers: false },
+      settingsLocal: { enableAllProjectMcpServers: true },
+    });
+    clean(ws);
+    expect(stdout).not.toContain(SETTINGS_ALARM);
+  });
+
   it('never edits settings', () => {
     const { ws } = run({ settings: REWRITTEN, settingsLocal: DISABLED_LOCAL });
     
