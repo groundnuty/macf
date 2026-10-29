@@ -43,6 +43,12 @@ marked **unverified** rather than guessed.
 
 This section and the next three are one worked example, meant to be followed top to bottom while typing. It brings up a three-agent fleet for a project called `$PROJECT`: a **science agent**, a **code agent** and a **paper agent**. Every name is derived from `$PROJECT`, so you set it once and copy the commands as they are.
 
+> **Two roles: the apply host and the agent host.**
+> - **The apply host** has the browser. `plan` and `apply` run there.
+> - **The agent host** runs the agents and holds their workspaces.
+>
+> They can be the same machine. This walkthrough calls them "the Mac" and "the VM". If you use one machine, read both as that machine: every "copy to the VM" and "ssh to the VM" step becomes a local step, and steps marked "(two hosts only)" can be skipped.
+
 **Two machines take part.**
 
 - **Your Mac** runs `macf bootstrap apply`. It talks to GitHub as you, and it opens the consent pages in your browser. The pages are served on `127.0.0.1`, so the browser must be on the same machine.
@@ -134,7 +140,7 @@ export VM_AGE_KEY=~/.config/macf/vm-age-key.txt     # on the VM (§1.3)
 
 No tool can mint these. Gather them before the first `apply`.
 
-**1. An age key on each machine.** The fleet's vault holds every App's private key and the CA key, encrypted to both keys: to the Mac's, so later applies can read it, and to the VM's, so deploy can. If you already have keys from another fleet, point `MAC_AGE_KEY` and `VM_AGE_KEY` at them. Otherwise generate them:
+**1. An age key on each machine.** (On one host, one key is enough: set `VM_AGE_KEY` to the same file as `MAC_AGE_KEY`, and list it once in `age_recipients`.) The fleet's vault holds every App's private key and the CA key, encrypted to both keys: to the Mac's, so later applies can read it, and to the VM's, so deploy can. If you already have keys from another fleet, point `MAC_AGE_KEY` and `VM_AGE_KEY` at them. Otherwise generate them:
 
 ```bash
 # on the Mac
@@ -323,7 +329,7 @@ done
 - **Where in the file:** if `AGENTS.md` already has a `<!-- BEGIN template-managed … -->` region, write below its `<!-- END template-managed -->` line, never inside it. If there is no such region, write the paragraphs at the top.
 - **Do not run the template's `.claude/init.sh` on an agent repo or workspace.** It moves every always-on rule out of `.claude/rules/` into `AGENTS.md`, macf's rules included, and `macf update` cannot refresh them there. On one live fleet it did this to the writing agent.
 
-**b. Copy the manifest and vault to the VM.** Deploy reads `fleet.yaml` and `secrets/vault.age` from the control repo's layout:
+**b. Copy the manifest and vault to the VM (two hosts only).** On one host, skip this: `$FLEET_DIR/control` is `~/macf-fleets/$PROJECT/control`, the path step c already reads. Deploy reads `fleet.yaml` and `secrets/vault.age` from the control repo's layout:
 
 ```bash
 # on the Mac
