@@ -15,7 +15,7 @@ vi.mock('node:https', () => ({
   request: (...args: unknown[]) => requestMock(...args),
 }));
 
-const { notifyPeer, createNotifyOutboxSend } = await import('../src/notify-peer.js');
+const { notifyPeer, createNotifyOutboxSend, deadLetterReason } = await import('../src/notify-peer.js');
 const { createOutbox } = await import('../src/delivery/outbox.js');
 const { createInMemoryOutboxStore } = await import('../src/delivery/in-memory-store.js');
 
@@ -313,20 +313,77 @@ describe('notify_peer tool', () => {
   });
 
   describe('single-peer mode (`to` provided)', () => {
-    it('returns offline when peer is not registered', async () => {
+    it('queues a named, unregistered peer instead of dropping it (#1525)', async () => {
       const reg = makeRegistry({ get: null });
-      const result = await notifyPeer(makeDeps(reg), {
-        to: 'missing-peer',
-        event: 'session-end',
-      });
-      expect(result).toEqual({
+      const deps = makeDeps(reg);
+      const enqueue = vi.spyOn(deps.outbox, 'enqueue');
+      const result = await notifyPeer(deps, { to: 'late-peer', event: 'custom', message: 'hi' });
+      expect(result).toMatchObject({
         delivered: false,
-        channel_state: 'offline',
+        channel_state: 'queued_not_registered',
+        queued: true,
         peers_attempted: 0,
-        peers_delivered: 0,
       });
-      expect(reg.get).toHaveBeenCalledWith('missing-peer');
+      expect(result.note).toBe(
+        'peer late-peer is not registered; the message is queued and will be delivered ' +
+          'when it registers (it will be lost if this channel server restarts)',
+      );
+      expect(enqueue).toHaveBeenCalledTimes(1);
+      expect(enqueue.mock.calls[0]?.[0]).toBe('late-peer');
       expect(requestMock).not.toHaveBeenCalled();
+    });
+
+    it('a queued unregistered send drains once the peer registers', async () => {
+      let registered = false;
+      const reg = makeRegistry({ get: null });
+      reg.get.mockImplementation(async () =>
+        registered
+          ? { host: '127.0.0.1', port: 9000, type: 'permanent', instance_id: 'a', started: 't' }
+          : null);
+      const base = {
+        registry: reg as unknown as Parameters<typeof notifyPeer>[0]['registry'],
+        selfAgentName: 'self-agent',
+        selfReplyTo: 'self-project/self-agent',
+        mTlsClientCertPem: 'c', mTlsClientKeyPem: 'k', caCertPem: 'ca',
+        logger: fakeLogger as unknown as Parameters<typeof notifyPeer>[0]['logger'],
+      };
+      const { send, lastAttempts } = createNotifyOutboxSend(base);
+      const store = createInMemoryOutboxStore();
+      const outbox = createOutbox({ store, send });
+      const deps = { ...base, outbox, outboxAttempts: lastAttempts };
+      await notifyPeer(deps, { to: 'late-peer', event: 'custom' });
+      await outbox.driveOnce(Date.now() + 60_000);
+      expect(await store.listPending()).toHaveLength(1); // still waiting
+      registered = true;
+      nextHttpsRespondsWith(200);
+      const summary = await outbox.driveOnce(Date.now() + 10 * 60_000);
+      expect(summary.acked).toBe(1);
+      expect(await store.listPending()).toHaveLength(0);
+    });
+
+    it('dead-letters an entry whose peer is not registered at the last attempt, with that reason', async () => {
+      const reg = makeRegistry({ get: null });
+      const base = {
+        registry: reg as unknown as Parameters<typeof notifyPeer>[0]['registry'],
+        selfAgentName: 'self-agent',
+        selfReplyTo: 'self-project/self-agent',
+        mTlsClientCertPem: 'c', mTlsClientKeyPem: 'k', caCertPem: 'ca',
+        logger: fakeLogger as unknown as Parameters<typeof notifyPeer>[0]['logger'],
+      };
+      const { send, lastAttempts } = createNotifyOutboxSend(base);
+      const reasons: string[] = [];
+      const outbox = createOutbox({
+        store: createInMemoryOutboxStore(),
+        send,
+        ttlMs: 1000,
+        onDeadLetter: (e) => { reasons.push(deadLetterReason(lastAttempts, e.id)); },
+      });
+      const deps = { ...base, outbox, outboxAttempts: lastAttempts };
+      await notifyPeer(deps, { to: 'ghost', event: 'custom' });
+      await outbox.driveOnce(Date.now() + 500); // a ticker pass records the miss
+      const summary = await outbox.driveOnce(Date.now() + 60 * 60_000);
+      expect(summary.deadLettered).toBe(1);
+      expect(reasons).toEqual(['peer not registered at the last attempt']);
     });
 
     it('returns delivered when peer responds 200', async () => {

@@ -78,8 +78,12 @@ export const NotifyPeerOutputSchema = {
   // peer was attempted and found unreachable. Conflating the two reads as
   // "my own channel-server is down" when the actual cause is a bad/
   // unfederated `<project>/<name>` slug. See the `error` field doc below.
-  channel_state: z.enum(['online', 'offline', 'no-peer-resolved'])
-    .describe('Aggregate state — "online" if at least one peer reachable, "offline" if peers were attempted but unreachable, "no-peer-resolved" if address resolution itself failed (see `error`).'),
+  channel_state: z.enum(['online', 'offline', 'no-peer-resolved', 'queued_not_registered'])
+    .describe('Aggregate state — "online" if at least one peer reachable, "offline" if peers were attempted but unreachable, "no-peer-resolved" if address resolution itself failed (see `error`), "queued_not_registered" if the named peer is not registered: the message is queued and sent when it registers (see `note`).'),
+  queued: z.boolean().optional()
+    .describe('True when the message was queued for a peer that is not registered yet.'),
+  note: z.string().optional()
+    .describe('Plain-language caveat for a queued message, including that it is lost if this channel server restarts.'),
   peers_attempted: z.number().int().nonnegative()
     .describe('Number of peers the tool attempted to notify.'),
   peers_delivered: z.number().int().nonnegative()
@@ -200,7 +204,10 @@ export interface NotifyPeerInput {
 export interface NotifyPeerResult {
   readonly delivered: boolean;
   /** macf#790 Gap 1 — see `NotifyPeerOutputSchema.channel_state` doc. */
-  readonly channel_state: 'online' | 'offline' | 'no-peer-resolved';
+  readonly channel_state: 'online' | 'offline' | 'no-peer-resolved' | 'queued_not_registered';
+  /** Set with `queued_not_registered`: the send waits in the outbox for the peer to register. */
+  readonly queued?: boolean;
+  readonly note?: string;
   readonly peers_attempted: number;
   readonly peers_delivered: number;
   /** DR-041 Amendment A (macf#786) — see `NotifyPeerOutputSchema.error` doc. */
@@ -230,13 +237,15 @@ async function resolveTargetPeers(
   readonly peers: ReadonlyArray<{ readonly name: string; readonly info: AgentInfo }>;
   /** DR-041 Amendment A (macf#786) — see `resolvePeerAddress`'s doc comment. */
   readonly error?: string;
+  /** A named, non-self own-project target with no registry entry: queue it. */
+  readonly unregisteredTarget?: string;
 }> {
   const selfNormalized = toVariableSegment(deps.selfAgentName);
   if (to !== undefined && to !== '') {
     if (toVariableSegment(to) === selfNormalized) return { peers: [] };
     const { info, error } = await resolvePeerAddress(deps, to);
     if (error !== undefined) return { peers: [], error };
-    if (info === null) return { peers: [] };
+    if (info === null) return { peers: [], unregisteredTarget: to };
     return { peers: [{ name: to, info }] };
   }
   // Broadcast: list all registered peers, exclude self. Normalize BOTH
@@ -737,6 +746,26 @@ export async function notifyPeer(
           };
         }
         const peers = resolved.peers;
+        if (peers.length === 0 && resolved.unregisteredTarget !== undefined) {
+          // The named peer may be restarting or not yet registered: queue the
+          // send under its name. Each drive tick re-resolves the name, so it
+          // drains once the peer registers (and dead-letters after the TTL).
+          await deps.outbox.enqueue(resolved.unregisteredTarget, input);
+          const note = `peer ${resolved.unregisteredTarget} is not registered; the message is ` +
+            'queued and will be delivered when it registers ' +
+            '(it will be lost if this channel server restarts)';
+          span.setAttribute(Attr.PeersAttempted, 0);
+          span.setAttribute(Attr.PeersDelivered, 0);
+          span.setStatus({ code: SpanStatusCode.ERROR, message: note });
+          return {
+            delivered: false,
+            channel_state: 'queued_not_registered' as const,
+            queued: true,
+            note,
+            peers_attempted: 0,
+            peers_delivered: 0,
+          };
+        }
         if (peers.length === 0) {
           span.setAttribute(Attr.PeersAttempted, 0);
           span.setAttribute(Attr.PeersDelivered, 0);
@@ -837,6 +866,18 @@ export async function notifyPeer(
 export interface NotifyOutboxAttempt {
   readonly httpOk: boolean;
   readonly transportOk: boolean;
+  /** The target had no registry entry at this attempt. */
+  readonly unregistered?: boolean;
+}
+
+/** Why a TTL-expired outbox entry never delivered, for the dead-letter log. */
+export function deadLetterReason(
+  attempts: ReadonlyMap<string, NotifyOutboxAttempt>,
+  entryId: string,
+): string {
+  return attempts.get(entryId)?.unregistered === true
+    ? 'peer not registered at the last attempt'
+    : 'no durable ACK before the TTL';
 }
 
 /**
@@ -916,7 +957,7 @@ export function createNotifyOutboxSend(
       // or permanent (removed) absence look identical here; either way,
       // report a failed attempt so the outbox retries until the TTL either
       // finds the peer registered again or dead-letters per Decision 4.
-      const attempt: NotifyOutboxAttempt = { httpOk: false, transportOk: false };
+      const attempt: NotifyOutboxAttempt = { httpOk: false, transportOk: false, unregistered: true };
       record(id, attempt);
       return { ack: false };
     }
