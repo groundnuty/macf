@@ -43,11 +43,15 @@ GH_PATTERN='(^|[[:space:];|&])(sudo[[:space:]]+|env[[:space:]]+([A-Za-z_][A-Za-z
 # isn't preceded by one of the allowed delimiters `[[:space:];|&]`.
 # Caught in the post-#140 audit pass, 2026-04-20.
 #
+# The `gh` / `git push` inside the quoted argument must sit at a command
+# position (after whitespace, `;`, `|`, `&`, `(` or a quote). A word that
+# merely ENDS in `gh` (`...=high `, `through `) is not an invocation (#1525).
+#
 # Flag handling: `(-[a-zA-Z]+[[:space:]]+)*` allows zero or more
 # separate flag groups like `-x ` or `-e `. Final flag uses
 # `-[a-zA-Z]*c` — must end in `c` (the `-c`-ness), optional letters
 # before it cover combined forms like `-xc`, `-lc`, `-exc`.
-SHELL_C_PATTERN='(^|[[:space:];|&])(sudo[[:space:]]+|env[[:space:]]+([A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+)*|[A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+)*(bash|sh|zsh)[[:space:]]+(-[a-zA-Z]+[[:space:]]+)*-[a-zA-Z]*c[[:space:]]+[^[:space:]].*(gh[[:space:]]|git[[:space:]]+push([[:space:]]|$))'
+SHELL_C_PATTERN='(^|[[:space:];|&])(sudo[[:space:]]+|env[[:space:]]+([A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+)*|[A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+)*(bash|sh|zsh)[[:space:]]+(-[a-zA-Z]+[[:space:]]+)*-[a-zA-Z]*c[[:space:]]+(.*[[:space:];|&('"\"'"'])?(gh[[:space:]]|git[[:space:]]+push([[:space:]]|$))'
 
 if [[ ! "$COMMAND" =~ $GH_PATTERN ]] && [[ ! "$COMMAND" =~ $SHELL_C_PATTERN ]]; then
   # Not a gh/git-push command — allow without checking token.
@@ -62,6 +66,37 @@ fi
 # out. Wrapper forms (`sudo gh auth ...`) also match because the regex
 # allows arbitrary wrapper prefix before `gh`.
 if [[ "$COMMAND" =~ (^|[[:space:];|&])(sudo[[:space:]]+|env[[:space:]]+([A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+)*|[A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+)*gh[[:space:]]+auth([[:space:]]|$) ]]; then
+  exit 0
+fi
+
+# Identity bypass (#1525): these forms run `gh` as the stored user login even
+# when the ambient token is valid, because they remove or empty GH_TOKEN
+# inside the command, after this hook has read the ambient value.
+_ws='[[:space:];|&(]'
+_dq='"'
+_sq="'"
+BYPASS_ENV_U='(^|'"$_ws"')env[[:space:]]+[^;|&]*(-u[[:space:]]*|--unset[=[:space:]]+)GH_TOKEN([[:space:]]|$)'
+BYPASS_EMPTY='(^|'"$_ws"')GH_TOKEN=('"$_dq$_dq|$_sq$_sq"')?([[:space:];|&]|$)'
+BYPASS_UNSET='(^|'"$_ws"')unset[[:space:]]+([^;|&]*[[:space:]])?GH_TOKEN([[:space:];|&]|$)'
+if [[ "$COMMAND" =~ $BYPASS_ENV_U ]] || [[ "$COMMAND" =~ $BYPASS_EMPTY ]] \
+  || [[ "$COMMAND" =~ $BYPASS_UNSET ]]; then
+  cat >&2 <<'ERR'
+BLOCKED by MACF attribution-trap hook: this command removes or empties GH_TOKEN before gh, so gh would act as the stored user login. Mint a bot token instead (see gh-token-refresh.md).
+ERR
+  exit 2
+fi
+
+# Canonical inline mint (#1525): in a session with no ambient GH_TOKEN the
+# rule's own recipe would be blocked, because this hook judges only the
+# ambient token. Allow exactly this form as the command's FIRST statement:
+#   GH_TOKEN=$("<...>/.claude/scripts/macf-gh-token.sh" <args>) || exit 1
+# The helper fails loud and validates the ghs_ prefix, and `|| exit 1` aborts
+# before any later gh runs. This is an exact allowlist, NOT general parsing of
+# inline GH_TOKEN assignments (rejected in silent-fallback-hazards Instance
+# 12). No variants: `export GH_TOKEN=$(...)` masks the failure, and without
+# `|| exit 1` a failed mint would let gh run on the stored user login.
+CANON_MINT='^[[:space:]]*GH_TOKEN=\$\("?[^"[:space:]]*\.claude/scripts/macf-gh-token\.sh"?[^)|;&]*\)[[:space:]]*\|\|[[:space:]]*exit[[:space:]]+1([[:space:];&]|$)'
+if [[ "$COMMAND" =~ $CANON_MINT ]]; then
   exit 0
 fi
 
@@ -140,13 +175,10 @@ This hook exists because behavioral controls for the GH_TOKEN attribution
 trap recurred 5 times in a single day. See groundnuty/macf#140 and
 .claude/rules/gh-token-attribution-traps.md.
 
-Fix — relaunch. The GH_TOKEN this session launched with is not a bot token, and
-a mint inside a command cannot change the env this hook reads. Ask the operator
-to relaunch this session with ./claude.sh. claude.sh full-shape-validates GH_TOKEN at the launch
-boundary (before exec) and re-mints or aborts loudly rather than starting a
-session this hook would then deadlock.
+Fix — mint a bot token in the same command, exactly:
+  GH_TOKEN=\$("\$MACF_WORKSPACE_DIR/.claude/scripts/macf-gh-token.sh" --app-id "\$APP_ID" --install-id "\$INSTALL_ID" --key "\$KEY_PATH") || exit 1; export GH_TOKEN; <your gh command>
 
-If the token helper (macf-gh-token.sh) is missing from the workspace, restore it first:
+If the helper (macf-gh-token.sh) is missing from the workspace, restore it:
   macf rules refresh --dir .
 
 Override (ONLY for intentional user-attributed ops like onboarding) is

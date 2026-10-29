@@ -911,6 +911,104 @@ describe('check-gh-token.sh (hook)', () => {
     });
   });
 
+  describe('#1525 — shell -c over-match, canonical mint, identity bypass', () => {
+    const VALID = { GH_TOKEN: 'ghs_faketokenvalue1234567890' };
+
+    describe('`bash -c` with a word merely ending in gh is allowed with no token', () => {
+      const cases = [
+        `bash -c "codex exec -c model_reasoning_effort=high 'do x'"`,
+        `bash -c "echo the plan's though  thing"`,
+        `bash -c "echo when load is high and more"`,
+        `bash -c "cat memory.high "`,
+        `bash -c 'echo start only through the gate'`,
+      ];
+      for (const command of cases) {
+        it(`allows: ${command}`, () => {
+          expect(runHook({ command, env: {} }).status).toBe(0);
+        });
+      }
+
+      it('still blocks a real `bash -c "gh ..."` with no token', () => {
+        const r = runHook({ command: 'bash -c "gh issue list"', env: {} });
+        expect(r.status).toBe(2);
+      });
+
+      it('still blocks a real `bash -c` git push with no token', () => {
+        const r = runHook({ command: `bash -c 'git push origin x'`, env: {} });
+        expect(r.status).toBe(2);
+      });
+    });
+
+    describe('canonical inline mint', () => {
+      const mint =
+        'GH_TOKEN=$("$MACF_WORKSPACE_DIR/.claude/scripts/macf-gh-token.sh" ' +
+        '--app-id "$APP_ID" --install-id "$INSTALL_ID" --key "$KEY_PATH")';
+
+      it('is allowed with no ambient token', () => {
+        const r = runHook({
+          command: `${mint} || exit 1; export GH_TOKEN; gh issue list`,
+          env: {},
+        });
+        expect(r.status).toBe(0);
+      });
+
+      it('is blocked when written with export', () => {
+        const r = runHook({
+          command: `export ${mint} || exit 1; gh issue list`,
+          env: {},
+        });
+        expect(r.status).toBe(2);
+      });
+
+      it('is blocked without `|| exit 1`', () => {
+        const r = runHook({ command: `${mint}; export GH_TOKEN; gh issue list`, env: {} });
+        expect(r.status).toBe(2);
+      });
+
+      it('is blocked when the mint is not the first statement', () => {
+        const r = runHook({ command: `gh issue list; ${mint} || exit 1`, env: {} });
+        expect(r.status).toBe(2);
+      });
+
+      it('is blocked for a helper at another path', () => {
+        const r = runHook({
+          command: 'GH_TOKEN=$(/tmp/other-mint.sh --app-id 1) || exit 1; gh issue list',
+          env: {},
+        });
+        expect(r.status).toBe(2);
+      });
+    });
+
+    describe('identity bypass is blocked even with a valid ambient token', () => {
+      const cases = [
+        'env -u GH_TOKEN gh issue list',
+        'env -u GITHUB_TOKEN -u GH_TOKEN gh issue list',
+        'GH_TOKEN= gh issue list',
+        'GH_TOKEN="" gh issue list',
+        'unset GH_TOKEN; gh issue list',
+        'unset GH_TOKEN && gh issue list',
+      ];
+      for (const command of cases) {
+        it(`blocks: ${command}`, () => {
+          const r = runHook({ command, env: VALID });
+          expect(r.status).toBe(2);
+          expect(r.stderr).toMatch(/removes or empties GH_TOKEN/);
+        });
+      }
+
+      it('allows a plain gh command with a valid ambient token', () => {
+        expect(runHook({ command: 'gh issue list', env: VALID }).status).toBe(0);
+      });
+    });
+
+    it('missing-token message gives the in-command mint remedy', () => {
+      const r = runHook({ command: 'gh issue list', env: {} });
+      expect(r.stderr).toContain(
+        'GH_TOKEN=$("$MACF_WORKSPACE_DIR/.claude/scripts/macf-gh-token.sh" --app-id "$APP_ID" --install-id "$INSTALL_ID" --key "$KEY_PATH") || exit 1; export GH_TOKEN; <your gh command>',
+      );
+    });
+  });
+
   describe('error message quality', () => {
     it('block message points at macf-gh-token.sh helper', () => {
       const r = runHook({
