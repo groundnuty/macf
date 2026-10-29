@@ -20,7 +20,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { findCliPackageRoot } from '../../src/cli/rules.js';
 
-const HOOK_SCRIPT = join(findCliPackageRoot(), 'scripts', 'emit-turn-receipt.sh');
+const HOOK_SCRIPT = join(findCliPackageRoot(), 'plugin', 'scripts', 'emit-turn-receipt.sh');
 
 /** Stub-`curl` dir: captures the POST body to $CURL_CAPTURE, exits $CURL_EXIT. */
 function makeStubCurlDir(): string {

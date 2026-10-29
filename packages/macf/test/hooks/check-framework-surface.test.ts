@@ -365,7 +365,7 @@ describe('check-framework-surface.sh (hook)', () => {
       // shape as role-settings-model.test.ts's "the script re-implements the
       // identical policy" auditor-sentinel pin.
       const thisScript = readFileSync(HOOK_SCRIPT, 'utf-8');
-      const siblingScript = readFileSync(join(findCliPackageRoot(), 'scripts', 'macf-startup-pickup.sh'), 'utf-8');
+      const siblingScript = readFileSync(join(findCliPackageRoot(), 'plugin', 'scripts', 'macf-startup-pickup.sh'), 'utf-8');
       // Same two-part predicate in both: a `.git` FILE-existence check
       // immediately followed by the identical `gitdir: ` grep pattern.
       // Bracket style intentionally differs ([ ] here vs [[ ]] there — see

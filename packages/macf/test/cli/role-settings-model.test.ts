@@ -134,37 +134,8 @@ describe('DR-028 role-settings model', () => {
     // turn-receipt hook (UserPromptSubmit) + the channels-enabled guard
     // (SessionStart). Their presence is still asserted overall by the
     // broader DR-039 `checkLoadBearingHooks` union-check in `doctor.ts`.
-    it('includes the turn-receipt + channels-enabled + startup-pickup hooks post-DR-039-Decision-2, none REQUIRED', () => {
-      const cmds = ROLE_FLOOR_HOOKS.map((h) => h.command);
-      expect(cmds.some((c) => c.includes('emit-turn-receipt.sh'))).toBe(true);
-      expect(cmds.some((c) => c.includes('check-channels-enabled.sh'))).toBe(true);
-      // groundnuty/macf#768: the canonical SessionStart work-pickup hook —
-      // written for EVERY role (including the auditor); the auditor's
-      // DR-026 default-OFF is enforced by the script at runtime, not by
-      // this expected-settings model.
-      expect(cmds.some((c) => c.includes('macf-startup-pickup.sh'))).toBe(true);
-      // The 7 hooks single-sourced into the plugin are NOT part of this floor.
-      expect(cmds.some((c) => c.includes('check-gh-token.sh'))).toBe(false);
-      expect(cmds.some((c) => c.includes('check-mention-routing.sh'))).toBe(false);
-      expect(cmds.some((c) => c.includes('check-lgtm-gate.sh'))).toBe(false);
-      expect(cmds.some((c) => c.includes('check-close-keyword.sh'))).toBe(false);
-      expect(cmds.some((c) => c.includes('check-gh-attribution.sh'))).toBe(false);
-      expect(cmds.some((c) => c.includes('harvest-reflection.sh'))).toBe(false);
-      expect(cmds.some((c) => c.includes('check-channel-alive.sh'))).toBe(false);
-      // The channels guard + the startup-pickup hook are both SessionStart
-      // hooks (macf#633 / macf#768).
-      expect(
-        ROLE_FLOOR_HOOKS.some(
-          (h) => h.event === 'SessionStart' && h.command.includes('check-channels-enabled.sh'),
-        ),
-      ).toBe(true);
-      expect(
-        ROLE_FLOOR_HOOKS.some(
-          (h) => h.event === 'SessionStart' && h.command.includes('macf-startup-pickup.sh'),
-        ),
-      ).toBe(true);
-      // No floor hook is REQUIRED (only the auditor's never-acts is).
-      expect(ROLE_FLOOR_HOOKS.every((h) => h.required === false)).toBe(true);
+    it('lists no settings.json hook: all of them ship in the plugin (groundnuty/macf#1525)', () => {
+      expect(ROLE_FLOOR_HOOKS).toEqual([]);
     });
   });
 
@@ -198,7 +169,7 @@ describe('DR-028 role-settings model', () => {
     // script's gate string drifts off "auditor", this test catches it rather
     // than the two silently diverging.
     it('the script re-implements the identical policy (same auditor sentinel)', () => {
-      const scriptPath = join(findCliPackageRoot(), 'scripts', 'macf-startup-pickup.sh');
+      const scriptPath = join(findCliPackageRoot(), 'plugin', 'scripts', 'macf-startup-pickup.sh');
       const script = readFileSync(scriptPath, 'utf-8');
       expect(script).toMatch(/MACF_AGENT_ROLE:-\}"\s*==\s*"auditor"/);
       // And the TS predicate agrees: false ONLY for 'auditor'.

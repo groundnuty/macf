@@ -207,7 +207,7 @@ function applyAllSettingsTransforms(settings: Settings, workspaceDir: string): S
   // groundnuty/macf#768: the canonical SessionStart work-pickup hook —
   // `update.ts` calls `installStartupPickupHook` right after
   // `installGhTokenHook`, so this transform is applied in the same spot.
-  out = applyStartupPickupHookTransform(out);
+  out = applyStartupPickupHookTransform(out, delivery);
   out = applyPluginSkillPermissionsTransform(out);
   out = applySandboxFdAllowReadTransform(out);
   out = applySandboxExcludedCommandsTransform(out);
