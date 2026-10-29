@@ -22,6 +22,7 @@ import { checkCollision, CollisionError, RegisterRaceError } from './collision.j
 import { registerWithTakeover } from './register-with-takeover.js';
 import { registerShutdownHandler } from './shutdown.js';
 import { createForensicLogger } from './forensic-log.js';
+import { checkIsLead, systemLeadCheckDeps } from './lead-check.js';
 import { createLifecycleTracker } from './lifecycle.js';
 import { registerCrashHandlers } from './crash-handlers.js';
 import { createAliveTicker } from './alive-ticker.js';
@@ -104,6 +105,21 @@ async function main(): Promise<void> {
     agentName: config.agentName,
     debug: config.debug,
   });
+
+  // #1525: only the lead Claude Code process runs a channel server. The launcher
+  // records its pid in .claude/.macf/lead-claude.pid; a server that is positively
+  // not a descendant of it belongs to an agent-team teammate and exits quietly,
+  // so it cannot take the registry slot from the lead. Any doubt runs as before.
+  {
+    const lead = checkIsLead(config.workspaceDir, systemLeadCheckDeps());
+    if (lead.action === 'skip') {
+      logger.info('not_lead_skipped', { lead_pid: lead.leadPid, ancestors: lead.ancestors });
+      process.exit(0);
+    }
+    if (lead.reason !== 'lead_is_ancestor' && lead.reason !== 'self_is_lead') {
+      logger.info('lead_check', { result: 'unknown', reason: lead.reason });
+    }
+  }
 
   // Loud startup forensic line — file AND stderr regardless of debug — so the
   // resolved log path is discoverable + the first line bounds the process start.

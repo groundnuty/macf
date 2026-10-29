@@ -956,6 +956,23 @@ export function generateClaudeSh(config: MacfAgentConfig): string {
     // set it) so the two-token `--dangerously-load-development-channels
     // server:macf-agent` flag word-splits into two argv entries; an empty value
     // (opt-out / old claude) expands to nothing. SC2086 is intentional here.
+    // #1525: record the lead's identity for the channel server. $$ is this
+    // shell, which becomes `claude` after exec (or its parent in the resume
+    // form). Not a MACF_* var: the tmux self-wrap copies those to teammates.
+    '# Record the lead pid so teammate channel servers can skip (#1525).',
+    'if [ -d "$SCRIPT_DIR/.claude/.macf" ]; then',
+    '  # Start time pins the pid against reuse: /proc field 22 (parsed after the',
+    '  # last ")"), else ps lstart. Pid alone when neither is readable.',
+    '  _lead_start=""',
+    '  if [ -r "/proc/$$/stat" ]; then',
+    '    _lead_stat="$(cat "/proc/$$/stat" 2>/dev/null || true)"',
+    '    _lead_start="$(printf "%s" "${_lead_stat##*) }" | awk \'{print $20}\' 2>/dev/null || true)"',
+    '  else',
+    '    _lead_start="$(ps -o lstart= -p "$$" 2>/dev/null | tr -s \'[:space:]\' \' \' | sed \'s/^ //;s/ $//\' || true)"',
+    '  fi',
+    '  { printf "%s\\n" "$$${_lead_start:+ $_lead_start}" > "$SCRIPT_DIR/.claude/.macf/lead-claude.pid.tmp.$$" \\',
+    '    && mv -f "$SCRIPT_DIR/.claude/.macf/lead-claude.pid.tmp.$$" "$SCRIPT_DIR/.claude/.macf/lead-claude.pid"; } 2>/dev/null || true',
+    'fi',
     '# shellcheck disable=SC2086',
     'if [ -n "${MACF_TEST:-}" ]; then',
     '  exec claude --plugin-dir "$SCRIPT_DIR/.macf/plugin" $MACF_CHANNELS_ARGS "$@"',
