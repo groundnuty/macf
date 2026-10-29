@@ -72,6 +72,29 @@ export function macfDirPaths(names: readonly string[]): string[] {
   return names.map((n) => `.claude/.macf/${n}`);
 }
 
+/**
+ * Managed files that are missing or whose content no longer matches the
+ * record. `null` when there is no readable record (a workspace macf never
+ * managed), so callers stay quiet there.
+ */
+export function findManagedDrift(workspaceDir: string): string[] | null {
+  const root = resolve(workspaceDir);
+  const path = join(root, RECORD_REL);
+  if (!existsSync(path)) return null;
+  const record = readRecord(root);
+  const drifted: string[] = [];
+  for (const [rel, want] of Object.entries(record)) {
+    if (isAbsolute(rel) || rel.split('/').includes('..')) continue;
+    const abs = join(root, rel);
+    try {
+      if (!existsSync(abs) || sha256(readFileSync(abs)) !== want) drifted.push(rel);
+    } catch {
+      drifted.push(rel);
+    }
+  }
+  return drifted;
+}
+
 /** True when `content` is byte-identical to what macf last wrote to `relPath`. */
 export function matchesLastWritten(workspaceDir: string, relPath: string, content: string | Buffer): boolean {
   const recorded = readRecord(workspaceDir)[relPath];

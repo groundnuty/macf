@@ -832,7 +832,7 @@ describe('checkLoadBearingHooks (DR-039 Decision 1)', () => {
     writeFileSync(join(dir, 'hooks.json'), JSON.stringify(obj, null, 2));
   }
 
-  /** All 7 bash-command load-bearing hooks (everything except the
+  /** All 11 bash-command load-bearing hooks (everything except the
    *  mcp_tool-only, plugin-bound `checkpoint_to_memory`), in settings.json shape. */
   function allBashHooksSettings(): unknown {
     return {
@@ -842,6 +842,7 @@ describe('checkLoadBearingHooks (DR-039 Decision 1)', () => {
           { hooks: [{ type: 'command', command: '$CLAUDE_PROJECT_DIR/.claude/scripts/check-mention-routing.sh' }] },
           { hooks: [{ type: 'command', command: '$CLAUDE_PROJECT_DIR/.claude/scripts/check-lgtm-gate.sh' }] },
           { hooks: [{ type: 'command', command: '$CLAUDE_PROJECT_DIR/.claude/scripts/check-close-keyword.sh' }] },
+          { hooks: [{ type: 'command', command: '$CLAUDE_PROJECT_DIR/.claude/scripts/check-auditor-never-acts.sh' }] },
         ],
         PostToolUse: [
           { hooks: [{ type: 'command', command: '$CLAUDE_PROJECT_DIR/.claude/scripts/check-gh-attribution.sh' }] },
@@ -851,9 +852,12 @@ describe('checkLoadBearingHooks (DR-039 Decision 1)', () => {
         ],
         SessionStart: [
           { hooks: [{ type: 'command', command: '$CLAUDE_PROJECT_DIR/.claude/scripts/check-channel-alive.sh' }] },
+          { hooks: [{ type: 'command', command: '$CLAUDE_PROJECT_DIR/.claude/scripts/check-channels-enabled.sh' }] },
+          { hooks: [{ type: 'command', command: '$CLAUDE_PROJECT_DIR/.claude/scripts/macf-startup-pickup.sh' }] },
         ],
         UserPromptSubmit: [
           { hooks: [{ type: 'command', command: '$CLAUDE_PROJECT_DIR/.claude/scripts/check-channel-alive.sh' }] },
+          { hooks: [{ type: 'command', command: '$CLAUDE_PROJECT_DIR/.claude/scripts/emit-turn-receipt.sh' }] },
         ],
       },
     };
@@ -878,18 +882,22 @@ describe('checkLoadBearingHooks (DR-039 Decision 1)', () => {
     };
   }
 
-  it('has exactly the 8 DR-039 load-bearing hooks (7 bash + 1 mcp_tool)', () => {
+  it('has exactly the 12 load-bearing hooks (11 bash + 1 mcp_tool)', () => {
     const names = DR039_LOAD_BEARING_HOOKS.map((h) => h.name).sort();
     expect(names).toEqual(
       [
+        'check-auditor-never-acts',
         'check-channel-alive',
+        'check-channels-enabled',
         'check-close-keyword',
         'check-gh-attribution',
         'check-gh-token',
         'check-lgtm-gate',
         'check-mention-routing',
         'checkpoint_to_memory',
+        'emit-turn-receipt',
         'harvest-reflection',
+        'macf-startup-pickup',
       ].sort(),
     );
     const mcpTools = DR039_LOAD_BEARING_HOOKS.filter((h) => h.kind === 'mcp_tool');
@@ -975,6 +983,16 @@ describe('checkLoadBearingHooks (DR-039 Decision 1)', () => {
         ],
         PostToolUse: [
           { hooks: [{ type: 'command', command: '${CLAUDE_PLUGIN_ROOT}/scripts/check-gh-attribution.sh' }] },
+        ],
+        PreToolUse: [
+          { hooks: [{ type: 'command', command: '${CLAUDE_PLUGIN_ROOT}/scripts/check-auditor-never-acts.sh' }] },
+        ],
+        SessionStart: [
+          { hooks: [{ type: 'command', command: '${CLAUDE_PLUGIN_ROOT}/scripts/check-channels-enabled.sh' }] },
+          { hooks: [{ type: 'command', command: '${CLAUDE_PLUGIN_ROOT}/scripts/macf-startup-pickup.sh' }] },
+        ],
+        UserPromptSubmit: [
+          { hooks: [{ type: 'command', command: '${CLAUDE_PLUGIN_ROOT}/scripts/emit-turn-receipt.sh' }] },
         ],
       },
     });

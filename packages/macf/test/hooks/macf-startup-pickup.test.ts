@@ -34,7 +34,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { findCliPackageRoot } from '../../src/cli/rules.js';
 
-const HOOK_SCRIPT = join(findCliPackageRoot(), 'scripts', 'macf-startup-pickup.sh');
+const HOOK_SCRIPT = join(findCliPackageRoot(), 'plugin', 'scripts', 'macf-startup-pickup.sh');
 
 const PENDING_OUTPUT = [
   '2 pending issue(s):',

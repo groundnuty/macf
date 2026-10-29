@@ -24,7 +24,7 @@ import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { findCliPackageRoot } from '../../src/cli/rules.js';
 
-const HOOK_SCRIPT = join(findCliPackageRoot(), 'scripts', 'check-auditor-never-acts.sh');
+const HOOK_SCRIPT = join(findCliPackageRoot(), 'plugin', 'scripts', 'check-auditor-never-acts.sh');
 
 function runHook(opts: {
   readonly command: string;

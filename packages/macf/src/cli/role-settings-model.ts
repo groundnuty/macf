@@ -34,10 +34,6 @@
  */
 import {
   MACF_AUDITOR_HOOK_COMMAND,
-  MACF_TURN_RECEIPT_HOOK_COMMAND,
-  MACF_CHANNELS_HOOK_COMMAND,
-  MACF_STARTUP_PICKUP_HOOK_COMMAND,
-  MACF_STARTUP_PICKUP_HOOK_MATCHER,
   ROLE_FLOOR_ALLOW,
   ROLE_FLOOR_DENY,
 } from './settings-writer.js';
@@ -69,21 +65,8 @@ export { ROLE_FLOOR_ALLOW, ROLE_FLOOR_DENY };
  * migrated hooks aren't listed).
  */
 export const ROLE_FLOOR_HOOKS: readonly ExpectedHook[] = [
-  { event: 'UserPromptSubmit', command: MACF_TURN_RECEIPT_HOOK_COMMAND, required: false },
-  { event: 'SessionStart', command: MACF_CHANNELS_HOOK_COMMAND, required: false },
-  // groundnuty/macf#768: written for every role (including the auditor) —
-  // `installStartupPickupHook` has no per-role branch, matching this floor
-  // entry. The auditor's DR-026 "never auto-resumes" default is enforced by
-  // the hook SCRIPT reading `MACF_AGENT_ROLE` at runtime, not by omitting
-  // this expected-settings entry — see `startupPickupAutoResumesByDefault`
-  // below for the policy the script's runtime check mirrors.
-  //
-  // `matcher: 'startup|resume'` (groundnuty/macf#930) mirrors what
-  // `applyStartupPickupHookTransform` actually writes — defense-in-depth
-  // only; `doctor.ts`'s `hookFindings` compares command presence, not
-  // matcher equality, so this field is documentation-accuracy, not a
-  // functional drift check.
-  { event: 'SessionStart', matcher: MACF_STARTUP_PICKUP_HOOK_MATCHER, command: MACF_STARTUP_PICKUP_HOOK_COMMAND, required: false },
+  // groundnuty/macf#1525: the turn-receipt, channels-enabled and startup-pickup
+  // hooks ship in the plugin's hooks.json now, so settings.json expects none.
 ];
 
 /** Per-role additions beyond the floor (DR-028 §Decision 1, Per-role deltas). */

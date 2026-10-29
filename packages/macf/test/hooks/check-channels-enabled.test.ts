@@ -25,7 +25,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { findCliPackageRoot } from '../../src/cli/rules.js';
 
-const HOOK_SCRIPT = join(findCliPackageRoot(), 'scripts', 'check-channels-enabled.sh');
+const HOOK_SCRIPT = join(findCliPackageRoot(), 'plugin', 'scripts', 'check-channels-enabled.sh');
 
 const SKIP_DEBUG =
   'Channel notifications skipped: server plugin:macf-agent:macf-agent not in --channels list for this session';

@@ -15,6 +15,7 @@
  * for the attribution-trap class this prevents).
  */
 import { execFileSync } from 'node:child_process';
+import { findManagedDrift } from '../managed-hashes.js';
 import { existsSync, lstatSync, readdirSync, readFileSync, statfsSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { createInterface } from 'node:readline';
@@ -987,10 +988,17 @@ function invalidAllowWildcardFindings(workspaceDir: string): RoleSettingFinding[
   }));
 }
 
-function hookFindings(commands: readonly string[], role: string): RoleSettingFinding[] {
+function hookFindings(
+  commands: readonly string[],
+  role: string,
+  pluginCommands: readonly string[] = [],
+): RoleSettingFinding[] {
   const findings: RoleSettingFinding[] = [];
   for (const hook of expectedHooksForRole(role)) {
     if (commands.includes(hook.command)) continue;
+    // The plugin's hooks.json delivers the hook too (groundnuty/macf#1525).
+    const base = hook.command.slice(hook.command.lastIndexOf('/') + 1);
+    if (pluginCommands.some((c) => c.includes(base))) continue;
     const where = `${hook.event}${hook.matcher ? ` / ${hook.matcher}` : ''}`;
     findings.push({
       category: 'hook',
@@ -1034,7 +1042,7 @@ export function checkRoleSettings(workspaceDir: string, role: string): RoleSetti
     ...denyFindings(deny),
     ...legacyDenyWriteFindings(deny),
     ...invalidAllowWildcardFindings(workspaceDir),
-    ...hookFindings(commands, role),
+    ...hookFindings(commands, role, pluginHookCommands(workspaceDir)),
   ];
 
   const status: RoleSettingsCheckResult['status'] =
@@ -1280,6 +1288,34 @@ export const DR039_LOAD_BEARING_HOOKS: readonly LoadBearingHookSpec[] = [
     events: ['SessionStart', 'UserPromptSubmit'],
     citation: 'channel-server liveness guard',
   },
+  {
+    name: 'check-channels-enabled',
+    kind: 'command',
+    match: 'check-channels-enabled.sh',
+    events: ['SessionStart'],
+    citation: 'native channel-push enabled guard',
+  },
+  {
+    name: 'macf-startup-pickup',
+    kind: 'command',
+    match: 'macf-startup-pickup.sh',
+    events: ['SessionStart'],
+    citation: 'work pickup at session start and resume',
+  },
+  {
+    name: 'emit-turn-receipt',
+    kind: 'command',
+    match: 'emit-turn-receipt.sh',
+    events: ['UserPromptSubmit'],
+    citation: 'turn receipts for routed messages',
+  },
+  {
+    name: 'check-auditor-never-acts',
+    kind: 'command',
+    match: 'check-auditor-never-acts.sh',
+    events: ['PreToolUse'],
+    citation: 'auditor never-acts guard (inert for other roles)',
+  },
 ];
 
 /**
@@ -1349,6 +1385,17 @@ export function getEffectiveHookConfig(workspaceDir: string): EffectiveHookConfi
     pluginHooksJsonPath,
     usedDefaultFallback,
   };
+}
+
+/** Hook commands the loaded plugin's hooks.json registers (groundnuty/macf#1525). */
+function pluginHookCommands(workspaceDir: string): string[] {
+  try {
+    return getEffectiveHookConfig(workspaceDir)
+      .entries.filter((e) => e.kind === 'command')
+      .map((e) => e.value);
+  } catch {
+    return [];
+  }
 }
 
 /** One load-bearing hook DR-039 found absent from the effective config. */
@@ -2953,6 +3000,11 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
   printLoadBearingHooksSection(checkLoadBearingHooks(projectDir));
 
   console.log('');
+  console.log('Managed files');
+  console.log('──────────────────────────────────────────────────────────────');
+  printManagedDriftSection(findManagedDrift(projectDir));
+
+  console.log('');
   console.log('Plugin pin currency');
   console.log('──────────────────────────────────────────────────────────────');
   printPluginPinCurrencySection(checkPluginPinCurrency(projectDir, config));
@@ -3145,6 +3197,22 @@ function printBotLoginSection(check: BotLoginCheckResult): void {
   } else {
     console.log(`  ℹ ${check.detail}  [INFO]`);
   }
+}
+
+/** Print the managed-files drift row (groundnuty/macf#1525). */
+function printManagedDriftSection(drifted: readonly string[] | null): void {
+  if (drifted === null) {
+    console.log('  ℹ no .macf/managed-hashes.json — nothing recorded to check  [INFO]');
+    return;
+  }
+  if (drifted.length === 0) {
+    console.log('  ✓ managed files match what macf last wrote  [PASS]');
+    return;
+  }
+  const shown = drifted.slice(0, 5).join(', ');
+  const more = drifted.length > 5 ? `, and ${drifted.length - 5} more` : '';
+  console.log(`  ⚠ ${drifted.length} managed files are missing or changed (${shown}${more})  [WARN]`);
+  console.log('    Fix: run `macf update` to restore them, and tell the operator.');
 }
 
 /** Print the DR-039 load-bearing-hook-set report section for `check`. */

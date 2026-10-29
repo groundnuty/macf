@@ -24,6 +24,10 @@ const MIGRATED_HOOK_BASENAMES = [
   'check-gh-attribution.sh',
   'harvest-reflection.sh',
   'check-channel-alive.sh',
+  'check-auditor-never-acts.sh',
+  'emit-turn-receipt.sh',
+  'check-channels-enabled.sh',
+  'macf-startup-pickup.sh',
 ];
 
 /** Write a `claude.sh` whose `--plugin-dir` resolves (via $SCRIPT_DIR) to `<root>/.macf/plugin`. */
@@ -58,6 +62,7 @@ function setupDeliveringPlugin(root: string): void {
             { matcher: 'Bash', hooks: [{ type: 'command', command: '${CLAUDE_PLUGIN_ROOT}/scripts/check-mention-routing.sh' }] },
             { matcher: 'Bash', hooks: [{ type: 'command', command: '${CLAUDE_PLUGIN_ROOT}/scripts/check-lgtm-gate.sh' }] },
             { matcher: 'Bash', hooks: [{ type: 'command', command: '${CLAUDE_PLUGIN_ROOT}/scripts/check-close-keyword.sh' }] },
+            { matcher: 'Bash', hooks: [{ type: 'command', command: '${CLAUDE_PLUGIN_ROOT}/scripts/check-auditor-never-acts.sh' }] },
           ],
           PostToolUse: [
             { matcher: 'Bash', hooks: [{ type: 'command', command: '${CLAUDE_PLUGIN_ROOT}/scripts/check-gh-attribution.sh' }] },
@@ -67,9 +72,12 @@ function setupDeliveringPlugin(root: string): void {
           ],
           SessionStart: [
             { hooks: [{ type: 'command', command: '${CLAUDE_PLUGIN_ROOT}/scripts/check-channel-alive.sh' }] },
+            { hooks: [{ type: 'command', command: '${CLAUDE_PLUGIN_ROOT}/scripts/check-channels-enabled.sh' }] },
+            { matcher: 'startup|resume', hooks: [{ type: 'command', command: '${CLAUDE_PLUGIN_ROOT}/scripts/macf-startup-pickup.sh' }] },
           ],
           UserPromptSubmit: [
             { hooks: [{ type: 'command', command: '${CLAUDE_PLUGIN_ROOT}/scripts/check-channel-alive.sh' }] },
+            { hooks: [{ type: 'command', command: '${CLAUDE_PLUGIN_ROOT}/scripts/emit-turn-receipt.sh', async: true }] },
           ],
         },
       },
@@ -105,13 +113,21 @@ function writeLegacyMigratedHooksSettings(settingsPath: string): void {
             { matcher: 'Bash', hooks: [{ type: 'command', command: '.claude/scripts/check-mention-routing.sh' }] },
             { matcher: 'Bash', hooks: [{ type: 'command', command: '.claude/scripts/check-lgtm-gate.sh' }] },
             { matcher: 'Bash', hooks: [{ type: 'command', command: '.claude/scripts/check-close-keyword.sh' }] },
+            { matcher: 'Bash', hooks: [{ type: 'command', command: MACF_AUDITOR_HOOK_COMMAND }] },
           ],
           PostToolUse: [
             { matcher: 'Bash', hooks: [{ type: 'command', command: '.claude/scripts/check-gh-attribution.sh' }] },
           ],
           PreCompact: [{ hooks: [{ type: 'command', command: '.claude/scripts/harvest-reflection.sh' }] }],
-          SessionStart: [{ hooks: [{ type: 'command', command: '.claude/scripts/check-channel-alive.sh' }] }],
-          UserPromptSubmit: [{ hooks: [{ type: 'command', command: '.claude/scripts/check-channel-alive.sh' }] }],
+          SessionStart: [
+            { hooks: [{ type: 'command', command: '.claude/scripts/check-channel-alive.sh' }] },
+            { hooks: [{ type: 'command', command: MACF_CHANNELS_HOOK_COMMAND }] },
+            { matcher: 'startup|resume', hooks: [{ type: 'command', command: MACF_STARTUP_PICKUP_HOOK_COMMAND, timeout: MACF_STARTUP_PICKUP_HOOK_TIMEOUT_SECONDS }] },
+          ],
+          UserPromptSubmit: [
+            { hooks: [{ type: 'command', command: '.claude/scripts/check-channel-alive.sh' }] },
+            { hooks: [{ type: 'command', command: MACF_TURN_RECEIPT_HOOK_COMMAND, async: true }] },
+          ],
         },
       },
       null,
@@ -182,19 +198,24 @@ describe('installGhTokenHook', () => {
     }
   });
 
-  it('creates .claude/settings.json when missing, with the auditor hook entry only', () => {
+  // groundnuty/macf#1525: no hook is hand-wired into settings.json any more
+  // (the plugin's hooks.json carries them), so a fresh install has none.
+  it('creates .claude/settings.json when missing, with NO macf hook entries', () => {
     installGhTokenHook(tmpRoot);
 
     expect(existsSync(settingsPath)).toBe(true);
     const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
-    // Only check-auditor-never-acts.sh (groundnuty/macf#499) remains
-    // hand-wired on PreToolUse post-DR-039-Decision-2 (groundnuty/macf#731/
-    // #739) — check-gh-token / check-mention-routing / check-lgtm-gate /
-    // check-close-keyword single-sourced into the plugin's hooks.json.
-    expect(s.hooks.PreToolUse).toHaveLength(1);
-    expect(s.hooks.PreToolUse[0].matcher).toBe('Bash');
-    expect(s.hooks.PreToolUse[0].hooks[0].command).toBe(MACF_AUDITOR_HOOK_COMMAND);
-    expect(s.hooks.PreToolUse[0].hooks[0].type).toBe('command');
+    expect(allHookCommands(s)).toEqual([]);
+  });
+
+  it('a fresh settings-writer output contains none of the four #1525 hooks', () => {
+    installGhTokenHook(tmpRoot);
+    installStartupPickupHook(tmpRoot);
+
+    const cmds = allHookCommands(JSON.parse(readFileSync(settingsPath, 'utf-8')));
+    for (const name of ['check-channels-enabled.sh', 'macf-startup-pickup.sh', 'emit-turn-receipt.sh', 'check-auditor-never-acts.sh']) {
+      expect(cmds.some((c) => c.includes(name)), name).toBe(false);
+    }
   });
 
   it('preserves existing unrelated settings keys', () => {
@@ -209,10 +230,9 @@ describe('installGhTokenHook', () => {
     const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
     expect(s.model).toBe('opus');
     expect(s.env).toEqual({ DEBUG: 'true' });
-    expect(s.hooks.PreToolUse[0].hooks[0].command).toBe(MACF_AUDITOR_HOOK_COMMAND);
   });
 
-  it('preserves other PreToolUse entries when adding ours', () => {
+  it('preserves other PreToolUse entries', () => {
     mkdirSync(join(tmpRoot, '.claude'), { recursive: true });
     writeFileSync(settingsPath, JSON.stringify({
       hooks: {
@@ -225,17 +245,8 @@ describe('installGhTokenHook', () => {
     installGhTokenHook(tmpRoot);
 
     const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
-    // 1 user Edit hook + 1 MACF Bash hook (auditor-never-acts only, post
-    // DR-039 Decision 2 — the other 4 moved to the plugin's hooks.json).
-    expect(s.hooks.PreToolUse).toHaveLength(2);
-    const userHook = s.hooks.PreToolUse.find((e: { matcher: string }) => e.matcher === 'Edit');
-    const macfHooks = s.hooks.PreToolUse.filter(
-      (e: { matcher: string; hooks: { command: string }[] }) =>
-        e.matcher === 'Bash' && e.hooks.some((h) => h.command === MACF_AUDITOR_HOOK_COMMAND),
-    );
-    expect(userHook).toBeDefined();
-    expect(userHook.hooks[0].command).toBe('./user-edit-hook.sh');
-    expect(macfHooks).toHaveLength(1);
+    expect(s.hooks.PreToolUse).toHaveLength(1);
+    expect(s.hooks.PreToolUse[0].hooks[0].command).toBe('./user-edit-hook.sh');
   });
 
   it('preserves operator hooks on other events (SessionStart op-hook kept, Stop untouched)', () => {
@@ -250,81 +261,19 @@ describe('installGhTokenHook', () => {
     installGhTokenHook(tmpRoot);
 
     const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
-    // SessionStart now carries the operator's hook PLUS only the macf
-    // channels-enabled guard (check-channel-alive.sh moved to the plugin,
-    // DR-039 Decision 2).
-    expect(s.hooks.SessionStart).toHaveLength(2);
-    const sessionCmds = s.hooks.SessionStart.flatMap((e: { hooks: { command: string }[] }) =>
-      e.hooks.map((h) => h.command),
-    );
-    expect(sessionCmds).toContain('./user-session-hook.sh');
-    expect(sessionCmds).toContain(MACF_CHANNELS_HOOK_COMMAND);
-    // Stop is not a MACF event → untouched.
+    expect(s.hooks.SessionStart).toHaveLength(1);
+    expect(allHookCommands({ hooks: { SessionStart: s.hooks.SessionStart } })).toEqual(['./user-session-hook.sh']);
     expect(s.hooks.Stop).toHaveLength(1);
-    expect(s.hooks.PreToolUse[0].hooks[0].command).toBe(MACF_AUDITOR_HOOK_COMMAND);
   });
 
-  it('is idempotent — second call does not duplicate the MACF entry', () => {
+  it('is idempotent — second call changes nothing', () => {
     installGhTokenHook(tmpRoot);
+    const first = readFileSync(settingsPath, 'utf-8');
     installGhTokenHook(tmpRoot);
-
-    const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
-    const macfEntries = s.hooks.PreToolUse.filter((e: { hooks: { command: string }[] }) =>
-      e.hooks.some((h) => h.command === MACF_AUDITOR_HOOK_COMMAND),
-    );
-    expect(macfEntries).toHaveLength(1);
+    expect(readFileSync(settingsPath, 'utf-8')).toBe(first);
   });
 
-  it('refreshes a stale MACF auditor entry (replaces by command-path match)', () => {
-    mkdirSync(join(tmpRoot, '.claude'), { recursive: true });
-    writeFileSync(settingsPath, JSON.stringify({
-      hooks: {
-        PreToolUse: [
-          {
-            matcher: 'Bash',
-            hooks: [{ type: 'command', command: '.claude/scripts/check-auditor-never-acts.sh --old-flag' }],
-          },
-        ],
-      },
-    }, null, 2));
-
-    installGhTokenHook(tmpRoot);
-
-    const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
-    const macfEntries = s.hooks.PreToolUse.filter((e: { hooks: { command: string }[] }) =>
-      e.hooks.some((h) => h.command.includes('check-auditor-never-acts.sh')),
-    );
-    expect(macfEntries).toHaveLength(1);
-    expect(macfEntries[0].hooks[0].command).toBe(MACF_AUDITOR_HOOK_COMMAND);
-    // --old-flag should be gone.
-    expect(macfEntries[0].hooks[0].command).not.toContain('--old-flag');
-  });
-
-  // ── UserPromptSubmit turn-ack receipt hook (groundnuty/macf#444) — the
-  // only hand-wired UserPromptSubmit hook post-DR-039-Decision-2
-  // (check-channel-alive.sh moved to the plugin). ──
-
-  it('installs the UserPromptSubmit turn-receipt hook (async, no matcher)', () => {
-    installGhTokenHook(tmpRoot);
-
-    const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
-    expect(s.hooks.UserPromptSubmit).toHaveLength(1);
-    const entry = s.hooks.UserPromptSubmit[0];
-    // UserPromptSubmit isn't tool-gated → no matcher (unlike the Bash PreToolUse hooks).
-    expect(entry.matcher).toBeUndefined();
-    expect(entry.hooks[0].type).toBe('command');
-    expect(entry.hooks[0].command).toBe(MACF_TURN_RECEIPT_HOOK_COMMAND);
-    // async so it never adds turn latency / can't block on a slow OTLP endpoint.
-    expect(entry.hooks[0].async).toBe(true);
-  });
-
-  it('MACF_TURN_RECEIPT_HOOK_COMMAND uses $CLAUDE_PROJECT_DIR (cwd-independent)', () => {
-    expect(MACF_TURN_RECEIPT_HOOK_COMMAND).toBe(
-      '$CLAUDE_PROJECT_DIR/.claude/scripts/emit-turn-receipt.sh',
-    );
-  });
-
-  it('preserves operator-authored UserPromptSubmit hooks when adding ours', () => {
+  it('preserves operator-authored UserPromptSubmit hooks, adding none', () => {
     mkdirSync(join(tmpRoot, '.claude'), { recursive: true });
     writeFileSync(settingsPath, JSON.stringify({
       hooks: {
@@ -335,26 +284,16 @@ describe('installGhTokenHook', () => {
     installGhTokenHook(tmpRoot);
 
     const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
-    // 1 operator hook + 1 MACF entry (turn-receipt only, post DR-039
-    // Decision 2 — check-channel-alive.sh moved to the plugin's hooks.json).
-    expect(s.hooks.UserPromptSubmit).toHaveLength(2);
-    const cmds = s.hooks.UserPromptSubmit.flatMap((e: { hooks: { command: string }[] }) =>
-      e.hooks.map((h) => h.command),
-    );
-    expect(cmds).toContain('./my-ups-hook.sh');
-    expect(cmds).toContain(MACF_TURN_RECEIPT_HOOK_COMMAND);
+    expect(s.hooks.UserPromptSubmit).toHaveLength(1);
+    expect(s.hooks.UserPromptSubmit[0].hooks[0].command).toBe('./my-ups-hook.sh');
   });
 
-  it('UserPromptSubmit install is idempotent (no duplicate macf entry)', () => {
-    installGhTokenHook(tmpRoot);
-    installGhTokenHook(tmpRoot);
-
-    const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
-    const macfUps = s.hooks.UserPromptSubmit.filter((e: { hooks: { command: string }[] }) =>
-      e.hooks.some((h) => h.command.includes('emit-turn-receipt.sh')),
+  it('MACF_TURN_RECEIPT_HOOK_COMMAND uses $CLAUDE_PROJECT_DIR (cwd-independent)', () => {
+    expect(MACF_TURN_RECEIPT_HOOK_COMMAND).toBe(
+      '$CLAUDE_PROJECT_DIR/.claude/scripts/emit-turn-receipt.sh',
     );
-    expect(macfUps).toHaveLength(1);
   });
+
 
   // ── PostToolUse: nothing remains hand-wired post-DR-039-Decision-2
   // (check-gh-attribution.sh moved to the plugin's hooks.json). ──
@@ -443,13 +382,7 @@ describe('installGhTokenHook', () => {
       e.hooks.some((h) => h.command === './my-check-gh-token.sh-wrapper --flag'),
     );
     expect(operatorEntry).toBeDefined();
-    const macfAuditorEntry = s.hooks.PreToolUse.find((e: { hooks: { command: string }[] }) =>
-      e.hooks.some((h) => h.command === MACF_AUDITOR_HOOK_COMMAND),
-    );
-    expect(macfAuditorEntry).toBeDefined();
-    // 1 operator lookalike + 1 MACF entry (auditor-never-acts only, post
-    // DR-039 Decision 2).
-    expect(s.hooks.PreToolUse).toHaveLength(2);
+    expect(s.hooks.PreToolUse).toHaveLength(1);
   });
 
   // groundnuty/macf#499 — DR-026 F1 auditor-never-acts hook entry shape.
@@ -519,8 +452,8 @@ describe('installGhTokenHook — DR-039 Decision 2 migration cleanup', () => {
     expect(cmds.some((c: string) => c.includes('check-mention-routing.sh'))).toBe(false);
     expect(cmds.some((c: string) => c.includes('check-lgtm-gate.sh'))).toBe(false);
     expect(cmds.some((c: string) => c.includes('check-close-keyword.sh'))).toBe(false);
-    // The still-hand-wired auditor hook IS present.
-    expect(cmds).toContain(MACF_AUDITOR_HOOK_COMMAND);
+    // Nothing is re-added in their place.
+    expect(cmds).not.toContain(MACF_AUDITOR_HOOK_COMMAND);
     // Operator-authored hook survives verbatim.
     expect(cmds).toContain('echo edited');
   });
@@ -611,9 +544,64 @@ describe('installGhTokenHook — DR-039 Decision 2 migration cleanup', () => {
     const upsCmds = s.hooks.UserPromptSubmit.flatMap((e: { hooks: { command: string }[] }) => e.hooks.map((h) => h.command));
     expect(sessionCmds.some((c: string) => c.includes('check-channel-alive.sh'))).toBe(false);
     expect(upsCmds.some((c: string) => c.includes('check-channel-alive.sh'))).toBe(false);
-    // The still-hand-wired hooks for each event ARE present.
-    expect(sessionCmds).toContain(MACF_CHANNELS_HOOK_COMMAND);
-    expect(upsCmds).toContain(MACF_TURN_RECEIPT_HOOK_COMMAND);
+    expect(sessionCmds).toEqual([]);
+    expect(upsCmds).toEqual([]);
+  });
+
+  // groundnuty/macf#1525: the four hooks that used to be hand-wired are
+  // removed exactly as written, and an operator-authored hook next to them stays.
+  it('removes the four old hand-wired hooks as written and keeps an operator-authored hook', () => {
+    mkdirSync(join(tmpRoot, '.claude'), { recursive: true });
+    writeFileSync(settingsPath, JSON.stringify({
+      hooks: {
+        PreToolUse: [
+          { matcher: 'Bash', hooks: [{ type: 'command', command: MACF_AUDITOR_HOOK_COMMAND }] },
+          { matcher: 'Bash', hooks: [{ type: 'command', command: './my-bash-guard.sh' }] },
+        ],
+        SessionStart: [
+          { hooks: [{ type: 'command', command: MACF_CHANNELS_HOOK_COMMAND }] },
+          { matcher: 'startup|resume', hooks: [{ type: 'command', command: MACF_STARTUP_PICKUP_HOOK_COMMAND, timeout: MACF_STARTUP_PICKUP_HOOK_TIMEOUT_SECONDS }] },
+          { hooks: [{ type: 'command', command: './my-session-hook.sh' }] },
+        ],
+        UserPromptSubmit: [
+          { hooks: [{ type: 'command', command: MACF_TURN_RECEIPT_HOOK_COMMAND, async: true }] },
+          { hooks: [{ type: 'command', command: './my-ups-hook.sh' }] },
+        ],
+      },
+    }, null, 2));
+
+    installGhTokenHook(tmpRoot);
+    installStartupPickupHook(tmpRoot);
+
+    const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    expect(allHookCommands(s).sort()).toEqual(['./my-bash-guard.sh', './my-session-hook.sh', './my-ups-hook.sh']);
+  });
+
+  it('keeps the four old hand-wired hooks when the loaded plugin cannot deliver them', () => {
+    rmSync(join(tmpRoot, '.macf'), { recursive: true, force: true });
+    setupHooksLessPlugin(tmpRoot);
+    mkdirSync(join(tmpRoot, '.claude'), { recursive: true });
+    writeFileSync(settingsPath, JSON.stringify({
+      hooks: {
+        PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: MACF_AUDITOR_HOOK_COMMAND }] }],
+        SessionStart: [
+          { hooks: [{ type: 'command', command: MACF_CHANNELS_HOOK_COMMAND }] },
+          { matcher: 'startup|resume', hooks: [{ type: 'command', command: MACF_STARTUP_PICKUP_HOOK_COMMAND }] },
+        ],
+        UserPromptSubmit: [{ hooks: [{ type: 'command', command: MACF_TURN_RECEIPT_HOOK_COMMAND, async: true }] }],
+      },
+    }, null, 2));
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    installGhTokenHook(tmpRoot);
+    installStartupPickupHook(tmpRoot);
+    warnSpy.mockRestore();
+
+    const cmds = allHookCommands(JSON.parse(readFileSync(settingsPath, 'utf-8')));
+    expect(cmds).toContain(MACF_AUDITOR_HOOK_COMMAND);
+    expect(cmds).toContain(MACF_CHANNELS_HOOK_COMMAND);
+    expect(cmds).toContain(MACF_STARTUP_PICKUP_HOOK_COMMAND);
+    expect(cmds).toContain(MACF_TURN_RECEIPT_HOOK_COMMAND);
   });
 
   it('migration cleanup is idempotent — re-running an already-migrated workspace is a no-op for the moved events', () => {
@@ -690,7 +678,7 @@ describe('installGhTokenHook — DR-039 Amendment B self-guard (macf#743 review)
       }
     });
 
-    it('reports canDeliver: true for a full plugin that registers all 7 migrated hooks', () => {
+    it('reports canDeliver: true for a full plugin that registers all the migrated hooks', () => {
       setupDeliveringPlugin(tmpRoot);
       const result = canPluginDeliverMigratedHooks(tmpRoot);
       expect(result.canDeliver).toBe(true);
@@ -719,10 +707,6 @@ describe('installGhTokenHook — DR-039 Amendment B self-guard (macf#743 review)
     for (const name of MIGRATED_HOOK_BASENAMES) {
       expect(cmds.some((c) => c.includes(name)), `expected ${name} to survive (deferred, not stripped)`).toBe(true);
     }
-    // The always-hand-wired 3 are still present too.
-    expect(cmds).toContain(MACF_AUDITOR_HOOK_COMMAND);
-    expect(cmds).toContain(MACF_TURN_RECEIPT_HOOK_COMMAND);
-    expect(cmds).toContain(MACF_CHANNELS_HOOK_COMMAND);
   });
 
   it('DEFERS the strip when claude.sh is absent (ambiguous/unresolvable) — legacy copies SURVIVE', () => {
@@ -749,10 +733,7 @@ describe('installGhTokenHook — DR-039 Amendment B self-guard (macf#743 review)
     for (const name of MIGRATED_HOOK_BASENAMES) {
       expect(cmds.some((c) => c.includes(name)), `expected ${name} to be stripped`).toBe(false);
     }
-    // The always-hand-wired 3 are still (re-)installed.
-    expect(cmds).toContain(MACF_AUDITOR_HOOK_COMMAND);
-    expect(cmds).toContain(MACF_TURN_RECEIPT_HOOK_COMMAND);
-    expect(cmds).toContain(MACF_CHANNELS_HOOK_COMMAND);
+    expect(cmds).toEqual([]);
   });
 
   it('is idempotent — re-running against an already-delivering plugin twice produces the same stripped result', () => {
@@ -788,7 +769,7 @@ describe('installGhTokenHook — DR-039 Amendment B self-guard (macf#743 review)
     expect(preToolUseCmds.filter((c: string) => c.includes('check-gh-token.sh'))).toHaveLength(1);
   });
 
-  it('does NOT strip a brand-new workspace differently — a fresh hooks-less-plugin install still ends up with only the 3 hand-wired hooks (nothing to defer)', () => {
+  it('does NOT strip a brand-new workspace differently — a fresh hooks-less-plugin install writes no hooks (nothing to defer)', () => {
     // No pre-existing legacy entries at all — a first-ever `macf init` on a
     // hooks-less-plugin launcher. The self-guard only prevents STRIPPING an
     // EXISTING fallback; it does not synthesize fresh copies of the 7.
@@ -801,7 +782,7 @@ describe('installGhTokenHook — DR-039 Amendment B self-guard (macf#743 review)
     for (const name of MIGRATED_HOOK_BASENAMES) {
       expect(cmds.some((c) => c.includes(name))).toBe(false);
     }
-    expect(cmds).toContain(MACF_AUDITOR_HOOK_COMMAND);
+    expect(cmds).toEqual([]);
   });
 
   it('warns loudly when deferring an actual strip (hooks-less plugin + existing legacy copies)', () => {
@@ -840,8 +821,8 @@ describe('installGhTokenHook — DR-039 Amendment B self-guard (macf#743 review)
   });
 });
 
-// ── Canonical role-aware SessionStart work-pickup hook (groundnuty/macf#768) ──
-describe('installStartupPickupHook (DR-026 / macf#768)', () => {
+// ── SessionStart work-pickup hook (groundnuty/macf#768; moved to the plugin by #1525) ──
+describe('installStartupPickupHook (DR-026 / macf#768 / macf#1525)', () => {
   let tmpRoot: string;
   let settingsPath: string;
 
@@ -854,119 +835,27 @@ describe('installStartupPickupHook (DR-026 / macf#768)', () => {
     rmSync(tmpRoot, { recursive: true, force: true });
   });
 
-  it('MACF_STARTUP_PICKUP_HOOK_COMMAND uses $CLAUDE_PROJECT_DIR (cwd-independent absolute path)', () => {
+  it('MACF_STARTUP_PICKUP_HOOK_COMMAND keeps the $CLAUDE_PROJECT_DIR form (used to match old copies)', () => {
     expect(MACF_STARTUP_PICKUP_HOOK_COMMAND).toMatch(/^\$CLAUDE_PROJECT_DIR\/\.claude\/scripts\//);
     expect(MACF_STARTUP_PICKUP_HOOK_COMMAND).toContain('macf-startup-pickup.sh');
   });
 
-  it('creates .claude/settings.json when missing, with the SessionStart entry', () => {
-    installStartupPickupHook(tmpRoot);
-
-    expect(existsSync(settingsPath)).toBe(true);
-    const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
-    expect(s.hooks.SessionStart).toHaveLength(1);
-    expect(s.hooks.SessionStart[0].hooks[0].command).toBe(MACF_STARTUP_PICKUP_HOOK_COMMAND);
-    expect(s.hooks.SessionStart[0].hooks[0].type).toBe('command');
-    // groundnuty/macf#930: `matcher: "startup"` — was matcher-less pre-#930
-    // (fired on every SessionStart source, incl. compact/resume/clear/fork).
-    // Defense-in-depth only; the script itself re-checks `source` on the
-    // payload, since Claude Code evaluates the matcher before invoking the
-    // command (see MACF_STARTUP_PICKUP_HOOK_COMMAND's doc comment).
-    expect(s.hooks.SessionStart[0].matcher).toBe('startup|resume');
-  });
-
-  it('registers an explicit timeout comfortably above the script\'s own readiness-poll budget (macf#802)', () => {
-    // Claude Code's own default hook timeout is not documented anywhere in
-    // this repo; the script's readiness-poll can legitimately run up to ~90s
-    // (macf#802) so the registration must not rely on an unverified default
-    // — see MACF_STARTUP_PICKUP_HOOK_TIMEOUT_SECONDS's doc comment.
-    installStartupPickupHook(tmpRoot);
-    const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
-    expect(s.hooks.SessionStart[0].hooks[0].timeout).toBe(MACF_STARTUP_PICKUP_HOOK_TIMEOUT_SECONDS);
-    expect(MACF_STARTUP_PICKUP_HOOK_TIMEOUT_SECONDS).toBeGreaterThan(90);
-  });
-
-  it('is written unconditionally — no role parameter, same entry regardless of workspace role', () => {
-    // installStartupPickupHook has no role argument at all: the per-role
-    // DR-026 default lives in the SCRIPT (runtime MACF_AGENT_ROLE check),
-    // not in conditional settings.json generation — see the exported
-    // function's doc comment for why (macf rules refresh has no role to
-    // read). This test just pins the current signature/behavior.
-    installStartupPickupHook(tmpRoot);
-    const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
-    const cmds = s.hooks.SessionStart.flatMap((e: { hooks: { command: string }[] }) =>
-      e.hooks.map((h) => h.command),
-    );
-    expect(cmds).toContain(MACF_STARTUP_PICKUP_HOOK_COMMAND);
-  });
-
-  it('preserves an operator-authored SessionStart hook alongside ours', () => {
-    mkdirSync(join(tmpRoot, '.claude'), { recursive: true });
-    writeFileSync(settingsPath, JSON.stringify({
-      hooks: {
-        SessionStart: [{ hooks: [{ type: 'command', command: './user-session-hook.sh' }] }],
-      },
-    }, null, 2));
-
+  it('writes no pickup entry to settings.json', () => {
     installStartupPickupHook(tmpRoot);
 
     const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
-    expect(s.hooks.SessionStart).toHaveLength(2);
-    const cmds = s.hooks.SessionStart.flatMap((e: { hooks: { command: string }[] }) =>
-      e.hooks.map((h) => h.command),
-    );
-    expect(cmds).toContain('./user-session-hook.sh');
-    expect(cmds).toContain(MACF_STARTUP_PICKUP_HOOK_COMMAND);
+    expect(allHookCommands(s)).toEqual([]);
   });
 
-  it('preserves the sibling check-channels-enabled.sh MACF entry installGhTokenHook writes', () => {
-    installGhTokenHook(tmpRoot); // writes check-channels-enabled.sh on SessionStart
-    installStartupPickupHook(tmpRoot);
-
-    const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
-    const cmds = s.hooks.SessionStart.flatMap((e: { hooks: { command: string }[] }) =>
-      e.hooks.map((h) => h.command),
-    );
-    expect(cmds).toContain(MACF_CHANNELS_HOOK_COMMAND);
-    expect(cmds).toContain(MACF_STARTUP_PICKUP_HOOK_COMMAND);
-  });
-
-  it('is idempotent (managed-header/basename refresh): calling twice does not duplicate', () => {
-    installStartupPickupHook(tmpRoot);
-    installStartupPickupHook(tmpRoot);
-
-    const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
-    const matching = s.hooks.SessionStart.filter((e: { hooks: { command: string }[] }) =>
-      e.hooks.some((h) => h.command === MACF_STARTUP_PICKUP_HOOK_COMMAND),
-    );
-    expect(matching).toHaveLength(1);
-  });
-
-  it('refreshes a legacy/stale command string in place (basename match, not exact-string match)', () => {
-    mkdirSync(join(tmpRoot, '.claude'), { recursive: true });
-    writeFileSync(settingsPath, JSON.stringify({
-      hooks: {
-        SessionStart: [
-          { hooks: [{ type: 'command', command: '.claude/scripts/macf-startup-pickup.sh' }] },
-        ],
-      },
-    }, null, 2));
-
-    installStartupPickupHook(tmpRoot);
-
-    const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
-    const cmds = s.hooks.SessionStart.flatMap((e: { hooks: { command: string }[] }) =>
-      e.hooks.map((h) => h.command),
-    );
-    expect(cmds).toEqual([MACF_STARTUP_PICKUP_HOOK_COMMAND]);
-  });
-
-  it('migrates an old startup-only entry to the startup|resume matcher without duplicating it', () => {
+  it('removes an old entry (any matcher or path form) when the plugin can deliver, keeping operator hooks', () => {
+    setupDeliveringPlugin(tmpRoot);
     mkdirSync(join(tmpRoot, '.claude'), { recursive: true });
     writeFileSync(settingsPath, JSON.stringify({
       hooks: {
         SessionStart: [
           { matcher: 'startup', hooks: [{ type: 'command', command: MACF_STARTUP_PICKUP_HOOK_COMMAND }] },
+          { hooks: [{ type: 'command', command: '.claude/scripts/macf-startup-pickup.sh' }] },
+          { hooks: [{ type: 'command', command: './user-session-hook.sh' }] },
         ],
       },
     }, null, 2));
@@ -975,11 +864,7 @@ describe('installStartupPickupHook (DR-026 / macf#768)', () => {
     installStartupPickupHook(tmpRoot);
 
     const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
-    const entries = s.hooks.SessionStart.filter((e: { hooks: { command: string }[] }) =>
-      e.hooks.some((h) => h.command === MACF_STARTUP_PICKUP_HOOK_COMMAND),
-    );
-    expect(entries).toHaveLength(1);
-    expect(entries[0].matcher).toBe('startup|resume');
+    expect(allHookCommands(s)).toEqual(['./user-session-hook.sh']);
   });
 
   it('preserves unrelated top-level settings keys', () => {
@@ -1122,12 +1007,38 @@ describe('plugin hooks.json single-source (DR-039 Decision 2)', () => {
     expect(entry?.matcher).toBeUndefined();
   });
 
-  it('does NOT register check-channels-enabled.sh, check-auditor-never-acts.sh, or emit-turn-receipt.sh (those stay hand-wired in settings.json)', () => {
+  // groundnuty/macf#1525: the four formerly hand-wired hooks now live here,
+  // with the event, matcher, timeout and async flag they had in settings.json.
+  it('registers the four formerly hand-wired hooks with their original event, matcher and timeout (groundnuty/macf#1525)', () => {
     const parsed = readPluginHooksJson();
-    const allCommands = Object.values(parsed.hooks).flatMap((entries) => commandsFor(entries));
-    expect(allCommands.some((c) => c.includes('check-channels-enabled.sh'))).toBe(false);
-    expect(allCommands.some((c) => c.includes('check-auditor-never-acts.sh'))).toBe(false);
-    expect(allCommands.some((c) => c.includes('emit-turn-receipt.sh'))).toBe(false);
+    type Hook = { command?: string; timeout?: number; async?: boolean };
+    const find = (event: string, name: string) => {
+      const entries = (parsed.hooks[event] ?? []) as ReadonlyArray<{ matcher?: string; hooks: Hook[] }>;
+      return entries.find((e) => e.hooks.some((h) => h.command === pluginRootHookCommand(name)));
+    };
+
+    const channels = find('SessionStart', 'check-channels-enabled.sh');
+    expect(channels, 'check-channels-enabled.sh on SessionStart').toBeDefined();
+    expect(channels?.matcher).toBeUndefined();
+
+    const pickup = find('SessionStart', 'macf-startup-pickup.sh');
+    expect(pickup?.matcher).toBe('startup|resume');
+    expect((pickup?.hooks[0] as Hook).timeout).toBe(MACF_STARTUP_PICKUP_HOOK_TIMEOUT_SECONDS);
+
+    const receipt = find('UserPromptSubmit', 'emit-turn-receipt.sh');
+    expect(receipt?.matcher).toBeUndefined();
+    expect((receipt?.hooks[0] as Hook).async).toBe(true);
+
+    const auditor = find('PreToolUse', 'check-auditor-never-acts.sh');
+    expect(auditor?.matcher).toBe('Bash');
+  });
+
+  it('registers check-managed-drift.sh on SessionStart startup|resume (groundnuty/macf#1525)', () => {
+    const parsed = readPluginHooksJson();
+    const entry = (parsed.hooks['SessionStart'] ?? []).find((e) =>
+      e.hooks.some((h) => h.command === pluginRootHookCommand('check-managed-drift.sh')),
+    );
+    expect(entry?.matcher).toBe('startup|resume');
   });
 
   it('the pre-existing mark-turn-state.sh entries are untouched (still plugin-root-relative)', () => {

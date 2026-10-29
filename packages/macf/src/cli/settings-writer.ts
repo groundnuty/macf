@@ -300,6 +300,7 @@ const MACF_HOOK_FILENAMES: readonly string[] = [
   'harvest-reflection.sh',
   'check-channels-enabled.sh',
   'check-channel-alive.sh',
+  'macf-startup-pickup.sh',
 ];
 
 /**
@@ -322,6 +323,12 @@ const MIGRATED_HOOK_FILENAMES: readonly string[] = [
   'check-gh-attribution.sh',
   'harvest-reflection.sh',
   'check-channel-alive.sh',
+  // groundnuty/macf#1525: these four were hand-wired into settings.json and
+  // were lost when a template rewrote that file; they now ship in the plugin.
+  'check-auditor-never-acts.sh',
+  'emit-turn-receipt.sh',
+  'check-channels-enabled.sh',
+  'macf-startup-pickup.sh',
 ];
 
 /**
@@ -1520,12 +1527,9 @@ export function applyGhTokenHookTransform(settings: Settings, delivery: PluginDe
   const preserved = preToolUse.filter(
     (entry) => !entry.hooks.some((h) => shouldStrip(h.command)),
   );
-  const macfEntries: readonly HookEntry[] = [
-    {
-      matcher: 'Bash',
-      hooks: [{ type: 'command', command: MACF_AUDITOR_HOOK_COMMAND }],
-    },
-  ];
+  // groundnuty/macf#1525: no hook is hand-wired any more; the plugin's
+  // hooks.json carries them all. Old copies are stripped above.
+  const macfEntries: readonly HookEntry[] = [];
 
   // PostToolUse: check-gh-attribution.sh moved to the plugin (DR-039 Decision
   // 2) — no MACF-managed PostToolUse hook remains hand-wired here. The
@@ -1545,11 +1549,7 @@ export function applyGhTokenHookTransform(settings: Settings, delivery: PluginDe
   const preservedUps = userPromptSubmit.filter(
     (entry) => !entry.hooks.some((h) => shouldStrip(h.command)),
   );
-  const macfUpsEntries: readonly HookEntry[] = [
-    {
-      hooks: [{ type: 'command', command: MACF_TURN_RECEIPT_HOOK_COMMAND, async: true }],
-    },
-  ];
+  const macfUpsEntries: readonly HookEntry[] = [];
 
   // PreCompact: harvest-reflection.sh moved to the plugin (DR-039 Decision 2)
   // — no MACF-managed PreCompact hook remains hand-wired here (the plugin's
@@ -1576,11 +1576,7 @@ export function applyGhTokenHookTransform(settings: Settings, delivery: PluginDe
   const preservedSession = sessionStart.filter(
     (entry) => !entry.hooks.some((h) => shouldStrip(h.command)),
   );
-  const macfSessionEntries: readonly HookEntry[] = [
-    {
-      hooks: [{ type: 'command', command: MACF_CHANNELS_HOOK_COMMAND }],
-    },
-  ];
+  const macfSessionEntries: readonly HookEntry[] = [];
 
   return {
     ...settings,
@@ -1730,29 +1726,22 @@ function isStartupPickupHookCommand(command: string): boolean {
  * test can actually drive. See `MACF_STARTUP_PICKUP_HOOK_COMMAND`'s doc
  * comment for why the matcher alone isn't sufficient.
  */
-export function applyStartupPickupHookTransform(settings: Settings): Settings {
+export function applyStartupPickupHookTransform(settings: Settings, delivery: PluginDeliveryCheck): Settings {
+  // groundnuty/macf#1525: the pickup hook ships in the plugin's hooks.json.
+  // This only removes an old hand-wired copy, and only when the loaded plugin
+  // can deliver it, so no workspace is left without the hook.
+  if (!delivery.canDeliver) return settings;
   const hooks = settings.hooks ?? {};
-  const sessionStart = hooks.SessionStart ?? [];
+  const sessionStart = hooks.SessionStart;
+  if (sessionStart === undefined) return settings;
   const preserved = sessionStart.filter(
     (entry) => !entry.hooks.some((h) => isStartupPickupHookCommand(h.command)),
   );
-  const macfEntries: readonly HookEntry[] = [
-    {
-      matcher: MACF_STARTUP_PICKUP_HOOK_MATCHER,
-      hooks: [
-        {
-          type: 'command',
-          command: MACF_STARTUP_PICKUP_HOOK_COMMAND,
-          timeout: MACF_STARTUP_PICKUP_HOOK_TIMEOUT_SECONDS,
-        },
-      ],
-    },
-  ];
   return {
     ...settings,
     hooks: {
       ...hooks,
-      SessionStart: [...preserved, ...macfEntries],
+      SessionStart: preserved,
     },
   };
 }
@@ -1772,6 +1761,6 @@ export function installStartupPickupHook(workspaceDir: string): void {
   mkdirSync(claudeDir, { recursive: true });
 
   const settings = readSettings(path);
-  const updated = applyStartupPickupHookTransform(settings);
+  const updated = applyStartupPickupHookTransform(settings, canPluginDeliverMigratedHooks(workspaceDir));
   writeFileSync(path, JSON.stringify(updated, null, 2) + '\n');
 }

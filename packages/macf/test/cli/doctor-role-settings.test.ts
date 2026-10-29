@@ -49,6 +49,32 @@ function installFullFloor(dir: string): void {
   installSandboxExcludedCommands(dir);
 }
 
+/**
+ * Make the loaded plugin deliver the auditor never-acts hook, as the real
+ * plugin's hooks.json does since groundnuty/macf#1525.
+ */
+function installAuditorPlugin(dir: string): void {
+  writeFileSync(
+    join(dir, 'claude.sh'),
+    '#!/bin/bash\nSCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"\nexec claude --plugin-dir "$SCRIPT_DIR/.macf/plugin" "$@"\n',
+  );
+  const hooksDir = join(dir, '.macf', 'plugin', 'hooks');
+  mkdirSync(hooksDir, { recursive: true });
+  writeFileSync(
+    join(hooksDir, 'hooks.json'),
+    JSON.stringify({
+      hooks: {
+        PreToolUse: [
+          {
+            matcher: 'Bash',
+            hooks: [{ type: 'command', command: '"${CLAUDE_PLUGIN_ROOT}/scripts/check-auditor-never-acts.sh"' }],
+          },
+        ],
+      },
+    }),
+  );
+}
+
 /** Strip the auditor never-acts hook entry from a workspace's settings.json. */
 function stripAuditorHook(dir: string): void {
   const path = join(dir, '.claude', 'settings.json');
@@ -101,8 +127,9 @@ describe('checkRoleSettings (DR-028)', () => {
     expect(checkRoleSettings(tmpRoot, 'auditor').roleKnown).toBe(true);
   });
 
-  it('PASS for the auditor role when the full floor (incl. never-acts hook) is installed', () => {
+  it('PASS for the auditor role when the full floor is installed and the plugin delivers the never-acts hook', () => {
     installFullFloor(tmpRoot);
+    installAuditorPlugin(tmpRoot);
     const result = checkRoleSettings(tmpRoot, 'auditor');
     expect(result.status).toBe('PASS');
     expect(result.findings).toHaveLength(0);
@@ -227,7 +254,8 @@ describe('runDoctor --fix (DR-028)', () => {
 
   it('writes the floor and the re-check passes (auditor, exit 0)', async () => {
     writeAgentConfig(tmpRoot, localConfig('auditor'));
-    // No settings.json yet → floor is entirely missing → auditor ERROR.
+    installAuditorPlugin(tmpRoot);
+    // No settings.json yet → floor is entirely missing.
     const code = await runDoctor(tmpRoot, { fix: true, yes: true });
     expect(code).toBe(0);
 
@@ -238,9 +266,8 @@ describe('runDoctor --fix (DR-028)', () => {
     expect(settings.permissions.allow).toContain('Bash(*)');
     expect(settings.permissions.allow).toContain('Write');
     expect(settings.permissions.deny).toContain('Bash(sudo *)');
-    const commands = (settings.hooks.PreToolUse as { hooks: { command: string }[] }[])
-      .flatMap((e) => e.hooks.map((h) => h.command));
-    expect(commands).toContain(MACF_AUDITOR_HOOK_COMMAND);
+    // The never-acts hook comes from the plugin, not from settings.json.
+    expect(JSON.stringify(settings.hooks ?? {})).not.toContain('check-auditor-never-acts.sh');
 
     // And a fresh check confirms PASS.
     expect(checkRoleSettings(tmpRoot, 'auditor').status).toBe('PASS');
