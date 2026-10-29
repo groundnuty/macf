@@ -277,6 +277,9 @@ export const MacfAgentConfigSchema = z.object({
     // from agent_name. Populated by macf init/doctor (DR-028); optional so
     // pre-existing configs + local-mode stay valid.
     bot_login: z.string().optional(),
+    // The bot account's numeric GitHub user id (GET /users/<bot_login>). Builds
+    // the noreply commit email so commits link to the bot (macf#1525).
+    bot_user_id: z.string().optional(),
   }).optional(),
   // Host the agent advertises in its registry entry (written by the
   // channel server on bind). When unset, claude.sh falls back to

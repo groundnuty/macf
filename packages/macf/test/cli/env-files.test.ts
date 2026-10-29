@@ -216,7 +216,7 @@ describe('generateEnvGitHub', () => {
 
   it('exports GIT_AUTHOR_NAME + GIT_COMMITTER_NAME with [bot] suffix', () => {
     const out = generateEnvGitHub(baseConfig);
-    expect(out).toContain('export GIT_AUTHOR_NAME="code-agent[bot]"');
+    expect(out).toContain('export GIT_AUTHOR_NAME="code-agent[bot]"'); // fallback: no bot_login
     expect(out).toContain('export GIT_COMMITTER_NAME="code-agent[bot]"');
   });
 

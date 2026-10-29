@@ -51,6 +51,7 @@ import { recordManagedHashes, copiedAssetPaths, macfDirPaths, SETTINGS_REL } fro
 import { createInterface } from 'node:readline';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { withBotUserId } from '../git-identity.js';
 import { readAgentConfig, writeAgentConfig, tokenSourceFromConfig, resolveCanonicalBranch } from '../config.js';
 import { resolveLatestVersions } from '../version-resolver.js';
 import { findCliPackageRoot } from '../rules.js';
@@ -303,7 +304,7 @@ export async function update(
   projectDir: string,
   opts: UpdateOptions,
 ): Promise<number> {
-  const config = readAgentConfig(projectDir);
+  let config = readAgentConfig(projectDir);
   if (!config) {
     console.error('No macf-agent.json found. Run `macf init` first.');
     return 1;
@@ -544,6 +545,9 @@ export async function update(
     // / env.github / env.certs / env.registry) overwrite + warn-on-
     // handedit; operator-managed files (env.telemetry, env.tmux)
     // bootstrap-write if absent + preserve unconditionally otherwise.
+    const withId = await withBotUserId(config);
+    if (withId !== config) writeAgentConfig(projectDir, withId);
+    config = withId;
     const refresh = refreshEnvFiles(projectDir, config);
     const summary =
       `Env: refreshed ${refresh.refreshed.length} macf-managed file(s); ` +

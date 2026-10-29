@@ -20,6 +20,7 @@ import { tmpdir } from 'node:os';
 import { createInterface } from 'node:readline';
 import { join, resolve } from 'node:path';
 import { fromVariableSegment, proxyAwareFetch } from '@groundnuty/macf-core';
+import { checkGitIdentityConfig, defaultGitConfigReader } from '../git-identity.js';
 import { missingMacfGitignoreEntries, updateGitignore } from './init.js';
 import { readAgentConfig, resolveCanonicalBranch, tokenSourceFromConfig, writeAgentConfig } from '../config.js';
 import type { MacfAgentConfig } from '../config.js';
@@ -2942,6 +2943,9 @@ export async function runDoctor(projectDir: string, opts?: RunDoctorOptions): Pr
   console.log('──────────────────────────────────────────────────────────────');
   let botLoginCheck = checkBotLogin(config);
   printBotLoginSection(botLoginCheck);
+  for (const w of checkGitIdentityConfig(defaultGitConfigReader(projectDir))) {
+    console.log(`  WARN  ${w}`);
+  }
 
   console.log('');
   console.log('Load-bearing hooks');
