@@ -4,6 +4,19 @@ All notable changes to the `macf` CLI. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.79] — 2026-10-29
+
+Two follow-ups to 0.2.78, both found by testing it live on the trial fleet (#1525).
+
+### Fixed
+
+- **Agent-team teammates keep their App credentials and `MACF_*` after an automatic restart** (#1537).
+  - **The gap:** 0.2.78 passed them into the agent's tmux session only when `claude.sh`'s own wrap created it. The restart-self relauncher (used by `fleet upgrade` and the watchdog) creates the session itself, so after any automatic restart, teammates again had no credentials.
+  - **The fix:** `claude.sh` now sets them on its own session whenever it runs inside tmux. It never sets `GH_TOKEN`.
+- **A one-step upgrade no longer registers the four migrated hooks twice** (#1538).
+  - **The problem:** upgrading from 0.2.77 with a single `macf update` left `check-channels-enabled`, `macf-startup-pickup`, `emit-turn-receipt` and `check-auditor-never-acts` registered in both the new plugin and `.claude/settings.json`, so each fired twice. The cause was that `update` refreshed the hook entries before fetching the new plugin.
+  - **The fix:** it refreshes them again after a successful fetch. A workspace already on 0.2.78 is cleaned up by one more `macf update`.
+
 ## [0.2.78] — 2026-10-29
 
 Fixes from the post-run review of the first walkthrough fleet (#1525). The fleet ran 12 days on 0.2.75; these are the defects it surfaced.
