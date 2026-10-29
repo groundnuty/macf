@@ -5,7 +5,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import type { ExecResult, PreflightDeps } from '../../src/cli/bootstrap/preflight.js';
 import { runLocalPreflight } from '../../src/cli/bootstrap/preflight.js';
-import { vmChecks, classifySshFailure } from '../../src/cli/bootstrap/preflight-vm.js';
+import { agentHostChecks, classifySshFailure } from '../../src/cli/bootstrap/preflight-agent-host.js';
 import { runBootstrapPreflight, buildReport, formatPreflightText, preflightToJson } from '../../src/cli/commands/bootstrap-preflight.js';
 
 const FAKE_SECRET = 'tskey-client-SUPERSECRETVALUE123';
@@ -37,6 +37,7 @@ ${opts.versions === false ? '' : `versions:\n  macf: ${opts.macf ?? '0.2.79'}\n 
 }
 
 const GH_OK = 'HTTP/2.0 200 OK\nX-Oauth-Scopes: admin:org, repo, workflow\n\n{"login":"someone"}';
+const PROBE_OK = 'node|login|v22.14.0\nclaude|login|2.1.300\ntmux|login|tmux 3.4\ncrontab|login|empty\ngh|login|gh version 2.60\nmacf|login|0.2.79\n';
 const ok = (stdout = ''): ExecResult => ({ code: 0, stdout, stderr: '' });
 const noSuchProgram: ExecResult = { code: null, stdout: '', stderr: 'ENOENT', spawnFailed: true };
 
@@ -46,6 +47,7 @@ interface Setup {
   env?: Record<string, string>;
   exec?: (cmd: string, args: readonly string[], input?: string) => ExecResult | undefined;
   fetch?: (url: string) => boolean;
+  platform?: string;
 }
 
 function makeDeps(s: Setup = {}): { deps: PreflightDeps; execCalls: string[]; fetchCalls: string[] } {
@@ -56,6 +58,7 @@ function makeDeps(s: Setup = {}): { deps: PreflightDeps; execCalls: string[]; fe
       execCalls.push([cmd, ...args].join(' '));
       const custom = s.exec?.(cmd, args, opts?.input);
       if (custom !== undefined) return custom;
+      if (cmd === 'sh') return args[0] === '-s' ? ok(PROBE_OK) : ok('/usr/bin/xdg-open');
       if (cmd === 'macf') return ok('0.2.79\n');
       if (cmd === 'gh') return args[1]?.includes('vault.age') ? { code: 1, stdout: '', stderr: 'gh: Not Found (HTTP 404)' } : ok(GH_OK);
       if (cmd === 'age') return ok('v1.2.0\n');
@@ -69,7 +72,8 @@ function makeDeps(s: Setup = {}): { deps: PreflightDeps; execCalls: string[]; fe
     },
     readText: (p) => s.files?.[p],
     fileMode: (p) => (s.files?.[p] !== undefined ? { exists: true, mode: s.modes?.[p] ?? 0o600 } : { exists: false }),
-    env: s.env ?? {},
+    env: { DISPLAY: ':0', ...(s.env ?? {}) },
+    platform: s.platform ?? 'linux',
     nodeVersion: '22.14.0',
     cliVersion: '0.2.79',
   };
@@ -279,20 +283,20 @@ describe('identity key', () => {
   });
 });
 
-describe('VM', () => {
-  const PROBE_OK = 'node|login|v22.14.0\nclaude|login|2.1.300\ntmux|login|tmux 3.4\ngh|login|gh version 2.60\nmacf|login|0.2.79\n';
+describe('agent host over ssh', () => {
   const vmDeps = (probe: ExecResult, ping: ExecResult = ok()): PreflightDeps =>
     makeDeps({ exec: (c, a, input) => (c === 'ssh' ? (a.includes('true') ? ping : input !== undefined ? probe : undefined) : undefined) }).deps;
 
   it('reports every tool on the VM when ready', async () => {
-    const checks = await vmChecks(vmDeps(ok(PROBE_OK)), 'ubuntu@vm');
-    expect(checks.map((c) => c.status)).toEqual(['ok', 'ok', 'ok', 'ok', 'ok', 'ok']);
-    expect(checks.find((c) => c.id === 'vm-macf')?.detail).toContain('0.2.79');
+    const checks = await agentHostChecks(vmDeps(ok(PROBE_OK)), 'ubuntu@vm');
+    expect(checks.map((c) => c.status)).toEqual(['ok', 'ok', 'ok', 'ok', 'ok', 'ok', 'ok', 'ok']);
+    expect(checks[0]?.detail).toBe('agents run on ubuntu@vm');
+    expect(checks.find((c) => c.id === 'agent-host-macf')?.detail).toContain('0.2.79');
   });
 
   it('uses BatchMode and a 10 s connect timeout, and sends the probe on stdin', async () => {
     const { deps, execCalls } = makeDeps({ exec: (c, a) => (c === 'ssh' ? (a.includes('true') ? ok() : ok(PROBE_OK)) : undefined) });
-    await vmChecks(deps, 'ubuntu@vm');
+    await agentHostChecks(deps, 'ubuntu@vm');
     expect(execCalls[0]).toBe('ssh -o BatchMode=yes -o ConnectTimeout=10 ubuntu@vm true');
     expect(execCalls[1]).toContain('ubuntu@vm sh -s');
   });
@@ -302,25 +306,97 @@ describe('VM', () => {
     ['ubuntu@vm: Permission denied (publickey).', 'permission denied'],
     ['ssh: Could not resolve hostname vm: Name or service not known', 'no route'],
   ])('classifies the ssh failure %s', async (stderr, expected) => {
-    const checks = await vmChecks(vmDeps(ok(), { code: 255, stdout: '', stderr }), 'ubuntu@vm');
-    expect(checks).toHaveLength(1);
-    expect(checks[0]?.status).toBe('wrong');
-    expect(checks[0]?.detail).toContain(expected);
+    const checks = await agentHostChecks(vmDeps(ok(), { code: 255, stdout: '', stderr }), 'ubuntu@vm');
+    expect(checks).toHaveLength(2);
+    expect(checks[1]?.status).toBe('wrong');
+    expect(checks[1]?.detail).toContain(expected);
     expect(classifySshFailure(stderr)).not.toBe('other');
   });
 
   it('flags macf missing from the non-interactive PATH, and macf only in an interactive shell', async () => {
-    const probe = 'node|login|v22\nclaude|login|2\ntmux|login|3\ngh|login|2\nmacf|interactive|\n';
-    const checks = await vmChecks(vmDeps(ok(probe)), 'ubuntu@vm');
-    const macf = checks.find((c) => c.id === 'vm-macf');
+    const probe = 'node|login|v22\nclaude|login|2\ntmux|login|3\ncrontab|login|empty\ngh|login|2\nmacf|interactive|\n';
+    const checks = await agentHostChecks(vmDeps(ok(probe)), 'ubuntu@vm');
+    const macf = checks.find((c) => c.id === 'agent-host-macf');
     expect(macf?.status).toBe('wrong');
     expect(macf?.detail).toContain('interactive shell');
-    const gone = await vmChecks(vmDeps(ok(probe.replace('macf|interactive|', 'macf|none|'))), 'ubuntu@vm');
-    expect(gone.find((c) => c.id === 'vm-macf')?.status).toBe('missing');
+    const gone = await agentHostChecks(vmDeps(ok(probe.replace('macf|interactive|', 'macf|none|'))), 'ubuntu@vm');
+    expect(gone.find((c) => c.id === 'agent-host-macf')?.status).toBe('missing');
   });
 
-  it('checks nothing without --vm', async () => {
-    expect(await vmChecks(makeDeps().deps, undefined)).toEqual([]);
+  it('reads crontab states: empty is fine, an error is wrong, absent is missing', async () => {
+    const base = 'node|login|v22\nclaude|login|2\ntmux|login|3\ngh|login|2\nmacf|login|0.2.79\n';
+    const cron = async (line: string) => (await agentHostChecks(vmDeps(ok(base + line)), 'ubuntu@vm')).find((c) => c.id === 'agent-host-crontab');
+    expect((await cron('crontab|login|empty\n'))?.status).toBe('ok');
+    expect((await cron('crontab|login|present\n'))?.status).toBe('ok');
+    expect((await cron('crontab|login|error: Operation not permitted\n'))?.status).toBe('wrong');
+    expect((await cron('crontab|none|\n'))?.status).toBe('missing');
+  });
+});
+
+describe('agent host on this machine', () => {
+  it('says agents run on this machine, runs the probe locally and never calls ssh', async () => {
+    const { deps, execCalls } = makeDeps();
+    const checks = await agentHostChecks(deps, undefined);
+    expect(checks[0]).toMatchObject({ id: 'agent-host', status: 'ok', detail: 'agents run on this machine' });
+    expect(checks.slice(1).every((c) => c.status === 'ok')).toBe(true);
+    expect(execCalls.some((c) => c.startsWith('ssh'))).toBe(false);
+    expect(execCalls).toContain('sh -s');
+  });
+
+  it('flags a tool that is missing from the local non-interactive PATH', async () => {
+    const probe = PROBE_OK.replace('tmux|login|tmux 3.4', 'tmux|none|');
+    const checks = await agentHostChecks(makeDeps({ exec: (c, a) => (c === 'sh' && a[0] === '-s' ? ok(probe) : undefined) }).deps, undefined);
+    expect(checks.find((c) => c.id === 'agent-host-tmux')?.status).toBe('missing');
+  });
+});
+
+describe('browser (apply host only)', () => {
+  it('macOS: ok when open exists, missing when it does not', async () => {
+    const mac = await byId(makeDeps({ files: baseFiles(), platform: 'darwin', env: {} }).deps);
+    expect(mac['browser']?.status).toBe('ok');
+    const noOpen = makeDeps({ files: baseFiles(), platform: 'darwin', exec: (c, a) => (c === 'sh' && a[0] === '-c' ? { code: 1, stdout: '', stderr: '' } : undefined) });
+    expect((await byId(noOpen.deps))['browser']?.status).toBe('missing');
+    expect(noOpen.execCalls).toContain('sh -c command -v open');
+  });
+
+  it('Linux: needs xdg-open and a display; Wayland counts', async () => {
+    const files = baseFiles();
+    expect((await byId(makeDeps({ files }).deps))['browser']?.status).toBe('ok');
+    const headless = makeDeps({ files });
+    const noDisplay = { ...headless.deps, env: {} };
+    expect((await byId(noDisplay))['browser']?.status).toBe('wrong');
+    expect((await byId({ ...headless.deps, env: { WAYLAND_DISPLAY: 'wayland-0' } }))['browser']?.status).toBe('ok');
+    const noOpener = makeDeps({ files, exec: (c, a) => (c === 'sh' && a[0] === '-c' ? { code: 1, stdout: '', stderr: '' } : undefined) });
+    expect((await byId(noOpener.deps))['browser']?.fix).toContain('xdg-utils');
+  });
+
+  it('is unknown, not wrong, on a platform it cannot judge', async () => {
+    expect((await byId(makeDeps({ files: baseFiles(), platform: 'win32' }).deps))['browser']?.status).toBe('unknown');
+  });
+});
+
+describe('platform differences', () => {
+  it('macOS: falls back to the Tailscale app CLI when tailscale is not on PATH', async () => {
+    const app = '/Applications/Tailscale.app/Contents/MacOS/Tailscale';
+    const { deps, execCalls } = makeDeps({
+      files: baseFiles(), platform: 'darwin',
+      exec: (c) => (c === 'tailscale' ? noSuchProgram : c === app ? ok('{"BackendState":"Running","Peer":{}}') : undefined),
+    });
+    expect((await byId(deps))['tailscale']?.status).toBe('ok');
+    expect(execCalls).toContain(`${app} status --json`);
+  });
+
+  it('Linux: does not try the macOS app path', async () => {
+    const { deps, execCalls } = makeDeps({ files: baseFiles(), exec: (c) => (c === 'tailscale' ? noSuchProgram : undefined) });
+    expect((await byId(deps))['tailscale']?.status).toBe('unknown');
+    expect(execCalls.some((c) => c.includes('Tailscale.app'))).toBe(false);
+  });
+
+  it('secrets mode comes from the permission bits on both platforms (same 0o077 rule)', async () => {
+    for (const platform of ['darwin', 'linux']) {
+      const bad = await byId(makeDeps({ files: baseFiles(), platform, modes: { [SECRETS_PATH]: 0o640 } }).deps);
+      expect(bad['secrets-file']?.status, platform).toBe('wrong');
+    }
   });
 });
 
@@ -352,6 +428,7 @@ describe('command: exit code and --json', () => {
     expect(json['schema_version']).toBe(1);
     expect(json['ready']).toBe(false);
     expect(json['to_fix']).toBe(1);
+    expect(json['agent_host']).toBe('this machine');
     expect(json.checks.find((c) => c.id === 'secrets-file')).toMatchObject({ status: 'wrong', fix: expect.stringContaining('chmod 600') });
   });
 });

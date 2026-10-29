@@ -21,7 +21,7 @@ export type PreflightStatus = 'ok' | 'missing' | 'wrong' | 'unknown';
 
 export interface PreflightCheck {
   readonly id: string;
-  readonly group: 'tools' | 'manifest' | 'secrets' | 'endpoint' | 'identity' | 'vm';
+  readonly group: 'tools' | 'manifest' | 'secrets' | 'endpoint' | 'identity' | 'browser' | 'agent-host';
   readonly status: PreflightStatus;
   readonly detail: string;
   readonly fix?: string;
@@ -48,6 +48,8 @@ export interface PreflightDeps {
   /** `mode` is the permission bits only (`& 0o777`). */
   readonly fileMode: (path: string) => { readonly exists: boolean; readonly mode?: number };
   readonly env: Readonly<Record<string, string | undefined>>;
+  /** `process.platform`: 'darwin', 'linux', ... */
+  readonly platform: string;
   readonly nodeVersion: string;
   readonly cliVersion: string;
 }
@@ -56,7 +58,7 @@ export interface PreflightOptions {
   readonly file: string;
   readonly secretsPath?: string;
   readonly identityKeyPath?: string;
-  readonly vm?: string;
+  readonly agentHost?: string;
 }
 
 const MIN_NODE = '22.12.0';
@@ -144,8 +146,17 @@ async function ageCheck(deps: PreflightDeps): Promise<PreflightCheck> {
   return check('age', 'tools', 'ok', `age ${firstSemver(r.stdout) ?? 'present'}`);
 }
 
+const MAC_TAILSCALE_APP = '/Applications/Tailscale.app/Contents/MacOS/Tailscale';
+
+/** `tailscale`, or on macOS the app's own CLI when the command is not on PATH. */
+async function tailscaleExec(deps: PreflightDeps, args: readonly string[]): Promise<ExecResult> {
+  const r = await deps.exec('tailscale', args, { timeoutMs: 10000 });
+  if (r.spawnFailed === true && deps.platform === 'darwin') return deps.exec(MAC_TAILSCALE_APP, args, { timeoutMs: 10000 });
+  return r;
+}
+
 async function tailscaleStatusJson(deps: PreflightDeps): Promise<{ readonly spawnFailed: boolean; readonly json?: Record<string, unknown> }> {
-  const r = await deps.exec('tailscale', ['status', '--json'], { timeoutMs: 10000 });
+  const r = await tailscaleExec(deps, ['status', '--json']);
   if (r.spawnFailed === true) return { spawnFailed: true };
   try {
     return { spawnFailed: false, json: JSON.parse(r.stdout) as Record<string, unknown> };
@@ -161,6 +172,25 @@ async function tailscaleCheck(deps: PreflightDeps): Promise<PreflightCheck> {
   const state = s.json['BackendState'];
   if (state !== 'Running') return check('tailscale', 'tools', 'wrong', `tailscale is ${String(state)}, not Running`, 'tailscale up');
   return check('tailscale', 'tools', 'ok', 'tailscale is Running');
+}
+
+// --- 1b. A browser for the consent pages (apply host only) ---
+
+/** `apply` opens pages with `open` (macOS) or `xdg-open` (Linux); see `realOpenUrl` in bootstrap-apply.ts. */
+export async function browserCheck(deps: PreflightDeps): Promise<PreflightCheck> {
+  const id = 'browser';
+  if (deps.platform !== 'darwin' && deps.platform !== 'linux') {
+    return check(id, 'browser', 'unknown', `cannot tell whether a browser can be opened on ${deps.platform}`);
+  }
+  const opener = deps.platform === 'darwin' ? 'open' : 'xdg-open';
+  const found = await deps.exec('sh', ['-c', `command -v ${opener}`], { timeoutMs: 5000 });
+  if (found.code !== 0) {
+    return check(id, 'browser', 'missing', `${opener} is not on PATH, so apply cannot open the consent pages`, deps.platform === 'linux' ? 'install xdg-utils, or run apply on a machine with a browser' : 'run apply on a machine with a browser');
+  }
+  if (deps.platform === 'linux' && !deps.env['DISPLAY'] && !deps.env['WAYLAND_DISPLAY']) {
+    return check(id, 'browser', 'wrong', `${opener} exists but neither DISPLAY nor WAYLAND_DISPLAY is set, so no browser can open here`, 'run apply from a desktop session on the machine whose browser is logged in to GitHub');
+  }
+  return check(id, 'browser', 'ok', deps.platform === 'darwin' ? 'open is available' : 'xdg-open is available and a display is set');
 }
 
 // --- 2. The manifest ---
@@ -271,7 +301,7 @@ function endpointValue(values: Readonly<Record<string, string>> | undefined, env
 }
 
 async function resolveTailnetIp(deps: PreflightDeps, host: string): Promise<string | undefined> {
-  const viaIp = await deps.exec('tailscale', ['ip', '-4', host], { timeoutMs: 10000 });
+  const viaIp = await tailscaleExec(deps, ['ip', '-4', host]);
   const direct = viaIp.spawnFailed === true || viaIp.code !== 0 ? undefined : /(\d+\.\d+\.\d+\.\d+)/.exec(viaIp.stdout)?.[1];
   if (direct !== undefined) return direct;
   const s = await tailscaleStatusJson(deps);
@@ -338,18 +368,19 @@ export async function identityChecks(deps: PreflightDeps, manifest: FleetManifes
   return [check('identity-key', 'identity', 'ok', `identity key readable; recipient ${recipient} is in transport.age_recipients`)];
 }
 
-// --- Assembly of checks 1-5 (the VM is in preflight-vm.ts) ---
+// --- Assembly of checks 1-5 (the agent host is in preflight-agent-host.ts) ---
 
 export async function runLocalPreflight(deps: PreflightDeps, opts: PreflightOptions): Promise<readonly PreflightCheck[]> {
   const load = loadManifestChecks(deps, opts.file);
   const secrets = secretsChecks(deps, load.manifest, opts.secretsPath);
-  const [macf, gh, age, tailscale, endpoint, identity] = await Promise.all([
+  const [macf, gh, age, tailscale, browser, endpoint, identity] = await Promise.all([
     macfOnPathCheck(deps),
     ghCheck(deps, load.manifest),
     ageCheck(deps),
     tailscaleCheck(deps),
+    browserCheck(deps),
     endpointCheck(deps, secrets.values),
     identityChecks(deps, load.manifest, opts.identityKeyPath),
   ]);
-  return [nodeCheck(deps), macf, gh, age, tailscale, ...load.checks, ...secrets.checks, ...endpoint, ...identity];
+  return [nodeCheck(deps), macf, gh, age, tailscale, browser, ...load.checks, ...secrets.checks, ...endpoint, ...identity];
 }

@@ -801,12 +801,12 @@ bootstrap
     'READ-ONLY: check this machine is ready for `bootstrap apply` and say exactly what is missing: tools ' +
     '(node, macf, gh login and scopes, age, tailscale), the manifest, the secrets file (mode 600, required keys, ' +
     'values never printed), the runner platform endpoint (by name, then by tailnet IP), the age identity key, and ' +
-    'with --vm the ssh login and the VM tools on a non-interactive PATH. Exit 0 when ready, 1 otherwise.',
+    'a browser for the consent pages, then the agent host (this machine, or --agent-host <ssh-target>): tools on a non-interactive PATH. Exit 0 when ready, 1 otherwise.',
   )
   .requiredOption('-f, --file <path>', 'Path to the fleet.yaml manifest')
   .option('--secrets <path>', 'Operator secrets file (plain KEY=value) to check')
   .option('--identity-key <path>', 'age identity file; shows its recipient and whether the manifest lists it')
-  .option('--vm <ssh-target>', 'ssh target of the VM that runs the agents, e.g. ubuntu@host')
+  .option('--agent-host <ssh-target>', 'ssh target of the machine that runs the agents, e.g. ubuntu@host. Omit when the agents run on this machine')
   .option('--json', 'Emit the checks as JSON (with schema_version)', false)
   .action(async (opts) => {
     process.exitCode = await runBootstrapPreflight({
@@ -814,7 +814,7 @@ bootstrap
       json: opts.json,
       secretsPath: opts.secrets,
       identityKeyPath: opts.identityKey,
-      vm: opts.vm,
+      agentHost: opts.agentHost,
     });
   });
 

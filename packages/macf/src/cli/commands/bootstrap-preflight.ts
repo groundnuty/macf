@@ -1,6 +1,6 @@
 /**
  * `macf bootstrap preflight` CLI entry point: one report on whether this
- * machine (and, with `--vm`, the VM) is ready for `bootstrap apply`.
+ * machine (and the agent host) is ready for `bootstrap apply`.
  * READ-ONLY: nothing is written, no token is kept, nothing on GitHub changes.
  */
 import { spawn } from 'node:child_process';
@@ -9,7 +9,7 @@ import { resolve as resolvePath } from 'node:path';
 import { packageVersionDisplay } from '../../package-version.js';
 import type { ExecResult, FetchResult, PreflightCheck, PreflightDeps, PreflightOptions } from '../bootstrap/preflight.js';
 import { PREFLIGHT_JSON_SCHEMA_VERSION, runLocalPreflight } from '../bootstrap/preflight.js';
-import { vmChecks } from '../bootstrap/preflight-vm.js';
+import { agentHostChecks } from '../bootstrap/preflight-agent-host.js';
 
 export interface RunBootstrapPreflightOptions extends PreflightOptions {
   readonly json?: boolean;
@@ -42,6 +42,7 @@ export function preflightToJson(report: PreflightReport): Record<string, unknown
     ready: report.ready,
     to_fix: report.toFix,
     unknown: report.unknown,
+    agent_host: report.checks.find((c) => c.id === 'agent-host')?.detail.replace(/^agents run on /, '') ?? null,
     checks: report.checks.map((c) => ({ id: c.id, group: c.group, status: c.status, detail: c.detail, ...(c.fix !== undefined ? { fix: c.fix } : {}) })),
   };
 }
@@ -100,6 +101,7 @@ export function realPreflightDeps(): PreflightDeps {
     },
     fileMode: (path) => (existsSync(path) ? { exists: true, mode: statSync(path).mode & 0o777 } : { exists: false }),
     env: process.env,
+    platform: process.platform,
     nodeVersion: process.versions.node,
     cliVersion: /(\d+\.\d+\.\d+)/.exec(packageVersionDisplay())?.[1] ?? packageVersionDisplay(),
   };
@@ -111,10 +113,10 @@ export async function runBootstrapPreflight(opts: RunBootstrapPreflightOptions, 
     file: resolvePath(opts.file),
     ...(opts.secretsPath !== undefined ? { secretsPath: resolvePath(opts.secretsPath) } : {}),
     ...(opts.identityKeyPath !== undefined ? { identityKeyPath: resolvePath(opts.identityKeyPath) } : {}),
-    ...(opts.vm !== undefined ? { vm: opts.vm } : {}),
+    ...(opts.agentHost !== undefined ? { agentHost: opts.agentHost } : {}),
   };
-  const [local, vm] = await Promise.all([runLocalPreflight(deps, resolved), vmChecks(deps, resolved.vm)]);
-  const report = buildReport([...local, ...vm]);
+  const [local, host] = await Promise.all([runLocalPreflight(deps, resolved), agentHostChecks(deps, resolved.agentHost)]);
+  const report = buildReport([...local, ...host]);
   console.log(opts.json ? JSON.stringify(preflightToJson(report), null, 2) : formatPreflightText(report));
   return report.ready ? 0 : 1;
 }
