@@ -35,6 +35,7 @@ import { join, resolve as resolvePath } from 'node:path';
 import {
   readAgentConfig,
   tokenSourceFromConfig,
+  ownerAccountFromRegistry,
   agentCertPath,
   agentKeyPath,
   findProjectRoot,
@@ -48,6 +49,7 @@ import {
 } from '@groundnuty/macf-core';
 import type { AgentInfo, HealthResponse } from '@groundnuty/macf-core';
 import { formatTable } from './ps.js';
+import { checkWatchdog, realWatchdogDeps, watchdogVerdictLine } from '../fleet/watchdog-status.js';
 import { discoverWorkspaces } from '../discovery.js';
 import {
   detectRoutingLabelDriftFromManifestFile,
@@ -814,6 +816,8 @@ export interface FleetDoctorDeps {
    * a real filesystem, same seam shape as `injectPost`/`injectPoll` above.
    */
   readonly routingLabelDriftCheck?: (manifestPath: string | undefined) => RoutingLabelDriftCheck | undefined;
+  /** The watchdog verdict line (#1525). Production wires the real crontab check; unset prints nothing. */
+  readonly watchdogVerdict?: () => string;
 }
 
 /**
@@ -866,6 +870,17 @@ async function resolveDepsFromRegistry(
     ok: true,
     deps: {
       project: config.project,
+      watchdogVerdict: () => {
+        let owner: string;
+        try {
+          owner = ownerAccountFromRegistry(config.registry);
+        } catch {
+          return watchdogVerdictLine({ kind: 'unreadable', reason: 'no registry owner in macf-agent.json' });
+        }
+        return watchdogVerdictLine(
+          checkWatchdog({ owner, project: config.project, workspaceDir: projectDir }, realWatchdogDeps(projectDir)),
+        );
+      },
       listPeers: () => registry.list(''),
       probe: (host, port) => pingAgentHealth({ host, port, caCertPem, certPath, keyPath }),
       diagnose: (host, port, correlationToken) =>
@@ -979,6 +994,7 @@ export async function runFleetDoctor(
     const header = `macf fleet doctor${resolved.project ? ` — ${resolved.project}` : ''}`;
     if (results.length === 0) {
       console.log(`${header}\n\nNo agents registered in the registry.`);
+      if (resolved.watchdogVerdict) console.log(`\n${resolved.watchdogVerdict()}`);
       if (routingLabelDrift) {
         console.log('');
         console.log(formatRoutingLabelDriftSection(routingLabelDrift));
@@ -990,6 +1006,7 @@ export async function runFleetDoctor(
     console.log(formatDoctorTable(results, !!inject));
     console.log('');
     console.log(summaryLine(results));
+    if (resolved.watchdogVerdict) console.log(resolved.watchdogVerdict());
     if (inject) {
       console.log(
         `--inject routed a REAL probe to ${String(injectableCount(results))} reachable agent(s), waking each.`,

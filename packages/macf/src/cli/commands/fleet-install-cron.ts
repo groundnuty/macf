@@ -342,7 +342,7 @@ function namesWorkspaceHelper(line: string, workspaceDir: string): boolean {
 }
 
 /** A line is this fleet's if it ends with its marker, or is a legacy line naming its workspace. */
-function isOwnedLine(line: string, marker: string, workspaceDir: string): boolean {
+export function isOwnedLine(line: string, marker: string, workspaceDir: string): boolean {
   const t = line.trimEnd();
   if (t.endsWith(marker)) return true;
   return t.endsWith(WATCHDOG_MARKER) && namesWorkspaceHelper(line, workspaceDir);

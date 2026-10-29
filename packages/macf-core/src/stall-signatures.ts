@@ -239,4 +239,29 @@ export const STALL_SIGNATURES_SEED: StallSignaturesConfig = [
       'Skill-approval / memory-accept dialogs. action=report. Signature strings are ' +
       'best-effort across CC versions — the allowlist is DATA, tune as the TUI evolves. #132.',
   },
+  {
+    name: 'context-overflow',
+    signature: 'Prompt is too long',
+    action: 'report',
+    report:
+      'stalled on "Prompt is too long": the context is full and a nudge cannot clear it. ' +
+      'Needs a /compact or a fresh session.',
+    max_fires: 1,
+    comment:
+      'Claude Code context-overflow error (string present in the 2.1.312 binary). ' +
+      'action=report: a nudge adds to the context and cannot help.',
+  },
+  {
+    name: 'usage-limit',
+    signature: "You.ve hit your (session|weekly) limit",
+    action: 'report',
+    report:
+      'stalled at a usage limit ("You\'ve hit your session/weekly limit"). The reset time is on ' +
+      'that pane line. Waiting or a plan change is the only fix.',
+    max_fires: 1,
+    comment:
+      "Claude Code usage-limit screen: \"You've hit your session limit\" / \"weekly limit\" " +
+      '(2.1.312 binary). action=report: a nudge or restart cannot lift a quota. The static ' +
+      'report text cannot carry the reset time, so it points at the pane line.',
+  },
 ];

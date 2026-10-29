@@ -6,6 +6,7 @@
  * is about flag resolution (--vault default derivation, the --identity-key
  * requirement), manifest/role loading, and rendering.
  */
+import type { CrontabRead } from '../../src/cli/fleet/watchdog-status.js';
 import { describe, it, expect, afterEach } from 'vitest';
 import { generateKeyPairSync } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -119,6 +120,12 @@ function depsFor(overrides: Partial<FleetDeployCommandDeps> = {}): FleetDeployCo
     },
     checkAgentCertPresent: () => true,
     keyPathFor: () => join(scratchDir(), 'scratch-agent-key.pem'),
+    // Hermetic: never read the host's real crontab (#1525 watchdog verdict).
+    watchdogDeps: {
+      readCrontab: () => ({ kind: 'unreadable', reason: 'test: no crontab' }),
+      readScript: () => null,
+      scriptDir: () => '/nowhere',
+    },
     ...overrides,
   };
 }
@@ -929,5 +936,66 @@ describe('runFleetDeploy — plugin-fetch outcome (groundnuty/macf#1419)', () =>
     } finally {
       cap.restore();
     }
+  });
+});
+
+describe('runFleetDeploy — watchdog verdict line (#1525)', () => {
+  const MARKER = '# macf-watchdog (DR-006) [fleet=groundnuty/demo-fleet]';
+
+  async function deployWith(crontab: CrontabRead, scriptBody: string | null = null): Promise<string> {
+    const { manifestPath, dir } = writeManifest();
+    const cap = captureConsole();
+    try {
+      const code = await runFleetDeploy(
+        { file: manifestPath, agent: 'code-agent', identityKey: join(dir, 'identity.txt'), dir: join(dir, 'workspace') },
+        depsFor({
+          readVault: async () => {
+            const seg = 'DEMO_FLEET_CODE_AGENT';
+            return {
+              [`MACF_AGENT_${seg}_APP_ID`]: '111',
+              [`MACF_AGENT_${seg}_INSTALL_ID`]: '222',
+              [`MACF_AGENT_${seg}_PRIVATE_KEY_B64`]: Buffer.from('SYNTH-PEM', 'utf-8').toString('base64'),
+            };
+          },
+          cloneRepo: async (_url, d) => mkdirSync(d, { recursive: true }),
+          initAgent: async () => {},
+          watchdogDeps: { readCrontab: () => crontab, readScript: () => scriptBody, scriptDir: () => '/nowhere' },
+        }),
+      );
+      expect(code).toBe(0);
+      return cap.logs.join('\n');
+    } finally {
+      cap.restore();
+    }
+  }
+
+  it('says the watchdog is NOT installed when the crontab has no line for this fleet', async () => {
+    const out = await deployWith({ kind: 'ok', content: '0 * * * * /bin/other\n' });
+    expect(out).toContain(
+      'Watchdog: NOT installed for this fleet on this host, so a crashed or stuck agent is not restarted or reported. Install it: macf fleet install-cron (runbook §3.6).',
+    );
+  });
+
+  it('does not take another fleet\'s line for this one', async () => {
+    const other = `*/10 * * * * /bin/sh '/h/.macf/cron/x__other.sh' >> '/l' 2>&1 # macf-watchdog (DR-006) [fleet=groundnuty/other-fleet]\n`;
+    expect(await deployWith({ kind: 'ok', content: other })).toContain('Watchdog: NOT installed');
+  });
+
+  it('reports installed with the schedule, report-only by default', async () => {
+    const line = `*/10 * * * * /bin/sh '/h/.macf/cron/groundnuty__demo-fleet.sh' >> '/l' 2>&1 ${MARKER}\n`;
+    const out = await deployWith({ kind: 'ok', content: line }, 'exec /usr/bin/macf fleet reconcile --dir /w\n');
+    expect(out).toContain('Watchdog: installed (*/10 * * * *, report-only).');
+  });
+
+  it('reports acting when the installed script passes --execute', async () => {
+    const line = `*/10 * * * * /bin/sh '/h/.macf/cron/groundnuty__demo-fleet.sh' >> '/l' 2>&1 ${MARKER}\n`;
+    const out = await deployWith({ kind: 'ok', content: line }, 'exec /usr/bin/macf fleet reconcile --dir /w --execute\n');
+    expect(out).toContain('Watchdog: installed (*/10 * * * *, acting).');
+  });
+
+  it('says it could not check, with the reason, when the crontab is unreadable', async () => {
+    const out = await deployWith({ kind: 'unreadable', reason: 'crontab not found on PATH' });
+    expect(out).toContain('Watchdog: could not check (crontab not found on PATH).');
+    expect(out).not.toContain('NOT installed');
   });
 });
