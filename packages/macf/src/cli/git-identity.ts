@@ -41,9 +41,11 @@ export function gitIdentityLines(config: MacfAgentConfig): string[] {
     const email = botNoreplyEmail(id, login);
     lines.push(`export GIT_AUTHOR_EMAIL="${email}"`, `export GIT_COMMITTER_EMAIL="${email}"`);
   } else {
+    // Without bot_login, update cannot resolve the id: doctor --fix fills bot_login first.
+    const repair = app?.bot_login ? 'macf update' : 'macf doctor --fix, then macf update';
     lines.push(
-      '# bot_user_id is unknown, so no GIT_*_EMAIL is set; run `macf update` to resolve it.',
-      `echo "MACF: bot user id unknown; commits will not be linked to ${login}. Run macf update." >&2`,
+      `# bot_user_id is unknown, so no GIT_*_EMAIL is set; run ${repair} to resolve it.`,
+      `echo "MACF: bot user id unknown; commits will not be linked to ${login}. Run ${repair}." >&2`,
     );
   }
   return lines;

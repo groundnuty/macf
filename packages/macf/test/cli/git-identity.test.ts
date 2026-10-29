@@ -36,6 +36,12 @@ describe('env.github git identity', () => {
     expect(out).toContain('# bot_user_id is unknown');
     expect(out).toContain('MACF: bot user id unknown; commits will not be linked to proj-code-agent[bot]. Run macf update.');
   });
+
+  it('no bot_login: the repair names doctor --fix first (update alone cannot resolve the id)', () => {
+    const out = generateEnvGitHub(cfg());
+    expect(out).toContain('Run macf doctor --fix, then macf update.');
+    expect(out).not.toContain('. Run macf update.');
+  });
 });
 
 describe('bot user id resolution', () => {
