@@ -99,6 +99,7 @@ describe('a2aMetadataToCommsEvent — A2A metadata.event → taxonomy', () => {
   }
   it('maps the three autonomous events through verbatim', () => {
     expect(a2aMetadataToCommsEvent(msg('session-end'))).toBe('session-end');
+    expect(a2aMetadataToCommsEvent(msg('session-compact'))).toBe('session-compact');
     expect(a2aMetadataToCommsEvent(msg('turn-complete'))).toBe('turn-complete');
     expect(a2aMetadataToCommsEvent(msg('error'))).toBe('error');
   });

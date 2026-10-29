@@ -16,8 +16,8 @@
 import type { Message } from './a2a-types.js';
 import type { NotifyPayload } from '@groundnuty/macf-core';
 
-/** The four wake-policy events `decideWake` recognizes (macf#355). */
-const KNOWN_EVENTS = ['session-end', 'turn-complete', 'error', 'custom'] as const;
+/** The wake-policy events `decideWake` recognizes (macf#355). */
+const KNOWN_EVENTS = ['session-end', 'session-compact', 'turn-complete', 'error', 'custom'] as const;
 type KnownEvent = (typeof KNOWN_EVENTS)[number];
 
 function isKnownEvent(v: unknown): v is KnownEvent {
