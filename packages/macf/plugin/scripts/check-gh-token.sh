@@ -43,11 +43,15 @@ GH_PATTERN='(^|[[:space:];|&])(sudo[[:space:]]+|env[[:space:]]+([A-Za-z_][A-Za-z
 # isn't preceded by one of the allowed delimiters `[[:space:];|&]`.
 # Caught in the post-#140 audit pass, 2026-04-20.
 #
+# The `gh` / `git push` inside the quoted argument must sit at a command
+# position (after whitespace, `;`, `|`, `&`, `(` or a quote). A word that
+# merely ENDS in `gh` (`...=high `, `through `) is not an invocation (#1525).
+#
 # Flag handling: `(-[a-zA-Z]+[[:space:]]+)*` allows zero or more
 # separate flag groups like `-x ` or `-e `. Final flag uses
 # `-[a-zA-Z]*c` — must end in `c` (the `-c`-ness), optional letters
 # before it cover combined forms like `-xc`, `-lc`, `-exc`.
-SHELL_C_PATTERN='(^|[[:space:];|&])(sudo[[:space:]]+|env[[:space:]]+([A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+)*|[A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+)*(bash|sh|zsh)[[:space:]]+(-[a-zA-Z]+[[:space:]]+)*-[a-zA-Z]*c[[:space:]]+[^[:space:]].*(gh[[:space:]]|git[[:space:]]+push([[:space:]]|$))'
+SHELL_C_PATTERN='(^|[[:space:];|&])(sudo[[:space:]]+|env[[:space:]]+([A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+)*|[A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+)*(bash|sh|zsh)[[:space:]]+(-[a-zA-Z]+[[:space:]]+)*-[a-zA-Z]*c[[:space:]]+(.*[[:space:];|&('"\"'"'])?(gh[[:space:]]|git[[:space:]]+push([[:space:]]|$))'
 
 if [[ ! "$COMMAND" =~ $GH_PATTERN ]] && [[ ! "$COMMAND" =~ $SHELL_C_PATTERN ]]; then
   # Not a gh/git-push command — allow without checking token.
@@ -63,6 +67,85 @@ fi
 # allows arbitrary wrapper prefix before `gh`.
 if [[ "$COMMAND" =~ (^|[[:space:];|&])(sudo[[:space:]]+|env[[:space:]]+([A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+)*|[A-Za-z_][A-Za-z_0-9]*=[^[:space:]]*[[:space:]]+)*gh[[:space:]]+auth([[:space:]]|$) ]]; then
   exit 0
+fi
+
+# Identity bypass (#1525): these forms run `gh` as the stored user login even
+# when the ambient token is valid, because they remove or empty GH_TOKEN
+# inside the command, after this hook has read the ambient value.
+_ws='[[:space:];|&("'"'"']'
+_dq='"'
+_sq="'"
+BYPASS_ENV_U='(^|'"$_ws"')env[[:space:]]+[^;|&]*(-u[[:space:]]*|--unset[=[:space:]]+)["'"'"']?GH_TOKEN["'"'"']?([[:space:]]|$)'
+BYPASS_EMPTY='(^|'"$_ws"')GH_TOKEN=('"$_dq$_dq|$_sq$_sq"')?([[:space:];|&]|$)'
+BYPASS_UNSET='(^|'"$_ws"')unset[[:space:]]+([^;|&]*[[:space:]])?["'"'"']?GH_TOKEN["'"'"']?([[:space:];|&]|$)'
+# Clearing the whole environment (env -i / --ignore-environment) drops the token too.
+BYPASS_ENV_I='(^|'"$_ws"')env[[:space:]]+([^;|&]*[[:space:]])?(-i|--ignore-environment|-)([[:space:]]|$)'
+# Removing only the export attribute (export -n, declare +x, typeset +x) has the same effect.
+BYPASS_UNEXPORT='(^|'"$_ws"')(export[[:space:]]+-n|declare[[:space:]]+\+x|typeset[[:space:]]+\+x)[[:space:]]+([^;|&]*[[:space:]])?["'"'"']?GH_TOKEN["'"'"']?([[:space:];|&=]|$)'
+
+# True when REGEX matches and a gh / git push comes AFTER the first match.
+# `gh issue list; unset GH_TOKEN` is cleanup after gh and stays allowed.
+bypass_before_gh() {
+  local m before rest
+  [[ "$COMMAND" =~ $1 ]] || return 1
+  m="${BASH_REMATCH[0]}"
+  before="${COMMAND%%"$m"*}"
+  rest="${COMMAND#"$before$m"}"
+  [[ "$rest" =~ $GH_PATTERN ]] || [[ "$rest" =~ $SHELL_C_PATTERN ]]
+}
+if bypass_before_gh "$BYPASS_ENV_U" || bypass_before_gh "$BYPASS_EMPTY" \
+  || bypass_before_gh "$BYPASS_UNSET" || bypass_before_gh "$BYPASS_UNEXPORT" \
+  || bypass_before_gh "$BYPASS_ENV_I"; then
+  cat >&2 <<'ERR'
+BLOCKED by MACF attribution-trap hook: this command removes or empties GH_TOKEN before gh, so gh would act as the stored user login. Mint a bot token instead (see gh-token-refresh.md).
+ERR
+  exit 2
+fi
+
+# Canonical inline mint (#1525): in a session with no ambient GH_TOKEN the
+# rule's own recipe would be blocked, because this hook judges only the
+# ambient token. Allow exactly this form at the start of the command:
+#   GH_TOKEN=$("$MACF_WORKSPACE_DIR/.claude/scripts/macf-gh-token.sh" --app-id "$APP_ID" --install-id "$INSTALL_ID" --key "$KEY_PATH") || exit 1; export GH_TOKEN
+# Only this literal recipe matches (whitespace may vary): no other path, argument
+# order, extra argument, redirect or quoting, since each loose form had a hole.
+# The helper fails loud and validates the ghs_ prefix, and `|| exit 1` aborts
+# before any later gh runs. The export must follow as its own statement, or gh
+# would not inherit the token. Statements are joined only by `;`, `&&` or a
+# newline: a lone `&` backgrounds the mint and `|` pipes it. This is an exact
+# allowlist, NOT general parsing of inline GH_TOKEN assignments (rejected in
+# silent-fallback-hazards Instance 12). No variants: `export GH_TOKEN=$(...)`
+# masks the failure, and without `|| exit 1` a failed mint would let gh run on
+# the stored user login.
+_nl=$'\n'
+_sep='[[:blank:]]*(;|&&|'"$_nl"')[[:blank:]]*'
+_b='[[:blank:]]+'
+CANON_MINT='^[[:space:]]*GH_TOKEN=\$\("\$MACF_WORKSPACE_DIR/\.claude/scripts/macf-gh-token\.sh"'"$_b"'--app-id'"$_b"'"\$APP_ID"'"$_b"'--install-id'"$_b"'"\$INSTALL_ID"'"$_b"'--key'"$_b"'"\$KEY_PATH"\)'"$_b"'\|\|'"$_b"'exit'"$_b"'1'"$_sep"'export'"$_b"'GH_TOKEN[[:blank:]]*(;|&&|'"$_nl"'|$)'
+# A literal user token assigned to GH_TOKEN / GITHUB_TOKEN before gh acts as that user.
+_USER_TOKEN_ASSIGN='(^|'"$_ws"')(GH_TOKEN|GITHUB_TOKEN)=["'"'"']?(ghp_|gho_|ghu_|ghr_|github_pat_)'
+BLOCK_IDENTITY_MSG='BLOCKED by MACF attribution-trap hook: this command removes or empties GH_TOKEN before gh, or sets it to a user token, so gh would act as the stored user login. Mint a bot token instead (see gh-token-refresh.md).'
+if bypass_before_gh "$_USER_TOKEN_ASSIGN"; then
+  echo "$BLOCK_IDENTITY_MSG" >&2
+  exit 2
+fi
+
+MINT_PRESENT=0
+if [[ "$COMMAND" =~ $CANON_MINT ]]; then
+  MINT_PRESENT=1
+  # After the mint, the rest of the command must not reassign the token.
+  # Only $GH_TOKEN, "$GH_TOKEN" and ${GH_TOKEN} are allowed as values.
+  _rest="${COMMAND#"${BASH_REMATCH[0]}"}"
+  _assign='(^|'"$_ws"')(GH_TOKEN|GITHUB_TOKEN)=([^[:space:];|&]*)'
+  while [[ "$_rest" =~ $_assign ]]; do
+    _val="${BASH_REMATCH[3]}"
+    case "$_val" in
+      '$GH_TOKEN'|'"$GH_TOKEN"'|'${GH_TOKEN}'|'"${GH_TOKEN}"') ;;
+      *)
+        echo "$BLOCK_IDENTITY_MSG" >&2
+        exit 2
+        ;;
+    esac
+    _rest="${_rest#*"${BASH_REMATCH[0]}"}"
+  done
 fi
 
 # Check GH_TOKEN: must be present AND match the bot-token shape
@@ -89,7 +172,9 @@ fi
 # is unset, which is exactly the case we need to handle.
 GH_TOKEN_VALUE="${GH_TOKEN:-}"
 TOKEN_PREFIX="${GH_TOKEN_VALUE:0:4}"
-if [[ -z "$GH_TOKEN_VALUE" ]] || [[ ! "$GH_TOKEN_VALUE" =~ ^ghs_[A-Za-z0-9._-]+$ ]]; then
+# With the canonical mint present the ambient token is not what gh will use,
+# so only this validation is skipped; the audit path below still runs.
+if [[ "$MINT_PRESENT" != 1 ]] && { [[ -z "$GH_TOKEN_VALUE" ]] || [[ ! "$GH_TOKEN_VALUE" =~ ^ghs_[A-Za-z0-9._-]+$ ]]; }; then
   # groundnuty/macf#1360 — branch on the discriminator this hook ALREADY has.
   # A `ghs_` prefix that fails the full-shape check is almost never an
   # attribution trap: `ghs_` IS a bot installation token by definition. It is
@@ -140,13 +225,10 @@ This hook exists because behavioral controls for the GH_TOKEN attribution
 trap recurred 5 times in a single day. See groundnuty/macf#140 and
 .claude/rules/gh-token-attribution-traps.md.
 
-Fix — relaunch. The GH_TOKEN this session launched with is not a bot token, and
-a mint inside a command cannot change the env this hook reads. Ask the operator
-to relaunch this session with ./claude.sh. claude.sh full-shape-validates GH_TOKEN at the launch
-boundary (before exec) and re-mints or aborts loudly rather than starting a
-session this hook would then deadlock.
+Fix — mint a bot token in the same command, exactly:
+  GH_TOKEN=\$("\$MACF_WORKSPACE_DIR/.claude/scripts/macf-gh-token.sh" --app-id "\$APP_ID" --install-id "\$INSTALL_ID" --key "\$KEY_PATH") || exit 1; export GH_TOKEN; <your gh command>
 
-If the token helper (macf-gh-token.sh) is missing from the workspace, restore it first:
+If the helper (macf-gh-token.sh) is missing from the workspace, restore it:
   macf rules refresh --dir .
 
 Override (ONLY for intentional user-attributed ops like onboarding) is
