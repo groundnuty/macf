@@ -1479,4 +1479,82 @@ describe('check-mention-routing.sh (hook)', () => {
       });
     });
   });
+
+  describe('stdin heredoc bodies and path-bound writers (groundnuty/macf#1525 item 7)', () => {
+    const GH = 'gh issue comment 9 --repo o/r';
+
+    describe('--body-file - with a heredoc on the same command', () => {
+      it('allows a line-start mention', () => {
+        const r = runHook({ command: `${GH} --body-file - <<'EOF'\n@macf-science-agent[bot] hi\nEOF` });
+        expect(r.status).toBe(0);
+        expect(String(r.stderr)).not.toContain('could not resolve');
+      });
+
+      it('blocks a body with no mention (Check A)', () => {
+        const r = runHook({ command: `${GH} --body-file - <<'EOF'\nstatus only\nEOF` });
+        expect(r.status).toBe(2);
+        expect(String(r.stderr)).toContain('zero');
+      });
+
+      it('blocks a raw mid-line mention (Check B)', () => {
+        const r = runHook({
+          command: `${GH} --body-file - <<'EOF'\n@macf-science-agent[bot] see\nthe @macf-tester-1-agent[bot] reply\nEOF`,
+        });
+        expect(r.status).toBe(2);
+        expect(String(r.stderr)).toContain('describing-context');
+      });
+
+      it('handles -F - and an unquoted delimiter', () => {
+        const r = runHook({ command: `${GH} -F - <<EOF\nno mention\nEOF` });
+        expect(r.status).toBe(2);
+      });
+
+      it('keeps the warning when stdin is not a heredoc', () => {
+        const r = runHook({ command: `cat note.md | ${GH} --body-file -` });
+        expect(r.status).toBe(0);
+        expect(warningOf(r) + String(r.stderr)).toContain('could not resolve');
+      });
+    });
+
+    describe('each --body-file is bound to its own writer', () => {
+      const write = (text: string): string => `cat > $S/c9.md <<'EOF'\n${text}\nEOF\n`;
+      const tail = `gh issue edit 9 --repo o/r --add-label y >/dev/null; ${GH} --body-file $S/c9.md; python3 -I - <<'EOF'\nprint(1)\nEOF`;
+
+      it('allows the file when a later unrelated heredoc follows on the same line', () => {
+        const r = runHook({ command: write('@macf-science-agent[bot] hi') + tail });
+        expect(r.status).toBe(0);
+      });
+
+      it('still blocks when that file has no mention', () => {
+        const r = runHook({ command: write('no mention here') + tail });
+        expect(r.status).toBe(2);
+        expect(String(r.stderr)).toContain('zero');
+      });
+
+      it('does not take a longer path sharing the prefix as the writer', () => {
+        const r = runHook({
+          command: `cat > /tmp/m1525-a.mdx <<'EOF'\n@macf-science-agent[bot] other\nEOF\ncat > /tmp/m1525-a.md <<'EOF'\nno mention\nEOF\n${GH} --body-file /tmp/m1525-a.md`,
+        });
+        expect(r.status).toBe(2);
+      });
+    });
+
+    describe('printf format \\n is a line break', () => {
+      it('allows a mention that starts a line after \\n', () => {
+        const r = runHook({ command: `${GH} --body "$(printf '\\n@macf-science-agent[bot] no need to wait')"` });
+        expect(r.status).toBe(0);
+      });
+
+      it('allows the double-quoted format form', () => {
+        const r = runHook({ command: `${GH} --body "$(printf "x\\n@macf-science-agent[bot] go")"` });
+        expect(r.status).toBe(0);
+      });
+
+      it('still blocks a real mid-line mention in a printf', () => {
+        const r = runHook({ command: `${GH} --body "$(printf 'see the @macf-science-agent[bot] reply')"` });
+        expect(r.status).toBe(2);
+        expect(String(r.stderr)).toContain('describing-context');
+      });
+    });
+  });
 });

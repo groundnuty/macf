@@ -742,6 +742,100 @@ macf_resolve_path_vars() {
 # no candidate line, more than one candidate line, or an unquoted
 # delimiter. Every failure mode here falls through to branch 3; this
 # function never guesses.
+macf_line_writes_path() {
+  local rest="$1" target="$2" before after
+  [[ -n "$target" ]] || return 1
+  while [[ "$rest" == *"$target"* ]]; do
+    before="${rest%%"$target"*}"
+    after="${rest#*"$target"}"
+    while [[ "$before" == *[[:space:]\"\']  ]]; do before="${before%?}"; done
+    # A real write: ">" or ">>" right before the whole path token, and the
+    # path ends there (not a longer name sharing the prefix).
+    if [[ "$before" == *">" ]]; then
+      after="${after#[\"\']}"
+      if [[ -z "$after" || "$after" == [[:space:]\;\&\|\<\)]* ]]; then
+        return 0
+      fi
+    fi
+    rest="$after"
+  done
+  return 1
+}
+
+# Heredoc body fed to the gh command's own stdin: `--body-file -` (or `-F -`)
+# followed on the same line by `<<DELIM`, `<<'DELIM'` or `<<-DELIM`. Prints
+# the body and returns 0 only when exactly one such line exists; anything
+# else returns 1.
+macf_extract_stdin_heredoc() {
+  local cmd="$1"
+  local arg_re='(--body-file|-F)(=|[[:space:]]+)-([[:space:]]|$)'
+  local open_re="^-?[[:space:]]*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)(['\"]?)"
+  local -a lines=()
+  local line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    lines+=("$line")
+  done <<<"$cmd"
+
+  local match_idx=-1 count=0 delimiter="" strip_tabs=false i=0 rest between frag
+  while [[ "$i" -lt "${#lines[@]}" ]]; do
+    line="${lines[$i]}"
+    if [[ "$line" =~ $arg_re ]]; then
+      rest="${line#*"${BASH_REMATCH[0]}"}"
+      if [[ "$rest" == *"<<"* ]]; then
+        between="${rest%%<<*}"
+        frag="${rest#*<<}"
+        count=$((count + 1))
+        if [[ "$between" != *[\;\&\|]* ]] && [[ "$frag" != "<"* ]] \
+           && [[ "$frag" =~ $open_re ]] && [[ "${BASH_REMATCH[1]}" == "${BASH_REMATCH[3]}" ]]; then
+          delimiter="${BASH_REMATCH[2]}"
+          match_idx="$i"
+          if [[ "$frag" == "-"* ]]; then strip_tabs=true; else strip_tabs=false; fi
+        else
+          delimiter=""
+        fi
+      fi
+    fi
+    i=$((i + 1))
+  done
+  if [[ "$count" -ne 1 ]] || [[ -z "$delimiter" ]] || [[ "$match_idx" -lt 0 ]]; then
+    return 1
+  fi
+
+  local body="" found_close=false cmp_line
+  i=$((match_idx + 1))
+  while [[ "$i" -lt "${#lines[@]}" ]]; do
+    line="${lines[$i]}"
+    cmp_line="$line"
+    if [[ "$strip_tabs" == "true" ]]; then
+      while [[ "$cmp_line" == $'\t'* ]]; do cmp_line="${cmp_line#$'\t'}"; done
+    fi
+    if [[ "$cmp_line" == "$delimiter" ]]; then found_close=true; break; fi
+    body+="${line}"$'\n'
+    i=$((i + 1))
+  done
+  [[ "$found_close" == "true" ]] || return 1
+  printf '%s' "$body" || true
+  return 0
+}
+
+# Inside a printf format argument, a literal \n is a line break at runtime.
+# Expands it for the line-start rule; other text is left as written.
+macf_expand_printf_newlines() {
+  local rest="$1" out="" fmt
+  local re_sq="(^|[^[:alnum:]_])printf[[:space:]]+('[^']*')"
+  local re_dq='(^|[^[:alnum:]_])printf[[:space:]]+("([^"\\]|\\.)*")'
+  local re m
+  while :; do
+    if [[ "$rest" =~ $re_sq ]]; then re="$re_sq"; elif [[ "$rest" =~ $re_dq ]]; then re="$re_dq"; else break; fi
+    [[ "$rest" =~ $re ]] || break
+    m="${BASH_REMATCH[0]}"; fmt="${BASH_REMATCH[2]}"
+    local head="${rest%%"$m"*}"
+    out+="${head}${m%"$fmt"}${fmt//\\n/$'\n'}"
+    rest="${rest#*"$m"}"
+  done
+  printf '%s' "${out}${rest}"
+}
+
 macf_extract_heredoc_body() {
   local target="$1" cmd="$2"
   if [[ -z "$target" ]]; then
@@ -761,7 +855,7 @@ macf_extract_heredoc_body() {
   local i=0
   while [[ "$i" -lt "${#lines[@]}" ]]; do
     line="${lines[$i]}"
-    if [[ "$line" == *">"* ]] && [[ "$line" == *"$target"* ]] && [[ "$line" == *"<<"* ]]; then
+    if [[ "$line" == *"<<"* ]] && macf_line_writes_path "$line" "$target"; then
       local frag="${line#*<<}"
       if [[ "$frag" =~ $heredoc_open_sq_pattern ]] || [[ "$frag" =~ $heredoc_open_dq_pattern ]]; then
         match_count=$((match_count + 1))
@@ -886,11 +980,14 @@ macf_chain_segment_count() {
   local seg="$1" re='--body-file(=|[[:space:]]+)([^[:space:]]+)' raw path body
   if [[ "$seg" =~ $re ]]; then
     raw="${BASH_REMATCH[2]}"
+    while [[ "$raw" == *[\;\&\|\)] ]]; do raw="${raw%?}"; done
     raw="${raw%\"}"; raw="${raw#\"}"; raw="${raw%\'}"; raw="${raw#\'}"
     path="$(macf_resolve_path_vars "$raw")"
     if [[ -n "$path" ]] && [[ -f "$path" ]] && [[ -r "$path" ]]; then
       macf_count_all <"$path"
-    elif body="$(macf_extract_heredoc_body "$raw" "$COMMAND")"; then
+    elif [[ "$raw" == "-" ]] && body="$(macf_extract_stdin_heredoc "$COMMAND")"; then
+      macf_count_all <<<"$body"
+    elif [[ "$raw" != "-" ]] && body="$(macf_extract_heredoc_body "$raw" "$COMMAND")"; then
       macf_count_all <<<"$body"
     fi
     return 0
@@ -928,9 +1025,17 @@ BODY_FILE_RESOLVED=false
 LINT_TARGET="$COMMAND"
 
 BODY_FILE_ARG_PATTERN='--body-file(=|[[:space:]]+)([^[:space:]]+)'
-if [[ "$COMMAND" =~ $BODY_FILE_ARG_PATTERN ]]; then
+STDIN_HEREDOC_BODY=""
+if STDIN_HEREDOC_BODY="$(macf_extract_stdin_heredoc "$COMMAND")"; then
+  # The comment body is a heredoc on the gh command's own stdin.
+  BODY_FILE_MODE=true
+  BODY_FILE_RESOLVED=true
+  LINT_TARGET="$STDIN_HEREDOC_BODY"
+elif [[ "$COMMAND" =~ $BODY_FILE_ARG_PATTERN ]]; then
   BODY_FILE_MODE=true
   BODY_FILE_RAW="${BASH_REMATCH[2]}"
+  # A path token ends at a shell separator: `--body-file f; next` is the path f.
+  while [[ "$BODY_FILE_RAW" == *[\;\&\|\)] ]]; do BODY_FILE_RAW="${BODY_FILE_RAW%?}"; done
   # Strip one layer of matching wrapping quotes (only the common
   # no-embedded-space quoted case; quoted paths WITH spaces aren't
   # captured by [^[:space:]]+ above and fall through to branch 3 —
@@ -984,6 +1089,10 @@ the file content manually before it posts.
 WARNERR
   fi
   exit 0
+fi
+
+if [[ "$LINT_TARGET" == "$COMMAND" ]]; then
+  LINT_TARGET="$(macf_expand_printf_newlines "$LINT_TARGET")"
 fi
 
 # Per-occurrence scan for raw @macf-<role>-agent[bot] patterns in the lint
