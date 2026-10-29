@@ -21,6 +21,7 @@ import { runFleetDeleteApps, runFleetDestroy, DESTROY_ENV_ACK_VAR } from './comm
 import { runFleetDeploy } from './commands/fleet-deploy.js';
 import { runBootstrapPlan } from './commands/bootstrap.js';
 import { runBootstrapApply } from './commands/bootstrap-apply.js';
+import { runnerTokenHowTo } from './bootstrap/apply-routing.js';
 import { writeOperatorSecretsFileTemplate } from './bootstrap/operator-secrets-file.js';
 import { runBootstrapStatus } from './commands/bootstrap-status.js';
 import { runBootstrapControlRepoInit } from './commands/bootstrap-control-repo-init.js';
@@ -818,10 +819,10 @@ bootstrap
   .option('--identity-key <path>', 'age identity (private key) file to decrypt --vault with. Required together with --vault.')
   .option(
     '--runner-token <token>',
-    'GitHub Actions runner-registration token — required when routing.runner declares ' +
-      'runs_on: "self-hosted"; licenses apply to POLL for a usable self-hosted runner before writing ' +
-      'MACF_TRUSTED_ACTORS (never substitutes for that live check). Falls back to MACF_BOOTSTRAP_RUNNER_TOKEN ' +
-      'when unset. Get one with: gh api -X POST /orgs/<org>/actions/runners/registration-token --jq .token',
+    'GitHub Actions runner-registration token. Not needed when the runner platform endpoint ' +
+      '(MACF_RUNNER_PLATFORM_ENDPOINT) is set; otherwise supply it so apply polls for a usable self-hosted ' +
+      'runner before writing MACF_TRUSTED_ACTORS (it never replaces that live check). Falls back to ' +
+      'MACF_BOOTSTRAP_RUNNER_TOKEN when unset. ' + runnerTokenHowTo(),
   )
   .option(
     '--ts-oauth-client-id <id>',

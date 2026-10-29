@@ -175,6 +175,18 @@ export function outcomeToJson(outcome: FleetDeployOutcome): unknown {
  * defensive case — a CA was available but no cert landed anyway (say so and
  * point at the local, key-copy-free `macf certs rotate`).
  */
+/** The steps left after a deploy. The watchdog verdict above already says whether to install it. */
+export function remainingStepsLines(destDir: string, repo: string): readonly string[] {
+  return [
+    '',
+    'Remaining steps:',
+    `  1. Launch the agent from a terminal that is not inside tmux: cd ${destDir} && ./claude.sh`,
+    '  2. Check the fleet can reach it: macf fleet doctor --inject',
+    `  3. Check routing delivers: macf routing doctor --e2e --target-repo ${repo}`,
+    'Do not assign work until these pass.',
+  ];
+}
+
 function nextStepLines(
   manifest: FleetManifest,
   destDir: string,
@@ -304,6 +316,7 @@ export async function runFleetDeploy(opts: RunFleetDeployOptions, deps?: FleetDe
         ),
       ),
     );
+    console.log(remainingStepsLines(destDir, agent.repo).join('\n'));
   } else {
     console.error(`Role "${outcome.role}" FAILED — ${outcome.reason}`);
   }

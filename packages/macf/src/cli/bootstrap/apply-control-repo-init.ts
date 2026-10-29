@@ -362,6 +362,7 @@ export async function applyControlRepoInit(
     const registryOpts = repoInitRegistryOptions(manifest.owner.registry);
     const result = await runRepoInit(controlDir, {
       repo,
+      insideApply: true,
       // groundnuty/macf#1072 — see `ControlRepoInitOptions`'s doc.
       actionsVersion: opts?.actionsVersion ?? manifest.versions?.actions ?? DEFAULT_ACTIONS_VERSION,
       // ALL declared agents, comma-joined — `repoInit`'s own `agents` option

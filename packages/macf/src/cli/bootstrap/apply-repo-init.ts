@@ -407,6 +407,7 @@ export async function applyRepoInitForAgent(
 
     const result = await runRepoInit(dir, {
       repo: agent.repo,
+      insideApply: true,
       actionsVersion,
       // groundnuty/macf#1425 (silent-fallback-hazards.md Instance 18) —
       // every DECLARED fleet role, not just this agent's own. `repoInit`'s

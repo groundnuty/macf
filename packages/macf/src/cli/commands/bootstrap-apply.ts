@@ -31,7 +31,7 @@ import { join, resolve as resolvePath } from 'node:path';
 import type { FleetManifest } from '../bootstrap/fleet-manifest.js';
 import { controlRepoSelfHosted, deriveAppHandle, deriveControlRepoName, parseFleetManifest, workRepos } from '../bootstrap/fleet-manifest.js';
 import type { FleetObserverFn, FleetPlan, FleetPlanFailure, ObservedState, OperatorInteractionBound, Presence, UnimplementedApplyItem } from '../bootstrap/plan.js';
-import { computeInstallScopeCoverage, formatInstallScopeCoverageLines, hasInstallScopeCoverageDrift, installScopeCoverageEntryToJson } from '../bootstrap/install-scope-coverage.js';
+import { computeInstallScopeCoverage, formatInstallScopeCoverageLines, hasInstallScopeCoverageDrift, installScopeCoverageEntryToJson, observedWorkRepoPresence } from '../bootstrap/install-scope-coverage.js';
 import type { InstallScopeCoverageEntry, InstallScopeCoverageTarget } from '../bootstrap/install-scope-coverage.js';
 import {
   checkVaultFlagsComplete,
@@ -171,6 +171,7 @@ import { buildRecordDeployedVersion } from '../bootstrap/fleet-lock-recorder.js'
 import { firstLaunchGuidanceHeaderLines, firstLaunchAttachLine } from '../bootstrap/first-launch-guidance.js';
 import { outcomeToJson as fleetDeployOutcomeToJson } from './fleet-deploy.js';
 import { initAgent as realInitAgent } from './init.js';
+import { announceOperatorWait } from '../bootstrap/operator-wait.js';
 import { agentCertPath, agentKeyPath } from '../config.js';
 
 const execFileAsync = promisify(execFile);
@@ -561,6 +562,7 @@ export function formatPlannedAppCreations(
   creations: readonly PlannedAppCreation[],
   gate2InstallOnly = 0,
   excludedRecoveryRoles: readonly string[] = [],
+  widenApps: readonly string[] = [],
 ): string {
   // groundnuty/macf#880 — the operator's consent-click budget, projected
   // from `creations` itself (already the vault-aware-filtered list when a
@@ -571,7 +573,7 @@ export function formatPlannedAppCreations(
   // the real pre-approval render (both call this same function — see the
   // call sites below).
   const budget = operatorInteractionBudget(creations.length, creations.length + gate2InstallOnly);
-  const budgetLine = formatOperatorInteractionLine(budget);
+  const budgetLine = formatOperatorInteractionLine(budget, widenApps);
   if (creations.length === 0) {
     const excludedNote =
       excludedRecoveryRoles.length === 0
@@ -909,11 +911,11 @@ async function realOpenUrl(url: string): Promise<void> {
  * never fires — `close` does, and this run's beat resolves instead of
  * hanging on a stream that will never produce another byte.
  */
-function realWaitForOperatorBeat(assumeYes: boolean): (role: string, gateLabel: string) => Promise<void> {
+export function realWaitForOperatorBeat(assumeYes: boolean): (role: string, gateLabel: string) => Promise<void> {
   if (assumeYes) {
     return () => Promise.resolve();
   }
-  return (role: string, gateLabel: string) => blockingEnterPrompt(`Role "${role}": press Enter to open the browser for ${gateLabel}… `);
+  return (role: string, gateLabel: string) => blockingEnterPrompt(`Role "${role}": press Enter to open the browser for ${gateLabel}… `, `press Enter to open the browser page for ${gateLabel}.`);
 }
 
 /**
@@ -938,15 +940,17 @@ function realWaitForOperatorFix(assumeYes: boolean): (role: string, gateLabel: s
   if (assumeYes) {
     return () => Promise.resolve();
   }
-  return (role: string, gateLabel: string) => blockingEnterPrompt(`Role "${role}": press Enter once you've fixed it on GitHub for ${gateLabel}… `);
+  return (role: string, gateLabel: string) => blockingEnterPrompt(`Role "${role}": press Enter once you've fixed it on GitHub for ${gateLabel}… `, `fix it on GitHub, then press Enter (${gateLabel}).`);
 }
 
 /** Shared blocking-"press Enter" mechanics for both operator-pause prompts above — same `readline` + stderr idiom, varying only the printed prompt text. See `realWaitForOperatorBeat`'s doc for why `close` is a defence-in-depth branch, not the primary resolve path. */
-function blockingEnterPrompt(promptText: string): Promise<void> {
+function blockingEnterPrompt(promptText: string, action: string): Promise<void> {
   return new Promise((resolve) => {
+    const stopReminders = announceOperatorWait(action);
     process.stderr.write(promptText);
     const rl = createInterface({ input: process.stdin, output: process.stderr });
     const done = (): void => {
+      stopReminders();
       rl.close();
       resolve();
     };
@@ -999,8 +1003,10 @@ function realConfirmRoutingReconciliation(assumeYes: boolean): (divergences: rea
     if (divergences.length === 0) return Promise.resolve(true);
     process.stderr.write(`\n${formatTrustedActorsReconciliationLines(divergences).join('\n')}\n`);
     return new Promise((resolve) => {
+      const stopReminders = announceOperatorWait('type "yes" to overwrite the values above, or anything else to keep them.');
       const rl = createInterface({ input: process.stdin, output: process.stderr });
       const done = (answer: string): void => {
+        stopReminders();
         rl.close();
         resolve(answer.trim().toLowerCase() === 'yes');
       };
@@ -1166,11 +1172,16 @@ export function deletionOutcomeToJson(r: DeletionOutcome): unknown {
 }
 
 /** Real y/N prompt on stderr (stdout stays clean for a `--json` render). */
-async function realConfirmPlan(plan: FleetPlan, creations: readonly PlannedAppCreation[], deletionActions: readonly DeletionAction[]): Promise<boolean> {
-  process.stderr.write(formatApprovalBanner(plan, creations, deletionActions));
+export async function realConfirmPlan(plan: FleetPlan, creations: readonly PlannedAppCreation[], deletionActions: readonly DeletionAction[]): Promise<boolean> {
+  const text = formatApprovalBanner(plan, creations, deletionActions);
+  const cut = text.lastIndexOf('\n') + 1;
+  process.stderr.write(text.slice(0, cut));
   return new Promise((resolve) => {
+    const stopReminders = announceOperatorWait('type "yes" to approve the plan above, or anything else to abort.');
+    process.stderr.write(text.slice(cut));
     const rl = createInterface({ input: process.stdin, output: process.stderr });
     rl.question('', (answer) => {
+      stopReminders();
       rl.close();
       resolve(answer.trim().toLowerCase() === 'yes');
     });
@@ -3517,7 +3528,7 @@ export async function runBootstrapApply(
       }
     }
 
-    const runnerTokenFailure = checkRunnerTokenPreflight(manifest.routing, resolvedRunnerToken);
+    const runnerTokenFailure = checkRunnerTokenPreflight(manifest.routing, resolvedRunnerToken, manifest.owner.type);
     if (runnerTokenFailure !== undefined) {
       // groundnuty/macf#1209 — WARN, don't abort: see the block comment
       // above for why. `applyFleet` below still runs every leg that doesn't
@@ -3633,6 +3644,24 @@ export async function runBootstrapApply(
     // groundnuty/macf#880), not a second, differently-named counter.
     const finalGate2InstallOnly = gate2InstallOnly + recoveryResumable.length;
 
+    // Apps (runner-ops included) whose existing install a probe already shows must grow: each is a
+    // "Save" click this run will ask for. Report-only; needs the vault to probe.
+    const widenApps: readonly string[] =
+      opts.vaultPath !== undefined && opts.identityKeyPath !== undefined
+        ? Object.values(
+            await computeInstallScopeCoverage(
+              manifest,
+              observed.lock,
+              Object.fromEntries(Object.entries(observed.agents).map(([role, a]) => [role, a.repo])) as Readonly<Record<string, Presence>>,
+              observed.controlRepoPresence,
+              { vaultPath: opts.vaultPath, identityPath: opts.identityKeyPath },
+              { workRepoPresence: observedWorkRepoPresence(observed) },
+            ),
+          )
+            .filter((e) => e.status === 'drift')
+            .map((e) => e.appHandle)
+        : [];
+
     if (opts.dryRun === true) {
       if (opts.json) {
         console.log(
@@ -3666,7 +3695,7 @@ export async function runBootstrapApply(
       } else {
         console.log(formatPlanText(plan));
         console.log('');
-        console.log(formatPlannedAppCreations(finalCreations, finalGate2InstallOnly, recoveryResumable));
+        console.log(formatPlannedAppCreations(finalCreations, finalGate2InstallOnly, recoveryResumable, widenApps));
         if (preview !== undefined) {
           console.log('');
           console.log(formatIdentityPreview(preview));
@@ -3688,7 +3717,7 @@ export async function runBootstrapApply(
     // clean; keeping it uniform (not conditional on opts.json) means a human
     // running without --json sees the identical preview a script would have
     // to skip past on stderr, rather than two different code paths.
-    process.stderr.write(`${formatPlanText(plan)}\n\n${formatPlannedAppCreations(finalCreations, finalGate2InstallOnly, recoveryResumable)}\n`);
+    process.stderr.write(`${formatPlanText(plan)}\n\n${formatPlannedAppCreations(finalCreations, finalGate2InstallOnly, recoveryResumable, widenApps)}\n`);
     if (preview !== undefined) {
       process.stderr.write(`\n${formatIdentityPreview(preview)}\n`);
     }

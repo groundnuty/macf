@@ -999,3 +999,16 @@ describe('runFleetDeploy — watchdog verdict line (#1525)', () => {
     expect(out).not.toContain('NOT installed');
   });
 });
+
+describe('remainingStepsLines (setup review)', () => {
+  it('lists launch, fleet doctor, routing check, and the hold', async () => {
+    const { remainingStepsLines } = await import('../../src/cli/commands/fleet-deploy.js');
+    const text = remainingStepsLines('/w/x', 'o/x').join('\n');
+    expect(text).toContain('cd /w/x && ./claude.sh');
+    expect(text).toContain('not inside tmux');
+    expect(text).toContain('macf fleet doctor --inject');
+    expect(text).toContain('macf routing doctor --e2e --target-repo o/x');
+    expect(text).toContain('Do not assign work until these pass.');
+    expect(text).not.toContain('install-cron');
+  });
+});
