@@ -196,16 +196,16 @@ describe('generateEnvGitHub', () => {
     expect(out).toContain('export KEY_PATH=".github-app-key.pem"');
   });
 
-  it('resolves KEY_PATH against $SCRIPT_DIR when relative (cross-repo cwd trap)', () => {
+  it('resolves KEY_PATH against the workspace dir when relative (cross-repo cwd trap)', () => {
     expect(generateEnvGitHub(baseConfig)).toMatch(
-      /case "\$KEY_PATH" in[\s\S]*?\/\*\) ;;[\s\S]*?\*\) KEY_PATH="\$SCRIPT_DIR\/\$KEY_PATH"/,
+      /case "\$KEY_PATH" in[\s\S]*?\/\*\) ;;[\s\S]*?\*\) KEY_PATH="\$MACF_GH_DIR\/\$KEY_PATH"/,
     );
   });
 
   it('uses the fail-loud token helper (no naive gh token generate | jq)', () => {
     const out = generateEnvGitHub(baseConfig);
     expect(out).toContain('macf-gh-token.sh');
-    expect(out).toContain('$SCRIPT_DIR/.claude/scripts/macf-gh-token.sh');
+    expect(out).toContain('$MACF_GH_DIR/.claude/scripts/macf-gh-token.sh');
     expect(out).toMatch(/macf-gh-token\.sh[\s\S]*?exit 1/);
     expect(out).not.toMatch(/gh token generate[^\n]*\|\s*jq/);
   });

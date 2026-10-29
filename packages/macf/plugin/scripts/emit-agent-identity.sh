@@ -187,6 +187,9 @@ if [ -n "$IDENTITY_SOURCE" ]; then
     fi
     printf '(identity source: %s — not macf-whoami.sh, which only confirms token attribution, see groundnuty/macf#664)\n' "$IDENTITY_SOURCE"
     printf 'Run `macf whoami` for the full self-discovery report (registry, cert CN+expiry, versions, token type).\n'
+    if [ -z "${APP_ID:-}" ] || [ -z "${INSTALL_ID:-}" ] || [ -z "${KEY_PATH:-}" ]; then
+      printf 'This session has no App credentials (APP_ID/INSTALL_ID/KEY_PATH), so it cannot mint a bot token; ask the lead session to run GitHub writes.\n'
+    fi
   } 2>/dev/null || true
 else
   cat <<'UNKNOWN'
