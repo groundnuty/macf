@@ -4,6 +4,41 @@ All notable changes to the `macf` CLI. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.78] — 2026-10-29
+
+Fixes from the post-run review of the first walkthrough fleet (#1525). The fleet ran 12 days on 0.2.75; these are the defects it surfaced.
+
+### Fixed
+
+- **An agent whose channel server is turned off or gone now says so loudly** (#1529).
+  - **What happened:** a workspace template rewrote `.claude/settings.json`, Claude Code then disabled `macf-agent`, and one agent ran with no channel server for 6.8 days while every guard passed.
+  - **Settings check:** a plugin hook now reads the project, local and user settings layers. If `macf-agent` is disabled or not enabled, it puts the fix into the agent's context, and the launcher warns. Settings are never edited.
+  - **Liveness check:** no running server past a two-minute grace period is now an alarm. That covers a server that never started.
+  - **`/macf-peers`:** it prints a `NOT REGISTERED` row for the agent itself.
+- **Each agent commit carries the bot's own identity** (#1527).
+  - **What happened:** `env.github` exported only `<agent_name>[bot]` and no email, so commits were credited to the host address or to the operator's account.
+  - **The fix:** the name is now `bot_login` and the email is `<bot user id>+<bot_login>@users.noreply.github.com`. `macf doctor` warns when commits would be signed with a human's key.
+- **Only the lead Claude Code process runs the channel server** (#1528).
+  - **What happened:** every agent-team teammate started its own channel server, 275 failed starts in one agent.
+  - **The fix:** `claude.sh` records the lead's pid and start time, and a teammate's server exits quietly. Any doubt runs the server as before.
+- **Agent-team teammates get the App credentials and the bot's git identity** (#1535).
+  - **The fix:** `APP_ID`, `INSTALL_ID`, `KEY_PATH` and the `GIT_*` identity reach teammate panes, never `GH_TOKEN`, so teammates mint their own token and commit as the bot. `env.github` can be sourced from any directory.
+- **`notify_peer` to a peer that is not registered is queued until it registers,** instead of being dropped as "offline" (#1526).
+- **Peer lifecycle notices no longer cost the receiver a turn** (#1531).
+  - **What happened:** with native channels, each pushed `session-compact`/`session-end` started a turn; one agent answered 51.
+  - **The fix:** they are recorded in the ledger only. A message with no event is still delivered.
+- **The token hook blocks identity bypasses, not innocent commands** (#1530).
+  - **False blocks:** `gh` inside `bash -c` is matched only at a command position. Seven blocks in the review had no `gh` in them.
+  - **Bypasses blocked:** `env -u GH_TOKEN`, `env -i`, `unset`, `export -n`, an empty or user-token assignment, and quoted forms, whenever a `gh` follows.
+  - **Canonical mint accepted:** the literal in-command mint now works in a session with no ambient token.
+- **The mention hook checks comment bodies passed on stdin** (`--body-file - <<EOF`, about 550 unchecked comments in the review), and a false block on chained commands is fixed (#1533).
+- **`fleet deploy` and `fleet doctor` say whether the watchdog is installed for the fleet** (#1534). Two report-only stall signatures were added: `context-overflow` and `usage-limit`.
+- **The startup pickup lists this agent's work, not issues it filed for others** (#1532).
+- **The last four hand-wired hooks ship in the plugin,** where a settings rewrite cannot remove them, and a session warns when managed files are missing (#1536).
+- **The router tells the sender about undelivered mentions** (`macf-actions` v3.6.3).
+  - **Registry miss:** a miss on the mention, CI or review route now posts a warning and one comment to the sender, where it used to skip silently with a green run.
+  - **Bare `@name`:** a mention without `[bot]` gets a did-you-mean comment.
+
 ## [0.2.77] — 2026-10-18
 
 ### Fixed
