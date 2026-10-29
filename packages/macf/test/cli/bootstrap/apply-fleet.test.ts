@@ -4585,7 +4585,7 @@ agents:
       const reason = leg && 'reason' in leg ? leg.reason : undefined;
       expect(reason).toContain('--runner-token');
       expect(reason).toContain('MACF_BOOTSTRAP_RUNNER_TOKEN');
-      expect(reason).toContain('gh api -X POST /orgs/<org>/actions/runners/registration-token --jq .token');
+      expect(reason).toContain('gh api -X POST /repos/groundnuty/demo-code/actions/runners/registration-token --jq .token'); // fixture owner is a user account
       // groundnuty/macf#1195 — the check IS attempted (that is the fix); the
       // refusal is now EVIDENCED by a live read, never assumed from the
       // flag alone.

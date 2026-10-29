@@ -93,3 +93,64 @@ describe('repoInit — tokenSource threading (groundnuty/macf#920)', () => {
     expect(result.labels).toEqual({ status: 'skipped', reason: 'JSON web token could not be decoded' });
   });
 });
+
+describe('repoInit — insideApply (setup review S17/F11)', () => {
+  it('prints the calm label line and no Next steps when no token can be minted inside apply', async () => {
+    const dir = tempDir();
+    mockGenerateToken.mockReset();
+    mockGenerateToken.mockRejectedValue(new Error('no token'));
+    const err: string[] = [];
+    const out: string[] = [];
+    const e = vi.spyOn(process.stderr, 'write').mockImplementation((t) => (err.push(String(t)), true));
+    const l = vi.spyOn(console, 'log').mockImplementation((...a) => void out.push(a.join(' ')));
+    try {
+      await repoInit(dir, { repo: 'owner/r', actionsVersion: 'v1', agents: 'code-agent', force: false, insideApply: true });
+    } finally {
+      e.mockRestore();
+      l.mockRestore();
+      rmSync(dir, { recursive: true, force: true });
+    }
+    expect(err.join('')).toContain('labels: will be created once the App exists (apply retries this)');
+    expect(err.join('')).not.toContain('Skipping label creation');
+    expect(out.join('\n')).not.toContain('Next steps');
+  });
+
+  it('standalone keeps the warning and Next steps', async () => {
+    const dir = tempDir();
+    mockGenerateToken.mockReset();
+    mockGenerateToken.mockRejectedValue(new Error('no token'));
+    const err: string[] = [];
+    const out: string[] = [];
+    const e = vi.spyOn(process.stderr, 'write').mockImplementation((t) => (err.push(String(t)), true));
+    const l = vi.spyOn(console, 'log').mockImplementation((...a) => void out.push(a.join(' ')));
+    try {
+      await repoInit(dir, { repo: 'owner/r', actionsVersion: 'v1', agents: 'code-agent', force: false });
+    } finally {
+      e.mockRestore();
+      l.mockRestore();
+      rmSync(dir, { recursive: true, force: true });
+    }
+    expect(err.join('')).toContain('Skipping label creation');
+    expect(out.join('\n')).toContain('Next steps');
+  });
+});
+
+describe('repoInit — insideApply with a working token', () => {
+  it('prints no Next steps', async () => {
+    const dir = tempDir();
+    mockGenerateToken.mockReset();
+    mockGenerateToken.mockResolvedValue('ghs_ok');
+    const orig = globalThis.fetch;
+    globalThis.fetch = vi.fn().mockResolvedValue({ status: 201 }) as typeof fetch;
+    const out: string[] = [];
+    const l = vi.spyOn(console, 'log').mockImplementation((...a) => void out.push(a.join(' ')));
+    try {
+      await repoInit(dir, { repo: 'owner/r', actionsVersion: 'v1', agents: 'code-agent', force: false, insideApply: true });
+    } finally {
+      l.mockRestore();
+      globalThis.fetch = orig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+    expect(out.join('\n')).not.toContain('Next steps');
+  });
+});

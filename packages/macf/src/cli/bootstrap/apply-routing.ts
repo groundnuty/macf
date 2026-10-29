@@ -276,7 +276,11 @@ export interface RunnerRegistrationDeps {
  * requirement: reuse, no separate seam to keep in sync) — PLUS the
  * register-before-route gate this module alone needs.
  */
-export type RoutingApplyDeps = Pick<CaApplyDeps, 'checkRepoPresence' | 'createRepoVariable'> & RunnerRegistrationDeps;
+export type RoutingApplyDeps = Pick<CaApplyDeps, 'checkRepoPresence' | 'createRepoVariable'> &
+  RunnerRegistrationDeps & {
+    /** The fleet owner's account type; picks the runner-token command in refusal text. */
+    readonly ownerType?: 'user' | 'org';
+  };
 
 function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
@@ -397,16 +401,28 @@ export const RUNNER_TOKEN_ENV_VAR = 'MACF_BOOTSTRAP_RUNNER_TOKEN';
  * isn't knowable yet at this point in the flow (before `observe` has even
  * run). Apply never registers a runner itself.
  */
-export function noRunnerTokenReason(): string {
+export function noRunnerTokenReason(ownerType?: 'user' | 'org'): string {
   return (
     'manifest declares routing.runner (runs_on: "self-hosted") and no runner registration token was ' +
     'supplied. That is fine when the runner platform is configured: apply waits up to 10 minutes for each ' +
     'runner it requests from the platform this run. For a repo whose runner apply did not request, it checks ' +
     'once instead of waiting, and a repo whose runner is not visible yet gets no MACF_TRUSTED_ACTORS and ' +
     'cannot route until a re-run writes it. To have apply wait for those too, supply ' +
-    `${RUNNER_TOKEN_FLAG} <token> (or the ${RUNNER_TOKEN_ENV_VAR} env var). Get a token with: ` +
-    'gh api -X POST /orgs/<org>/actions/runners/registration-token --jq .token'
+    `${RUNNER_TOKEN_FLAG} <token> (or the ${RUNNER_TOKEN_ENV_VAR} env var). ${runnerTokenHowTo(ownerType)}`
   );
+}
+
+/**
+ * How to get a runner registration token. An organisation has one org-level
+ * endpoint; a user account has none, so each repo needs its own token.
+ * With no owner type known, both forms are given.
+ */
+export function runnerTokenHowTo(ownerType?: 'user' | 'org', repo?: string): string {
+  const org = 'gh api -X POST /orgs/<org>/actions/runners/registration-token --jq .token';
+  const repoForm = `gh api -X POST /repos/${repo ?? '<owner>/<repo>'}/actions/runners/registration-token --jq .token`;
+  if (ownerType === 'org') return `Get a token with: ${org}`;
+  if (ownerType === 'user') return `A user account has no org endpoint; get a token per repo with: ${repoForm}`;
+  return `For an organisation: ${org}. For a user account, per repo: ${repoForm}`;
 }
 
 /** The exit-code-relevant refusal code {@link checkRunnerTokenPreflight} returns — distinct from `plan.ts`'s own `'vault_flags_incomplete'` (macf#913's sibling XOR refusal) so a caller/log can tell the two argument-boundary refusals apart. */
@@ -491,10 +507,11 @@ export interface RunnerTokenPreflightFailure {
 export function checkRunnerTokenPreflight(
   routing: FleetRouting | undefined,
   runnerToken: string | undefined,
+  ownerType?: 'user' | 'org',
 ): RunnerTokenPreflightFailure | undefined {
   if (routing?.runner === undefined || routing.runner.runs_on !== 'self-hosted') return undefined;
   if (runnerToken !== undefined && runnerToken.length > 0) return undefined;
-  return { code: RUNNER_TOKEN_MISSING_CODE, message: noRunnerTokenReason() };
+  return { code: RUNNER_TOKEN_MISSING_CODE, message: noRunnerTokenReason(ownerType) };
 }
 
 // --- The runner-requirement's OWN leg (groundnuty/macf#1323) ---
@@ -530,9 +547,9 @@ export type RunnerRequirementOutcome =
  * a second, independently-drifting copy of "is this declared self-hosted") so
  * the two can never disagree about whether the requirement applies.
  */
-export function runnerRequirementOutcome(routing: FleetRouting | undefined, runnerToken: string | undefined): RunnerRequirementOutcome {
+export function runnerRequirementOutcome(routing: FleetRouting | undefined, runnerToken: string | undefined, ownerType?: 'user' | 'org'): RunnerRequirementOutcome {
   if (routing?.runner === undefined || routing.runner.runs_on !== 'self-hosted') return { status: 'not-required' };
-  const preflight = checkRunnerTokenPreflight(routing, runnerToken);
+  const preflight = checkRunnerTokenPreflight(routing, runnerToken, ownerType);
   return preflight === undefined ? { status: 'ok' } : { status: 'failed', reason: preflight.message };
 }
 
@@ -705,7 +722,7 @@ export function runnerTokenPollExhaustedReason(repo: string, usability: RunnerUs
  * {@link runnerJustCreatedRepoReason}'s doc names for the sibling
  * fast-path case.
  */
-export function noUsableRunnerWithoutTokenReason(repo: string, usability: RunnerUsability, justCreated: boolean): string {
+export function noUsableRunnerWithoutTokenReason(repo: string, usability: RunnerUsability, justCreated: boolean, ownerType?: 'user' | 'org'): string {
   const cause =
     usability.presence === 'unknown'
       ? 'could not confirm whether a self-hosted runner is registered (auth / network / insufficient scope)'
@@ -719,8 +736,7 @@ export function noUsableRunnerWithoutTokenReason(repo: string, usability: Runner
     'was NOT written. This repo cannot route until it is: its routing jobs wait for a self-hosted runner ' +
     'and never fall back to a GitHub-hosted one. Re-run `macf bootstrap apply` once a runner for this repo ' +
     `is visible (no token is needed then), or supply ${RUNNER_TOKEN_FLAG} <token> (or the ` +
-    `${RUNNER_TOKEN_ENV_VAR} env var) so this run waits for it. Get a token with: gh api -X POST ` +
-    `/orgs/<org>/actions/runners/registration-token --jq .token.${detailSuffix}${handoverSuffix}`
+    `${RUNNER_TOKEN_ENV_VAR} env var) so this run waits for it. ${runnerTokenHowTo(ownerType, repo)}.${detailSuffix}${handoverSuffix}`
   );
 }
 
@@ -959,7 +975,7 @@ async function publishTrustedActorsWithoutToken(
     }
     out[repo] = {
       status: 'failed',
-      reason: noUsableRunnerWithoutTokenReason(repo, usability, justCreatedRepos?.has(repo) === true),
+      reason: noUsableRunnerWithoutTokenReason(repo, usability, justCreatedRepos?.has(repo) === true, deps.ownerType),
     };
   }
   return out;

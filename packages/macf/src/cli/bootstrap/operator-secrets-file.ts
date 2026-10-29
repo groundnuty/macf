@@ -48,10 +48,10 @@
  * containing directory's `.gitignore` covers the file it just wrote, so
  * "never committed" does not depend on the operator remembering.
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { TS_OAUTH_CLIENT_ID_ENV_VAR, TS_OAUTH_SECRET_ENV_VAR } from './apply-routing-secrets.js';
-import { RUNNER_TOKEN_ENV_VAR } from './apply-routing.js';
+import { RUNNER_TOKEN_ENV_VAR, runnerTokenHowTo } from './apply-routing.js';
 import { RUNNER_PLATFORM_ENDPOINT_ENV_VAR } from './runner-platform.js';
 
 function errMessage(err: unknown): string {
@@ -243,7 +243,7 @@ export const OPERATOR_SECRETS_FILE_KEYS: readonly OperatorSecretsFileKeyInfo[] =
   {
     key: RUNNER_TOKEN_ENV_VAR,
     purpose: 'Optional. Lets apply wait up to 10 minutes for a runner it did not request from the runner platform itself; runners it requested are waited for without it.',
-    howToObtain: 'gh api -X POST /orgs/<org>/actions/runners/registration-token --jq .token (expires in about an hour — get a fresh one if apply is re-run later).',
+    howToObtain: `${runnerTokenHowTo()} (expires in about an hour — get a fresh one if apply is re-run later).`,
     storageClass: 'ephemeral-discard',
   },
   {
@@ -321,10 +321,14 @@ export function ensureOperatorSecretsGitignore(dir: string, fileBasename: string
  * operator who already filled one in must not have it silently blanked).
  */
 export function writeOperatorSecretsFileTemplate(path: string): { readonly created: boolean } {
-  if (existsSync(path)) return { created: false };
+  if (existsSync(path)) {
+    // The file holds credentials: owner-only, even if an older run wrote it wider.
+    chmodSync(path, 0o600);
+    return { created: false };
+  }
   const dir = dirname(path);
   mkdirSync(dir, { recursive: true });
-  writeFileSync(path, operatorSecretsFileTemplate(), 'utf-8');
+  writeFileSync(path, operatorSecretsFileTemplate(), { encoding: 'utf-8', mode: 0o600 });
   ensureOperatorSecretsGitignore(dir, basename(path));
   return { created: true };
 }

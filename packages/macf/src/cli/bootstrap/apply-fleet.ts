@@ -2880,7 +2880,7 @@ export async function applyFleet(
       ? await publishTrustedActorsGated(
           buildTrustedActorsValue(manifest.metadata.name, manifest.agents, manifest.routing?.runner.trusted_actors ?? []),
           nonProvisionedRepos,
-          deps.trustDeps,
+          { ...deps.trustDeps, ownerType: manifest.owner.type },
           // POLICY only (macf#929): the token gates whether we ATTEMPT the
           // detection-and-write at all; it never substitutes for confirming a
           // usable runner. `publishTrustedActorsGated` owns that contract.
@@ -2920,7 +2920,7 @@ export async function applyFleet(
   // this manifest-level guess and must win; that guard is repeated here so
   // the live transcript narration never contradicts what the final summary
   // says.
-  const runnerRequirement = runnerRequirementOutcome(manifest.routing, deps.runnerToken);
+  const runnerRequirement = runnerRequirementOutcome(manifest.routing, deps.runnerToken, manifest.owner.type);
   if (runnerRequirement.status === 'failed' && Object.keys(routing).length === 0) {
     deps.log(`Runner requirement: FAILED — ${runnerRequirement.reason}`);
   }
@@ -3723,7 +3723,7 @@ export async function retryWorkRepoRouting(
   const notProvisioned = ready.filter((r) => leg.routing[r] === undefined);
   const restRouting: Readonly<Record<string, EnsureVariableOutcome>> =
     notProvisioned.length > 0 && manifest.routing?.runner?.runs_on === 'self-hosted'
-      ? await publishTrustedActorsGated(trustedValue, notProvisioned, deps.trustDeps, deps.runnerToken, deps.runnerTokenPollOptions ?? {}, new Set<string>())
+      ? await publishTrustedActorsGated(trustedValue, notProvisioned, { ...deps.trustDeps, ownerType: manifest.owner.type }, deps.runnerToken, deps.runnerTokenPollOptions ?? {}, new Set<string>())
       : {};
   for (const [repo, l] of Object.entries<EnsureVariableOutcome>(restRouting)) {
     deps.log(`Routing var (${repo}): ${l.status}` + (l.status === 'failed' || l.status === 'skipped' || l.status === 'pending' ? ` — ${l.reason}` : '.'));

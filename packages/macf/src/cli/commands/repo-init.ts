@@ -14,6 +14,8 @@ import { ALL_ROUTING_SECRET_NAMES, ROUTING_BUNDLE_SECRET_NAME } from '../bootstr
 
 export interface RepoInitOptions {
   readonly repo?: string;
+  /** Set when `macf bootstrap apply` calls this: apply creates labels later and does the rest itself, so the standalone warning and "Next steps" are not shown. */
+  readonly insideApply?: boolean;
   readonly actionsVersion: string;
   readonly agents?: string;
   readonly force: boolean;
@@ -1243,10 +1245,14 @@ export async function repoInit(
     token = await generateToken(opts.tokenSource);
   } catch (err) {
     const reason = err instanceof Error ? err.message : 'unknown';
-    process.stderr.write(`Warning: could not generate token (${reason}). Skipping label creation.\n`);
+    process.stderr.write(
+      opts.insideApply === true
+        ? 'labels: will be created once the App exists (apply retries this)\n'
+        : `Warning: could not generate token (${reason}). Skipping label creation.\n`,
+    );
     const labels: LabelsOutcome = { status: 'skipped', reason };
     printResults(workflowResult, configResult, labels);
-    printNextSteps(configResult, agentList, opts.actionsVersion);
+    if (opts.insideApply !== true) printNextSteps(configResult, agentList, opts.actionsVersion);
     return { workflow: workflowResult, config: configResult, labels };
   }
 
@@ -1269,7 +1275,7 @@ export async function repoInit(
   const labels: LabelsOutcome = failed.length === 0 ? { status: 'ok', created, existed } : { status: 'partial-failure', created, existed, failed };
 
   printResults(workflowResult, configResult, labels);
-  printNextSteps(configResult, agentList, opts.actionsVersion);
+  if (opts.insideApply !== true) printNextSteps(configResult, agentList, opts.actionsVersion);
   return { workflow: workflowResult, config: configResult, labels };
 }
 

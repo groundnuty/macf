@@ -2413,8 +2413,8 @@ function routingClientItem(repo: string, presence: Presence): PlanItem {
  * appended.
  */
 const RUNNER_TOKEN_PLAN_NOTE =
-  ` \`macf bootstrap apply\` additionally requires ${RUNNER_TOKEN_FLAG} (or ${RUNNER_TOKEN_ENV_VAR}) before it will ` +
-  'attempt this write at all.';
+  ` With no runner platform endpoint set, \`macf bootstrap apply\` needs ${RUNNER_TOKEN_FLAG} (or ${RUNNER_TOKEN_ENV_VAR}) ` +
+  'to wait for a runner before it writes this.';
 
 /**
  * groundnuty/macf#993 — the operator's ruling, stated plainly BEFORE the
@@ -2470,6 +2470,7 @@ function runnerClassReason(
   representativeRepo: string | undefined,
   handover: string | undefined,
   detail: string | undefined,
+  platformEndpointResolves: boolean,
 ): string {
   const repoLabel = representativeRepo ?? '(no agent repos declared)';
   if (runnerRegistered === 'present') {
@@ -2485,7 +2486,7 @@ function runnerClassReason(
     `Runner class: self-hosted, no runner yet — ${cause} yet. apply requests one from the runner platform ` +
     'when MACF_RUNNER_PLATFORM_ENDPOINT resolves, and writes MACF_TRUSTED_ACTORS only once it is visible ' +
     "(register-before-route); until then this repo's routing jobs wait for a runner and never fall back to " +
-    `a GitHub-hosted one.${detailSuffix}${handoverSuffix}${RUNNER_TOKEN_PLAN_NOTE}` +
+    `a GitHub-hosted one.${detailSuffix}${handoverSuffix}${platformEndpointResolves ? '' : RUNNER_TOKEN_PLAN_NOTE}` +
     RUNNER_REQUIRED_FAILURE_PLAN_NOTE
   );
 }
@@ -2507,6 +2508,7 @@ function routingItem(
   representativeRepo: string | undefined,
   runnerHandover: string | undefined,
   runnerDetail: string | undefined,
+  platformEndpointResolves = false,
 ): PlanItem {
   const target = `routing:${fleetName}:runner`;
 
@@ -2522,7 +2524,7 @@ function routingItem(
     };
   }
 
-  const classSuffix = runnerClassReason(runnerRegistered, representativeRepo, runnerHandover, runnerDetail);
+  const classSuffix = runnerClassReason(runnerRegistered, representativeRepo, runnerHandover, runnerDetail, platformEndpointResolves);
 
   if (observedTrustedActors === undefined) {
     return {
@@ -3224,6 +3226,7 @@ export function computePlan(
         representativeRepo,
         observed.routingRunnerHandover,
         observed.routingRunnerDetail,
+        observed.runnerPlatformEndpoint?.value !== undefined,
       ),
     );
     items.push(runnerWarmItem(fleetName, manifest.routing.runner.warm));

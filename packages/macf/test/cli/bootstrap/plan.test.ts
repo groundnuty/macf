@@ -501,6 +501,18 @@ describe('computePlan — a version/config mismatch → update + confirm_require
     expect(routing?.reason).toMatch(/no self-hosted runner is confirmed registered/);
   });
 
+  it('shows the runner-token note only when the runner platform endpoint does not resolve', () => {
+    const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
+    const without = computePlan(manifest, { ...EMPTY_OBSERVED, routingRunnerRegistered: 'absent' });
+    const withEp = computePlan(manifest, {
+      ...EMPTY_OBSERVED,
+      routingRunnerRegistered: 'absent',
+      runnerPlatformEndpoint: { value: 'http://10.0.0.1:9', source: 'env' },
+    });
+    expect(itemFor(without.items, 'routing', 'routing:icsoc-2026:runner')?.reason).toContain(RUNNER_TOKEN_FLAG);
+    expect(itemFor(withEp.items, 'routing', 'routing:icsoc-2026:runner')?.reason).not.toContain(RUNNER_TOKEN_FLAG);
+  });
+
   it('names "self-hosted, no runner yet" when registration is UNKNOWN — never overclaims confidence', () => {
     const manifest = baseManifest({ routing: { runner: { runs_on: 'self-hosted', warm: 1 } } });
     const observed: ObservedState = { ...EMPTY_OBSERVED, routingRunnerRegistered: 'unknown' };
