@@ -1129,6 +1129,10 @@ describe('check-gh-token.sh (hook)', () => {
         'export -n GH_TOKEN; gh issue list',
         'declare +x GH_TOKEN; gh issue list',
         'typeset +x GH_TOKEN; gh issue list',
+        'unset "GH_TOKEN"; gh issue list',
+        "unset 'GH_TOKEN'; gh issue list",
+        'env -u "GH_TOKEN" gh issue list',
+        'export -n "GH_TOKEN"; gh issue list',
       ];
       for (const rest of blockedAfterMint) {
         it(`blocks after a mint: ${rest}`, () => {

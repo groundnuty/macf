@@ -75,11 +75,11 @@ fi
 _ws='[[:space:];|&("'"'"']'
 _dq='"'
 _sq="'"
-BYPASS_ENV_U='(^|'"$_ws"')env[[:space:]]+[^;|&]*(-u[[:space:]]*|--unset[=[:space:]]+)GH_TOKEN([[:space:]]|$)'
+BYPASS_ENV_U='(^|'"$_ws"')env[[:space:]]+[^;|&]*(-u[[:space:]]*|--unset[=[:space:]]+)["'"'"']?GH_TOKEN["'"'"']?([[:space:]]|$)'
 BYPASS_EMPTY='(^|'"$_ws"')GH_TOKEN=('"$_dq$_dq|$_sq$_sq"')?([[:space:];|&]|$)'
-BYPASS_UNSET='(^|'"$_ws"')unset[[:space:]]+([^;|&]*[[:space:]])?GH_TOKEN([[:space:];|&]|$)'
+BYPASS_UNSET='(^|'"$_ws"')unset[[:space:]]+([^;|&]*[[:space:]])?["'"'"']?GH_TOKEN["'"'"']?([[:space:];|&]|$)'
 # Removing only the export attribute (export -n, declare +x, typeset +x) has the same effect.
-BYPASS_UNEXPORT='(^|'"$_ws"')(export[[:space:]]+-n|declare[[:space:]]+\+x|typeset[[:space:]]+\+x)[[:space:]]+([^;|&]*[[:space:]])?GH_TOKEN([[:space:];|&=]|$)'
+BYPASS_UNEXPORT='(^|'"$_ws"')(export[[:space:]]+-n|declare[[:space:]]+\+x|typeset[[:space:]]+\+x)[[:space:]]+([^;|&]*[[:space:]])?["'"'"']?GH_TOKEN["'"'"']?([[:space:];|&=]|$)'
 
 # True when REGEX matches and a gh / git push comes AFTER the first match.
 # `gh issue list; unset GH_TOKEN` is cleanup after gh and stays allowed.
