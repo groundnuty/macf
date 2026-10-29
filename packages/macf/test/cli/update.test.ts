@@ -1412,4 +1412,83 @@ describe('update command', () => {
       rmSync(fakeRoot, { recursive: true, force: true });
     });
   });
+
+  // ---------------------------------------------------------------------
+  // groundnuty/macf#1525: the early hook refresh runs against the OLD
+  // plugin, so the four migrated hooks stayed in settings.json after the
+  // bump delivered them through the plugin (each fired twice).
+  // ---------------------------------------------------------------------
+  describe('migrated hooks after a plugin fetch (#1525)', () => {
+    const FOUR = ['check-channels-enabled.sh', 'macf-startup-pickup.sh', 'emit-turn-receipt.sh', 'check-auditor-never-acts.sh'];
+    const ALL = [
+      'check-gh-token.sh', 'check-mention-routing.sh', 'check-lgtm-gate.sh', 'check-close-keyword.sh',
+      'check-gh-attribution.sh', 'harvest-reflection.sh', 'check-channel-alive.sh', ...FOUR,
+    ];
+    const OPERATOR_HOOK = '/opt/operator/own-hook.sh';
+
+    function writeLauncher(): void {
+      writeFileSync(
+        join(dir, 'claude.sh'),
+        '#!/usr/bin/env bash\n# Hand-wired launcher, no managed-header.\n' +
+          'SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"\n' +
+          'exec claude --plugin-dir "$SCRIPT_DIR/.macf/plugin" "$@"\n',
+        { mode: 0o755 },
+      );
+    }
+    function writePluginHooks(names: readonly string[]): void {
+      const hooksDir = join(dir, '.macf', 'plugin', 'hooks');
+      mkdirSync(hooksDir, { recursive: true });
+      const entries = names.map((n) => ({ hooks: [{ type: 'command', command: `\${CLAUDE_PLUGIN_ROOT}/scripts/${n}` }] }));
+      writeFileSync(join(hooksDir, 'hooks.json'), JSON.stringify({ hooks: { SessionStart: entries } }));
+    }
+    function writeOldSettings(): void {
+      mkdirSync(join(dir, '.claude'), { recursive: true });
+      const entries = [...FOUR, OPERATOR_HOOK].map((n) => ({
+        hooks: [{ type: 'command', command: n.startsWith('/') ? n : `.claude/scripts/${n}` }],
+      }));
+      writeFileSync(join(dir, '.claude', 'settings.json'), JSON.stringify({ hooks: { SessionStart: entries } }));
+    }
+    function settingsText(): string {
+      return readFileSync(join(dir, '.claude', 'settings.json'), 'utf-8');
+    }
+    function setup(): void {
+      writeConfig(dir, { cli: '0.2.0', plugin: '0.1.0', actions: 'v1' });
+      seedInstalledPlugin(join(dir, '.macf', 'plugin'), '0.1.0');
+      writeLauncher();
+      writePluginHooks(['check-gh-token.sh']); // OLD plugin: lacks the four
+      writeOldSettings();
+      mockFetchReturning({ cli: '0.2.0', plugin: '0.2.0', actions: 'v1' });
+      vi.mocked(fetchPluginToWorkspace).mockReset();
+    }
+
+    it('bump: the fetch delivers the four, so settings.json no longer carries them', async () => {
+      setup();
+      vi.mocked(fetchPluginToWorkspace).mockImplementation(() => {
+        writePluginHooks(ALL); // NEW plugin registers the full set
+      });
+
+      const code = await update(dir, { all: false, cli: false, plugin: true, actions: false, yes: true, dryRun: false });
+      expect(code).toBe(0);
+      expect(fetchPluginToWorkspace).toHaveBeenCalledTimes(1);
+
+      const text = settingsText();
+      for (const name of FOUR) expect(text, name).not.toContain(name);
+      expect(text).toContain(OPERATOR_HOOK);
+    });
+
+    it('failed fetch: the four stay, nothing is stripped against a plugin that is not there', async () => {
+      setup();
+      vi.mocked(fetchPluginToWorkspace).mockImplementation(() => {
+        throw new Error('clone failed');
+      });
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+      await update(dir, { all: false, cli: false, plugin: true, actions: false, yes: true, dryRun: false });
+      expect(fetchPluginToWorkspace).toHaveBeenCalledTimes(1);
+
+      const text = settingsText();
+      for (const name of FOUR) expect(text, name).toContain(name);
+      expect(text).toContain(OPERATOR_HOOK);
+    });
+  });
 });

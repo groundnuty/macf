@@ -297,6 +297,19 @@ async function confirmPlan(rows: readonly DiffRow[]): Promise<boolean> {
   return normalized === 'y' || normalized === 'yes';
 }
 
+
+/**
+ * Re-run the two hook refreshes once a plugin fetch has succeeded. The early
+ * refresh runs against the old plugin, whose hooks.json lacks the migrated
+ * hooks, so it keeps the settings.json copies and they fire twice. Called
+ * only after a successful fetch (groundnuty/macf#1525).
+ */
+function refreshHookEntriesAfterPluginFetch(projectDir: string): void {
+  installGhTokenHook(projectDir);
+  installStartupPickupHook(projectDir);
+  recordManagedHashes(projectDir, [SETTINGS_REL]);
+}
+
 /**
  * Main entry. Returns exit code (0 success/noop, 1 failure).
  */
@@ -658,6 +671,7 @@ export async function update(
       const reasonText = repairCheck.detail ? `${repairCheck.reason} — ${repairCheck.detail}` : repairCheck.reason;
       try {
         fetchPluginToWorkspace(projectDir, config.versions.plugin, { targetDir: pluginTarget.dir });
+        refreshHookEntriesAfterPluginFetch(projectDir);
         console.log(`Repaired ${pluginTarget.dir} with macf-agent@v${config.versions.plugin} (${reasonText})`);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -821,6 +835,7 @@ export async function update(
     if (pluginTarget.dir) {
       try {
         fetchPluginToWorkspace(projectDir, newVersions.plugin, { targetDir: pluginTarget.dir });
+        refreshHookEntriesAfterPluginFetch(projectDir);
         console.log(`Refreshed ${pluginTarget.dir} to macf-agent@v${newVersions.plugin}`);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
