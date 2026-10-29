@@ -19,6 +19,7 @@ import { reportSeedPromptResponses, seedPromptResponsesConfig } from '../prompt-
 import { reportSeedStallSignatures, seedStallSignaturesConfig } from '../stall-signatures.js';
 import { installGhTokenHook, installStartupPickupHook, installPluginSkillPermissions, installSandboxFdAllowRead, installSandboxExcludedCommands, installIdleCompactionOff } from '../settings-writer.js';
 import { deriveBotLogin, fetchAppSlug } from './doctor.js';
+import { withBotUserId } from '../git-identity.js';
 import { fetchPluginToWorkspace, copyLocalPluginToWorkspace, stripPluginMcpServers, linkPluginCliDist } from '../plugin-fetcher.js';
 import { writeMcpJsonChannelServer } from '../mcp-json.js';
 import { writeClaudeSh, hasManagedHeader } from '../claude-sh.js';
@@ -705,7 +706,7 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
   // Write agent config. `github_app` is omitted in local-registry mode
   // (DR-024) — the launcher does not mint a token, and the schema marks
   // the field optional to encode that conditional shape.
-  const config: MacfAgentConfig = {
+  let config: MacfAgentConfig = {
     project: opts.project,
     agent_name: agentName,
     agent_role: opts.role,
@@ -750,7 +751,8 @@ export async function initAgent(projectDir: string, opts: InitOptions): Promise<
         ...config,
         github_app: { ...config.github_app, bot_login: botLogin },
       };
-      writeAgentConfig(absDir, updatedConfig);
+      config = await withBotUserId(updatedConfig);
+      writeAgentConfig(absDir, config);
       console.log(`  Attribution: resolved github_app.bot_login = ${botLogin}`);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);

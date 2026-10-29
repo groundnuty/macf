@@ -14,6 +14,7 @@ import { join, resolve } from 'node:path';
 import type { MacfAgentConfig } from './config.js';
 import { ownerAccountFromRegistry } from './config.js';
 import { MCP_SERVER_NAME } from './mcp-json.js';
+import { gitIdentityLines } from './git-identity.js';
 
 // ---------------------------------------------------------------------------
 // Legacy per-concern emitters (macf#342 PR-B note)
@@ -803,8 +804,7 @@ export function githubTokenAndIdentityLines(cfg: MacfAgentConfig): string[] {
     '}',
     'export GH_TOKEN',
     '',
-    `export GIT_AUTHOR_NAME="${cfg.agent_name}[bot]"`,
-    `export GIT_COMMITTER_NAME="${cfg.agent_name}[bot]"`,
+    ...gitIdentityLines(cfg),
     '',
     `echo "Starting ${cfg.agent_name} (${cfg.agent_role})..."`,
   ];

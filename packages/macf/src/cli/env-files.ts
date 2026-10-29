@@ -38,6 +38,7 @@
  * detect the format version without parsing.
  */
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { gitIdentityLines } from './git-identity.js';
 import { join, resolve } from 'node:path';
 import type { MacfAgentConfig } from './config.js';
 import { ownerAccountFromRegistry } from './config.js';
@@ -384,8 +385,7 @@ export function generateEnvGitHub(config: MacfAgentConfig): string {
     '}',
     'export GH_TOKEN',
     '',
-    `export GIT_AUTHOR_NAME="${config.agent_name}[bot]"`,
-    `export GIT_COMMITTER_NAME="${config.agent_name}[bot]"`,
+    ...gitIdentityLines(config),
     '',
     `echo "Starting ${config.agent_name} (${config.agent_role})..."`,
   ];
