@@ -1479,4 +1479,164 @@ describe('check-mention-routing.sh (hook)', () => {
       });
     });
   });
+
+  describe('stdin heredoc bodies and path-bound writers (groundnuty/macf#1525 item 7)', () => {
+    const GH = 'gh issue comment 9 --repo o/r';
+
+    describe('--body-file - with a heredoc on the same command', () => {
+      it('allows a line-start mention', () => {
+        const r = runHook({ command: `${GH} --body-file - <<'EOF'\n@macf-science-agent[bot] hi\nEOF` });
+        expect(r.status).toBe(0);
+        expect(String(r.stderr)).not.toContain('could not resolve');
+      });
+
+      it('blocks a body with no mention (Check A)', () => {
+        const r = runHook({ command: `${GH} --body-file - <<'EOF'\nstatus only\nEOF` });
+        expect(r.status).toBe(2);
+        expect(String(r.stderr)).toContain('zero');
+      });
+
+      it('blocks a raw mid-line mention (Check B)', () => {
+        const r = runHook({
+          command: `${GH} --body-file - <<'EOF'\n@macf-science-agent[bot] see\nthe @macf-tester-1-agent[bot] reply\nEOF`,
+        });
+        expect(r.status).toBe(2);
+        expect(String(r.stderr)).toContain('describing-context');
+      });
+
+      it('handles -F - and an unquoted delimiter', () => {
+        const r = runHook({ command: `${GH} -F - <<EOF\nno mention\nEOF` });
+        expect(r.status).toBe(2);
+      });
+
+      it('keeps the warning when stdin is not a heredoc', () => {
+        const r = runHook({ command: `cat note.md | ${GH} --body-file -` });
+        expect(r.status).toBe(0);
+        expect(warningOf(r) + String(r.stderr)).toContain('could not resolve');
+      });
+    });
+
+    describe('each --body-file is bound to its own writer', () => {
+      const write = (text: string): string => `cat > $S/c9.md <<'EOF'\n${text}\nEOF\n`;
+      const tail = `gh issue edit 9 --repo o/r --add-label y >/dev/null; ${GH} --body-file $S/c9.md; python3 -I - <<'EOF'\nprint(1)\nEOF`;
+
+      it('allows the file when a later unrelated heredoc follows on the same line', () => {
+        const r = runHook({ command: write('@macf-science-agent[bot] hi') + tail });
+        expect(r.status).toBe(0);
+      });
+
+      it('still blocks when that file has no mention', () => {
+        const r = runHook({ command: write('no mention here') + tail });
+        expect(r.status).toBe(2);
+        expect(String(r.stderr)).toContain('zero');
+      });
+
+      it('does not take a longer path sharing the prefix as the writer', () => {
+        const r = runHook({
+          command: `cat > /tmp/m1525-a.mdx <<'EOF'\n@macf-science-agent[bot] other\nEOF\ncat > /tmp/m1525-a.md <<'EOF'\nno mention\nEOF\n${GH} --body-file /tmp/m1525-a.md`,
+        });
+        expect(r.status).toBe(2);
+      });
+    });
+
+    describe('a stdin heredoc does not hide a chained file-backed comment', () => {
+      it('blocks a describing leak in the file when another comment uses --body-file - <<EOF', () => {
+        const dir = mkdtempSync(join(tmpdir(), 'macf1525-chain-'));
+        try {
+          const f = join(dir, 'body.md');
+          writeFileSync(f, 'see the @macf-tester-1-agent[bot] reply\n');
+          const r = runHook({
+            command: `gh issue comment 9 --body-file ${f}; gh issue comment 10 --body-file - <<'EOF'\n@macf-science-agent[bot] ok\nEOF`,
+          });
+          expect(r.status).toBe(2);
+          expect(String(r.stderr)).toContain('describing-context');
+        } finally {
+          rmSync(dir, { recursive: true, force: true });
+        }
+      });
+
+      it('allows the same chain when the file addresses at line start', () => {
+        const dir = mkdtempSync(join(tmpdir(), 'macf1525-chain-'));
+        try {
+          const f = join(dir, 'body.md');
+          writeFileSync(f, '@macf-tester-1-agent[bot] please look\n');
+          const r = runHook({
+            command: `gh issue comment 9 --body-file ${f}; gh issue comment 10 --body-file - <<'EOF'\n@macf-science-agent[bot] ok\nEOF`,
+          });
+          expect(r.status).toBe(0);
+        } finally {
+          rmSync(dir, { recursive: true, force: true });
+        }
+      });
+    });
+
+    describe('the command text is linted as written, with no rewriting', () => {
+      it('blocks a mention after a printf \\n inside a double-quoted body (as on main)', () => {
+        const r = runHook({ command: `${GH} --body "$(printf '\\n@macf-science-agent[bot] no need to wait')"` });
+        expect(r.status).toBe(2);
+        expect(String(r.stderr)).toContain('describing-context');
+      });
+
+      it('blocks a literal printf with a newline escape inside a single-quoted body', () => {
+        const r = runHook({ command: `gh issue comment 9 --body '$(printf "\\n@x[bot] hi")'` });
+        expect(r.status).toBe(2);
+      });
+
+      it('blocks heredoc-like example lines inside a multi-line quoted body', () => {
+        const r = runHook({
+          command: `gh issue comment 9 --body "see\nexample; python <<EOF\nthe @macf-tester-1-agent[bot] reply\nEOF\nend"`,
+        });
+        expect(r.status).toBe(2);
+        expect(String(r.stderr)).toContain('describing-context');
+      });
+    });
+
+    describe('a stdin heredoc of another tool is not stripped', () => {
+      it('lints the whole command, as on main (the line-start mention counts, so it is allowed)', () => {
+        const r = runHook({
+          command: `${GH} --body "no mention"; other-tool -F - <<EOF\n@macf-science-agent[bot] hi\nEOF`,
+        });
+        expect(r.status).toBe(0);
+      });
+    });
+
+    describe('a resolved stdin body is added to the command text, not swapped for it', () => {
+      const first = (text: string): string => `gh issue comment 9 --body "${text}"; `;
+      const second = `gh issue comment 10 --repo o/r --body-file - <<EOF\n@macf-science-agent[bot] hi\nEOF`;
+
+      it('blocks a describing leak in the first comment', () => {
+        const r = runHook({ command: first('see @macf-tester-1-agent[bot] reply') + second });
+        expect(r.status).toBe(2);
+        expect(String(r.stderr)).toContain('describing-context');
+      });
+
+      it('allows the same command once the first comment is fixed', () => {
+        const r = runHook({ command: first('ok\n@macf-tester-1-agent[bot] reply') + second });
+        expect(r.status).toBe(0);
+      });
+    });
+
+    describe('heredoc delimiters are read as whole words', () => {
+      const lead = `${GH} --body "ok\n@macf-science-agent[bot] ok"; `;
+      const leak = `${GH} --body "see @macf-tester-1-agent[bot] reply"`;
+
+      it('keeps checking after a foreign heredoc closed by EOF-PY', () => {
+        const r = runHook({ command: `${lead}python3 - <<EOF-PY\nprint(1)\nEOF-PY\n${leak}` });
+        expect(r.status).toBe(2);
+        expect(String(r.stderr)).toContain('describing-context');
+      });
+
+      it('strips nothing when the heredoc has no closing line', () => {
+        const r = runHook({ command: `${lead}python3 - <<EOF-PY\nprint(1)\n${leak}` });
+        expect(r.status).toBe(2);
+        expect(String(r.stderr)).toContain('describing-context');
+      });
+
+      it('reads a quoted word delimiter on a stdin body', () => {
+        const r = runHook({ command: `${GH} --body-file - <<'EOF-PY'\n@macf-science-agent[bot] hi\nEOF-PY` });
+        expect(r.status).toBe(0);
+        expect(String(r.stderr)).not.toContain('could not resolve');
+      });
+    });
+  });
 });
