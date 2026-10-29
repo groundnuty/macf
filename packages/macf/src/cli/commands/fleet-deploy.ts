@@ -17,6 +17,7 @@ import { readVault } from '../bootstrap/vault-read.js';
 import { firstLaunchGuidanceHeaderLines, firstLaunchAttachLine } from '../bootstrap/first-launch-guidance.js';
 import { initAgent as realInitAgent } from './init.js';
 import { agentCertPath, agentKeyPath } from '../config.js';
+import { checkWatchdog, realWatchdogDeps, watchdogVerdictLine, type WatchdogStatusDeps } from '../fleet/watchdog-status.js';
 
 export const FLEET_DEPLOY_JSON_SCHEMA_VERSION = 1;
 
@@ -68,6 +69,8 @@ export interface FleetDeployCommandDeps extends FleetDeployDeps {
    * is test-safe without an override.
    */
   readonly checkAgentCertPresent?: (destDir: string) => boolean;
+  /** Crontab/script reads behind the closing watchdog verdict line; tests inject a fake crontab. */
+  readonly watchdogDeps?: WatchdogStatusDeps;
 }
 
 interface DeployFailure {
@@ -293,6 +296,14 @@ export async function runFleetDeploy(opts: RunFleetDeployOptions, deps?: FleetDe
         `fingerprint ${outcome.keyFingerprint})`,
     );
     console.log(nextStepLines(manifest, destDir, outcome, resolved).join('\n'));
+    console.log(
+      watchdogVerdictLine(
+        checkWatchdog(
+          { owner: manifest.owner.account, project: manifest.metadata.name, workspaceDir: destDir },
+          resolved.watchdogDeps ?? realWatchdogDeps(destDir),
+        ),
+      ),
+    );
   } else {
     console.error(`Role "${outcome.role}" FAILED — ${outcome.reason}`);
   }

@@ -329,6 +329,21 @@ describe('runFleetDoctor (injected deps)', () => {
     expect(out).toContain('--inject');
   });
 
+  it('prints the watchdog verdict line after the summary, and none when unwired (#1525)', async () => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const peers = [{ name: 'CODE_AGENT', info: info('127.0.0.1', 4100) }];
+    await runFleetDoctor('/unused', {}, {
+      ...deps(peers, async () => ONLINE, echoingDiagnostic),
+      watchdogVerdict: () => 'Watchdog: NOT installed for this fleet on this host, so X.',
+    });
+    const withLine = logSpy.mock.calls.flat().join('\n');
+    expect(withLine).toContain('Watchdog: NOT installed for this fleet on this host');
+    expect(withLine.indexOf('Watchdog:')).toBeGreaterThan(withLine.indexOf('mesh interconnect:'));
+    logSpy.mockClear();
+    await runFleetDoctor('/unused', {}, deps(peers, async () => ONLINE, echoingDiagnostic));
+    expect(logSpy.mock.calls.flat().join('\n')).not.toContain('Watchdog:');
+  });
+
   it('exits 0 when the whole mesh is HEALTHY', async () => {
     logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     const peers = [{ name: 'CODE_AGENT', info: info('127.0.0.1', 4100) }];

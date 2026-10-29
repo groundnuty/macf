@@ -150,6 +150,28 @@ describe('STALL_SIGNATURES_SEED', () => {
     expect(byName.get('skill-or-memory-prompt')?.action).toBe('report');
   });
 
+  it('context-overflow and usage-limit are report-only and match their real Claude Code panes (#1525)', () => {
+    const seed = STALL_SIGNATURES_SEED;
+    const byName = new Map(seed.map((e) => [e.name, e]));
+    expect(byName.get('context-overflow')?.action).toBe('report');
+    expect(byName.get('usage-limit')?.action).toBe('report');
+    for (const n of ['context-overflow', 'usage-limit']) {
+      expect(byName.get(n)?.nudge).toBeUndefined();
+      expect(byName.get(n)?.report).toBeTruthy();
+    }
+    expect(matchStallSignature('  ⎿  Prompt is too long\n❯ ', seed)?.name).toBe('context-overflow');
+    expect(matchStallSignature("You've hit your session limit · resets 3pm (UTC)", seed)?.name).toBe('usage-limit');
+    expect(matchStallSignature("You've hit your weekly limit · resets Mon 9am", seed)?.name).toBe('usage-limit');
+  });
+
+  it('neither new signature matches an ordinary pane or a rate-limit pane', () => {
+    const seed = STALL_SIGNATURES_SEED;
+    for (const pane of ['❯ DR-032 ok', 'Reading the prompt file, it is long but fine', "You've hit a snag"]) {
+      expect(['context-overflow', 'usage-limit']).not.toContain(matchStallSignature(pane, seed)?.name);
+    }
+    expect(matchStallSignature('API Error: Server is temporarily limiting requests · Rate limited', seed)?.name).toBe('rate-limit');
+  });
+
   it('every seed regex compiles', () => {
     for (const e of STALL_SIGNATURES_SEED) {
       expect(() => new RegExp(e.signature, 'i')).not.toThrow();

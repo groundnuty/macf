@@ -44,6 +44,7 @@ describe('seedStallSignaturesConfig — absent', () => {
     const entries = loadStallSignatures(raw);
     expect(entries.map((e) => e.name)).toEqual([
       'rate-limit', 'turn-aborted', 'permission-prompt', 'trust-folder-prompt', 'skill-or-memory-prompt',
+      'context-overflow', 'usage-limit',
     ]);
   });
 });
