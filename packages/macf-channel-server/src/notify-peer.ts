@@ -876,7 +876,7 @@ export function deadLetterReason(
   entryId: string,
 ): string {
   return attempts.get(entryId)?.unregistered === true
-    ? 'peer never registered'
+    ? 'peer not registered at the last attempt'
     : 'no durable ACK before the TTL';
 }
 

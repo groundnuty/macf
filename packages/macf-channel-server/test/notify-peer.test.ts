@@ -361,7 +361,7 @@ describe('notify_peer tool', () => {
       expect(await store.listPending()).toHaveLength(0);
     });
 
-    it('dead-letters an entry whose peer never registered, with that reason', async () => {
+    it('dead-letters an entry whose peer is not registered at the last attempt, with that reason', async () => {
       const reg = makeRegistry({ get: null });
       const base = {
         registry: reg as unknown as Parameters<typeof notifyPeer>[0]['registry'],
@@ -383,7 +383,7 @@ describe('notify_peer tool', () => {
       await outbox.driveOnce(Date.now() + 500); // a ticker pass records the miss
       const summary = await outbox.driveOnce(Date.now() + 60 * 60_000);
       expect(summary.deadLettered).toBe(1);
-      expect(reasons).toEqual(['peer never registered']);
+      expect(reasons).toEqual(['peer not registered at the last attempt']);
     });
 
     it('returns delivered when peer responds 200', async () => {
