@@ -27,9 +27,13 @@ describe('autonomous peer lifecycle notices are recorded, not pushed (macf#1525)
     });
   }
 
-  it('treats a missing event as autonomous', async () => {
+  it('still pushes a peer message with no event (an external A2A client), it is not a lifecycle notice', async () => {
     const payload: NotifyPayload = { type: 'peer_notification', source: 'peer-a', message: 'x' };
-    await expect(pushUnlessLifecycle(payload, throwingPush, logger())).resolves.toBe(false);
+    const push = vi.fn(async () => undefined);
+    const log = logger();
+    await expect(pushUnlessLifecycle(payload, push, log)).resolves.toBe(true);
+    expect(push).toHaveBeenCalledTimes(1);
+    expect(log.lines).toEqual([]);
   });
 
   it('still pushes event=custom and non-peer types', async () => {
