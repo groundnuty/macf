@@ -150,6 +150,7 @@ import { checkRegistryScopePreflight } from '../bootstrap/registry-scope-preflig
 // contract `checkRegistryScopePreflight` above establishes; this one also
 // reads `fleet.lock` (a local file, never a GitHub call) via `readFleetLock`
 // (already imported above from `observer.js`) to compare against.
+import { checkProvisionedFleetNeedsVault } from '../bootstrap/provisioned-vault-guard.js';
 import { ageRecipientsRecordAbsent, ageRecipientsRecordAbsentNotice, checkAgeRecipientsNarrowing } from '../bootstrap/age-recipients-narrowing.js';
 import { reconcileFederatedTrustVerdicts, federatedTrustNotices } from '../bootstrap/apply-federated-trust.js';
 import type { DeployFlagsEcho, RemainingDeployReport, RemainingDeployStep } from '../bootstrap/remaining-deploy.js';
@@ -3561,6 +3562,15 @@ export async function runBootstrapApply(
 
   try {
     const observed = await resolved.observe(manifest);
+
+    // A provisioned fleet re-run without the vault flags refuses here,
+    // before the plan prompt and before any write. A dry run writes nothing.
+    if (opts.dryRun !== true) {
+      const provisionedFailure = checkProvisionedFleetNeedsVault(observed.lock, opts.vaultPath, opts.identityKeyPath, manifestPath);
+      if (provisionedFailure !== undefined) {
+        return renderFailure(provisionedFailure, opts);
+      }
+    }
 
     // groundnuty/macf#1389 — the `#1330`-shaped federated-CA-trust
     // enumerate-and-name consent notices, `--dry-run` ONLY (deliberately

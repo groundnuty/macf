@@ -64,6 +64,10 @@ agents:
     deploy_path: /home/ubuntu/repos/demo-science
 `;
 
+// The observed lock below records a provisioned fleet, so these runs carry the vault flags
+// (a vault-less re-run is refused: provisioned-vault-guard.ts).
+const VAULT_FLAGS = { vaultPath: '/fake/vault.age', identityKeyPath: '/fake/identity.txt', deploy: false } as const;
+
 const EMPTY_OBSERVED: ObservedState = { lock: null, agents: {}, caRegistry: 'absent', caRepos: {}, controlRepoPresence: 'absent' };
 
 /** Same shape `manifest.agents[0].role` recorded, plus MACF_TRUSTED_ACTORS observed present -> `computePlan` (plan.ts row 4) emits ONE 'routing'-kind delete item. Not this file's concern to re-derive; this is the SAME `routingDroppedItem` trigger `plan.test.ts` already exercises. */
@@ -380,8 +384,8 @@ describe('runBootstrapApply — deletion execution wiring (groundnuty/macf#1272)
     const deleteDeps: ApplyDeleteDeps = { deleteRepoVariable };
 
     const code = await runBootstrapApply(
-      { file, yes: true },
-      { observe: () => Promise.resolve(OBSERVED_WITH_ROUTING_DROPPED), deleteDeps },
+      { file, yes: true, ...VAULT_FLAGS },
+      { observe: () => Promise.resolve(OBSERVED_WITH_ROUTING_DROPPED), readVault: async () => ({}), deleteDeps },
       fakeMutateDeps(file),
     );
 
@@ -406,8 +410,8 @@ describe('runBootstrapApply — deletion execution wiring (groundnuty/macf#1272)
     const deleteDeps: ApplyDeleteDeps = { deleteRepoVariable };
 
     const code = await runBootstrapApply(
-      { file },
-      { observe: () => Promise.resolve(OBSERVED_WITH_ROUTING_DROPPED), deleteDeps },
+      { file, ...VAULT_FLAGS },
+      { observe: () => Promise.resolve(OBSERVED_WITH_ROUTING_DROPPED), readVault: async () => ({}), deleteDeps },
       fakeMutateDeps(file, { confirmPlan: async () => false }),
     );
 
@@ -419,8 +423,8 @@ describe('runBootstrapApply — deletion execution wiring (groundnuty/macf#1272)
     const file = writeManifest();
     let seenActions: readonly DeletionAction[] = [];
     const code = await runBootstrapApply(
-      { file },
-      { observe: () => Promise.resolve(OBSERVED_WITH_ROUTING_DROPPED), deleteDeps: { deleteRepoVariable: async () => 'deregistered' } },
+      { file, ...VAULT_FLAGS },
+      { observe: () => Promise.resolve(OBSERVED_WITH_ROUTING_DROPPED), readVault: async () => ({}), deleteDeps: { deleteRepoVariable: async () => 'deregistered' } },
       fakeMutateDeps(file, {
         confirmPlan: async (_plan, _creations, deletionActions) => {
           seenActions = deletionActions;
@@ -443,8 +447,8 @@ describe('runBootstrapApply — deletion execution wiring (groundnuty/macf#1272)
 
     const fileWith = writeManifest();
     await runBootstrapApply(
-      { file: fileWith, yes: true, json: true },
-      { observe: () => Promise.resolve(OBSERVED_WITH_ROUTING_DROPPED), deleteDeps: { deleteRepoVariable: async () => 'deregistered' } },
+      { file: fileWith, yes: true, json: true, ...VAULT_FLAGS },
+      { observe: () => Promise.resolve(OBSERVED_WITH_ROUTING_DROPPED), readVault: async () => ({}), deleteDeps: { deleteRepoVariable: async () => 'deregistered' } },
       fakeMutateDeps(fileWith),
     );
     const withDeleteJson = JSON.parse(logs.at(-1) ?? '{}') as { deletions?: unknown };
@@ -455,5 +459,81 @@ describe('runBootstrapApply — deletion execution wiring (groundnuty/macf#1272)
     await runBootstrapApply({ file: fileWithout, yes: true, json: true }, { observe: () => Promise.resolve(EMPTY_OBSERVED) }, fakeMutateDeps(fileWithout));
     const withoutDeleteJson = JSON.parse(logs.at(-1) ?? '{}') as { deletions?: unknown };
     expect(withoutDeleteJson.deletions).toBeUndefined();
+  });
+});
+
+// --- A vault-less re-run of a provisioned fleet refuses before any write ----
+
+describe('runBootstrapApply — provisioned fleet needs the vault flags (setup review S4)', () => {
+  const dirs: string[] = [];
+  let errors: string[];
+
+  beforeEach(() => {
+    errors = [];
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation((...a: unknown[]) => {
+      errors.push(a.join(' '));
+    });
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const recoverySafetyDir = mkdtempSync(join(tmpdir(), 'macf-apply-vaultguard-recovery-'));
+    dirs.push(recoverySafetyDir);
+    vi.stubEnv('MACF_RECOVERY_DIR', recoverySafetyDir);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+    for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+  });
+
+  function manifestFile(): string {
+    const dir = mkdtempSync(join(tmpdir(), 'macf-apply-vaultguard-'));
+    dirs.push(dir);
+    const p = join(dir, 'fleet.yaml');
+    writeFileSync(p, FLEET_YAML);
+    return p;
+  }
+
+  const PROVISIONED: ObservedState = {
+    ...EMPTY_OBSERVED,
+    lock: { schema_version: 1, fleet: 'demo-fleet', agents: [{ role: 'code-agent', app_id: 'a', install_id: 'i' }] },
+  };
+
+  it('a provisioned fleet without the vault flags refuses, and no writer fake is called', async () => {
+    const file = manifestFile();
+    const confirmPlan = vi.fn(async () => true);
+    const buildAgentDeps = vi.fn(() => fakeAgentDeps());
+    const deleteRepoVariable = vi.fn(async () => 'deregistered' as const);
+
+    const code = await runBootstrapApply(
+      { file, yes: true, deploy: false },
+      { observe: () => Promise.resolve(PROVISIONED), deleteDeps: { deleteRepoVariable } },
+      fakeMutateDeps(file, { confirmPlan, buildAgentDeps }),
+    );
+
+    expect(code).toBe(1);
+    expect(confirmPlan).not.toHaveBeenCalled();
+    expect(buildAgentDeps).not.toHaveBeenCalled();
+    expect(deleteRepoVariable).not.toHaveBeenCalled();
+    expect(errors.join('\n')).toContain('--vault <path-to-vault.age> --identity-key');
+    expect(errors.join('\n')).toContain('its vault already exists');
+  });
+
+  it('a fresh fleet (no lock) without the flags proceeds', async () => {
+    const file = manifestFile();
+    const code = await runBootstrapApply({ file, yes: true, deploy: false }, { observe: () => Promise.resolve(EMPTY_OBSERVED) }, fakeMutateDeps(file));
+    expect(code).toBe(0);
+  });
+
+  it('a provisioned fleet with both flags proceeds', async () => {
+    const file = manifestFile();
+    const confirmPlan = vi.fn(async () => true);
+    const code = await runBootstrapApply(
+      { file, yes: true, deploy: false, vaultPath: '/fake/vault.age', identityKeyPath: '/fake/identity.txt' },
+      { observe: () => Promise.resolve(PROVISIONED), readVault: async () => ({}) },
+      fakeMutateDeps(file, { confirmPlan }),
+    );
+    expect(code).toBe(0);
+    expect(errors.join('\n')).not.toContain('already provisioned');
   });
 });
