@@ -7,7 +7,7 @@
 import { compareSemver } from '@groundnuty/macf-core';
 import type { ExecResult, PreflightCheck, PreflightDeps } from './preflight.js';
 
-const AGENT_HOST_TOOLS = ['node', 'claude', 'tmux', 'crontab', 'gh', 'macf'] as const;
+const AGENT_HOST_TOOLS = ['node', 'claude', 'tmux', 'crontab', 'gh', 'bash', 'macf'] as const;
 
 const SSH_OPTS = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10'] as const;
 
@@ -17,6 +17,7 @@ const SSH_OPTS = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10'] as const;
  */
 const AGENT_HOST_MINIMUMS: Readonly<Partial<Record<string, { readonly min: string; readonly fix: string }>>> = {
   node: { min: '22.12.0', fix: 'install Node.js 22.12 or later on the agent host' },
+  bash: { min: '4.0.0', fix: 'install Bash 4+ (on macOS: brew install bash) and make sure it comes first on the non-interactive login PATH.' },
   claude: { min: '2.1.80', fix: 'update Claude Code on the agent host (claude update)' },
 };
 

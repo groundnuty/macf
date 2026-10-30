@@ -37,7 +37,7 @@ ${opts.versions === false ? '' : `versions:\n  macf: ${opts.macf ?? '0.2.79'}\n 
 }
 
 const GH_OK = 'HTTP/2.0 200 OK\nX-Oauth-Scopes: admin:org, repo, workflow\n\n{"login":"someone"}';
-const PROBE_OK = 'node|login|v22.14.0\nclaude|login|2.1.300\ntmux|login|tmux 3.4\ncrontab|login|empty\ngh|login|gh version 2.60\nmacf|login|0.2.79\n';
+const PROBE_OK = 'node|login|v22.14.0\nclaude|login|2.1.300\ntmux|login|tmux 3.4\ncrontab|login|empty\ngh|login|gh version 2.60\nbash|login|GNU bash, version 5.2.21(1)-release\nmacf|login|0.2.79\n';
 const ok = (stdout = ''): ExecResult => ({ code: 0, stdout, stderr: '' });
 const noSuchProgram: ExecResult = { code: null, stdout: '', stderr: 'ENOENT', spawnFailed: true };
 
@@ -170,7 +170,7 @@ describe('secrets.env', () => {
   it('is ok at mode 600 with every key, and never prints a value', async () => {
     const checks = await runLocalPreflight(makeDeps({ files: baseFiles() }).deps, opts);
     expect(checks.find((c) => c.id === 'secrets-file')?.status).toBe('ok');
-    expect(checks.filter((c) => c.id.startsWith('secret-')).map((c) => c.status)).toEqual(['ok', 'ok', 'ok']);
+    expect(checks.filter((c) => c.id.startsWith('secret-')).map((c) => c.status)).toEqual(['ok', 'ok']);
     const text = formatPreflightText(buildReport(checks)) + JSON.stringify(preflightToJson(buildReport(checks)));
     expect(text).not.toContain(FAKE_SECRET);
   });
@@ -186,15 +186,14 @@ describe('secrets.env', () => {
     expect(noFile['secrets-file']?.status).toBe('missing');
     const partial = `MACF_BOOTSTRAP_TS_OAUTH_CLIENT_ID=abc\nMACF_BOOTSTRAP_TS_OAUTH_SECRET=${FAKE_SECRET}\n`;
     const checks = await runLocalPreflight(makeDeps({ files: { [MANIFEST_PATH]: fleetYaml(), [SECRETS_PATH]: partial } }).deps, opts);
-    const endpoint = checks.find((c) => c.id === 'secret-MACF_RUNNER_PLATFORM_ENDPOINT');
-    expect(endpoint?.status).toBe('missing');
+    expect(checks.find((c) => c.id === 'secret-MACF_RUNNER_PLATFORM_ENDPOINT')).toBeUndefined();
     expect(JSON.stringify(checks)).not.toContain(FAKE_SECRET);
   });
 
   it('takes a key from the environment when the file lacks it', async () => {
     const files = { [MANIFEST_PATH]: fleetYaml(), [SECRETS_PATH]: `MACF_BOOTSTRAP_TS_OAUTH_CLIENT_ID=abc\nMACF_BOOTSTRAP_TS_OAUTH_SECRET=x\n` };
     const r = await byId(makeDeps({ files, env: { MACF_RUNNER_PLATFORM_ENDPOINT: ENDPOINT } }).deps);
-    expect(r['secret-MACF_RUNNER_PLATFORM_ENDPOINT']?.detail).toContain('environment');
+    expect(r['runner-endpoint-source']?.detail).toBe(`runner endpoint: ${ENDPOINT} (from the MACF_RUNNER_PLATFORM_ENDPOINT environment variable)`);
   });
 
   it('requires none of the keys for a hosted fleet', async () => {
@@ -251,6 +250,49 @@ describe('runner platform endpoint', () => {
     expect(fetchCalls).toEqual([`${ENDPOINT}/`]);
   });
 
+  const noEndpointFiles = (extraManifest = ''): Record<string, string> => ({
+    [MANIFEST_PATH]: fleetYaml().replace('transport:\n', `transport:\n${extraManifest}`),
+    [SECRETS_PATH]: 'MACF_BOOTSTRAP_TS_OAUTH_CLIENT_ID=abc\nMACF_BOOTSTRAP_TS_OAUTH_SECRET=x\n',
+  });
+  const noScopeVar = (c: string, a: readonly string[]): ExecResult | undefined =>
+    c === 'gh' && a[1]?.includes('actions/variables') ? { code: 1, stdout: '', stderr: 'gh: Not Found (HTTP 404)' } : undefined;
+
+  it('finds the endpoint in fleet.yaml and probes it', async () => {
+    const { deps, fetchCalls } = makeDeps({ files: noEndpointFiles(`  runner_platform_endpoint: ${ENDPOINT}\n`), exec: noScopeVar });
+    const r = await byId(deps);
+    expect(r['runner-endpoint-source']?.status).toBe('ok');
+    expect(r['runner-endpoint-source']?.detail).toBe(`runner endpoint: ${ENDPOINT} (from transport.runner_platform_endpoint in fleet.yaml)`);
+    expect(r['runner-endpoint']?.status).toBe('ok');
+    expect(fetchCalls).toEqual([`${ENDPOINT}/`]);
+  });
+
+  it('finds the endpoint in the scope variable and probes it', async () => {
+    const { deps, fetchCalls, execCalls } = makeDeps({
+      files: noEndpointFiles(),
+      exec: (c, a) => (c === 'gh' && a[1]?.includes('actions/variables/MACF_RUNNER_PLATFORM_ENDPOINT') ? ok(`${ENDPOINT}\n`) : undefined),
+    });
+    const r = await byId(deps);
+    expect(r['runner-endpoint-source']?.detail).toContain("from the scope's shared Actions variable");
+    expect(r['runner-endpoint']?.status).toBe('ok');
+    expect(fetchCalls).toEqual([`${ENDPOINT}/`]);
+    expect(execCalls).toContain('gh api repos/acme/demo-control/actions/variables/MACF_RUNNER_PLATFORM_ENDPOINT --jq .value');
+  });
+
+  it('is missing, with every source named, when none sets it', async () => {
+    const { deps, fetchCalls } = makeDeps({ files: noEndpointFiles(), exec: noScopeVar });
+    const r = await byId(deps);
+    expect(r['runner-endpoint-source']?.status).toBe('missing');
+    for (const where of ['MACF_RUNNER_PLATFORM_ENDPOINT', 'secrets.env', 'Actions variable', 'transport.runner_platform_endpoint']) {
+      expect(r['runner-endpoint-source']?.fix, where).toContain(where);
+    }
+    expect(fetchCalls).toEqual([]);
+  });
+
+  it('is unknown, not missing, when the scope variable cannot be read', async () => {
+    const { deps } = makeDeps({ files: noEndpointFiles(), exec: (c, a) => (c === 'gh' && a[1]?.includes('actions/variables') ? { code: 1, stdout: '', stderr: 'HTTP 403' } : undefined) });
+    expect((await byId(deps))['runner-endpoint-source']?.status).toBe('unknown');
+  });
+
   it('does nothing when no endpoint is declared', async () => {
     const files = { [MANIFEST_PATH]: fleetYaml({ selfHosted: false }), [SECRETS_PATH]: '' };
     const { deps, fetchCalls } = makeDeps({ files });
@@ -295,7 +337,7 @@ describe('agent host over ssh', () => {
 
   it('reports every tool on the VM when ready', async () => {
     const checks = await agentHostChecks(vmDeps(ok(PROBE_OK)), 'ubuntu@vm');
-    expect(checks.map((c) => c.status)).toEqual(['ok', 'ok', 'ok', 'ok', 'ok', 'ok', 'ok', 'ok']);
+    expect(checks.map((c) => c.status)).toEqual(['ok', 'ok', 'ok', 'ok', 'ok', 'ok', 'ok', 'ok', 'ok']);
     expect(checks[0]?.detail).toBe('agents run on ubuntu@vm');
     expect(checks.find((c) => c.id === 'agent-host-macf')?.detail).toContain('0.2.79');
   });
@@ -320,7 +362,7 @@ describe('agent host over ssh', () => {
   });
 
   it('flags macf missing from the non-interactive PATH, and macf only in an interactive shell', async () => {
-    const probe = 'node|login|v22\nclaude|login|2\ntmux|login|3\ncrontab|login|empty\ngh|login|2\nmacf|interactive|\n';
+    const probe = 'node|login|v22\nclaude|login|2\ntmux|login|3\ncrontab|login|empty\ngh|login|2\nbash|login|GNU bash, version 5.2.21(1)-release\nmacf|interactive|\n';
     const checks = await agentHostChecks(vmDeps(ok(probe)), 'ubuntu@vm');
     const macf = checks.find((c) => c.id === 'agent-host-macf');
     expect(macf?.status).toBe('wrong');
@@ -330,7 +372,7 @@ describe('agent host over ssh', () => {
   });
 
   it('reads crontab states: empty is fine, an error is wrong, absent is missing', async () => {
-    const base = 'node|login|v22\nclaude|login|2\ntmux|login|3\ngh|login|2\nmacf|login|0.2.79\n';
+    const base = 'node|login|v22\nclaude|login|2\ntmux|login|3\ngh|login|2\nbash|login|GNU bash, version 5.2.21(1)-release\nmacf|login|0.2.79\n';
     const cron = async (line: string) => (await agentHostChecks(vmDeps(ok(base + line)), 'ubuntu@vm')).find((c) => c.id === 'agent-host-crontab');
     expect((await cron('crontab|login|empty\n'))?.status).toBe('ok');
     expect((await cron('crontab|login|present\n'))?.status).toBe('ok');
@@ -360,6 +402,26 @@ describe('agent-host version floors', () => {
     const fine = await run(PROBE_OK);
     expect(fine['agent-host-claude']?.status).toBe('ok');
     expect(fine['agent-host-node']?.status).toBe('ok');
+  });
+});
+
+describe('bash on the agent host', () => {
+  const vmDeps = (probe: string): PreflightDeps =>
+    makeDeps({ exec: (c, a, input) => (c === 'ssh' ? (a.includes('true') ? ok() : input !== undefined ? ok(probe) : undefined) : undefined) }).deps;
+  const bashCheck = async (line: string) =>
+    (await agentHostChecks(vmDeps(PROBE_OK.replace(/bash\|login\|.*\n/, line)), 'ubuntu@vm')).find((c) => c.id === 'agent-host-bash');
+  it('3.2 is wrong with the install fix, 5.2 is ok, an unparseable version is unknown', async () => {
+    const old = await bashCheck('bash|login|GNU bash, version 3.2.57(1)-release\n');
+    expect(old?.status).toBe('wrong');
+    expect(old?.fix).toBe('install Bash 4+ (on macOS: brew install bash) and make sure it comes first on the non-interactive login PATH.');
+    expect((await bashCheck('bash|login|GNU bash, version 5.2.21(1)-release\n'))?.status).toBe('ok');
+    expect((await bashCheck('bash|login|weird\n'))?.status).toBe('unknown');
+  });
+  it('the probe script itself avoids Bash 4 features', async () => {
+    const { readFileSync } = await import('node:fs');
+    const { resolve } = await import('node:path');
+    const src = readFileSync(resolve(__dirname, '../../src/cli/bootstrap/preflight-agent-host.ts'), 'utf-8');
+    expect(src).not.toMatch(/mapfile|readarray|declare -A|\$\{[a-z_]+,,\}/);
   });
 });
 

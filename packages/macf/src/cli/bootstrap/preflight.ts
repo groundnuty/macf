@@ -12,7 +12,13 @@ import type { FleetManifest } from './fleet-manifest.js';
 import { parseFleetManifest } from './fleet-manifest.js';
 import { controlRepoFullName } from './control-repo.js';
 import { TS_OAUTH_CLIENT_ID_ENV_VAR, TS_OAUTH_SECRET_ENV_VAR } from './apply-routing-secrets.js';
-import { RUNNER_PLATFORM_ENDPOINT_ENV_VAR } from './runner-platform.js';
+import {
+  RUNNER_PLATFORM_ENDPOINT_ENV_VAR,
+  registerRunnerPlatformEndpointFileTier,
+  resolveRunnerPlatformEndpointWithProvenance,
+  type RunnerPlatformEndpointSource,
+} from './runner-platform.js';
+import { registryPathPrefix } from '../registry-helper.js';
 import { parseOperatorSecretsFile } from './operator-secrets-file.js';
 
 export const PREFLIGHT_JSON_SCHEMA_VERSION = 1;
@@ -250,7 +256,6 @@ function requiredSecretKeys(manifest: FleetManifest): readonly RequiredKey[] {
     keys.push({ key: TS_OAUTH_CLIENT_ID_ENV_VAR, why: 'Tailscale OAuth client id' });
     keys.push({ key: TS_OAUTH_SECRET_ENV_VAR, why: 'Tailscale OAuth secret' });
   }
-  if (selfHosted) keys.push({ key: RUNNER_PLATFORM_ENDPOINT_ENV_VAR, why: 'runner platform endpoint' });
   return keys;
 }
 
@@ -294,13 +299,56 @@ export function secretsChecks(deps: PreflightDeps, manifest: FleetManifest | und
 
 // --- 4. The runner platform endpoint ---
 
-function endpointValue(values: Readonly<Record<string, string>> | undefined, env: PreflightDeps['env']): string | undefined {
-  // Like apply's resolver: an empty value does not count, so an exported-but-empty
-  // env var falls back to the secrets file.
-  for (const raw of [env[RUNNER_PLATFORM_ENDPOINT_ENV_VAR], values?.[RUNNER_PLATFORM_ENDPOINT_ENV_VAR]]) {
-    if (raw !== undefined && raw.trim().length > 0) return raw.trim().replace(/\/+$/, '');
+const ENDPOINT_SOURCE_LABEL: Readonly<Record<Exclude<RunnerPlatformEndpointSource, 'none'>, string>> = {
+  flag: 'the environment',
+  env: `the ${RUNNER_PLATFORM_ENDPOINT_ENV_VAR} environment variable`,
+  'fleet-file': 'the secrets file',
+  'scope-file': 'the secrets file',
+  scope: "the scope's shared Actions variable",
+  manifest: 'transport.runner_platform_endpoint in fleet.yaml',
+};
+
+const ENDPOINT_FIX =
+  `set ${RUNNER_PLATFORM_ENDPOINT_ENV_VAR} in the environment or in secrets.env, as a shared Actions variable on the scope, ` +
+  'or set transport.runner_platform_endpoint in fleet.yaml';
+
+type ScopeRead = { readonly value?: string; readonly state: 'read' | 'absent' | 'unreadable' };
+
+/** A GET of the scope's shared variable, the same read plan makes. Never throws. */
+async function readScopeEndpoint(deps: PreflightDeps, manifest: FleetManifest): Promise<ScopeRead> {
+  let prefix: string;
+  try {
+    prefix = registryPathPrefix(manifest.owner.registry);
+  } catch {
+    return { state: 'unreadable' };
   }
-  return undefined;
+  const r = await deps.exec('gh', ['api', `${prefix.replace(/^\//, '')}/actions/variables/${RUNNER_PLATFORM_ENDPOINT_ENV_VAR}`, '--jq', '.value'], { timeoutMs: 15000 });
+  if (r.spawnFailed === true) return { state: 'unreadable' };
+  if (r.code === 0) {
+    const value = r.stdout.trim();
+    return value.length > 0 ? { value, state: 'read' } : { state: 'absent' };
+  }
+  return /404|Not Found/i.test(r.stderr + r.stdout) ? { state: 'absent' } : { state: 'unreadable' };
+}
+
+/** Apply's own chain: flag, env, secrets file, scope variable, manifest. */
+async function resolveEndpoint(
+  deps: PreflightDeps,
+  manifest: FleetManifest | undefined,
+  values: Readonly<Record<string, string>> | undefined,
+): Promise<{ readonly value?: string; readonly source: RunnerPlatformEndpointSource; readonly scope: ScopeRead }> {
+  const envValue = deps.env[RUNNER_PLATFORM_ENDPOINT_ENV_VAR];
+  const manifestValue = manifest?.transport.runner_platform_endpoint;
+  registerRunnerPlatformEndpointFileTier(values?.[RUNNER_PLATFORM_ENDPOINT_ENV_VAR], undefined);
+  try {
+    const first = resolveRunnerPlatformEndpointWithProvenance({ explicit: envValue, manifestValue: undefined, scopeValue: undefined });
+    if (first.value !== undefined) return { value: first.value, source: first.source === 'flag' ? 'env' : first.source, scope: { state: 'unreadable' } };
+    const scope: ScopeRead = manifest === undefined ? { state: 'unreadable' } : await readScopeEndpoint(deps, manifest);
+    const full = resolveRunnerPlatformEndpointWithProvenance({ explicit: undefined, manifestValue, scopeValue: scope.value });
+    return { ...(full.value !== undefined ? { value: full.value } : {}), source: full.source, scope };
+  } finally {
+    registerRunnerPlatformEndpointFileTier(undefined, undefined);
+  }
 }
 
 async function resolveTailnetIp(deps: PreflightDeps, host: string): Promise<string | undefined> {
@@ -318,27 +366,46 @@ async function resolveTailnetIp(deps: PreflightDeps, host: string): Promise<stri
   return undefined;
 }
 
-export async function endpointCheck(deps: PreflightDeps, values: Readonly<Record<string, string>> | undefined): Promise<readonly PreflightCheck[]> {
-  const endpoint = endpointValue(values, deps.env);
-  if (endpoint === undefined) return [];
+export async function endpointCheck(
+  deps: PreflightDeps,
+  manifest: FleetManifest | undefined,
+  values: Readonly<Record<string, string>> | undefined,
+): Promise<readonly PreflightCheck[]> {
+  if (manifest !== undefined && manifest.routing?.runner.runs_on !== 'self-hosted') return [];
+  const found = await resolveEndpoint(deps, manifest, values);
+  const endpoint = found.value?.replace(/\/+$/, '');
+  if (endpoint === undefined) {
+    if (manifest === undefined) return [];
+    const sourceId = 'runner-endpoint-source';
+    if (found.scope.state === 'unreadable') {
+      return [check(sourceId, 'endpoint', 'unknown', 'runner endpoint: not in the environment, secrets file or fleet.yaml, and the scope variable could not be read', ENDPOINT_FIX)];
+    }
+    return [check(sourceId, 'endpoint', 'missing', 'runner endpoint: not set anywhere', ENDPOINT_FIX)];
+  }
+  const label = found.source === 'none' ? 'unknown' : ENDPOINT_SOURCE_LABEL[found.source];
+  const sourceCheck = check('runner-endpoint-source', 'endpoint', 'ok', `runner endpoint: ${endpoint} (from ${label})`);
+  return [sourceCheck, await probeEndpoint(deps, endpoint)];
+}
+
+async function probeEndpoint(deps: PreflightDeps, endpoint: string): Promise<PreflightCheck> {
   let url: URL;
   try {
     url = new URL(endpoint);
   } catch {
-    return [check('runner-endpoint', 'endpoint', 'wrong', `${RUNNER_PLATFORM_ENDPOINT_ENV_VAR} is not a URL`, 'use http://<tailnet-host>:<port>')];
+    return check('runner-endpoint', 'endpoint', 'wrong', `${RUNNER_PLATFORM_ENDPOINT_ENV_VAR} is not a URL`, 'use http://<tailnet-host>:<port>');
   }
   const byName = await deps.fetchUrl(url.toString(), NET_TIMEOUT_MS);
-  if (byName.reached) return [check('runner-endpoint', 'endpoint', 'ok', `runner endpoint reachable by name (${url.host})`)];
+  if (byName.reached) return check('runner-endpoint', 'endpoint', 'ok', `runner endpoint reachable by name (${url.host})`);
   const ip = await resolveTailnetIp(deps, url.hostname);
   if (ip !== undefined) {
     const ipUrl = new URL(url.toString());
     ipUrl.hostname = ip;
     const byIp = await deps.fetchUrl(ipUrl.toString(), NET_TIMEOUT_MS);
     if (byIp.reached) {
-      return [check('runner-endpoint', 'endpoint', 'wrong', `runner endpoint reachable only by IP ${ip} (MagicDNS off here)`, `put http://${ip}:${url.port || '80'} in secrets.env as ${RUNNER_PLATFORM_ENDPOINT_ENV_VAR}`)];
+      return check('runner-endpoint', 'endpoint', 'wrong', `runner endpoint reachable only by IP ${ip} (MagicDNS off here)`, `put http://${ip}:${url.port || '80'} in secrets.env as ${RUNNER_PLATFORM_ENDPOINT_ENV_VAR}`);
     }
   }
-  return [check('runner-endpoint', 'endpoint', 'wrong', `runner endpoint unreachable by name${ip !== undefined ? ' and by IP' : ''} (${byName.detail})`, 'check `tailscale status` and that the runner platform is up')];
+  return check('runner-endpoint', 'endpoint', 'wrong', `runner endpoint unreachable by name${ip !== undefined ? ' and by IP' : ''} (${byName.detail})`, 'check `tailscale status` and that the runner platform is up');
 }
 
 // --- 5. The identity key ---
@@ -382,7 +449,7 @@ export async function runLocalPreflight(deps: PreflightDeps, opts: PreflightOpti
     ageCheck(deps),
     tailscaleCheck(deps),
     browserCheck(deps),
-    endpointCheck(deps, secrets.values),
+    endpointCheck(deps, load.manifest, secrets.values),
     identityChecks(deps, load.manifest, opts.identityKeyPath),
   ]);
   return [nodeCheck(deps), macf, gh, age, tailscale, browser, ...load.checks, ...secrets.checks, ...endpoint, ...identity];
