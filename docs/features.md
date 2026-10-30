@@ -50,11 +50,11 @@ Distributed via [`groundnuty/macf-marketplace`](https://github.com/groundnuty/ma
 | `/macf-peers` | mTLS peer-health table — list of registered peers with reachability + cert info |
 | `/macf-ping` | Round-trip mTLS test — POST `/health` against a named peer; report latency + cert chain |
 | `/macf-issues` | Pending-work queue — open issues tagged for this agent, with `agent-offline` highlighted |
-| `/macf-notify-peer` | Send a peer notification (operator-driven cross-agent messaging). Wraps the `notify_peer` MCP tool with one-line minimal output by default — minimizes context-token consumption per macf#350. |
+| `/macf-notify-peer` | Send a peer notification (operator-driven cross-agent messaging, always `event: custom`). Wraps the `notify_peer` MCP tool with one-line minimal output by default — minimizes context-token consumption per macf#350. |
 
 Pre-approved in `.claude/settings.json` per `installPluginSkillPermissions` so first-invocation doesn't fire an interactive permission prompt. Implementation: `packages/macf/src/plugin/`. Backing CLI: `macf-plugin-cli` binary.
 
-`/macf-notify-peer` is the operator-driven counterpart to the autonomous Stop-hook `notify_peer` invocation. The receiver discriminates wake-on-receipt by `event` type alone (macf#355): `event: 'custom'` (the slash-command's default) wakes the receiver TUI; autonomous events (`session-end` / `turn-complete` / `error` from Stop-hook flows) are observational-only (Pattern E preserves cross-agent Stop-hook loop prevention). The slash-command emits a one-line confirmation (`→ <peer> [<event>] delivered=<bool>`); use `--verbose` to opt into the full JSON result for debugging.
+`/macf-notify-peer` is the operator-driven counterpart to the SessionEnd and PreCompact `notify_peer` hooks. It always sends `event: custom`, which is pushed into the receiver's session and starts a turn. The hook events are recorded and never shown. Output: `→ <peer> delivered=<bool>`; `--verbose` prints the full JSON.
 
 ### 7 agent identity templates
 

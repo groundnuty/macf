@@ -772,17 +772,10 @@ async function main(): Promise<void> {
   mcp.mcp.registerTool(
     'notify_peer',
     {
-      description: 'Notify a peer agent of an event via the channel-server network. ' +
-        'If `to` is provided, POSTs to that peer\'s /notify. If absent, broadcasts to ' +
-        'all registered peers in the project (excluding self). `to` also accepts a ' +
-        '`<project>/<name>` cross-fleet guest slug (DR-041 Amendment A, macf#786), gated ' +
-        'on the fleet\'s `federated_cas` trust bundle. Failure semantics are ' +
-        'observational + non-blocking per DR-023 §"Failure-mode contract" — `isError: true` ' +
-        'when peers were attempted but none delivered, OR when a guest `to` fails the DR-041 ' +
-        'addressing ladder (see the `error` field), signaling LLM self-correction. ' +
-        'A named peer that is not registered returns `channel_state: "queued_not_registered"` ' +
-        '(queued, sent when it registers, lost if this server restarts); ' +
-        'the triggering Stop event proceeds regardless.',
+      description: 'Send a message to a peer agent (`event: custom`). `to` is a peer name or a ' +
+        '`<project>/<name>` cross-fleet slug; omitted, it broadcasts to all registered peers. ' +
+        'isError is true when peers were tried and none took it, when a cross-fleet `to` fails ' +
+        'to resolve (see `error`), or when the message is queued for an unregistered peer (see `note`).',
       inputSchema: NotifyPeerInputSchema,
       outputSchema: NotifyPeerOutputSchema,
     },
