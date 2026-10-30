@@ -8,6 +8,8 @@ import { compareSemver } from '@groundnuty/macf-core';
 import type { ExecResult, PreflightCheck, PreflightDeps } from './preflight.js';
 
 const AGENT_HOST_TOOLS = ['node', 'claude', 'tmux', 'crontab', 'gh', 'bash', 'macf'] as const;
+/** Every line the probe answers: the tools, plus the gh-token extension the agents mint App tokens with. */
+const PROBED = [...AGENT_HOST_TOOLS, 'gh-token'] as const;
 
 const SSH_OPTS = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10'] as const;
 
@@ -39,6 +41,7 @@ const PROBE_SCRIPT = `for t in ${AGENT_HOST_TOOLS.join(' ')}; do
     if [ -n "$i" ]; then echo "$t|interactive|"; else echo "$t|none|"; fi
   fi
 done
+if bash -lc "gh extension list" 2>/dev/null | grep -qi 'gh-token'; then echo "gh-token|login|installed"; else echo "gh-token|none|"; fi
 `;
 
 export type SshFailure = 'host-key' | 'permission' | 'no-route' | 'other';
@@ -97,6 +100,9 @@ function toolCheck(tool: string, mode: string, version: string, skipCron = false
       fix: `add its directory to PATH in ~/.profile on the agent host (not only ~/.bashrc)`,
     };
   }
+  if (tool === 'gh-token') {
+    return { id, group: 'agent-host', status: 'missing', detail: 'the gh-token extension is not installed on the agent host (the agents mint their App tokens with it)', fix: 'gh extension install Link-/gh-token (on the agent host)' };
+  }
   return { id, group: 'agent-host', status: 'missing', detail: `${tool} is not on the agent host`, fix: `install ${tool} on the agent host` };
 }
 
@@ -104,11 +110,11 @@ function parseProbe(stdout: string): readonly PreflightCheck[] {
   const seen = new Map<string, { mode: string; version: string }>();
   for (const line of stdout.split('\n')) {
     const [tool, mode, ...rest] = line.split('|');
-    if (tool !== undefined && mode !== undefined && (AGENT_HOST_TOOLS as readonly string[]).includes(tool)) {
+    if (tool !== undefined && mode !== undefined && (PROBED as readonly string[]).includes(tool)) {
       seen.set(tool, { mode, version: rest.join('|').trim() });
     }
   }
-  return AGENT_HOST_TOOLS.map((tool) => {
+  return PROBED.map((tool) => {
     const s = seen.get(tool);
     if (s === undefined) return { id: `agent-host-${tool}`, group: 'agent-host' as const, status: 'unknown' as const, detail: `no answer for ${tool} from the agent-host probe` };
     return toolCheck(tool, s.mode, s.version);

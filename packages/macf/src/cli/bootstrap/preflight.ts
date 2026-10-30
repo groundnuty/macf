@@ -421,7 +421,7 @@ export async function identityChecks(deps: PreflightDeps, manifest: FleetManifes
   if (keyPath === undefined) {
     if (manifest === undefined) return [];
     const has = await vaultExists(deps, manifest);
-    if (has === true) return [check('identity-key', 'identity', 'missing', 'the control repo already has a vault, and no --identity-key was given', 'pass --identity-key <path to your age key>')];
+    if (has === true) return [check('identity-key', 'identity', 'missing', 'the control repo already has a vault, and no --identity-key was given', 'apply needs --vault and --identity-key together: clone the control repo (gh repo clone <owner>/<project>-control) and pass --vault <clone>/secrets/vault.age --identity-key <your age key>; give preflight --identity-key too')];
     return [];
   }
   if (deps.readText(keyPath) === undefined) {

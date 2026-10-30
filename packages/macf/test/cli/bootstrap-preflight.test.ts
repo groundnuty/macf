@@ -37,7 +37,7 @@ ${opts.versions === false ? '' : `versions:\n  macf: ${opts.macf ?? '0.2.79'}\n 
 }
 
 const GH_OK = 'HTTP/2.0 200 OK\nX-Oauth-Scopes: admin:org, repo, workflow\n\n{"login":"someone"}';
-const PROBE_OK = 'node|login|v22.14.0\nclaude|login|2.1.300\ntmux|login|tmux 3.4\ncrontab|login|empty\ngh|login|gh version 2.60\nbash|login|GNU bash, version 5.2.21(1)-release\nmacf|login|0.2.79\n';
+const PROBE_OK = 'node|login|v22.14.0\nclaude|login|2.1.300\ntmux|login|tmux 3.4\ncrontab|login|empty\ngh|login|gh version 2.60\nbash|login|GNU bash, version 5.2.21(1)-release\nmacf|login|0.2.79\n\ngh-token|login|installed';
 const ok = (stdout = ''): ExecResult => ({ code: 0, stdout, stderr: '' });
 const noSuchProgram: ExecResult = { code: null, stdout: '', stderr: 'ENOENT', spawnFailed: true };
 
@@ -337,7 +337,7 @@ describe('agent host over ssh', () => {
 
   it('reports every tool on the VM when ready', async () => {
     const checks = await agentHostChecks(vmDeps(ok(PROBE_OK)), 'ubuntu@vm');
-    expect(checks.map((c) => c.status)).toEqual(['ok', 'ok', 'ok', 'ok', 'ok', 'ok', 'ok', 'ok', 'ok']);
+    expect(checks.map((c) => c.status)).toEqual(['ok', 'ok', 'ok', 'ok', 'ok', 'ok', 'ok', 'ok', 'ok', 'ok']);
     expect(checks[0]?.detail).toBe('agents run on ubuntu@vm');
     expect(checks.find((c) => c.id === 'agent-host-macf')?.detail).toContain('0.2.79');
   });
@@ -422,6 +422,23 @@ describe('bash on the agent host', () => {
     const { resolve } = await import('node:path');
     const src = readFileSync(resolve(__dirname, '../../src/cli/bootstrap/preflight-agent-host.ts'), 'utf-8');
     expect(src).not.toMatch(/mapfile|readarray|declare -A|\$\{[a-z_]+,,\}/);
+  });
+});
+
+describe('the gh-token extension on the agent host', () => {
+  const vmDeps = (probe: ExecResult): PreflightDeps =>
+    makeDeps({ exec: (c, a, input) => (c === 'ssh' ? (a.includes('true') ? ok() : input !== undefined ? probe : undefined) : undefined) }).deps;
+  it('missing when gh has no gh-token extension, with the install command', async () => {
+    const checks = await agentHostChecks(vmDeps(ok(PROBE_OK.replace('gh-token|login|installed', 'gh-token|none|'))), 'ubuntu@vm');
+    const c = checks.find((x) => x.id === 'agent-host-gh-token');
+    expect(c?.status).toBe('missing');
+    expect(c?.fix).toContain('gh extension install Link-/gh-token');
+  });
+  it('the identity fix names --vault and --identity-key together', async () => {
+    const { readFileSync } = await import('node:fs');
+    const { resolve } = await import('node:path');
+    const src = readFileSync(resolve(__dirname, '../../src/cli/bootstrap/preflight.ts'), 'utf-8');
+    expect(src).toContain('apply needs --vault and --identity-key together');
   });
 });
 
