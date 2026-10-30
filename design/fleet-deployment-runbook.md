@@ -30,6 +30,8 @@ one file means one place to keep current, and `--help` (§5) is *always*
 correct even if this document lags, because it is generated from the same
 source this document was written from.
 
+**Deploying with a Claude Code agent?** Paste `design/fleet-deploy-agent-prompt.md` into a fresh session, with its inputs filled in.
+
 **Everything below is derived from the schema in
 `packages/macf/src/cli/bootstrap/fleet-manifest.ts`, the command definitions
 in `packages/macf/src/cli/index.ts`, and the modules under
