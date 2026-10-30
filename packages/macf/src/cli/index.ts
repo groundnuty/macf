@@ -806,6 +806,7 @@ bootstrap
   .requiredOption('-f, --file <path>', 'Path to the fleet.yaml manifest')
   .option('--secrets-file <path>', 'Operator secrets file (plain KEY=value) to check')
   .option('--identity-key <path>', 'age identity file; shows its recipient and whether the manifest lists it')
+  .option('--vault <path>', 'The vault apply will be given; checked together with --identity-key, the way apply does')
   .option('--agent-host <ssh-target>', 'ssh target of the machine that runs the agents, e.g. ubuntu@host. Omit when the agents run on this machine')
   .option('--json', 'Emit the checks as JSON (with schema_version)', false)
   .action(async (opts) => {
@@ -814,6 +815,7 @@ bootstrap
       json: opts.json,
       secretsPath: opts.secretsFile,
       identityKeyPath: opts.identityKey,
+      vaultPath: opts.vault,
       agentHost: opts.agentHost,
     });
   });

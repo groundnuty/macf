@@ -113,6 +113,7 @@ export async function runBootstrapPreflight(opts: RunBootstrapPreflightOptions, 
     file: resolvePath(opts.file),
     ...(opts.secretsPath !== undefined ? { secretsPath: resolvePath(opts.secretsPath) } : {}),
     ...(opts.identityKeyPath !== undefined ? { identityKeyPath: resolvePath(opts.identityKeyPath) } : {}),
+    ...(opts.vaultPath !== undefined ? { vaultPath: resolvePath(opts.vaultPath) } : {}),
     ...(opts.agentHost !== undefined ? { agentHost: opts.agentHost } : {}),
   };
   const [local, host] = await Promise.all([runLocalPreflight(deps, resolved), agentHostChecks(deps, resolved.agentHost)]);

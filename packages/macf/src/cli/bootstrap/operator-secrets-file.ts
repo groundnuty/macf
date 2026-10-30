@@ -132,13 +132,14 @@ export function resolveOperatorInput(
   flagValue: string | undefined,
   fleetFileValues: Readonly<Record<string, string>> | undefined,
   scopeFileValues: Readonly<Record<string, string>> | undefined,
+  env: Readonly<Record<string, string | undefined>> = process.env,
 ): OperatorInputResolution {
   if (flagValue !== undefined && flagValue.length > 0) return { value: flagValue, source: 'flag' };
   const fleetValue = fleetFileValues?.[key];
   if (fleetValue !== undefined && fleetValue.length > 0) return { value: fleetValue, source: 'fleet-file' };
   const scopeValue = scopeFileValues?.[key];
   if (scopeValue !== undefined && scopeValue.length > 0) return { value: scopeValue, source: 'scope-file' };
-  const envValue = process.env[key];
+  const envValue = env[key];
   if (envValue !== undefined && envValue.length > 0) return { value: envValue, source: 'env' };
   return { value: undefined, source: 'none' };
 }

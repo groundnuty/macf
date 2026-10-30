@@ -1183,21 +1183,23 @@ function composeValidateInstall(
  * A role WITH a prior lock entry is unaffected — reuse/resume/skip/drift
  * never mint a new credential, so an unconfigured recipient can't lose one.
  */
-function wouldCreateWithNoRecipient(prior: FleetLockAgent | undefined, recipients: readonly string[]): boolean {
+export function wouldCreateWithNoRecipient(prior: FleetLockAgent | undefined, recipients: readonly string[]): boolean {
   return prior === undefined && recipients.length === 0;
 }
 
+/** The refusal text for a role that would be created with no age recipient; shared with `macf bootstrap preflight`. */
+export function noRecipientReason(role: string): string {
+  return (
+    `role "${role}" has no prior fleet.lock entry, so it would take the CREATE path — but ` +
+    'transport.age_recipients is empty, so its credential could NEVER be made durable ' +
+    '(no recipient to encrypt the recovery artifact OR the final vault to). Refusing to open consent gate 1 ' +
+    "for a credential that can never be saved — mint an age recipient and add it to transport.age_recipients in " +
+    'fleet.yaml, then re-run.'
+  );
+}
+
 function noRecipientPreflightFailure(role: string): AgentApplyOutcome {
-  return {
-    role,
-    status: 'failed',
-    reason:
-      `role "${role}" has no prior fleet.lock entry, so it would take the CREATE path — but ` +
-      'transport.age_recipients is empty, so its credential could NEVER be made durable ' +
-      '(no recipient to encrypt the recovery artifact OR the final vault to). Refusing to open consent gate 1 ' +
-      "for a credential that can never be saved — mint an age recipient and add it to transport.age_recipients in " +
-      'fleet.yaml, then re-run.',
-  };
+  return { role, status: 'failed', reason: noRecipientReason(role) };
 }
 
 /**

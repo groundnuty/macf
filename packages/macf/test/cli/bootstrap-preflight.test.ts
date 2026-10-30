@@ -603,7 +603,7 @@ describe('command: exit code and --json', () => {
 
   it('does not count unknown as a failure', async () => {
     vi.spyOn(console, 'log').mockImplementation(() => undefined);
-    const code = await runBootstrapPreflight({ file: MANIFEST_PATH }, makeDeps({ files: baseFiles(), env: { MACF_BOOTSTRAP_TS_OAUTH_CLIENT_ID: 'a', MACF_BOOTSTRAP_TS_OAUTH_SECRET: 'b', MACF_RUNNER_PLATFORM_ENDPOINT: ENDPOINT } }).deps);
+    const code = await runBootstrapPreflight({ file: MANIFEST_PATH }, makeDeps({ files: baseFiles(), env: { MACF_BOOTSTRAP_TS_OAUTH_CLIENT_ID: 'a', MACF_BOOTSTRAP_TS_OAUTH_SECRET: 'tskey-client-b', MACF_RUNNER_PLATFORM_ENDPOINT: ENDPOINT } }).deps);
     expect(code).toBe(0);
   });
 

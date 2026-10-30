@@ -20,7 +20,8 @@ import {
   type RunnerPlatformEndpointSource,
 } from './runner-platform.js';
 import { registryPathPrefix } from '../registry-helper.js';
-import { parseOperatorSecretsFile } from './operator-secrets-file.js';
+import { parseOperatorSecretsFile, missingRequiredOperatorInputs, resolveOperatorInput } from './operator-secrets-file.js';
+import { applyFlagRefusalChecks, applyManifestRefusalChecks } from './preflight-apply-refusals.js';
 
 export const PREFLIGHT_JSON_SCHEMA_VERSION = 1;
 
@@ -65,6 +66,8 @@ export interface PreflightOptions {
   readonly file: string;
   readonly secretsPath?: string;
   readonly identityKeyPath?: string;
+  /** The vault apply would be given; only used to judge the vault flags together. */
+  readonly vaultPath?: string;
   readonly agentHost?: string;
 }
 
@@ -283,17 +286,15 @@ function secretsFileCheck(deps: PreflightDeps, path: string): { readonly check: 
   return { check: check('secrets-file', 'secrets', 'ok', `${path} exists with mode 600`), values };
 }
 
-function secretKeyCheck(req: RequiredKey, fileValues: Readonly<Record<string, string>> | undefined, env: PreflightDeps['env'], hasFile: boolean): PreflightCheck {
+function secretKeyCheck(req: RequiredKey, source: string, isMissing: boolean, hasFile: boolean, vaultGiven: boolean): PreflightCheck {
   const id = `secret-${req.key}`;
-  const fromFile = fileValues?.[req.key];
-  if (fromFile !== undefined && fromFile.length > 0) return check(id, 'secrets', 'ok', `${req.key} (${req.why}) is set in the secrets file`);
-  const fromEnv = env[req.key];
-  if (fromEnv !== undefined && fromEnv.length > 0) return check(id, 'secrets', 'ok', `${req.key} (${req.why}) is set in the environment`);
+  if (!isMissing) return check(id, 'secrets', 'ok', `${req.key} (${req.why}) is set in ${source === 'fleet-file' ? 'the secrets file' : 'the environment'}`);
+  if (vaultGiven) return check(id, 'secrets', 'unknown', `${req.key} (${req.why}) is not set here; it may be in the vault, which preflight does not decrypt`);
   const where = hasFile ? 'the secrets file or the environment' : 'the environment (no --secrets-file given)';
   return check(id, 'secrets', 'missing', `${req.key} (${req.why}) is not set in ${where}`, `set ${req.key} in secrets.env`);
 }
 
-export function secretsChecks(deps: PreflightDeps, manifest: FleetManifest | undefined, secretsPath: string | undefined): { readonly checks: readonly PreflightCheck[]; readonly values?: Readonly<Record<string, string>> } {
+export function secretsChecks(deps: PreflightDeps, manifest: FleetManifest | undefined, secretsPath: string | undefined, vaultGiven = false): { readonly checks: readonly PreflightCheck[]; readonly values?: Readonly<Record<string, string>> } {
   const checks: PreflightCheck[] = [];
   let values: Readonly<Record<string, string>> | undefined;
   if (secretsPath === undefined) {
@@ -304,7 +305,11 @@ export function secretsChecks(deps: PreflightDeps, manifest: FleetManifest | und
     values = r.values;
   }
   if (manifest !== undefined) {
-    for (const req of requiredSecretKeys(manifest)) checks.push(secretKeyCheck(req, values, deps.env, secretsPath !== undefined));
+    // Apply's own aggregate: the keys it would refuse on as missing.
+    const required = requiredSecretKeys(manifest);
+    const resolved = required.map((r) => ({ req: r, res: resolveOperatorInput(r.key, undefined, values, undefined, deps.env) }));
+    const missing = new Set(missingRequiredOperatorInputs(resolved.map((r) => ({ key: r.req.key, required: true, value: r.res.value }))));
+    for (const r of resolved) checks.push(secretKeyCheck(r.req, r.res.source, missing.has(r.req.key), secretsPath !== undefined, vaultGiven));
   }
   return { checks, ...(values !== undefined ? { values } : {}) };
 }
@@ -460,7 +465,8 @@ export async function identityChecks(deps: PreflightDeps, manifest: FleetManifes
 
 export async function runLocalPreflight(deps: PreflightDeps, opts: PreflightOptions): Promise<readonly PreflightCheck[]> {
   const load = loadManifestChecks(deps, opts.file);
-  const secrets = secretsChecks(deps, load.manifest, opts.secretsPath);
+  const vaultGiven = opts.vaultPath !== undefined && opts.identityKeyPath !== undefined;
+  const secrets = secretsChecks(deps, load.manifest, opts.secretsPath, vaultGiven);
   const [macf, gh, age, tailscale, browser, endpoint, identity] = await Promise.all([
     macfOnPathCheck(deps),
     ghCheck(deps, load.manifest),
@@ -470,5 +476,5 @@ export async function runLocalPreflight(deps: PreflightDeps, opts: PreflightOpti
     endpointCheck(deps, load.manifest, secrets.values),
     identityChecks(deps, load.manifest, opts.identityKeyPath),
   ]);
-  return [nodeCheck(deps), macf, gh, age, tailscale, browser, ...load.checks, ...secrets.checks, ...endpoint, ...identity];
+  return [nodeCheck(deps), macf, gh, age, tailscale, browser, ...load.checks, ...(load.manifest !== undefined ? applyManifestRefusalChecks(deps, load.manifest, opts) : []), ...secrets.checks, ...applyFlagRefusalChecks(deps, opts, secrets.values), ...endpoint, ...identity];
 }
