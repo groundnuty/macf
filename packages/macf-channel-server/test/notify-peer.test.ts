@@ -312,6 +312,27 @@ describe('notify_peer tool', () => {
     });
   });
 
+  describe('lifecycle events are recorded, not shown (#1525)', () => {
+    const peer = { host: '127.0.0.1', port: 9000, type: 'permanent', instance_id: 'a', started: 't' };
+    it.each(['session-end', 'session-compact', 'turn-complete', 'error'] as const)(
+      '%s reports recorded_only with a note',
+      async (event) => {
+        const reg = makeRegistry({ get: peer });
+        nextHttpsRespondsWith(200);
+        const result = await notifyPeer(makeDeps(reg), { to: 'peer-a', event });
+        expect(result.channel_state).toBe('recorded_only');
+        expect(result.note).toContain('never shows it in its session');
+      },
+    );
+    it('custom keeps channel_state online and carries no note', async () => {
+      const reg = makeRegistry({ get: peer });
+      nextHttpsRespondsWith(200);
+      const result = await notifyPeer(makeDeps(reg), { to: 'peer-a', event: 'custom', message: 'hi' });
+      expect(result.channel_state).toBe('online');
+      expect(result.note).toBeUndefined();
+    });
+  });
+
   describe('single-peer mode (`to` provided)', () => {
     it('queues a named, unregistered peer instead of dropping it (#1525)', async () => {
       const reg = makeRegistry({ get: null });
@@ -393,7 +414,7 @@ describe('notify_peer tool', () => {
       nextHttpsRespondsWith(200);
       const result = await notifyPeer(makeDeps(reg), {
         to: 'peer-a',
-        event: 'session-end',
+        event: 'custom',
         message: 'bye',
       });
       expect(result).toEqual({
@@ -411,7 +432,7 @@ describe('notify_peer tool', () => {
       nextHttpsRespondsWith(500);
       const result = await notifyPeer(makeDeps(reg), {
         to: 'peer-a',
-        event: 'error',
+        event: 'custom',
       });
       expect(result.delivered).toBe(false);
       expect(result.channel_state).toBe('online'); // transport ok, peer alive
@@ -474,7 +495,7 @@ describe('notify_peer tool', () => {
       nextHttpsRespondsWith(200);
       const result = await notifyPeer(
         makeDeps(reg, { federatedCas: ['ppam-2026'], resolveCrossProjectAgent }),
-        { to: 'ppam-2026/code-agent', event: 'session-end' },
+        { to: 'ppam-2026/code-agent', event: 'custom' },
       );
       expect(result).toEqual({
         delivered: true,
@@ -495,7 +516,7 @@ describe('notify_peer tool', () => {
       const resolveCrossProjectAgent = vi.fn().mockResolvedValue(guestInfo);
       const result = await notifyPeer(
         makeDeps(reg, { federatedCas: [], resolveCrossProjectAgent }),
-        { to: 'ppam-2026/code-agent', event: 'session-end' },
+        { to: 'ppam-2026/code-agent', event: 'custom' },
       );
       expect(result).toEqual({
         delivered: false,
@@ -518,7 +539,7 @@ describe('notify_peer tool', () => {
       const resolveCrossProjectAgent = vi.fn().mockResolvedValue(null);
       const result = await notifyPeer(
         makeDeps(reg, { federatedCas: ['ppam-2026'], resolveCrossProjectAgent }),
-        { to: 'ppam-2026/code-agent', event: 'session-end' },
+        { to: 'ppam-2026/code-agent', event: 'custom' },
       );
       expect(result).toEqual({
         delivered: false,
@@ -539,7 +560,7 @@ describe('notify_peer tool', () => {
       nextHttpsRespondsWith(200);
       const result = await notifyPeer(
         makeDeps(reg, { federatedCas: ['ppam-2026'], resolveCrossProjectAgent }),
-        { to: 'peer-a', event: 'session-end' },
+        { to: 'peer-a', event: 'custom' },
       );
       expect(result).toEqual({
         delivered: true,
@@ -621,7 +642,7 @@ describe('notify_peer tool', () => {
   describe('broadcast mode (`to` absent)', () => {
     it('returns offline+0 when no peers registered', async () => {
       const reg = makeRegistry({ list: [] });
-      const result = await notifyPeer(makeDeps(reg), { event: 'session-end' });
+      const result = await notifyPeer(makeDeps(reg), { event: 'custom' });
       expect(result).toEqual({
         delivered: false,
         channel_state: 'offline',
@@ -636,7 +657,7 @@ describe('notify_peer tool', () => {
           { name: 'self-agent', info: { host: '127.0.0.1', port: 9000, type: 'permanent', instance_id: 'a', started: 't' } },
         ],
       });
-      const result = await notifyPeer(makeDeps(reg), { event: 'session-end' });
+      const result = await notifyPeer(makeDeps(reg), { event: 'custom' });
       expect(result.peers_attempted).toBe(0);
       expect(requestMock).not.toHaveBeenCalled();
     });
@@ -656,7 +677,7 @@ describe('notify_peer tool', () => {
         ],
       });
       nextHttpsRespondsWith(200);
-      const result = await notifyPeer(makeDeps(reg), { event: 'session-end' });
+      const result = await notifyPeer(makeDeps(reg), { event: 'custom' });
       expect(result.peers_attempted).toBe(1); // only PEER_B; SELF_AGENT filtered as self
       expect(result.peers_delivered).toBe(1);
       expect(requestMock).toHaveBeenCalledTimes(1);
@@ -672,7 +693,7 @@ describe('notify_peer tool', () => {
       });
       nextHttpsRespondsWith(200);
       nextHttpsRespondsWith(200);
-      const result = await notifyPeer(makeDeps(reg), { event: 'session-end' });
+      const result = await notifyPeer(makeDeps(reg), { event: 'custom' });
       expect(result.peers_attempted).toBe(2);
       expect(result.peers_delivered).toBe(2);
       expect(result.channel_state).toBe('online');
@@ -689,7 +710,7 @@ describe('notify_peer tool', () => {
       });
       nextHttpsRespondsWith(200);
       nextHttpsErrorsWith(new Error('ECONNREFUSED'));
-      const result = await notifyPeer(makeDeps(reg), { event: 'session-end' });
+      const result = await notifyPeer(makeDeps(reg), { event: 'custom' });
       expect(result.peers_attempted).toBe(2);
       expect(result.peers_delivered).toBe(1);
       expect(result.delivered).toBe(true);
@@ -703,7 +724,7 @@ describe('notify_peer tool', () => {
         ],
       });
       nextHttpsErrorsWith(new Error('ECONNREFUSED'));
-      const result = await notifyPeer(makeDeps(reg), { event: 'session-end' });
+      const result = await notifyPeer(makeDeps(reg), { event: 'custom' });
       expect(result.peers_attempted).toBe(1);
       expect(result.peers_delivered).toBe(0);
       expect(result.channel_state).toBe('offline');

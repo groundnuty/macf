@@ -50,7 +50,7 @@ Distributed via [`groundnuty/macf-marketplace`](https://github.com/groundnuty/ma
 | `/macf-peers` | mTLS peer-health table — list of registered peers with reachability + cert info |
 | `/macf-ping` | Round-trip mTLS test — POST `/health` against a named peer; report latency + cert chain |
 | `/macf-issues` | Pending-work queue — open issues tagged for this agent, with `agent-offline` highlighted |
-| `/macf-notify-peer` | Send a peer notification (operator-driven cross-agent messaging). Wraps the `notify_peer` MCP tool with one-line minimal output by default — minimizes context-token consumption per macf#350. |
+| `/macf-notify-peer` | Send a peer notification (operator-driven cross-agent messaging, always `event: custom`). Wraps the `notify_peer` MCP tool with one-line minimal output by default — minimizes context-token consumption per macf#350. |
 
 Pre-approved in `.claude/settings.json` per `installPluginSkillPermissions` so first-invocation doesn't fire an interactive permission prompt. Implementation: `packages/macf/src/plugin/`. Backing CLI: `macf-plugin-cli` binary.
 

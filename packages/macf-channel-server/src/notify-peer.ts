@@ -56,7 +56,7 @@ export const NotifyPeerInputSchema = {
   to: z.string().optional()
     .describe('Peer agent name to notify. If omitted, broadcasts to all registered peers in the project.'),
   event: z.enum(['session-end', 'session-compact', 'turn-complete', 'error', 'custom'])
-    .describe('Event type triggering the notification. Receiver-side wake policy keys off this field (macf#355): `custom` (operator-driven) wakes the receiver TUI; `session-end` / `session-compact` / `turn-complete` / `error` (autonomous-flow) are observational-only — Pattern E preserves cross-agent Stop-hook loop prevention. `session-compact` (macf#673) is the PreCompact-hook event, distinct from the SessionEnd `session-end`.'),
+    .describe('Event type. Use `custom` to send a message: it is pushed into the peer\'s session and starts a turn. The other events are sent by MACF hooks; the peer only records them and its session never sees them.'),
   message: z.string().optional()
     .describe('Optional human-readable message body.'),
   context: z.record(z.string(), z.unknown()).optional()
@@ -78,8 +78,8 @@ export const NotifyPeerOutputSchema = {
   // peer was attempted and found unreachable. Conflating the two reads as
   // "my own channel-server is down" when the actual cause is a bad/
   // unfederated `<project>/<name>` slug. See the `error` field doc below.
-  channel_state: z.enum(['online', 'offline', 'no-peer-resolved', 'queued_not_registered'])
-    .describe('Aggregate state — "online" if at least one peer reachable, "offline" if peers were attempted but unreachable, "no-peer-resolved" if address resolution itself failed (see `error`), "queued_not_registered" if the named peer is not registered: the message is queued and sent when it registers (see `note`).'),
+  channel_state: z.enum(['online', 'offline', 'no-peer-resolved', 'queued_not_registered', 'recorded_only'])
+    .describe('Aggregate state — "online" if at least one peer reachable, "offline" if peers were attempted but unreachable, "no-peer-resolved" if address resolution itself failed (see `error`), "queued_not_registered" if the named peer is not registered: the message is queued and sent when it registers (see `note`). "recorded_only" for any event other than `custom`: the peer records it and its session never sees it (see `note`).'),
   queued: z.boolean().optional()
     .describe('True when the message was queued for a peer that is not registered yet.'),
   note: z.string().optional()
@@ -204,7 +204,7 @@ export interface NotifyPeerInput {
 export interface NotifyPeerResult {
   readonly delivered: boolean;
   /** macf#790 Gap 1 — see `NotifyPeerOutputSchema.channel_state` doc. */
-  readonly channel_state: 'online' | 'offline' | 'no-peer-resolved' | 'queued_not_registered';
+  readonly channel_state: 'online' | 'offline' | 'no-peer-resolved' | 'queued_not_registered' | 'recorded_only';
   /** Set with `queued_not_registered`: the send waits in the outbox for the peer to register. */
   readonly queued?: boolean;
   readonly note?: string;
@@ -673,6 +673,25 @@ async function dispatchToPeer(
  * this notify_peer span (cross-channel-server trace correlation).
  */
 export async function notifyPeer(
+  deps: NotifyPeerDeps,
+  input: NotifyPeerInput,
+): Promise<NotifyPeerResult> {
+  const result = await dispatchNotifyPeer(deps, input);
+  return input.event === 'custom' ? result : markRecordedOnly(result);
+}
+
+const RECORDED_ONLY_NOTE =
+  'The peer records this event and never shows it in its session. Send a message with event custom.';
+
+/** A lifecycle event reaching the peer's /notify is not a message the peer's session sees. */
+function markRecordedOnly(result: NotifyPeerResult): NotifyPeerResult {
+  const note = result.note === undefined ? RECORDED_ONLY_NOTE : `${RECORDED_ONLY_NOTE} ${result.note}`;
+  return result.channel_state === 'online'
+    ? { ...result, channel_state: 'recorded_only', note }
+    : { ...result, note };
+}
+
+async function dispatchNotifyPeer(
   deps: NotifyPeerDeps,
   input: NotifyPeerInput,
 ): Promise<NotifyPeerResult> {

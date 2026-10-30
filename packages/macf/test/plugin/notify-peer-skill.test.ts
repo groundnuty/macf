@@ -40,7 +40,23 @@ describe('macf-notify-peer SKILL.md (macf#350)', () => {
   it('declares the notify_peer MCP tool in allowed-tools', () => {
     // Required for the MCP tool invocation; without it, every call
     // would gate on interactive approval (sister to macf#349).
-    expect(content).toMatch(/allowed-tools:.*mcp__plugin_macf-agent_macf-agent__notify_peer/);
+    expect(content).toMatch(/allowed-tools:.*mcp__macf-agent__notify_peer\b/);
+  });
+
+  it('names the same tool id that macf init pre-approves', () => {
+    const writer = readFileSync(
+      join(repoRoot, 'src', 'cli', 'settings-writer.ts'),
+      'utf-8',
+    );
+    const allowed = /allowed-tools:\s*(\S+)/.exec(content)?.[1];
+    expect(allowed).toBeDefined();
+    expect(writer).toContain(`'${allowed}'`);
+  });
+
+  it('does not recommend a lifecycle event for a message', () => {
+    expect(content).not.toMatch(/--event/);
+    expect(content).not.toMatch(/use a non-`custom`/);
+    expect(content).toMatch(/never use them for a message/);
   });
 
   it('has an argument-hint covering peer + message', () => {
