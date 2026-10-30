@@ -804,7 +804,7 @@ bootstrap
     'a browser for the consent pages, then the agent host (this machine, or --agent-host <ssh-target>): tools on a non-interactive PATH. Exit 0 when ready, 1 otherwise.',
   )
   .requiredOption('-f, --file <path>', 'Path to the fleet.yaml manifest')
-  .option('--secrets <path>', 'Operator secrets file (plain KEY=value) to check')
+  .option('--secrets-file <path>', 'Operator secrets file (plain KEY=value) to check')
   .option('--identity-key <path>', 'age identity file; shows its recipient and whether the manifest lists it')
   .option('--agent-host <ssh-target>', 'ssh target of the machine that runs the agents, e.g. ubuntu@host. Omit when the agents run on this machine')
   .option('--json', 'Emit the checks as JSON (with schema_version)', false)
@@ -812,7 +812,7 @@ bootstrap
     process.exitCode = await runBootstrapPreflight({
       file: opts.file,
       json: opts.json,
-      secretsPath: opts.secrets,
+      secretsPath: opts.secretsFile,
       identityKeyPath: opts.identityKey,
       agentHost: opts.agentHost,
     });

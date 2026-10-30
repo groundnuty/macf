@@ -68,7 +68,7 @@ export interface PreflightOptions {
   readonly agentHost?: string;
 }
 
-const MIN_NODE = '22.12.0';
+export const MIN_NODE = '22.12.0';
 const SEMVER_RE = /(\d+\.\d+\.\d+)/;
 const NET_TIMEOUT_MS = 5000;
 
@@ -289,7 +289,7 @@ function secretKeyCheck(req: RequiredKey, fileValues: Readonly<Record<string, st
   if (fromFile !== undefined && fromFile.length > 0) return check(id, 'secrets', 'ok', `${req.key} (${req.why}) is set in the secrets file`);
   const fromEnv = env[req.key];
   if (fromEnv !== undefined && fromEnv.length > 0) return check(id, 'secrets', 'ok', `${req.key} (${req.why}) is set in the environment`);
-  const where = hasFile ? 'the secrets file or the environment' : 'the environment (no --secrets file given)';
+  const where = hasFile ? 'the secrets file or the environment' : 'the environment (no --secrets-file given)';
   return check(id, 'secrets', 'missing', `${req.key} (${req.why}) is not set in ${where}`, `set ${req.key} in secrets.env`);
 }
 
@@ -297,7 +297,7 @@ export function secretsChecks(deps: PreflightDeps, manifest: FleetManifest | und
   const checks: PreflightCheck[] = [];
   let values: Readonly<Record<string, string>> | undefined;
   if (secretsPath === undefined) {
-    checks.push(check('secrets-file', 'secrets', 'unknown', 'no --secrets file given, so none was checked', 'pass --secrets <path>'));
+    checks.push(check('secrets-file', 'secrets', 'unknown', 'no --secrets-file given, so none was checked', 'pass --secrets-file <path>'));
   } else {
     const r = secretsFileCheck(deps, secretsPath);
     checks.push(r.check);
