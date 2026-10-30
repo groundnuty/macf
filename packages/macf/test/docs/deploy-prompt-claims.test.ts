@@ -8,7 +8,7 @@
  * walkthrough owns it.
  */
 import { describe, it, expect, beforeAll } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { codeBlockLines, loadCommandTree, macfCommand, unknownFlags, type CmdNode } from './helpers/command-tree.js';
@@ -19,6 +19,21 @@ const runbook = readFileSync(resolve(designDir, 'fleet-deployment-runbook.md'), 
 const prompt = readFileSync(resolve(designDir, 'fleet-deploy-agent-prompt.md'), 'utf-8');
 const runbookLines = runbook.split('\n');
 const promptLines = prompt.split('\n');
+
+const repoRoot = resolve(designDir, '..');
+const packDir = resolve(designDir, 'onboarding-packs/paper-fleet');
+const packReadme = readFileSync(resolve(packDir, 'README.md'), 'utf-8');
+
+/** Repo paths under design/ that the text names in backticks. */
+function designPaths(text: string): string[] {
+  return [...text.matchAll(/`(design\/[^`\s]+)`/g)].map((m) => m[1] ?? '');
+}
+
+/** Names in the README fetch loop (`for f in a b c; do`), as .md file names. */
+function packFiles(text: string): string[] {
+  const m = /for f in ([^;]+);\s*do/.exec(text);
+  return (m?.[1] ?? '').split(/\s+/).filter(Boolean).map((n) => `${n}.md`);
+}
 
 let tree: CmdNode;
 
@@ -93,5 +108,19 @@ describe('fleet-deploy-agent-prompt.md claims', () => {
       .filter(({ l }) => /approv\w*[^.\n]{0,60}`(?:y|yes)`/i.test(l) || /`(?:y|yes)`[^.\n]{0,60}approv/i.test(l) || /\b(?:type|answer|reply|enter)\b[^.\n]{0,30}`(?:y|yes)`/i.test(l))
       .map(({ n, l }) => `prompt line ${String(n)}: ${l.trim().slice(0, 100)}`);
     expect(hits).toEqual([]);
+  });
+
+  it('only names design/ paths that exist', () => {
+    const paths = designPaths(prompt);
+    expect(paths.length).toBeGreaterThan(0);
+    const missing = paths.filter((p) => !existsSync(resolve(repoRoot, p)));
+    expect(missing).toEqual([]);
+  });
+
+  it('ships every file the pack README fetches', () => {
+    const files = packFiles(packReadme);
+    expect(files.length).toBeGreaterThan(0);
+    const missing = files.filter((f) => !existsSync(resolve(packDir, f)));
+    expect(missing).toEqual([]);
   });
 });
