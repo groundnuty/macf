@@ -11,6 +11,14 @@ const AGENT_HOST_TOOLS = ['node', 'claude', 'tmux', 'crontab', 'gh', 'bash', 'ma
 /** Every line the probe answers: the tools, plus the gh-token extension the agents mint App tokens with. */
 const PROBED = [...AGENT_HOST_TOOLS, 'gh-token'] as const;
 
+/** The extension name both probes look for in `gh extension list` (case-insensitive). */
+const GH_TOKEN_EXTENSION = 'gh-token';
+
+/** Whether `gh extension list` output names the gh-token extension. Shared by the apply-host and agent-host probes. */
+export function ghTokenListed(extensionList: string): boolean {
+  return new RegExp(GH_TOKEN_EXTENSION, 'i').test(extensionList);
+}
+
 const SSH_OPTS = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10'] as const;
 
 /**
@@ -42,7 +50,7 @@ const PROBE_SCRIPT = `for t in ${AGENT_HOST_TOOLS.join(' ')}; do
     if [ -n "$i" ]; then echo "$t|interactive|"; else echo "$t|none|"; fi
   fi
 done
-if bash -lc "gh extension list" 2>/dev/null | grep -qi 'gh-token'; then echo "gh-token|login|installed"; else echo "gh-token|none|"; fi
+if bash -lc "gh extension list" 2>/dev/null | grep -qi '${GH_TOKEN_EXTENSION}'; then echo "gh-token|login|installed"; else echo "gh-token|none|"; fi
 `;
 
 export type SshFailure = 'host-key' | 'permission' | 'no-route' | 'other';

@@ -21,6 +21,7 @@ import {
 } from './runner-platform.js';
 import { registryPathPrefix } from '../registry-helper.js';
 import { parseOperatorSecretsFile, missingRequiredOperatorInputs, resolveOperatorInput } from './operator-secrets-file.js';
+import { ghTokenListed } from './preflight-agent-host.js';
 import { applyFlagRefusalChecks, applyManifestRefusalChecks } from './preflight-apply-refusals.js';
 
 export const PREFLIGHT_JSON_SCHEMA_VERSION = 1;
@@ -157,6 +158,19 @@ async function ghCheck(deps: PreflightDeps, manifest: FleetManifest | undefined)
   const { login, scopes } = parseGhApi(r.stdout);
   if (login === undefined) return check('gh', 'tools', 'unknown', 'gh answered but the login could not be read');
   return ghScopeResult(login, scopes, manifest);
+}
+
+/**
+ * apply mints App tokens with `gh token generate` on THIS machine, so the extension must be here.
+ * Only run with --agent-host: with no agent host the agent-host probe already covers this machine.
+ */
+async function ghTokenExtensionCheck(deps: PreflightDeps): Promise<PreflightCheck> {
+  const fix = 'gh extension install Link-/gh-token';
+  const r = await deps.exec('gh', ['extension', 'list'], { timeoutMs: 15000 });
+  if (r.spawnFailed === true) return check('gh-token', 'tools', 'missing', 'gh is not on PATH, so the gh-token extension cannot be checked', 'install the GitHub CLI (https://cli.github.com)');
+  if (r.code !== 0) return check('gh-token', 'tools', 'wrong', `gh extension list failed: ${probeFailure(r)}`, 'run gh extension list by hand to see the error');
+  if (ghTokenListed(r.stdout)) return check('gh-token', 'tools', 'ok', 'the gh-token extension is installed on this machine (apply mints App tokens with it)');
+  return check('gh-token', 'tools', 'missing', 'the gh-token extension is not installed on this machine (apply mints App tokens with it)', fix);
 }
 
 async function ageCheck(deps: PreflightDeps): Promise<PreflightCheck> {
@@ -483,14 +497,15 @@ export async function runLocalPreflight(deps: PreflightDeps, opts: PreflightOpti
   const load = loadManifestChecks(deps, opts.file);
   const vaultGiven = opts.vaultPath !== undefined && opts.identityKeyPath !== undefined;
   const secrets = secretsChecks(deps, load.manifest, opts.secretsPath, vaultGiven);
-  const [macf, gh, age, tailscale, browser, endpoint, identity] = await Promise.all([
+  const [macf, gh, ghToken, age, tailscale, browser, endpoint, identity] = await Promise.all([
     macfOnPathCheck(deps),
     ghCheck(deps, load.manifest),
+    opts.agentHost !== undefined ? ghTokenExtensionCheck(deps) : Promise.resolve(undefined),
     ageCheck(deps),
     tailscaleCheck(deps),
     browserCheck(deps),
     endpointCheck(deps, load.manifest, secrets.values),
     identityChecks(deps, load.manifest, opts.identityKeyPath),
   ]);
-  return [nodeCheck(deps), macf, gh, age, tailscale, browser, ...load.checks, ...(load.manifest !== undefined ? applyManifestRefusalChecks(deps, load.manifest, opts) : []), ...secrets.checks, ...applyFlagRefusalChecks(deps, opts, secrets.values), ...endpoint, ...identity];
+  return [nodeCheck(deps), macf, gh, ...(ghToken !== undefined ? [ghToken] : []), age, tailscale, browser, ...load.checks, ...(load.manifest !== undefined ? applyManifestRefusalChecks(deps, load.manifest, opts) : []), ...secrets.checks, ...applyFlagRefusalChecks(deps, opts, secrets.values), ...endpoint, ...identity];
 }

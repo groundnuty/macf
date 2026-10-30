@@ -61,6 +61,7 @@ function makeDeps(s: Setup = {}): { deps: PreflightDeps; execCalls: string[]; fe
       if (custom !== undefined) return custom;
       if (cmd === 'sh') return args[0] === '-s' ? ok(PROBE_OK) : ok('/usr/bin/xdg-open');
       if (cmd === 'macf') return ok('0.2.79\n');
+      if (cmd === 'gh' && args[0] === 'extension') return ok('gh token\tLink-/gh-token\tv2.0.0\n');
       if (cmd === 'gh') return args[1]?.includes('vault.age') ? { code: 1, stdout: '', stderr: 'gh: Not Found (HTTP 404)' } : ok(GH_OK);
       if (cmd === 'age') return ok('v1.2.0\n');
       if (cmd === 'tailscale') return ok('{"BackendState":"Running","Peer":{}}');
@@ -523,6 +524,27 @@ describe('bash on the agent host', () => {
     const { resolve } = await import('node:path');
     const src = readFileSync(resolve(__dirname, '../../src/cli/bootstrap/preflight-agent-host.ts'), 'utf-8');
     expect(src).not.toMatch(/mapfile|readarray|declare -A|\$\{[a-z_]+,,\}/);
+  });
+});
+
+describe('the gh-token extension on the apply host', () => {
+  const withExt = (r: ExecResult) => makeDeps({ files: baseFiles(), exec: (c, a) => (c === 'gh' && a[0] === 'extension' ? r : undefined) }).deps;
+  const host = { ...opts, agentHost: 'ubuntu@vm' };
+  it('is missing, with the install fix, when this machine lacks it', async () => {
+    const r = await byId(withExt(ok('gh other\towner/gh-other\tv1\n')), host);
+    expect(r['gh-token']?.status).toBe('missing');
+    expect(r['gh-token']?.fix).toBe('gh extension install Link-/gh-token');
+  });
+  it('is ok when installed', async () => {
+    expect((await byId(withExt(ok('gh token\tLink-/gh-token\tv2\n')), host))['gh-token']?.status).toBe('ok');
+  });
+  it('a non-zero exit is wrong, not missing', async () => {
+    expect((await byId(withExt({ code: 1, stdout: '', stderr: 'boom' }), host))['gh-token']?.status).toBe('wrong');
+  });
+  it('a one-machine run shows exactly one gh-token line', async () => {
+    const { deps } = makeDeps({ files: baseFiles() });
+    const checks = [...(await runLocalPreflight(deps, opts)), ...(await agentHostChecks(deps, undefined))];
+    expect(checks.filter((c) => c.id === 'gh-token' || c.id === 'agent-host-gh-token')).toHaveLength(1);
   });
 });
 
