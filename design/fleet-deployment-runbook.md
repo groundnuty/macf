@@ -89,7 +89,7 @@ This section and the next three are one worked example, meant to be followed top
 | Node.js 22.12 or later | ✓ | ✓ |
 | `macf` at the fleet's version, installed globally: `npm install -g @groundnuty/macf@0.2.80`. If that needs `sudo`, first run `npm config set prefix ~/.npm-global` and add `~/.npm-global/bin` to `PATH` in your shell profile | ✓ | ✓ |
 | `gh` with the token extension, `Link-/gh-token`. Every App token is minted with `gh token generate` | `gh extension install Link-/gh-token` | from the Mac: `gh auth token \| ssh $VM_SSH 'GH_TOKEN=$(cat) gh extension install Link-/gh-token'` (the install needs a token once; the extension itself needs none) |
-| `gh auth login` as an **owner of the org**, with the `workflow` and `admin:org` scopes (add them with `gh auth refresh -h github.com -s workflow,admin:org`). For a personal account, see the box below | ✓ | **no:** never log in as yourself on the VM, or an agent whose token fails falls back to your account (`gh-token-attribution-traps.md` mode 4) (one host: see the box at the top of §1) |
+| `gh auth login` as an **owner of the org**, with the `repo`, `workflow` and `admin:org` scopes (the default login has `repo`; add the others with `gh auth refresh -h github.com -s workflow,admin:org`). For a personal account, see the box below | ✓ | **no:** never log in as yourself on the VM, or an agent whose token fails falls back to your account (`gh-token-attribution-traps.md` mode 4) (one host: see the box at the top of §1) |
 | `git` able to push to GitHub over HTTPS (`gh auth setup-git`) | ✓ | — (agents push with their own App tokens) |
 | `age` (`brew install age` on the Mac, `sudo apt install age` on Ubuntu) | ✓ | ✓ |
 | A browser logged in to GitHub as an owner of the org | ✓ | — |
@@ -97,14 +97,14 @@ This section and the next three are one worked example, meant to be followed top
 | `tmux`, `bash` 4 or later, `crontab` | — | ✓ |
 | `claude` 2.1.277 or later, logged in once (run `claude`, log in, exit). The template's `init.sh` names 2.1.277 as the first version that reads `AGENTS.md`, the agents' role file | — | ✓ |
 
-Nothing checks these up front. A missing tool fails at the step that needs it, for example `Failed to spawn "age" — is it on PATH?`.
+`macf bootstrap preflight` checks all of these before §3.1.
 
 **The machine that runs `apply` must resolve tailnet names.** `apply` calls the runner platform at a `*.ts.net` name. Either turn MagicDNS on for that machine, or set `MACF_RUNNER_PLATFORM_ENDPOINT=http://<tailnet-IP>:8088` (§1.3; keep `http://` and the port; `tailscale status` shows the IP). To tell which you need, run `curl -sS -m 10 -o /dev/null -w '%{http_code}\n' <endpoint>` once with the name and once with the IP. A failure by name (a timeout or `Could not resolve host`) and `200` by IP means names do not resolve there. Check this before §3.3: an unreachable platform does not stop apply, it only creates no runners.
 
 > **If the owner is a personal account.** Everything below works for a user as well as an org, with these differences:
 > - **Names:** set `OWNER` (§1.2) to your own login.
 > - **Manifest:** set `owner.type: user` (§2 shows `type: org`). Keep `registry` as `{ type: repo, … }`, the control repo.
-> - **`gh` scopes:** `workflow` is still needed. `admin:org` is read only by the org-level checks (org installations, org-level runners), which do not apply to a user, so you can leave it out.
+> - **`gh` scopes:** `repo` and `workflow` are still needed. `admin:org` is read only by the org-level checks (org installations, org-level runners), which do not apply to a user, so you can leave it out.
 > - **Consent page:** `https://github.com/settings/apps/new`, not the organisation's page.
 > - **Runners:** a personal account has no account-level runners; registration is per repo. The runner platform does it for you. If you ever need a token yourself, use `gh api -X POST /repos/<owner>/<repo>/actions/runners/registration-token --jq .token`. The CLI's own hint names the `/orgs/<org>/…` endpoint, which a user cannot use.
 > - **Weaker plan checks:** for a user there is no org listing, so the plan checks App presence by the predicted name only. It cannot see an App's install scope, so the "only selected repositories" check is not run in the plan. Check `https://github.com/settings/installations` yourself.
@@ -240,6 +240,12 @@ Every other field, with its default, is in §6.
 ---
 
 ## 3. Provision and deploy
+
+**Check the machines first.** Run this (two hosts only: add `--agent-host $VM_SSH`). Every line should read `ok`; fix any other line before §3.1.
+
+```bash
+macf bootstrap preflight -f fleet.yaml --secrets-file secrets.env --identity-key $MAC_AGE_KEY
+```
 
 ### 3.1 Check the plan (changes nothing)
 

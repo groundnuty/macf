@@ -12,6 +12,8 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { APPLY_CONFIRM_WORD } from '../../src/cli/commands/bootstrap-apply.js';
+import { MIN_NODE } from '../../src/cli/bootstrap/preflight.js';
+import { AGENT_HOST_MINIMUMS } from '../../src/cli/bootstrap/preflight-agent-host.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const pkgRoot = resolve(here, '../..');
@@ -159,5 +161,18 @@ describe('fleet-deployment-runbook.md claims', () => {
     const [a, b] = [parts(row ?? '0.0.0'), parts(gate ?? '999.0.0')];
     const atLeast = a[0]! !== b[0]! ? a[0]! > b[0]! : a[1]! !== b[1]! ? a[1]! > b[1]! : a[2]! >= b[2]!;
     expect(atLeast, `runbook says ${String(row)}, claude-sh gates on ${String(gate)}`).toBe(true);
+  });
+
+  it('states the node, bash and claude minimums that preflight enforces', () => {
+    const pad = (v: string): string => [...v.split('.'), '0', '0'].slice(0, 3).join('.');
+    const node = /Node\.js (\d+(?:\.\d+)*) or later/.exec(runbook)?.[1];
+    const bash = /`bash` (\d+(?:\.\d+)*) or later/.exec(runbook)?.[1];
+    const claude = /`claude` (\d+(?:\.\d+)*) or later/.exec(runbook)?.[1];
+    expect(node).toBeDefined();
+    expect(bash).toBeDefined();
+    expect(claude).toBeDefined();
+    expect(pad(node ?? '')).toBe(MIN_NODE);
+    expect(pad(bash ?? '')).toBe(AGENT_HOST_MINIMUMS['bash']?.min);
+    expect(pad(claude ?? '')).toBe(AGENT_HOST_MINIMUMS['claude']?.min);
   });
 });

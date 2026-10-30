@@ -24,6 +24,7 @@ import { runBootstrapApply } from './commands/bootstrap-apply.js';
 import { runnerTokenHowTo } from './bootstrap/apply-routing.js';
 import { writeOperatorSecretsFileTemplate } from './bootstrap/operator-secrets-file.js';
 import { runBootstrapStatus } from './commands/bootstrap-status.js';
+import { runBootstrapPreflight } from './commands/bootstrap-preflight.js';
 import { runBootstrapControlRepoInit } from './commands/bootstrap-control-repo-init.js';
 import { runManifestScaffold } from './commands/bootstrap-manifest-scaffold.js';
 import { runRoutingDoctor } from './commands/routing-doctor.js';
@@ -792,6 +793,39 @@ bootstrap
       identityKeyPath: opts.identityKey,
     });
     process.exitCode = code;
+  });
+
+bootstrap
+  .command('preflight')
+  .description(
+    'READ-ONLY: check this machine is ready for `bootstrap apply` and say exactly what is missing: tools ' +
+    '(node, macf, gh login and scopes, age, tailscale), the manifest, the secrets file (mode 600, required keys, ' +
+    'values never printed), the runner platform endpoint (by name, then by tailnet IP), the age identity key, and ' +
+    'a browser for the consent pages, then the agent host (this machine, or --agent-host <ssh-target>): tools on a non-interactive PATH. Exit 0 when ready, 1 otherwise.',
+  )
+  .requiredOption('-f, --file <path>', 'Path to the fleet.yaml manifest')
+  .option('--secrets-file <path>', 'Operator secrets file (plain KEY=value) to check')
+  .option('--scope-secrets-file <path>', 'Per-SCOPE operator secrets file, shared across a fleet\'s org/account. Lower precedence than --secrets-file.')
+  .option('--runner-token <token>', 'GitHub Actions runner-registration token, as apply is given it. Falls back to MACF_BOOTSTRAP_RUNNER_TOKEN when unset.')
+  .option('--ts-oauth-client-id <id>', 'Tailscale OAuth client ID, as apply is given it. Falls back to MACF_BOOTSTRAP_TS_OAUTH_CLIENT_ID when unset.')
+  .option('--ts-oauth-secret <secret>', 'Tailscale OAuth client secret, the pair to --ts-oauth-client-id. Falls back to MACF_BOOTSTRAP_TS_OAUTH_SECRET when unset.')
+  .option('--identity-key <path>', 'age identity file; shows its recipient and whether the manifest lists it')
+  .option('--vault <path>', 'The vault apply will be given; checked together with --identity-key, the way apply does')
+  .option('--agent-host <ssh-target>', 'ssh target of the machine that runs the agents, e.g. ubuntu@host. Omit when the agents run on this machine')
+  .option('--json', 'Emit the checks as JSON (with schema_version)', false)
+  .action(async (opts) => {
+    process.exitCode = await runBootstrapPreflight({
+      file: opts.file,
+      json: opts.json,
+      secretsPath: opts.secretsFile,
+      scopeSecretsPath: opts.scopeSecretsFile,
+      runnerToken: opts.runnerToken,
+      tsOauthClientId: opts.tsOauthClientId,
+      tsOauthSecret: opts.tsOauthSecret,
+      identityKeyPath: opts.identityKey,
+      vaultPath: opts.vault,
+      agentHost: opts.agentHost,
+    });
   });
 
 bootstrap
