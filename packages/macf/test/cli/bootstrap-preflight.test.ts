@@ -125,6 +125,34 @@ describe('tools', () => {
     expect(noHeader['gh']?.status).toBe('unknown');
   });
 
+  it('an org token with only workflow and admin:org lacks repo', async () => {
+    const r = await byId(makeDeps({ files: baseFiles(), exec: (c) => (c === 'gh' ? ok('HTTP/2 200\nX-Oauth-Scopes: workflow, admin:org\n\n{"login":"someone"}') : undefined) }).deps);
+    expect(r['gh']?.status).toBe('wrong');
+    expect(r['gh']?.detail).toContain('missing repo');
+    expect(r['gh']?.fix).toContain('repo');
+  });
+
+  it('age: EACCES and a non-zero exit are wrong, exit 0 is ok, ENOENT is missing', async () => {
+    const age = async (res: ExecResult) => (await byId(makeDeps({ files: baseFiles(), exec: (c) => (c === 'age' ? res : undefined) }).deps))['age'];
+    const eacces = await age({ code: null, stdout: '', stderr: 'spawn age EACCES' });
+    expect(eacces?.status).toBe('wrong');
+    expect(eacces?.detail).toContain('EACCES');
+    const bad = await age({ code: 2, stdout: '', stderr: 'bad things\nmore' });
+    expect(bad?.status).toBe('wrong');
+    expect(bad?.detail).toContain('bad things');
+    expect(bad?.detail).not.toContain('more');
+    expect((await age({ code: null, stdout: '', stderr: 'timed out' }))?.status).toBe('wrong');
+    expect((await age(ok('v1.2.0')))?.status).toBe('ok');
+    expect((await age(noSuchProgram))?.status).toBe('missing');
+  });
+
+  it('macf on PATH and gh: a failed or unrunnable probe is wrong', async () => {
+    const macf = await byId(makeDeps({ files: baseFiles(), exec: (c) => (c === 'macf' ? { code: 1, stdout: '0.2.79', stderr: 'boom' } : undefined) }).deps);
+    expect(macf['macf-on-path']?.status).toBe('wrong');
+    const gh = await byId(makeDeps({ files: baseFiles(), exec: (c) => (c === 'gh' ? { code: null, stdout: '', stderr: 'spawn gh EACCES' } : undefined) }).deps);
+    expect(gh['gh']?.status).toBe('wrong');
+  });
+
   it('needs repo (not admin:org) for a user owner, and the login must be the owner', async () => {
     const files = { [MANIFEST_PATH]: fleetYaml({ type: 'user' }), [SECRETS_PATH]: FULL_SECRETS };
     const wrongLogin = await byId(makeDeps({ files }).deps);

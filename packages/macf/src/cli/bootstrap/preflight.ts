@@ -91,10 +91,17 @@ function nodeCheck(deps: PreflightDeps): PreflightCheck {
   return check('node', 'tools', 'ok', `node ${have}`);
 }
 
+/** Why a probe that started did not succeed: the first line of stderr, else the exit state. */
+function probeFailure(r: ExecResult): string {
+  const line = r.stderr.split(/\r?\n/).map((l) => l.trim()).find((l) => l.length > 0);
+  return line ?? (r.code === null ? 'it did not finish' : `it exited ${r.code}`);
+}
+
 async function macfOnPathCheck(deps: PreflightDeps): Promise<PreflightCheck> {
   const r = await deps.exec('macf', ['--version'], { timeoutMs: 10000 });
   const fix = `npm install -g @groundnuty/macf@${deps.cliVersion}`;
   if (r.spawnFailed === true) return check('macf-on-path', 'tools', 'missing', 'macf is not on PATH', fix);
+  if (r.code !== 0) return check('macf-on-path', 'tools', 'wrong', `macf --version failed: ${probeFailure(r)}`, fix);
   const onPath = firstSemver(r.stdout);
   if (onPath === undefined) return check('macf-on-path', 'tools', 'unknown', 'macf --version printed no version');
   if (onPath !== deps.cliVersion) {
@@ -125,7 +132,7 @@ function ghScopeResult(login: string, scopes: readonly string[] | undefined, man
   }
   const have = `gh is logged in as ${login} with scopes: ${scopes.join(', ') || 'none'}`;
   if (manifest === undefined) return check('gh', 'tools', 'ok', have);
-  const needed = manifest.owner.type === 'org' ? ['workflow', 'admin:org'] : ['workflow', 'repo'];
+  const needed = manifest.owner.type === 'org' ? ['workflow', 'repo', 'admin:org'] : ['workflow', 'repo'];
   const absent = needed.filter((s) => !scopes.includes(s));
   if (absent.length > 0) {
     return check('gh', 'tools', 'wrong', `${have}; missing ${absent.join(', ')}`, `gh auth refresh -h github.com -s ${absent.join(',')}`);
@@ -139,6 +146,7 @@ function ghScopeResult(login: string, scopes: readonly string[] | undefined, man
 async function ghCheck(deps: PreflightDeps, manifest: FleetManifest | undefined): Promise<PreflightCheck> {
   const r = await deps.exec('gh', ['api', '-i', 'user'], { timeoutMs: 15000 });
   if (r.spawnFailed === true) return check('gh', 'tools', 'missing', 'gh is not on PATH', 'install the GitHub CLI (https://cli.github.com)');
+  if (r.code === null) return check('gh', 'tools', 'wrong', `gh could not run: ${probeFailure(r)}`, 'check that the gh binary is executable and not hung');
   if (r.code !== 0) return check('gh', 'tools', 'missing', 'gh is not logged in', 'gh auth login');
   const { login, scopes } = parseGhApi(r.stdout);
   if (login === undefined) return check('gh', 'tools', 'unknown', 'gh answered but the login could not be read');
@@ -149,6 +157,9 @@ async function ageCheck(deps: PreflightDeps): Promise<PreflightCheck> {
   const r = await deps.exec('age', ['--version'], { timeoutMs: 10000 });
   if (r.spawnFailed === true) {
     return check('age', 'tools', 'missing', 'age is not on PATH', 'brew install age (Mac) or sudo apt install age (Ubuntu)');
+  }
+  if (r.code !== 0) {
+    return check('age', 'tools', 'wrong', `age --version failed: ${probeFailure(r)}`, 'reinstall age (brew install age on Mac, sudo apt install age on Ubuntu) and check the binary is executable');
   }
   return check('age', 'tools', 'ok', `age ${firstSemver(r.stdout) ?? 'present'}`);
 }
