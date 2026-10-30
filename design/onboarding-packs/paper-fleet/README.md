@@ -19,7 +19,7 @@ Every agent starts with its role and the fleet's working style instead of being 
 
 **How to ask:**
 - Never ask the operator to edit a file.
-- Ask a few questions at a time, and offer the options where the answer is a choice.
+- Ask in plain conversation, a few questions at a time.
 - Take what the deploy inputs already give, such as the operator's login and the work repos, instead of asking again.
 
 **What to ask:**

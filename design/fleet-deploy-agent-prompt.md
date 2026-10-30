@@ -8,7 +8,7 @@ MACF runs several Claude Code agents as a team. Each agent has its own GitHub Ap
 
 ## Inputs: get them all before anything else
 
-The operator may give some of these in their first message. **Ask for every row that is still missing,** a few at a time; where the answer is a choice, offer the options. `n/a` is a valid answer where a row does not apply. Until every row is answered you may read the walkthrough, but **do nothing else:** no installs, no repos, no other project.
+The operator may give some of these in their first message. **Ask the operator for every row that is still missing,** in plain conversation, a few at a time. `n/a` is a valid answer where a row does not apply. Until every row is answered you may read the walkthrough, but **do nothing else:** no installs, no repos, no other project.
 
 | field | |
 |---|---|
