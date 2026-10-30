@@ -568,11 +568,11 @@ describe('the gh-token extension on the agent host', () => {
 });
 
 describe('the agent-host probe script', () => {
-  it('reads crontab in the same login shell that found it', async () => {
+  it('reads crontab in the same shell that found it', async () => {
     const { readFileSync } = await import('node:fs');
     const { resolve } = await import('node:path');
     const src = readFileSync(resolve(__dirname, '../../src/cli/bootstrap/preflight-agent-host.ts'), 'utf-8');
-    expect(src).toContain('out=$(bash -lc "crontab -l" 2>&1)');
+    expect(src).toContain('out=$(run "crontab -l" 2>&1)');
     expect(src).not.toMatch(/out=\$\(crontab -l/);
   });
 });

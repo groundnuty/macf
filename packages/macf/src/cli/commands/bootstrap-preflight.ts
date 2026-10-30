@@ -8,7 +8,7 @@ import { existsSync, readFileSync, statSync } from 'node:fs';
 import { resolve as resolvePath } from 'node:path';
 import { packageVersionDisplay } from '../../package-version.js';
 import type { ExecResult, FetchResult, PreflightCheck, PreflightDeps, PreflightOptions } from '../bootstrap/preflight.js';
-import { PREFLIGHT_JSON_SCHEMA_VERSION, runLocalPreflight } from '../bootstrap/preflight.js';
+import { PREFLIGHT_JSON_SCHEMA_VERSION, loadManifestChecks, runLocalPreflight } from '../bootstrap/preflight.js';
 import { agentHostChecks } from '../bootstrap/preflight-agent-host.js';
 
 export interface RunBootstrapPreflightOptions extends PreflightOptions {
@@ -107,6 +107,12 @@ export function realPreflightDeps(): PreflightDeps {
   };
 }
 
+/** The manifest's owner and fleet name, which name the watchdog script; undefined when the manifest does not parse. */
+function fleetFor(deps: PreflightDeps, file: string): { owner: string; project: string } | undefined {
+  const m = loadManifestChecks(deps, file).manifest;
+  return m === undefined ? undefined : { owner: m.owner.account, project: m.metadata.name };
+}
+
 /** Returns the shell exit code: 0 when ready, 1 when anything is missing or wrong. Never exits the process itself. */
 export async function runBootstrapPreflight(opts: RunBootstrapPreflightOptions, deps: PreflightDeps = realPreflightDeps()): Promise<number> {
   const resolved: PreflightOptions = {
@@ -116,7 +122,7 @@ export async function runBootstrapPreflight(opts: RunBootstrapPreflightOptions, 
     ...(opts.vaultPath !== undefined ? { vaultPath: resolvePath(opts.vaultPath) } : {}),
     ...(opts.agentHost !== undefined ? { agentHost: opts.agentHost } : {}),
   };
-  const [local, host] = await Promise.all([runLocalPreflight(deps, resolved), agentHostChecks(deps, resolved.agentHost)]);
+  const [local, host] = await Promise.all([runLocalPreflight(deps, resolved), agentHostChecks(deps, resolved.agentHost, fleetFor(deps, resolved.file))]);
   const report = buildReport([...local, ...host]);
   console.log(opts.json ? JSON.stringify(preflightToJson(report), null, 2) : formatPreflightText(report));
   return report.ready ? 0 : 1;

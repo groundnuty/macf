@@ -32,19 +32,44 @@ export const AGENT_HOST_MINIMUMS: Readonly<Partial<Record<string, { readonly min
   claude: { min: '2.1.277', fix: 'update Claude Code on the agent host (claude update); below 2.1.277 the agent does not read AGENTS.md, where its job is written' },
 };
 
-/** One shell script, sent over stdin so no quoting survives the remote login shell. */
-const PROBE_SCRIPT = `for t in ${AGENT_HOST_TOOLS.join(' ')}; do
-  p=$(bash -lc "command -v $t" 2>/dev/null)
+/** The fleet whose watchdog script preflight reads the PATH from. */
+export interface AgentHostFleet {
+  readonly owner: string;
+  readonly project: string;
+}
+
+/**
+ * One shell script, sent over stdin so no quoting survives the remote login shell.
+ * When this fleet's cron script exists, tools are looked up under `/bin/sh` with the
+ * PATH it exports; otherwise under a login shell.
+ */
+export function buildProbeScript(fleet: AgentHostFleet | undefined): string {
+  const safe = fleet !== undefined && /^[A-Za-z0-9.-]+$/.test(fleet.owner) && /^[A-Za-z0-9.-]+$/.test(fleet.project);
+  const file = safe ? `$HOME/.macf/cron/${fleet.owner}__${fleet.project}.sh` : '';
+  return `f="${file}"
+cronpath=""
+if [ -n "$f" ] && [ -f "$f" ]; then
+  l=$(grep -m1 '^PATH=' "$f")
+  if printf '%s\n' "$l" | grep -Eq "^PATH='[^']*'; export PATH$"; then
+    cronpath=$(printf '%s\n' "$l" | sed "s/^PATH='//; s/'; export PATH$//")
+  fi
+fi
+if [ -n "$cronpath" ]; then echo "source|cron|$f"; else echo "source|login|"; fi
+run() {
+  if [ -n "$cronpath" ]; then env -i PATH="$cronpath" /bin/sh -c "$1"; else bash -lc "$1"; fi
+}
+for t in ${AGENT_HOST_TOOLS.join(' ')}; do
+  p=$(run "command -v $t" 2>/dev/null)
   if [ -n "$p" ]; then
     if [ "$t" = crontab ]; then
-      out=$(bash -lc "crontab -l" 2>&1); rc=$?
+      out=$(run "crontab -l" 2>&1); rc=$?
       if [ $rc -eq 0 ]; then v=present
       elif echo "$out" | grep -qi 'no crontab'; then v=empty
       else v="error: $(echo "$out" | head -n 1)"; fi
     elif [ "$t" = openssl ]; then
-      v=$(bash -lc "openssl version 2>&1 | head -n 1")
+      v=$(run "openssl version 2>&1 | head -n 1")
     else
-      v=$(bash -lc "$t --version 2>&1 | head -n 1")
+      v=$(run "$t --version 2>&1 | head -n 1")
     fi
     echo "$t|login|$v"
   else
@@ -52,8 +77,9 @@ const PROBE_SCRIPT = `for t in ${AGENT_HOST_TOOLS.join(' ')}; do
     if [ -n "$i" ]; then echo "$t|interactive|"; else echo "$t|none|"; fi
   fi
 done
-if bash -lc "gh extension list" 2>/dev/null | grep -qi '${GH_TOKEN_EXTENSION}'; then echo "gh-token|login|installed"; else echo "gh-token|none|"; fi
+if run "gh extension list" 2>/dev/null | grep -qi '${GH_TOKEN_EXTENSION}'; then echo "gh-token|login|installed"; else echo "gh-token|none|"; fi
 `;
+}
 
 export type SshFailure = 'host-key' | 'permission' | 'no-route' | 'other';
 
@@ -79,18 +105,18 @@ function sshFailureCheck(vm: string, r: ExecResult): PreflightCheck {
   }
 }
 
-function crontabCheck(id: string, mode: string, state: string): PreflightCheck {
-  if (mode !== 'login') return toolCheck('crontab', mode, state, true);
+function crontabCheck(id: string, mode: string, state: string, where: string): PreflightCheck {
+  if (mode !== 'login') return toolCheck('crontab', mode, state, where, true);
   if (state.startsWith('error')) {
     return { id, group: 'agent-host', status: 'wrong', detail: `crontab is installed but \`crontab -l\` fails (${state})`, fix: 'allow crontab for this user (on macOS: give the terminal Full Disk Access)' };
   }
   const note = state === 'empty' ? 'no crontab yet (an empty crontab makes `crontab -l` exit 1; that is fine)' : 'crontab readable';
-  return { id, group: 'agent-host', status: 'ok', detail: `crontab on the agent host: ${note}` };
+  return { id, group: 'agent-host', status: 'ok', detail: `crontab ${where}: ${note}` };
 }
 
-function toolCheck(tool: string, mode: string, version: string, skipCron = false): PreflightCheck {
+function toolCheck(tool: string, mode: string, version: string, where: string, skipCron = false): PreflightCheck {
   const id = `agent-host-${tool}`;
-  if (tool === 'crontab' && !skipCron) return crontabCheck(id, mode, version);
+  if (tool === 'crontab' && !skipCron) return crontabCheck(id, mode, version, where);
   if (mode === 'login') {
     const floor = AGENT_HOST_MINIMUMS[tool];
     if (floor !== undefined) {
@@ -102,7 +128,7 @@ function toolCheck(tool: string, mode: string, version: string, skipCron = false
         return { id, group: 'agent-host', status: 'wrong', detail: `${tool} ${have} on the agent host is older than ${floor.min}`, fix: floor.fix };
       }
     }
-    return { id, group: 'agent-host', status: 'ok', detail: `${tool} on the agent host (non-interactive login PATH): ${version || 'version unknown'}` };
+    return { id, group: 'agent-host', status: 'ok', detail: `${tool} ${where}: ${version || 'version unknown'}` };
   }
   if (mode === 'interactive') {
     return {
@@ -112,12 +138,17 @@ function toolCheck(tool: string, mode: string, version: string, skipCron = false
     };
   }
   if (tool === 'gh-token') {
-    return { id, group: 'agent-host', status: 'missing', detail: 'the gh-token extension is not installed on the agent host (the agents mint their App tokens with it)', fix: 'gh extension install Link-/gh-token (on the agent host)' };
+    return { id, group: 'agent-host', status: 'missing', detail: 'the gh-token extension is not installed ${where} (the agents mint their App tokens with it)', fix: 'gh extension install Link-/gh-token (on the agent host)' };
   }
-  return { id, group: 'agent-host', status: 'missing', detail: `${tool} is not on the agent host`, fix: `install ${tool} on the agent host` };
+  return { id, group: 'agent-host', status: 'missing', detail: `${tool} is not ${where}`, fix: `install ${tool} on the agent host` };
 }
 
+const LOGIN_WHERE = 'on the login-shell PATH, which install-cron captures when run as §3.6 says';
+
 function parseProbe(stdout: string): readonly PreflightCheck[] {
+  let where = LOGIN_WHERE;
+  const src = /^source\|cron\|(.*)$/m.exec(stdout);
+  if (src !== null) where = `on the watchdog's PATH (from ${src[1]?.trim()})`;
   const seen = new Map<string, { mode: string; version: string }>();
   for (const line of stdout.split('\n')) {
     const [tool, mode, ...rest] = line.split('|');
@@ -128,13 +159,13 @@ function parseProbe(stdout: string): readonly PreflightCheck[] {
   return PROBED.map((tool) => {
     const s = seen.get(tool);
     if (s === undefined) return { id: `agent-host-${tool}`, group: 'agent-host' as const, status: 'unknown' as const, detail: `no answer for ${tool} from the agent-host probe` };
-    return toolCheck(tool, s.mode, s.version);
+    return toolCheck(tool, s.mode, s.version, where);
   });
 }
 
-export async function agentHostChecks(deps: PreflightDeps, agentHost: string | undefined): Promise<readonly PreflightCheck[]> {
+export async function agentHostChecks(deps: PreflightDeps, agentHost: string | undefined, fleet?: AgentHostFleet): Promise<readonly PreflightCheck[]> {
   if (agentHost === undefined) {
-    const probe = await deps.exec('sh', ['-s'], { timeoutMs: 60000, input: PROBE_SCRIPT });
+    const probe = await deps.exec('sh', ['-s'], { timeoutMs: 60000, input: buildProbeScript(fleet) });
     const head: PreflightCheck = { id: 'agent-host', group: 'agent-host', status: 'ok', detail: 'agents run on this machine' };
     if (probe.code !== 0) return [head, probeFailed('run `bash -lc "command -v macf"` by hand')];
     return [head, ...parseProbe(probe.stdout)];
@@ -146,7 +177,7 @@ export async function agentHostChecks(deps: PreflightDeps, agentHost: string | u
   }
   if (ping.code !== 0) return [head, sshFailureCheck(agentHost, ping)];
   const ssh: PreflightCheck = { id: 'agent-host-ssh', group: 'agent-host', status: 'ok', detail: `ssh to ${agentHost} works` };
-  const probe = await deps.exec('ssh', [...SSH_OPTS, agentHost, 'sh', '-s'], { timeoutMs: 60000, input: PROBE_SCRIPT });
+  const probe = await deps.exec('ssh', [...SSH_OPTS, agentHost, 'sh', '-s'], { timeoutMs: 60000, input: buildProbeScript(fleet) });
   if (probe.code !== 0) return [head, ssh, probeFailed(`run ssh ${agentHost} 'bash -lc "command -v macf"' by hand`)];
   return [head, ssh, ...parseProbe(probe.stdout)];
 }
