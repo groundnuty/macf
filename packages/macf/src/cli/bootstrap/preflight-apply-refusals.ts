@@ -22,7 +22,7 @@ import { checkAppNameLengths } from './apply-runner-ops.js';
 import { checkRegistryScopePreflight } from './registry-scope-preflight.js';
 import { checkAgeRecipientsNarrowing } from './age-recipients-narrowing.js';
 import { checkProvisionedFleetNeedsVault } from './provisioned-vault-guard.js';
-import { resolveOperatorInput } from './operator-secrets-file.js';
+import { resolvePreflightInput, type OperatorInputs } from './preflight-inputs.js';
 import { noRecipientReason, wouldCreateWithNoRecipient } from './apply-fleet.js';
 
 export interface ApplyRefusalEntry {
@@ -69,16 +69,16 @@ function result(id: string, group: PreflightCheck['group'], failure: { readonly 
   return failure === undefined ? { id, group, status: 'ok', detail: okDetail } : { id, group, status: 'wrong', detail: failure.message, fix };
 }
 
-/** The Tailscale pair as apply resolves it: secrets file, then environment. */
-export function resolveTsOauthInputs(deps: PreflightDeps, values: Readonly<Record<string, string>> | undefined): { readonly clientId: string | undefined; readonly secret: string | undefined } {
+/** The Tailscale pair as apply resolves it: flag, secrets file, scope file, environment. */
+export function resolveTsOauthInputs(deps: PreflightDeps, inputs: OperatorInputs | undefined): { readonly clientId: string | undefined; readonly secret: string | undefined } {
   return {
-    clientId: resolveOperatorInput(TS_OAUTH_CLIENT_ID_ENV_VAR, undefined, values, undefined, deps.env).value,
-    secret: resolveOperatorInput(TS_OAUTH_SECRET_ENV_VAR, undefined, values, undefined, deps.env).value,
+    clientId: resolvePreflightInput(deps.env, inputs, TS_OAUTH_CLIENT_ID_ENV_VAR).value,
+    secret: resolvePreflightInput(deps.env, inputs, TS_OAUTH_SECRET_ENV_VAR).value,
   };
 }
 
-function tsOauthChecks(deps: PreflightDeps, values: Readonly<Record<string, string>> | undefined): readonly PreflightCheck[] {
-  const { clientId, secret } = resolveTsOauthInputs(deps, values);
+function tsOauthChecks(deps: PreflightDeps, inputs: OperatorInputs | undefined): readonly PreflightCheck[] {
+  const { clientId, secret } = resolveTsOauthInputs(deps, inputs);
   const incomplete = checkTsOauthFlagsComplete(clientId, secret);
   const out = [result('apply-ts-oauth-incomplete', 'secrets', incomplete, 'the Tailscale OAuth values are both set or both unset', `set both ${TS_OAUTH_CLIENT_ID_ENV_VAR} and ${TS_OAUTH_SECRET_ENV_VAR} in secrets.env, or neither`)];
   const pair = resolvedTsOauthPair(clientId, secret);
@@ -131,12 +131,12 @@ export function applyManifestRefusalChecks(deps: PreflightDeps, manifest: FleetM
 }
 
 /** The refusals that read the vault flags and the secrets values: run even when the manifest does not parse. */
-export function applyFlagRefusalChecks(deps: PreflightDeps, opts: PreflightOptions, values: Readonly<Record<string, string>> | undefined): readonly PreflightCheck[] {
+export function applyFlagRefusalChecks(deps: PreflightDeps, opts: PreflightOptions, inputs: OperatorInputs | undefined): readonly PreflightCheck[] {
   const out: PreflightCheck[] = [];
   // A lone --identity-key is also the fresh-run recipient check, so the pair is judged once --vault is given.
   if (opts.vaultPath !== undefined) {
     out.push(result('apply-vault-flags', 'identity', checkVaultFlagsComplete(opts.vaultPath, opts.identityKeyPath), '--vault and --identity-key are given together', 'give --identity-key with --vault, to preflight and to apply'));
   }
-  out.push(...tsOauthChecks(deps, values));
+  out.push(...tsOauthChecks(deps, inputs));
   return out;
 }

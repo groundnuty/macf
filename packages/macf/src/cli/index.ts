@@ -805,6 +805,10 @@ bootstrap
   )
   .requiredOption('-f, --file <path>', 'Path to the fleet.yaml manifest')
   .option('--secrets-file <path>', 'Operator secrets file (plain KEY=value) to check')
+  .option('--scope-secrets-file <path>', 'Per-SCOPE operator secrets file, shared across a fleet\'s org/account. Lower precedence than --secrets-file.')
+  .option('--runner-token <token>', 'GitHub Actions runner-registration token, as apply is given it. Falls back to MACF_BOOTSTRAP_RUNNER_TOKEN when unset.')
+  .option('--ts-oauth-client-id <id>', 'Tailscale OAuth client ID, as apply is given it. Falls back to MACF_BOOTSTRAP_TS_OAUTH_CLIENT_ID when unset.')
+  .option('--ts-oauth-secret <secret>', 'Tailscale OAuth client secret, the pair to --ts-oauth-client-id. Falls back to MACF_BOOTSTRAP_TS_OAUTH_SECRET when unset.')
   .option('--identity-key <path>', 'age identity file; shows its recipient and whether the manifest lists it')
   .option('--vault <path>', 'The vault apply will be given; checked together with --identity-key, the way apply does')
   .option('--agent-host <ssh-target>', 'ssh target of the machine that runs the agents, e.g. ubuntu@host. Omit when the agents run on this machine')
@@ -814,6 +818,10 @@ bootstrap
       file: opts.file,
       json: opts.json,
       secretsPath: opts.secretsFile,
+      scopeSecretsPath: opts.scopeSecretsFile,
+      runnerToken: opts.runnerToken,
+      tsOauthClientId: opts.tsOauthClientId,
+      tsOauthSecret: opts.tsOauthSecret,
       identityKeyPath: opts.identityKey,
       vaultPath: opts.vault,
       agentHost: opts.agentHost,

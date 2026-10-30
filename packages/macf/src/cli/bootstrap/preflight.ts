@@ -20,7 +20,8 @@ import {
   type RunnerPlatformEndpointSource,
 } from './runner-platform.js';
 import { registryPathPrefix } from '../registry-helper.js';
-import { parseOperatorSecretsFile, missingRequiredOperatorInputs, resolveOperatorInput } from './operator-secrets-file.js';
+import { parseOperatorSecretsFile, missingRequiredOperatorInputs } from './operator-secrets-file.js';
+import { resolvePreflightInput, type OperatorInputs } from './preflight-inputs.js';
 import { ghTokenListed } from './preflight-agent-host.js';
 import { applyFlagRefusalChecks, applyManifestRefusalChecks } from './preflight-apply-refusals.js';
 
@@ -69,6 +70,12 @@ export interface PreflightDeps {
 export interface PreflightOptions {
   readonly file: string;
   readonly secretsPath?: string;
+  /** Apply's per-scope secrets file, shared across a scope's fleets. */
+  readonly scopeSecretsPath?: string;
+  /** Apply's `--runner-token`, `--ts-oauth-client-id` and `--ts-oauth-secret`. */
+  readonly runnerToken?: string;
+  readonly tsOauthClientId?: string;
+  readonly tsOauthSecret?: string;
   readonly identityKeyPath?: string;
   /** The vault apply would be given; only used to judge the vault flags together. */
   readonly vaultPath?: string;
@@ -299,44 +306,70 @@ function requiredSecretKeys(manifest: FleetManifest): readonly RequiredKey[] {
   return keys;
 }
 
-function secretsFileCheck(deps: PreflightDeps, path: string): { readonly check: PreflightCheck; readonly values?: Readonly<Record<string, string>> } {
+function secretsFileCheck(deps: PreflightDeps, path: string, id = 'secrets-file'): { readonly check: PreflightCheck; readonly values?: Readonly<Record<string, string>> } {
   const m = deps.fileMode(path);
-  if (!m.exists) return { check: check('secrets-file', 'secrets', 'missing', `${path} does not exist`, 'macf bootstrap secrets template --out secrets.env') };
+  if (!m.exists) return { check: check(id, 'secrets', 'missing', `${path} does not exist`, 'macf bootstrap secrets template --out secrets.env') };
   const text = deps.readText(path);
-  if (text === undefined) return { check: check('secrets-file', 'secrets', 'wrong', `${path} cannot be read`, `chmod 600 ${path}`) };
+  if (text === undefined) return { check: check(id, 'secrets', 'wrong', `${path} cannot be read`, `chmod 600 ${path}`) };
   const values = parseOperatorSecretsFile(text);
   if (m.mode !== undefined && (m.mode & 0o077) !== 0) {
-    return { check: check('secrets-file', 'secrets', 'wrong', `${path} has mode ${m.mode.toString(8)}, not 600`, `chmod 600 ${path}`), values };
+    return { check: check(id, 'secrets', 'wrong', `${path} has mode ${m.mode.toString(8)}, not 600`, `chmod 600 ${path}`), values };
   }
-  return { check: check('secrets-file', 'secrets', 'ok', `${path} exists with mode 600`), values };
+  return { check: check(id, 'secrets', 'ok', `${path} exists with mode 600`), values };
 }
 
-function secretKeyCheck(req: RequiredKey, source: string, isMissing: boolean, hasFile: boolean, vaultGiven: boolean): PreflightCheck {
+const SECRET_SOURCE_LABEL: Readonly<Record<string, string>> = {
+  flag: 'a flag',
+  'fleet-file': 'the secrets file',
+  'scope-file': 'the scope secrets file',
+  env: 'the environment',
+};
+
+function secretKeyCheck(req: RequiredKey, source: string, isMissing: boolean, files: readonly string[], vaultGiven: boolean): PreflightCheck {
   const id = `secret-${req.key}`;
-  if (!isMissing) return check(id, 'secrets', 'ok', `${req.key} (${req.why}) is set in ${source === 'fleet-file' ? 'the secrets file' : 'the environment'}`);
+  if (!isMissing) return check(id, 'secrets', 'ok', `${req.key} (${req.why}) is set in ${SECRET_SOURCE_LABEL[source] ?? 'the environment'}`);
   if (vaultGiven) return check(id, 'secrets', 'unknown', `${req.key} (${req.why}) is not set here; it may be in the vault, which preflight does not decrypt`);
-  const where = hasFile ? 'the secrets file or the environment' : 'the environment (no --secrets-file given)';
+  const where = files.length > 0 ? `${files.join(', ')} or the environment` : 'the environment (no --secrets-file given)';
   return check(id, 'secrets', 'missing', `${req.key} (${req.why}) is not set in ${where}`, `set ${req.key} in secrets.env`);
 }
 
-export function secretsChecks(deps: PreflightDeps, manifest: FleetManifest | undefined, secretsPath: string | undefined, vaultGiven = false): { readonly checks: readonly PreflightCheck[]; readonly values?: Readonly<Record<string, string>> } {
+export function secretsChecks(
+  deps: PreflightDeps,
+  manifest: FleetManifest | undefined,
+  opts: Pick<PreflightOptions, 'secretsPath' | 'scopeSecretsPath' | 'runnerToken' | 'tsOauthClientId' | 'tsOauthSecret'>,
+  vaultGiven = false,
+): { readonly checks: readonly PreflightCheck[]; readonly inputs: OperatorInputs } {
   const checks: PreflightCheck[] = [];
-  let values: Readonly<Record<string, string>> | undefined;
-  if (secretsPath === undefined) {
+  let fleet: Readonly<Record<string, string>> | undefined;
+  let scope: Readonly<Record<string, string>> | undefined;
+  if (opts.secretsPath === undefined) {
     checks.push(check('secrets-file', 'secrets', 'unknown', 'no --secrets-file given, so none was checked', 'pass --secrets-file <path>'));
   } else {
-    const r = secretsFileCheck(deps, secretsPath);
+    const r = secretsFileCheck(deps, opts.secretsPath);
     checks.push(r.check);
-    values = r.values;
+    fleet = r.values;
   }
+  if (opts.scopeSecretsPath !== undefined) {
+    const r = secretsFileCheck(deps, opts.scopeSecretsPath, 'scope-secrets-file');
+    checks.push(r.check);
+    scope = r.values;
+  }
+  const inputs: OperatorInputs = {
+    ...(fleet !== undefined ? { fleet } : {}),
+    ...(scope !== undefined ? { scope } : {}),
+    ...(opts.runnerToken !== undefined ? { runnerToken: opts.runnerToken } : {}),
+    ...(opts.tsOauthClientId !== undefined ? { tsOauthClientId: opts.tsOauthClientId } : {}),
+    ...(opts.tsOauthSecret !== undefined ? { tsOauthSecret: opts.tsOauthSecret } : {}),
+  };
   if (manifest !== undefined) {
     // Apply's own aggregate: the keys it would refuse on as missing.
     const required = requiredSecretKeys(manifest);
-    const resolved = required.map((r) => ({ req: r, res: resolveOperatorInput(r.key, undefined, values, undefined, deps.env) }));
+    const resolved = required.map((r) => ({ req: r, res: resolvePreflightInput(deps.env, inputs, r.key) }));
     const missing = new Set(missingRequiredOperatorInputs(resolved.map((r) => ({ key: r.req.key, required: true, value: r.res.value }))));
-    for (const r of resolved) checks.push(secretKeyCheck(r.req, r.res.source, missing.has(r.req.key), secretsPath !== undefined, vaultGiven));
+    const files = [...(opts.secretsPath !== undefined ? ['the secrets file'] : []), ...(opts.scopeSecretsPath !== undefined ? ['the scope secrets file'] : [])];
+    for (const r of resolved) checks.push(secretKeyCheck(r.req, r.res.source, missing.has(r.req.key), files, vaultGiven));
   }
-  return { checks, ...(values !== undefined ? { values } : {}) };
+  return { checks, inputs };
 }
 
 // --- 4. The runner platform endpoint ---
@@ -345,7 +378,7 @@ const ENDPOINT_SOURCE_LABEL: Readonly<Record<Exclude<RunnerPlatformEndpointSourc
   flag: 'the environment',
   env: `the ${RUNNER_PLATFORM_ENDPOINT_ENV_VAR} environment variable`,
   'fleet-file': 'the secrets file',
-  'scope-file': 'the secrets file',
+  'scope-file': 'the scope secrets file',
   scope: "the scope's shared Actions variable",
   manifest: 'transport.runner_platform_endpoint in fleet.yaml',
 };
@@ -379,11 +412,11 @@ async function readScopeEndpoint(deps: PreflightDeps, manifest: FleetManifest): 
 async function resolveEndpoint(
   deps: PreflightDeps,
   manifest: FleetManifest | undefined,
-  values: Readonly<Record<string, string>> | undefined,
+  inputs: OperatorInputs | undefined,
 ): Promise<{ readonly value?: string; readonly source: RunnerPlatformEndpointSource; readonly scope: ScopeRead }> {
   const envValue = deps.env[RUNNER_PLATFORM_ENDPOINT_ENV_VAR];
   const manifestValue = manifest?.transport.runner_platform_endpoint;
-  registerRunnerPlatformEndpointFileTier(values?.[RUNNER_PLATFORM_ENDPOINT_ENV_VAR], undefined);
+  registerRunnerPlatformEndpointFileTier(inputs?.fleet?.[RUNNER_PLATFORM_ENDPOINT_ENV_VAR], inputs?.scope?.[RUNNER_PLATFORM_ENDPOINT_ENV_VAR]);
   try {
     const first = resolveRunnerPlatformEndpointWithProvenance({ explicit: envValue, manifestValue: undefined, scopeValue: undefined });
     if (first.value !== undefined) return { value: first.value, source: first.source === 'flag' ? 'env' : first.source, scope: { state: 'unreadable' } };
@@ -413,10 +446,10 @@ async function resolveTailnetIp(deps: PreflightDeps, host: string): Promise<stri
 export async function endpointCheck(
   deps: PreflightDeps,
   manifest: FleetManifest | undefined,
-  values: Readonly<Record<string, string>> | undefined,
+  inputs: OperatorInputs | undefined,
 ): Promise<readonly PreflightCheck[]> {
   if (manifest !== undefined && manifest.routing?.runner.runs_on !== 'self-hosted') return [];
-  const found = await resolveEndpoint(deps, manifest, values);
+  const found = await resolveEndpoint(deps, manifest, inputs);
   const endpoint = found.value?.replace(/\/+$/, '');
   if (endpoint === undefined) {
     if (manifest === undefined) return [];
@@ -424,8 +457,7 @@ export async function endpointCheck(
     if (found.scope.state === 'unreadable') {
       return [check(sourceId, 'endpoint', 'unknown', 'runner endpoint: not in the environment, secrets file or fleet.yaml, and the scope variable could not be read', ENDPOINT_FIX)];
     }
-    const token = values?.[RUNNER_TOKEN_ENV_VAR] || deps.env[RUNNER_TOKEN_ENV_VAR];
-    if (token !== undefined && token.length > 0) {
+    if (resolvePreflightInput(deps.env, inputs, RUNNER_TOKEN_ENV_VAR).value !== undefined) {
       return [check(sourceId, 'endpoint', 'ok', 'no runner platform endpoint; a runner-registration token is set instead (it expires about an hour after it was issued)')];
     }
     return [check(sourceId, 'endpoint', 'missing', 'runner endpoint: not set anywhere', ENDPOINT_OR_TOKEN_FIX)];
@@ -504,7 +536,7 @@ export async function identityChecks(deps: PreflightDeps, manifest: FleetManifes
 export async function runLocalPreflight(deps: PreflightDeps, opts: PreflightOptions): Promise<readonly PreflightCheck[]> {
   const load = loadManifestChecks(deps, opts.file);
   const vaultGiven = opts.vaultPath !== undefined && opts.identityKeyPath !== undefined;
-  const secrets = secretsChecks(deps, load.manifest, opts.secretsPath, vaultGiven);
+  const secrets = secretsChecks(deps, load.manifest, opts, vaultGiven);
   const [macf, gh, ghToken, git, age, tailscale, browser, endpoint, identity] = await Promise.all([
     macfOnPathCheck(deps),
     ghCheck(deps, load.manifest),
@@ -513,8 +545,8 @@ export async function runLocalPreflight(deps: PreflightDeps, opts: PreflightOpti
     ageCheck(deps),
     tailscaleCheck(deps),
     browserCheck(deps),
-    endpointCheck(deps, load.manifest, secrets.values),
+    endpointCheck(deps, load.manifest, secrets.inputs),
     identityChecks(deps, load.manifest, opts.identityKeyPath),
   ]);
-  return [nodeCheck(deps), macf, gh, ...(ghToken !== undefined ? [ghToken] : []), git, age, tailscale, browser, ...load.checks, ...(load.manifest !== undefined ? applyManifestRefusalChecks(deps, load.manifest, opts) : []), ...secrets.checks, ...applyFlagRefusalChecks(deps, opts, secrets.values), ...endpoint, ...identity];
+  return [nodeCheck(deps), macf, gh, ...(ghToken !== undefined ? [ghToken] : []), git, age, tailscale, browser, ...load.checks, ...(load.manifest !== undefined ? applyManifestRefusalChecks(deps, load.manifest, opts) : []), ...secrets.checks, ...applyFlagRefusalChecks(deps, opts, secrets.inputs), ...endpoint, ...identity];
 }
