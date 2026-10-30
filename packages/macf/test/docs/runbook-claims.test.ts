@@ -2,9 +2,9 @@
  * Drift check for design/fleet-deployment-runbook.md.
  *
  * The runbook is read by agents and humans who follow it literally, so a wrong
- * word or a flag that does not exist stalls them. This pins three claims to
- * source: the plan-approval word, every `--flag` in a `macf …` code line, and
- * the name of the agent's role file.
+ * word or a flag that does not exist stalls them. This pins four claims to
+ * source: the plan-approval word, every `--flag` in a `macf …` code line, the
+ * name of the agent's role file, and the `claude` minimum.
  */
 import { describe, it, expect, beforeAll, vi } from 'vitest';
 import { Command } from 'commander';
@@ -147,5 +147,17 @@ describe('fleet-deployment-runbook.md claims', () => {
       .filter(({ l }) => roleFile.some((re) => re.test(l)))
       .map(({ n, l }) => `runbook line ${String(n)}: ${l.trim().slice(0, 100)}`);
     expect(hits).toEqual([]);
+  });
+
+  it('requires a claude version at least as new as the one claude-sh gates channels on', () => {
+    const claudeSh = readFileSync(resolve(pkgRoot, 'src/cli/claude-sh.ts'), 'utf-8');
+    const gate = /GATED on Claude Code >= (\d+\.\d+\.\d+)/.exec(claudeSh)?.[1];
+    const row = /`claude` (\d+\.\d+\.\d+) or later/.exec(runbook)?.[1];
+    expect(gate).toBeDefined();
+    expect(row).toBeDefined();
+    const parts = (v: string): number[] => v.split('.').map(Number);
+    const [a, b] = [parts(row ?? '0.0.0'), parts(gate ?? '999.0.0')];
+    const atLeast = a[0]! !== b[0]! ? a[0]! > b[0]! : a[1]! !== b[1]! ? a[1]! > b[1]! : a[2]! >= b[2]!;
+    expect(atLeast, `runbook says ${String(row)}, claude-sh gates on ${String(gate)}`).toBe(true);
   });
 });
