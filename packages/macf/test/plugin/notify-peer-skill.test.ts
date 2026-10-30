@@ -56,7 +56,7 @@ describe('macf-notify-peer SKILL.md (macf#350)', () => {
   it('does not recommend a lifecycle event for a message', () => {
     expect(content).not.toMatch(/--event/);
     expect(content).not.toMatch(/use a non-`custom`/);
-    expect(content).toMatch(/never use them for a message/);
+    expect(content).toMatch(/always `custom`.*only recorded, never seen/);
   });
 
   it('has an argument-hint covering peer + message', () => {

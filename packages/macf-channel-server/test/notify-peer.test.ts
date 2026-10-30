@@ -321,9 +321,17 @@ describe('notify_peer tool', () => {
         nextHttpsRespondsWith(200);
         const result = await notifyPeer(makeDeps(reg), { to: 'peer-a', event });
         expect(result.channel_state).toBe('recorded_only');
-        expect(result.note).toContain('never shows it in its session');
+        expect(result.note).toContain('never shown in its session');
       },
     );
+    it('a lifecycle event rejected with HTTP 500 keeps its state and claims nothing recorded', async () => {
+      const reg = makeRegistry({ get: peer });
+      nextHttpsRespondsWith(500);
+      const result = await notifyPeer(makeDeps(reg), { to: 'peer-a', event: 'session-end' });
+      expect(result.delivered).toBe(false);
+      expect(result.channel_state).toBe('online');
+      expect(result.note ?? '').not.toContain('recorded by the peer');
+    });
     it('custom keeps channel_state online and carries no note', async () => {
       const reg = makeRegistry({ get: peer });
       nextHttpsRespondsWith(200);

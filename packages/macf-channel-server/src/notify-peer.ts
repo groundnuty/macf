@@ -56,7 +56,7 @@ export const NotifyPeerInputSchema = {
   to: z.string().optional()
     .describe('Peer agent name to notify. If omitted, broadcasts to all registered peers in the project.'),
   event: z.enum(['session-end', 'session-compact', 'turn-complete', 'error', 'custom'])
-    .describe('Event type. Use `custom` to send a message: it is pushed into the peer\'s session and starts a turn. The other events are sent by MACF hooks; the peer only records them and its session never sees them.'),
+    .describe('Event type. Always use `custom`: it is pushed into the peer\'s session and starts a turn. The other events are for MACF\'s own hooks; the peer only records them and its session never sees them.'),
   message: z.string().optional()
     .describe('Optional human-readable message body.'),
   context: z.record(z.string(), z.unknown()).optional()
@@ -79,11 +79,11 @@ export const NotifyPeerOutputSchema = {
   // "my own channel-server is down" when the actual cause is a bad/
   // unfederated `<project>/<name>` slug. See the `error` field doc below.
   channel_state: z.enum(['online', 'offline', 'no-peer-resolved', 'queued_not_registered', 'recorded_only'])
-    .describe('Aggregate state — "online" if at least one peer reachable, "offline" if peers were attempted but unreachable, "no-peer-resolved" if address resolution itself failed (see `error`), "queued_not_registered" if the named peer is not registered: the message is queued and sent when it registers (see `note`). "recorded_only" for any event other than `custom`: the peer records it and its session never sees it (see `note`).'),
+    .describe('Aggregate state — "online" if at least one peer reachable, "offline" if peers were attempted but unreachable, "no-peer-resolved" if address resolution itself failed (see `error`), "queued_not_registered" if the named peer is not registered: the message is queued and sent when it registers (see `note`). "recorded_only" when an event other than `custom` reached the peer: it is recorded, never shown in the peer\'s session (see `note`).'),
   queued: z.boolean().optional()
     .describe('True when the message was queued for a peer that is not registered yet.'),
   note: z.string().optional()
-    .describe('Plain-language caveat for a queued message, including that it is lost if this channel server restarts.'),
+    .describe('Plain-language caveat: why an event other than `custom` is only recorded, or that a queued message is lost if this channel server restarts.'),
   peers_attempted: z.number().int().nonnegative()
     .describe('Number of peers the tool attempted to notify.'),
   peers_delivered: z.number().int().nonnegative()
@@ -681,14 +681,13 @@ export async function notifyPeer(
 }
 
 const RECORDED_ONLY_NOTE =
-  'The peer records this event and never shows it in its session. Send a message with event custom.';
+  'Events other than custom are recorded by the peer, never shown in its session. To send a message, use event custom.';
 
-/** A lifecycle event reaching the peer's /notify is not a message the peer's session sees. */
+/** A lifecycle event the peer took is recorded, not shown; any other outcome is left as it was. */
 function markRecordedOnly(result: NotifyPeerResult): NotifyPeerResult {
+  if (!result.delivered || result.channel_state !== 'online') return result;
   const note = result.note === undefined ? RECORDED_ONLY_NOTE : `${RECORDED_ONLY_NOTE} ${result.note}`;
-  return result.channel_state === 'online'
-    ? { ...result, channel_state: 'recorded_only', note }
-    : { ...result, note };
+  return { ...result, channel_state: 'recorded_only', note };
 }
 
 async function dispatchNotifyPeer(
