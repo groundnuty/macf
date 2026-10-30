@@ -6,9 +6,9 @@
 
 MACF runs several Claude Code agents as a team. Each agent has its own GitHub App and repo, and the agents coordinate through issues and PRs.
 
-## Inputs: do not start without them
+## Inputs: get them all before anything else
 
-The operator fills this block in, in the same message as this prompt. **Write `n/a` where a row does not apply.**
+The operator may give some of these in their first message. **Ask the operator for every row that is still missing,** in plain conversation, a few at a time. `n/a` is a valid answer where a row does not apply. Until the operator has answered every row (never fill one from a guess), including an onboarding pack's interview, and has confirmed the read-back table, you may read the walkthrough and fetch and read the onboarding pack, but **do nothing else:** no installs, no repos, no other project.
 
 | field | |
 |---|---|
@@ -17,8 +17,8 @@ The operator fills this block in, in the same message as this prompt. **Write `n
 | `OPERATOR` | the operator's GitHub login |
 | `VERSION` | the `macf` release, **0.2.80 or later** (the first with `bootstrap preflight`); also `versions.macf` in the manifest. Where the walkthrough writes `0.2.80`, write this |
 | work repos | repos the agents work in besides their own (`work_repos`) |
-| the project | one paragraph: what it is, and what "done" means; or the project block of an onboarding pack |
-| each agent | its role name and **one line on its job**; or that agent's role block from an onboarding pack |
+| the project | one paragraph: what it is, and what "done" means; or an onboarding pack |
+| each agent | its role name and **one line on its job**; or an onboarding pack |
 | the apply host | where `apply` runs (for example the operator's laptop). It needs a browser logged in to GitHub as an owner of `OWNER`: the consent pages are served on `127.0.0.1` |
 | the agent host | where the agents run: "the apply host", or an ssh target with user and home directory |
 | its tailnet name | the agent host's `*.ts.net` name, for `network.advertise_host`. An ssh alias is not a tailnet name |
@@ -29,10 +29,9 @@ The operator fills this block in, in the same message as this prompt. **Write `n
 | agent host ready | `claude` installed and logged in there. Two hosts: whether the agent host keeps the operator's own `gh` login (the walkthrough says it should not) |
 | ready credentials | the Tailscale OAuth pair is created; the path of each existing age key (two hosts: one per host), or "generate" |
 
-**If any field is blank or says "TBD", list exactly the missing fields and stop.** You may read the walkthrough while you wait. **Do nothing else:** no installs, no repos, no other project.
-
-**Read the operator's answers back once, as a table.**
-- **The project paragraph and the job lines** go into each agent's `AGENTS.md` at §3.4a. With an onboarding pack, write its project block, then its working-style block, then the agent's role block.
+**Read all the answers back once, as a table, and get the operator's confirmation.**
+- **With an onboarding pack** (for a paper fleet: `design/onboarding-packs/paper-fleet/`): fetch it from `main`, as its README §1 shows, and interview the operator for it as its README says. It replaces the project and agent rows, and its blocks go into each agent's `AGENTS.md` at §3.4a.
+- **Without one:** the project paragraph and the job lines go into each agent's `AGENTS.md` at §3.4a.
 - **If work repos is not `n/a`,** add a top-level `work_repos:` list to §2's manifest (§6.1).
 - **If the roles are not science, code and writing,** substitute the operator's roles in every loop and name the walkthrough uses, and recompute §3.3's click count and §1.2's length cap.
 
@@ -119,7 +118,8 @@ The operator fills this block in, in the same message as this prompt. **Write `n
   - `~/.macf/{keys,certs}/<OWNER>/<PROJECT>/`;
   - its age keys;
   - the private `macf` prefix;
-  - its own cron script and watchdog line, through `macf fleet install-cron` only.
+  - its own cron script and watchdog line, through `macf fleet install-cron` only;
+  - with an onboarding pack's HPC worker, the `AGENTS.md` in `<HPC_HOME_REPO>`, and nothing else in that repo.
 
   Everything else on these machines, or in `OWNER`, belongs to someone else. Before §3.1, confirm `<OWNER>/<PROJECT>-control` does not exist, unless `run-log.md` shows this run created it.
 - **Never:**
