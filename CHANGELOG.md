@@ -4,6 +4,63 @@ All notable changes to the `macf` CLI. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning per
 [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.80] — 2026-10-30
+
+From a review of how the agent that deployed the www-2027 fleet got on with the walkthrough (#1525). It stalled wherever the walkthrough, the CLI and the template disagreed, and the fleet was never finished: no watchdog, no final checks.
+
+### Added
+
+- **`macf bootstrap preflight`** checks, read-only, that both machines are ready before `apply`. It works on one machine, or on two with `--agent-host <ssh-target>` (#1547).
+  - **Apply host:**
+    - tools and versions;
+    - `gh` scopes for the owner type, and the `gh-token` extension;
+    - a browser for the consent pages.
+  - **Inputs:**
+    - the manifest;
+    - the secrets files: present, mode `600`, values never printed;
+    - every input, resolved through `apply`'s own resolver;
+    - the runner platform endpoint: by name, then by tailnet IP, and it must answer 2xx.
+  - **`apply`'s own pre-write refusals,** run through the same functions.
+  - **The agent host:** its tools, on the PATH the watchdog actually uses.
+  - **Exit code and output:** it exits `0` when ready and `1` otherwise, and has `--json`.
+  - **Guard tests fail if `preflight` drifts from `apply`:** a refusal, a required program, or an input option that `preflight` does not cover.
+- **`design/fleet-deploy-agent-prompt.md`: the prompt for an agent that deploys a fleet** (#1549). It covers the working agreement: required inputs, who does what, never inferring state from silence, a decision log, and what "finished" means. It points at the walkthrough instead of repeating it, and a test checks its `§` references, flags and version against the runbook and the CLI.
+
+### Changed
+
+- **The walkthrough matches the CLI** (#1542).
+  - **Fixed facts:**
+    - approve with `yes`;
+    - the role file is `AGENTS.md`;
+    - a box for personal accounts;
+    - no `--runner-token` with a runner platform;
+    - tailnet name resolution on the apply host;
+    - launch from outside tmux;
+    - `install-cron` and `fleet doctor --inject` are safe on busy agents;
+    - don't assign work until §3.6 and §4 are done.
+  - **One machine or two:** the apply host and the agent host can be the same machine.
+  - **§3 starts with `preflight`.**
+  - **A drift test** fails CI when the runbook's approval word, flags, role file or minimum versions stop matching the code.
+- **`apply` marks every wait for the operator** with `▶ ACTION NEEDED`, repeated while it waits (#1540).
+- **CLI text corrected** (#1540):
+  - `--runner-token` is described as not needed when a runner platform is set;
+  - the token hint names the right endpoint for a personal account;
+  - the plan preview counts the runner-ops consent gate;
+  - repo-init inside `apply` drops a false alarm about labels;
+  - `fleet deploy` ends with the remaining steps.
+
+### Fixed
+
+- **`apply` refuses a re-run of a provisioned fleet without `--vault`/`--identity-key` before writing anything** (#1541). It used to write first and object afterwards.
+- **`plan` and `bootstrap status` warn when an agent's App is installed on another agent's repo** (#1541).
+- **`secrets.env` is written mode `600`** (#1540).
+- **`notify_peer` no longer steers agents to events the peer never sees** (#1544). Since 0.2.78 the lifecycle events are only recorded by the receiver. The `macf-notify-peer` skill now always sends `custom` and names the live tool ID, and a delivered non-`custom` event returns `channel_state: 'recorded_only'` with a note.
+
+### Upgrade notes
+
+- **Deploy agents:** a new fleet can pin `versions.macf: 0.2.80`. Give the deploy agent `design/fleet-deploy-agent-prompt.md` with its inputs filled in.
+- **Existing workspaces:** `macf update` picks up the corrected `macf-notify-peer` skill.
+
 ## [0.2.79] — 2026-10-29
 
 Two follow-ups to 0.2.78, both found by testing it live on the trial fleet (#1525).
