@@ -62,6 +62,20 @@ describe('the probe script', () => {
     const out = probe(h);
     expect(out.get('jq')).toBe('login|jq-9.9');
   });
+
+  it('keeps HOME under the watchdog PATH, as cron does', () => {
+    const h = home(undefined);
+    const bin = join(h, 'bin');
+    mkdirSync(bin);
+    writeFileSync(join(h, 'marker'), 'x');
+    writeFileSync(join(bin, 'gh'), '#!/bin/sh\n[ -f "$HOME/marker" ] && echo gh-token\nexit 0\n');
+    chmodSync(join(bin, 'gh'), 0o755);
+    mkdirSync(join(h, '.macf', 'cron'), { recursive: true });
+    writeFileSync(join(h, '.macf', 'cron', 'acme__demo.sh'), `#!/bin/sh\nPATH='${bin}:/usr/bin:/bin'; export PATH\n`);
+    const out = probe(h);
+    expect(out.get('source')).toContain('cron|');
+    expect(out.get('gh-token')).toBe('login|installed');
+  });
 });
 
 describe('the details name the PATH that was tested', () => {

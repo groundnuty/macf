@@ -41,7 +41,7 @@ export interface AgentHostFleet {
 /**
  * One shell script, sent over stdin so no quoting survives the remote login shell.
  * When this fleet's cron script exists, tools are looked up under `/bin/sh` with the
- * PATH it exports; otherwise under a login shell.
+ * PATH it exports, with the HOME, LOGNAME, USER and SHELL cron provides; otherwise under a login shell.
  */
 export function buildProbeScript(fleet: AgentHostFleet | undefined): string {
   const safe = fleet !== undefined && /^[A-Za-z0-9.-]+$/.test(fleet.owner) && /^[A-Za-z0-9.-]+$/.test(fleet.project);
@@ -56,7 +56,7 @@ if [ -n "$f" ] && [ -f "$f" ]; then
 fi
 if [ -n "$cronpath" ]; then echo "source|cron|$f"; else echo "source|login|"; fi
 run() {
-  if [ -n "$cronpath" ]; then env -i PATH="$cronpath" /bin/sh -c "$1"; else bash -lc "$1"; fi
+  if [ -n "$cronpath" ]; then env -i HOME="$HOME" LOGNAME="\${LOGNAME:-$USER}" USER="\${USER:-$LOGNAME}" SHELL=/bin/sh PATH="$cronpath" /bin/sh -c "$1"; else bash -lc "$1"; fi
 }
 for t in ${AGENT_HOST_TOOLS.join(' ')}; do
   p=$(run "command -v $t" 2>/dev/null)
