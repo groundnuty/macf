@@ -1059,6 +1059,9 @@ export function formatDeletionEnumerationLines(actions: readonly DeletionAction[
   return lines;
 }
 
+/** The word the operator types at the plan-approval prompt; the runbook names it, and a test pins both. */
+export const APPLY_CONFIRM_WORD = 'yes';
+
 /**
  * Pure — the exact banner text `realConfirmPlan` writes to stderr, extracted
  * so the decisive tests for groundnuty/macf#1272 exercise the SAME function
@@ -1137,7 +1140,7 @@ export function formatApprovalBanner(plan: FleetPlan, creations: readonly Planne
         'approving will NOT create or update them (see the ⚠ block in the plan above for which).',
     );
   }
-  lines.push('Type "yes" to proceed with this plan, anything else to abort: ');
+  lines.push(`Type "${APPLY_CONFIRM_WORD}" to proceed with this plan, anything else to abort: `);
   return lines.join('\n');
 }
 
@@ -1184,7 +1187,7 @@ export async function realConfirmPlan(plan: FleetPlan, creations: readonly Plann
     rl.question('', (answer) => {
       stopReminders();
       rl.close();
-      resolve(answer.trim().toLowerCase() === 'yes');
+      resolve(answer.trim().toLowerCase() === APPLY_CONFIRM_WORD);
     });
   });
 }

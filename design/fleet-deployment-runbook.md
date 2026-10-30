@@ -43,7 +43,15 @@ marked **unverified** rather than guessed.
 
 This section and the next three are one worked example, meant to be followed top to bottom while typing. It brings up a three-agent fleet for a project called `$PROJECT`: a **science agent**, a **code agent** and a **paper agent**. Every name is derived from `$PROJECT`, so you set it once and copy the commands as they are.
 
-**Two machines take part.**
+> **Two roles: the apply host and the agent host.**
+> - **The apply host** has the browser. `plan` and `apply` run there.
+> - **The agent host** runs the agents and holds their workspaces.
+>
+> They can be the same machine. This walkthrough calls them "the Mac" and "the VM". If you use one machine, read both as that machine: every "copy to the VM" and "ssh to the VM" step becomes a local step, and steps marked "(two hosts only)" can be skipped. The one machine must have a browser logged in to GitHub: the consent pages are served on 127.0.0.1.
+>
+> On one host your own `gh` login is on the agent host. An agent whose token fails acts as you. After §4, check that the agents' comments show `[bot]` authors.
+
+**In this walkthrough, two machines take part.**
 
 - **Your Mac** runs `macf bootstrap apply`. It talks to GitHub as you, and it opens the consent pages in your browser. The pages are served on `127.0.0.1`, so the browser must be on the same machine.
 - **The VM** runs the agents. It must be on your tailnet, because the agents are reached at its tailnet name.
@@ -61,6 +69,7 @@ This section and the next three are one worked example, meant to be followed top
 > - `install-cron` (0.2.75): installed, its line run as cron runs it (from `$HOME`, empty environment) through a real reconcile, then uninstalled, leaving another fleet's watchdog line untouched.
 >
 > **Not yet run end to end:**
+> - one machine as both the apply host and the agent host;
 > - the consent pages and App creation, including `router_app_scope: per-fleet`;
 > - label or mention routing on a self-hosted agent repo (the last check in §4);
 > - apply requesting runners from the runner platform;
@@ -78,17 +87,27 @@ This section and the next three are one worked example, meant to be followed top
 | Needed | Mac | VM |
 |---|---|---|
 | Node.js 22.12 or later | ✓ | ✓ |
-| `macf` at the fleet's version, installed globally: `npm install -g @groundnuty/macf@0.2.75`. If that needs `sudo`, first run `npm config set prefix ~/.npm-global` and add `~/.npm-global/bin` to `PATH` in your shell profile | ✓ | ✓ |
+| `macf` at the fleet's version, installed globally: `npm install -g @groundnuty/macf@0.2.80`. If that needs `sudo`, first run `npm config set prefix ~/.npm-global` and add `~/.npm-global/bin` to `PATH` in your shell profile | ✓ | ✓ |
 | `gh` with the token extension, `Link-/gh-token`. Every App token is minted with `gh token generate` | `gh extension install Link-/gh-token` | from the Mac: `gh auth token \| ssh $VM_SSH 'GH_TOKEN=$(cat) gh extension install Link-/gh-token'` (the install needs a token once; the extension itself needs none) |
-| `gh auth login` as an **owner of the org**, with the `workflow` and `admin:org` scopes (add them with `gh auth refresh -h github.com -s workflow,admin:org`) | ✓ | **no:** never log in as yourself on the VM, or an agent whose token fails falls back to your account (`gh-token-attribution-traps.md` mode 4) |
+| `gh auth login` as an **owner of the org**, with the `workflow` and `admin:org` scopes (add them with `gh auth refresh -h github.com -s workflow,admin:org`). For a personal account, see the box below | ✓ | **no:** never log in as yourself on the VM, or an agent whose token fails falls back to your account (`gh-token-attribution-traps.md` mode 4) (one host: see the box at the top of §1) |
 | `git` able to push to GitHub over HTTPS (`gh auth setup-git`) | ✓ | — (agents push with their own App tokens) |
 | `age` (`brew install age` on the Mac, `sudo apt install age` on Ubuntu) | ✓ | ✓ |
 | A browser logged in to GitHub as an owner of the org | ✓ | — |
 | On the tailnet (`tailscale status`) | ✓ (apply calls the runner platform) | ✓ |
 | `tmux`, `bash` 4 or later, `crontab` | — | ✓ |
-| `claude` 2.1.80 or later, logged in once (run `claude`, log in, exit) | — | ✓ |
+| `claude` 2.1.277 or later, logged in once (run `claude`, log in, exit). The template's `init.sh` names 2.1.277 as the first version that reads `AGENTS.md`, the agents' role file | — | ✓ |
 
 Nothing checks these up front. A missing tool fails at the step that needs it, for example `Failed to spawn "age" — is it on PATH?`.
+
+**The machine that runs `apply` must resolve tailnet names.** `apply` calls the runner platform at a `*.ts.net` name. Either turn MagicDNS on for that machine, or set `MACF_RUNNER_PLATFORM_ENDPOINT=http://<tailnet-IP>:8088` (§1.3; keep `http://` and the port; `tailscale status` shows the IP). To tell which you need, run `curl -sS -m 10 -o /dev/null -w '%{http_code}\n' <endpoint>` once with the name and once with the IP. A failure by name (a timeout or `Could not resolve host`) and `200` by IP means names do not resolve there. Check this before §3.3: an unreachable platform does not stop apply, it only creates no runners.
+
+> **If the owner is a personal account.** Everything below works for a user as well as an org, with these differences:
+> - **Names:** set `OWNER` (§1.2) to your own login.
+> - **Manifest:** set `owner.type: user` (§2 shows `type: org`). Keep `registry` as `{ type: repo, … }`, the control repo.
+> - **`gh` scopes:** `workflow` is still needed. `admin:org` is read only by the org-level checks (org installations, org-level runners), which do not apply to a user, so you can leave it out.
+> - **Consent page:** `https://github.com/settings/apps/new`, not the organisation's page.
+> - **Runners:** a personal account has no account-level runners; registration is per repo. The runner platform does it for you. If you ever need a token yourself, use `gh api -X POST /repos/<owner>/<repo>/actions/runners/registration-token --jq .token`. The CLI's own hint names the `/orgs/<org>/…` endpoint, which a user cannot use.
+> - **Weaker plan checks:** for a user there is no org listing, so the plan checks App presence by the predicted name only. It cannot see an App's install scope, so the "only selected repositories" check is not run in the plan. Check `https://github.com/settings/installations` yourself.
 
 ### 1.2 Names
 
@@ -125,7 +144,7 @@ export VM_AGE_KEY=~/.config/macf/vm-age-key.txt     # on the VM (§1.3)
 
 No tool can mint these. Gather them before the first `apply`.
 
-**1. An age key on each machine.** The fleet's vault holds every App's private key and the CA key, encrypted to both keys: to the Mac's, so later applies can read it, and to the VM's, so deploy can. If you already have keys from another fleet, point `MAC_AGE_KEY` and `VM_AGE_KEY` at them. Otherwise generate them:
+**1. An age key on each machine.** (On one host, one key is enough: set `VM_AGE_KEY` to the same file as `MAC_AGE_KEY`, skip the VM `age-keygen` line below, and in §2 delete the `- $VM_AGE` line so the key is listed once.) The fleet's vault holds every App's private key and the CA key, encrypted to both keys: to the Mac's, so later applies can read it, and to the VM's, so deploy can. If you already have keys from another fleet, point `MAC_AGE_KEY` and `VM_AGE_KEY` at them. Otherwise generate them:
 
 ```bash
 # on the Mac
@@ -143,18 +162,18 @@ mkdir -p $FLEET_DIR && cd $FLEET_DIR
 macf bootstrap secrets template --out secrets.env
 ```
 
-Fill in three keys, and leave the rest blank:
+**You fill in all three keys yourself, including the runner platform endpoint, and leave the rest blank.** Fill all three in one edit.
 
 | Key | Value | Why it is needed |
 |---|---|---|
 | `MACF_BOOTSTRAP_TS_OAUTH_CLIENT_ID`, `MACF_BOOTSTRAP_TS_OAUTH_SECRET` | A Tailscale OAuth client with write access to auth keys, allowed to create keys tagged `tag:ci-runner` | The control repo routes on GitHub-hosted runners, which join the tailnet to reach the agents (§7.4). GitHub cannot show a stored value back to you: reuse the pair only if you kept a copy, otherwise generate one under Tailscale admin console → Settings → OAuth clients. |
-| `MACF_RUNNER_PLATFORM_ENDPOINT` | `http://orzech-dev-agents-monitoring.tail491af.ts.net:8088` | apply asks this runner platform for one self-hosted runner per agent repo, and waits for them. Without it, no runner is created and routing jobs wait for one forever (§6.6). |
+| `MACF_RUNNER_PLATFORM_ENDPOINT` | `http://orzech-dev-agents-monitoring.tail491af.ts.net:8088` | apply asks this runner platform for one self-hosted runner per agent repo, and waits for them. Without it, no runner is created and routing jobs wait for one forever (§6.6). When it is set, **`--runner-token` is not needed**: do not fetch a token. Use the platform's tailnet IP here if names do not resolve (§1.1). |
 
 ---
 
 ## 2. The manifest
 
-`fleet.yaml` is the only file you write. Get the VM's public age key first: on the VM, run `age-keygen -y $VM_AGE_KEY`. Then, on the Mac:
+`fleet.yaml` is the only file you write. (two hosts only) Get the VM's public age key first: on the VM, run `age-keygen -y $VM_AGE_KEY`. Then, on the Mac:
 
 ```bash
 export VM_AGE=age1…              # paste the line the VM printed
@@ -174,7 +193,7 @@ transport:
   router_app_scope: per-fleet
   age_recipients:
     - $(age-keygen -y $MAC_AGE_KEY)
-    - $VM_AGE
+    - $VM_AGE   # two hosts only; one host: delete this line
 routing:
   runner:
     runs_on: self-hosted
@@ -194,8 +213,8 @@ agents:
     repo: $OWNER/$PROJECT-writing-agent
     deploy_path: $VM_HOME/repos/$PROJECT/$PROJECT-writing-agent
 versions:
-  macf: 0.2.75
-  actions: v3.6.2
+  macf: 0.2.80
+  actions: v3.6.3
 EOF
 ```
 
@@ -206,11 +225,11 @@ EOF
 - **Both `age_recipients` from the start.** Adding the VM's key later works, but costs an extra apply with `--vault` and `--identity-key` to re-encrypt.
 - **`routing.runner`.** Every routing job on the agent repos runs on the fleet's own runner, never on GitHub-hosted minutes. A job with no runner waits; it never falls back (§6.5).
 - **`trusted_actors: [$OPERATOR]`** (new in 0.2.74). On a self-hosted repo, the router acts only for listed actors. Without your login there, your own labels, comments and reviews on the agent repos reach no agent, because only the agent bots are listed by default. List every human who will give the agents work.
-- **`role_template`.** Each agent repo is created from this template. Its `CLAUDE.md` is a stub that you fill in at §3.4.
+- **`role_template`.** Each agent repo is created from this template. The agent's role file is `AGENTS.md`, which you write at §3.4a. The template ships no `CLAUDE.md`.
 - **`work_repos`.** Optional `work_repos:` lists shared repos where the agents do the work. Each is routed exactly like a home repo (caller, labels, routing secrets, runner, trusted actors), and every agent's App is installed on it.
-- **`writing-agent` is the paper agent.** A role name is free-form: it sets the App, bot, label and session names, and nothing else. No role selects a persona; the agent's job comes from its `CLAUDE.md`. `writing-agent` is the paper role exercised end to end. `role: paper-agent` behaves identically, apart from the names and one informational line in `macf doctor`.
+- **`writing-agent` is the paper agent.** A role name is free-form: it sets the App, bot, label and session names, and nothing else. No role selects a persona; the agent's job comes from its `AGENTS.md`. `writing-agent` is the paper role exercised end to end. `role: paper-agent` behaves identically, apart from the names and one informational line in `macf doctor`.
 - **`deploy_path` under `~/repos`.** `fleet reconcile` looks for workspaces under `~/repos`, down to four levels deep.
-- **`versions`.** It pins every workspace to `macf` 0.2.75 and every router caller to `macf-actions` v3.6.2.
+- **`versions`.** It pins every workspace to `macf` 0.2.80 and every router caller to `macf-actions` v3.6.3.
 
 **Left out deliberately:**
 - `agents[].profile` and `defaults.app_manifest` are accepted but consumed nowhere.
@@ -236,7 +255,7 @@ macf bootstrap plan -f fleet.yaml --secrets-file secrets.env
 - `runner_platform … resolved via the per-fleet operator secrets file`;
 - `Operator interaction: up to 5 Apps to create → up to 5 "Create GitHub App" clicks + 5 install flows`.
 
-If `runner_platform` reads `not resolved`, the endpoint is missing from `secrets.env`.
+If `runner_platform` reads `not resolved`, the endpoint is missing from `secrets.env`; the `routing … runner` row then also says apply needs `--runner-token`. Set the endpoint (§1.3) rather than fetching a token. With the endpoint resolved, the `routing … runner` row does not ask for one.
 
 ### 3.2 Dry run (changes nothing)
 
@@ -255,7 +274,7 @@ macf bootstrap apply -f fleet.yaml --secrets-file secrets.env
 
 A first run takes neither `--vault` nor `--identity-key`, because no vault exists yet. It also says early on that no runner registration token was supplied, and that this is fine when the runner platform is configured. Do not fetch a token: apply waits for the runners it requests from the platform. What follows (steps 3 and 4 are the clicks):
 
-1. You see the plan again, and approve it once with `y`.
+1. You see the plan again. Answer the confirmation prompt with `yes`; anything else aborts.
 2. apply creates `$OWNER/$PROJECT-control` first, then each agent repo (from the template) just before that agent's consent pages.
 3. **Consent gate 1, once per App.** The terminal says `press Enter to open the browser`. A local page opens and forwards you to GitHub. **Click "Create GitHub App".** There is nothing to copy back.
 4. **Consent gate 2, once per App.** The install page opens. **Choose "Only select repositories", select exactly the repos the terminal lists, and click Install.** Never choose "All repositories"; apply refuses that install (§7.2). The repos per App:
@@ -282,8 +301,8 @@ A first run takes neither `--vault` nor `--identity-key`, because no vault exist
 | `1` | A leg failed, and the summary names it | Fix the cause, then re-run as below |
 
 **Two lines on the Mac are expected and change no exit code:**
-- `Version reconcile: could not attempt … (driver-unresolved)`, on every run, because the agents' workspaces are on the VM;
-- on a run with the vault flags, one deploy line per agent saying `this host cannot create …` for its `/home/…` path.
+- (two hosts only) `Version reconcile: could not attempt … (driver-unresolved)`, on every run, because the agents' workspaces are on the VM;
+- (two hosts only) on a run with the vault flags, one deploy line per agent saying `this host cannot create …` for its `/home/…` path.
 
 **To re-run, from `$FLEET_DIR`:**
 
@@ -296,27 +315,33 @@ macf bootstrap apply -f fleet.yaml --secrets-file secrets.env --vault control/se
 - **Always pass both flags,** even if `control/secrets/vault.age` does not exist yet.
 - **`--identity-key` lets the re-run use an App you already created.** It decrypts the copy apply saved right after each "Create GitHub App" click, so a re-run doesn't open that App's creation page again.
 - **A re-run repeats only what is missing.**
+- **A re-run without the flags is refused** once `fleet.lock` records the fleet's agents; nothing is changed.
+- **On one host, a re-run with the vault flags also deploys the agents (§3.4c).** Do §3.4a before any re-run, or run `git -C <deploy_path> pull` in each workspace afterwards.
 
 ### 3.4 Deploy the agents
 
-**a. Give each agent its job.** Every agent repo starts with the template's stub `CLAUDE.md`, so until you edit it, the three agents differ only in name. macf never writes `CLAUDE.md`, so your text survives every update. Edit it on the Mac before deploying, so each workspace clones your version:
+**a. Give each agent its job.** The template ships no `CLAUDE.md`, and a new agent repo has no instruction file yet, so until you write one the three agents differ only in name. The file is `AGENTS.md`. Claude Code 2.1.277 and later reads it (the template's `init.sh` names that version), and a `CLAUDE.md` or `CLAUDE.local.md` in the workspace or any folder above it hides it. macf never writes `AGENTS.md`, so your text survives every update. Write it on the Mac before deploying, so each workspace clones your version:
 
 ```bash
 mkdir -p $FLEET_DIR/repos
 for r in science-agent code-agent writing-agent; do gh repo clone $OWNER/$PROJECT-$r $FLEET_DIR/repos/$r; done
-# Edit $FLEET_DIR/repos/<role>/CLAUDE.md: one paragraph on the project, one on this agent's job
+# Create or edit $FLEET_DIR/repos/<role>/AGENTS.md: one paragraph on the project, one on this agent's job
 # (science: research, design and review; code: implementation in its repo; writing: the paper). Then:
 for r in science-agent code-agent writing-agent; do
-  git -C $FLEET_DIR/repos/$r commit -am "docs: describe this agent's job" && git -C $FLEET_DIR/repos/$r push
+  git -C $FLEET_DIR/repos/$r add AGENTS.md && git -C $FLEET_DIR/repos/$r commit -m "docs: describe this agent's job" && git -C $FLEET_DIR/repos/$r push
 done
 ```
 
-**b. Copy the manifest and vault to the VM.** Deploy reads `fleet.yaml` and `secrets/vault.age` from the control repo's layout:
+- **Where in the file:** if `AGENTS.md` already has a `<!-- BEGIN template-managed … -->` region, write below its `<!-- END template-managed -->` line, never inside it. If there is no such region, write the paragraphs at the top.
+- **Do not run the template's `.claude/init.sh` or `bootstrap.sh` on an agent repo or workspace.** `bootstrap.sh` runs `init.sh`, which moves every always-on rule out of `.claude/rules/` into `AGENTS.md`, macf's rules included, and `macf update` cannot refresh them there.
+
+**b. Clone the control repo, and on two hosts only copy it to the VM.** Apply checks the control repo out only into a temporary folder, so this clone is needed on every setup. On one host it lands at `~/macf-fleets/$PROJECT/control`, the path step c reads. Deploy reads `fleet.yaml` and `secrets/vault.age` from the control repo's layout:
 
 ```bash
 # on the Mac
 cd $FLEET_DIR
 gh repo clone $OWNER/$PROJECT-control control 2>/dev/null || git -C control pull
+# two hosts only:
 ssh $VM_SSH "mkdir -p macf-fleets/$PROJECT/control/secrets"
 scp control/fleet.yaml $VM_SSH:macf-fleets/$PROJECT/control/
 scp control/secrets/vault.age $VM_SSH:macf-fleets/$PROJECT/control/secrets/
@@ -349,7 +374,7 @@ On the VM, start each agent once by hand:
 cd $VM_HOME/repos/$PROJECT/$PROJECT-science-agent && ./claude.sh
 ```
 
-`claude.sh` opens the tmux session `$PROJECT@science-agent` and starts Claude Code. Because the folder is new, Claude Code first asks whether you trust it. The question reads `Is this a project you created or one you trust?`, and the first option is a "No" option, highlighted.
+**Start it from a terminal that is not inside tmux** (`echo $TMUX` prints nothing). `claude.sh` then opens the tmux session `$PROJECT@science-agent`. Started inside tmux, it runs in the current pane under the wrong name, and cron (§3.6) launches a second copy. Because the folder is new, Claude Code first asks whether you trust it. The question reads `Is this a project you created or one you trust?`, and the first option is a "No" option, highlighted.
 
 1. **Select "Yes, I trust this folder"** (down arrow, then Enter).
 2. The next prompt, about development channels, is answered for you.
@@ -357,6 +382,8 @@ cd $VM_HOME/repos/$PROJECT/$PROJECT-science-agent && ./claude.sh
 4. Repeat for `$PROJECT-code-agent` and `$PROJECT-writing-agent`.
 
 **Only you can answer the trust check.** macf never types into it, and `fleet reconcile` reports an agent waiting there as `BLOCKED` (exit 3) rather than answering. On its first start, each agent registers and picks up any issue already labelled for it.
+
+**Do not assign the agents real work until §3.6 and §4 are done.**
 
 ### 3.6 Reboot recovery
 
@@ -376,6 +403,8 @@ cd $VM_HOME/repos/$PROJECT/$PROJECT-science-agent
 macf fleet install-cron --execute --manifest ~/macf-fleets/$PROJECT/desired-agents.yaml --print   # look first
 macf fleet install-cron --execute --manifest ~/macf-fleets/$PROJECT/desired-agents.yaml --yes
 ```
+
+**It is safe while the agents are working, once `tmux ls` lists all three `$PROJECT@…` sessions.** `install-cron` only writes its script and adds a crontab line; it does not touch a running session. Later ticks act only as listed below.
 
 **It refuses if no `macf` is on PATH, or if that `macf` is not the version you are running.** The refusal names the `npm install -g` to run.
 
@@ -416,6 +445,8 @@ Run these after §3.5. Each row answers a different question, and none implies a
 ```bash
 macf fleet doctor --inject
 ```
+
+**It is safe while the agents are working,** but do not type in an agent's pane while it runs. `--inject` sends each agent one probe message, delivered like a routed `@mention`: over the channel when the agent's Claude Code has it registered, otherwise typed into the pane, where the helper first clears the input line and so can mix with a half-typed message. The message reads `fleet-doctor --inject probe (run_id=…) — no action needed`. The agent takes it as its next prompt; a hook records the receipt, which is the ✓. An agent still busy when the wait ends shows `unconfirmed — possibly busy`; re-run when it is idle.
 
 **Expect `HEALTHY`, and a ✓ in the `PROCESSED` column for all three agents.** `PROCESSED` means each agent's session consumed a real injected message, not only that the server accepted it.
 
@@ -461,7 +492,7 @@ gh run view $RUN -R $OWNER/$PROJECT-code-agent --log | grep -E 'Routed issue #[0
    macf bootstrap apply -f fleet.yaml --secrets-file secrets.env --vault control/secrets/vault.age --identity-key $MAC_AGE_KEY
    ```
 
-   That commits the version to the control repo; when `versions.actions` changed, it also re-pins every router caller. Expect the `Version reconcile: … (driver-unresolved)` line from §3.3: the Mac has no agent workspaces, so apply's own roll has nothing to do there.
+   That commits the version to the control repo; when `versions.actions` changed, it also re-pins every router caller. Expect the `Version reconcile: … (driver-unresolved)` line from §3.3: the Mac has no agent workspaces, so apply's own roll has nothing to do there. On one host it reads `Version reconcile: 0 of 3 discovered member(s) rolled … none behind target` instead.
 3. **Copy the new files to the VM,** exactly as in §3.4 step b. That step starts with the pull, so the VM gets the versions apply just committed. A later `fleet deploy` then installs the same version.
 
 To take a fleet down, see §9.
