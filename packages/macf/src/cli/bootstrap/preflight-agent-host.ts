@@ -14,13 +14,14 @@ const PROBED = [...AGENT_HOST_TOOLS, 'gh-token'] as const;
 const SSH_OPTS = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10'] as const;
 
 /**
- * Minimum versions on the agent host. Below Claude Code 2.1.80, claude.sh drops the
+ * Minimum versions on the agent host. Claude Code 2.1.277 is the first that reads
+ * AGENTS.md, where each agent's job is written; below 2.1.80 claude.sh also drops the
  * channel flags and the agents get no routed notifications.
  */
 const AGENT_HOST_MINIMUMS: Readonly<Partial<Record<string, { readonly min: string; readonly fix: string }>>> = {
   node: { min: '22.12.0', fix: 'install Node.js 22.12 or later on the agent host' },
   bash: { min: '4.0.0', fix: 'install Bash 4+ (on macOS: brew install bash) and make sure it comes first on the non-interactive login PATH.' },
-  claude: { min: '2.1.80', fix: 'update Claude Code on the agent host (claude update)' },
+  claude: { min: '2.1.277', fix: 'update Claude Code on the agent host (claude update); below 2.1.277 the agent does not read AGENTS.md, where its job is written' },
 };
 
 /** One shell script, sent over stdin so no quoting survives the remote login shell. */

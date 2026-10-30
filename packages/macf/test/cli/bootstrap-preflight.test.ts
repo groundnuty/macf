@@ -12,7 +12,7 @@ const FAKE_SECRET = 'tskey-client-SUPERSECRETVALUE123';
 const RECIPIENT = 'age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq';
 const ENDPOINT = 'http://runner-host.tail1234.ts.net:8088';
 
-function fleetYaml(opts: { selfHosted?: boolean; versions?: boolean; type?: 'org' | 'user'; macf?: string } = {}): string {
+function fleetYaml(opts: { selfHosted?: boolean; versions?: boolean; type?: 'org' | 'user'; macf?: string; tsOauth?: boolean } = {}): string {
   const type = opts.type ?? 'org';
   return `
 apiVersion: macf/v0
@@ -27,7 +27,7 @@ network:
   advertise_host: vm.example.ts.net
 transport:
   age_recipients: [${RECIPIENT}]
-${opts.selfHosted === false ? '' : 'routing:\n  runner:\n    runs_on: self-hosted\n    labels: [self-hosted, macf-vm]\n    warm: 1\n    trusted_actors: [someone]\n'}defaults:
+${(opts.tsOauth ?? opts.selfHosted !== false) ? '  tailscale_oauth_required: true\n' : ''}${opts.selfHosted === false ? '' : 'routing:\n  runner:\n    runs_on: self-hosted\n    labels: [self-hosted, macf-vm]\n    warm: 1\n    trusted_actors: [someone]\n'}defaults:
   role_template: groundnuty/agentic-repo-template
 agents:
   - role: code-agent
@@ -196,6 +196,18 @@ describe('secrets.env', () => {
     expect(r['runner-endpoint-source']?.detail).toBe(`runner endpoint: ${ENDPOINT} (from the MACF_RUNNER_PLATFORM_ENDPOINT environment variable)`);
   });
 
+  it('self-hosted with tailscale_oauth_required false checks no Tailscale keys', async () => {
+    const files = { [MANIFEST_PATH]: fleetYaml({ tsOauth: false }), [SECRETS_PATH]: '' };
+    const checks = await runLocalPreflight(makeDeps({ files }).deps, opts);
+    expect(checks.filter((c) => c.id.startsWith('secret-'))).toEqual([]);
+  });
+
+  it('self-hosted with tailscale_oauth_required true checks both keys', async () => {
+    const files = { [MANIFEST_PATH]: fleetYaml({ tsOauth: true }), [SECRETS_PATH]: '' };
+    const checks = await runLocalPreflight(makeDeps({ files }).deps, opts);
+    expect(checks.filter((c) => c.id.startsWith('secret-')).map((c) => c.status)).toEqual(['missing', 'missing']);
+  });
+
   it('requires none of the keys for a hosted fleet', async () => {
     const files = { [MANIFEST_PATH]: fleetYaml({ selfHosted: false }), [SECRETS_PATH]: '' };
     const checks = await runLocalPreflight(makeDeps({ files }).deps, opts);
@@ -286,6 +298,28 @@ describe('runner platform endpoint', () => {
       expect(r['runner-endpoint-source']?.fix, where).toContain(where);
     }
     expect(fetchCalls).toEqual([]);
+  });
+
+  it('is ok with a runner token and no endpoint, and never prints the token', async () => {
+    const TOKEN = 'ATOKENVALUE-SECRET-9988';
+    const { deps } = makeDeps({ files: noEndpointFiles(), exec: noScopeVar, env: { MACF_BOOTSTRAP_RUNNER_TOKEN: TOKEN } });
+    const checks = await runLocalPreflight(deps, opts);
+    const c = checks.find((x) => x.id === 'runner-endpoint-source');
+    expect(c?.status).toBe('ok');
+    expect(c?.detail).toContain('a runner-registration token is set instead');
+    expect(formatPreflightText(buildReport(checks)) + JSON.stringify(preflightToJson(buildReport(checks)))).not.toContain(TOKEN);
+  });
+
+  it('missing with neither endpoint nor token, and the fix names both', async () => {
+    const r = await byId(makeDeps({ files: noEndpointFiles(), exec: noScopeVar }).deps);
+    expect(r['runner-endpoint-source']?.status).toBe('missing');
+    expect(r['runner-endpoint-source']?.fix).toContain('MACF_RUNNER_PLATFORM_ENDPOINT');
+    expect(r['runner-endpoint-source']?.fix).toContain('MACF_BOOTSTRAP_RUNNER_TOKEN');
+  });
+
+  it('an endpoint present ignores the token', async () => {
+    const r = await byId(makeDeps({ files: baseFiles(), env: { MACF_BOOTSTRAP_RUNNER_TOKEN: 'x' } }).deps);
+    expect(r['runner-endpoint-source']?.detail).toContain(`runner endpoint: ${ENDPOINT}`);
   });
 
   it('is unknown, not missing, when the scope variable cannot be read', async () => {
@@ -388,10 +422,15 @@ describe('agent-host version floors', () => {
     const checks = await agentHostChecks(vmDeps(ok(probe)), 'ubuntu@vm');
     return Object.fromEntries(checks.map((c) => [c.id, c]));
   };
-  it('an old Claude Code on the agent host is wrong (below 2.1.80 the agents get no channel notifications)', async () => {
-    const r = await run(PROBE_OK.replace('claude|login|2.1.300', 'claude|login|2.1.79 (Claude Code)'));
+  it('an old Claude Code on the agent host is wrong (below 2.1.277 it does not read AGENTS.md)', async () => {
+    const r = await run(PROBE_OK.replace('claude|login|2.1.300', 'claude|login|2.1.276 (Claude Code)'));
     expect(r['agent-host-claude']?.status).toBe('wrong');
-    expect(r['agent-host-claude']?.detail).toContain('older than 2.1.80');
+    expect(r['agent-host-claude']?.detail).toContain('older than 2.1.277');
+    expect(r['agent-host-claude']?.fix).toContain('AGENTS.md');
+  });
+  it('Claude Code 2.1.277 is ok', async () => {
+    const r = await run(PROBE_OK.replace('claude|login|2.1.300', 'claude|login|2.1.277 (Claude Code)'));
+    expect(r['agent-host-claude']?.status).toBe('ok');
   });
   it('an old node on the agent host is wrong', async () => {
     const r = await run(PROBE_OK.replace('node|login|v22.14.0', 'node|login|v20.11.1'));

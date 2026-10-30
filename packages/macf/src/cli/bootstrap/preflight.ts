@@ -12,6 +12,7 @@ import type { FleetManifest } from './fleet-manifest.js';
 import { parseFleetManifest } from './fleet-manifest.js';
 import { controlRepoFullName } from './control-repo.js';
 import { TS_OAUTH_CLIENT_ID_ENV_VAR, TS_OAUTH_SECRET_ENV_VAR } from './apply-routing-secrets.js';
+import { RUNNER_TOKEN_ENV_VAR } from './apply-routing.js';
 import {
   RUNNER_PLATFORM_ENDPOINT_ENV_VAR,
   registerRunnerPlatformEndpointFileTier,
@@ -250,9 +251,9 @@ interface RequiredKey {
 }
 
 function requiredSecretKeys(manifest: FleetManifest): readonly RequiredKey[] {
-  const selfHosted = manifest.routing?.runner.runs_on === 'self-hosted';
   const keys: RequiredKey[] = [];
-  if (manifest.transport.tailscale_oauth_required || selfHosted) {
+  // Same condition apply uses (bootstrap-apply.ts missing-inputs check).
+  if (manifest.transport.tailscale_oauth_required) {
     keys.push({ key: TS_OAUTH_CLIENT_ID_ENV_VAR, why: 'Tailscale OAuth client id' });
     keys.push({ key: TS_OAUTH_SECRET_ENV_VAR, why: 'Tailscale OAuth secret' });
   }
@@ -311,6 +312,8 @@ const ENDPOINT_SOURCE_LABEL: Readonly<Record<Exclude<RunnerPlatformEndpointSourc
 const ENDPOINT_FIX =
   `set ${RUNNER_PLATFORM_ENDPOINT_ENV_VAR} in the environment or in secrets.env, as a shared Actions variable on the scope, ` +
   'or set transport.runner_platform_endpoint in fleet.yaml';
+
+const ENDPOINT_OR_TOKEN_FIX = `${ENDPOINT_FIX} (preferred); or pass a runner-registration token as ${RUNNER_TOKEN_ENV_VAR}`;
 
 type ScopeRead = { readonly value?: string; readonly state: 'read' | 'absent' | 'unreadable' };
 
@@ -380,7 +383,11 @@ export async function endpointCheck(
     if (found.scope.state === 'unreadable') {
       return [check(sourceId, 'endpoint', 'unknown', 'runner endpoint: not in the environment, secrets file or fleet.yaml, and the scope variable could not be read', ENDPOINT_FIX)];
     }
-    return [check(sourceId, 'endpoint', 'missing', 'runner endpoint: not set anywhere', ENDPOINT_FIX)];
+    const token = values?.[RUNNER_TOKEN_ENV_VAR] || deps.env[RUNNER_TOKEN_ENV_VAR];
+    if (token !== undefined && token.length > 0) {
+      return [check(sourceId, 'endpoint', 'ok', 'no runner platform endpoint; a runner-registration token is set instead (it expires about an hour after it was issued)')];
+    }
+    return [check(sourceId, 'endpoint', 'missing', 'runner endpoint: not set anywhere', ENDPOINT_OR_TOKEN_FIX)];
   }
   const label = found.source === 'none' ? 'unknown' : ENDPOINT_SOURCE_LABEL[found.source];
   const sourceCheck = check('runner-endpoint-source', 'endpoint', 'ok', `runner endpoint: ${endpoint} (from ${label})`);
