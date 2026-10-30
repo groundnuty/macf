@@ -39,24 +39,38 @@ export interface AgentHostFleet {
 }
 
 /**
+ * Shell that reads a cron script's environment lines (the PATH line and the prelude
+ * line, matched by the shape `cronEnvironmentLines` writes) from "$f" into $cronenv.
+ * $cronenv stays empty when the PATH line is missing or oddly shaped. The token and
+ * exec lines never match, so they are never run.
+ */
+export const CRON_ENV_EXTRACT_SH = String.raw`cronenv=""
+l=$(grep -m1 '^PATH=' "$f")
+if printf '%s\n' "$l" | grep -Eq "^PATH='[^']*'; export PATH$"; then
+  cronenv="$l"
+  pre=$(grep -m1 -E "^\[ -f '[^']*' \] && \. '[^']*'$" "$f")
+  if [ -n "$pre" ]; then cronenv="$cronenv
+$pre"; fi
+fi`;
+
+/**
  * One shell script, sent over stdin so no quoting survives the remote login shell.
- * When this fleet's cron script exists, tools are looked up under `/bin/sh` with the
- * PATH it exports, with the HOME, LOGNAME, USER and SHELL cron provides; otherwise under a login shell.
+ * When this fleet's cron script exists, tools are looked up under `/bin/sh` after
+ * replaying its environment lines (PATH, prelude), with the HOME, LOGNAME, USER and
+ * SHELL cron provides; otherwise under a login shell.
  */
 export function buildProbeScript(fleet: AgentHostFleet | undefined): string {
   const safe = fleet !== undefined && /^[A-Za-z0-9.-]+$/.test(fleet.owner) && /^[A-Za-z0-9.-]+$/.test(fleet.project);
   const file = safe ? `$HOME/.macf/cron/${fleet.owner}__${fleet.project}.sh` : '';
   return `f="${file}"
-cronpath=""
+cronenv=""
 if [ -n "$f" ] && [ -f "$f" ]; then
-  l=$(grep -m1 '^PATH=' "$f")
-  if printf '%s\n' "$l" | grep -Eq "^PATH='[^']*'; export PATH$"; then
-    cronpath=$(printf '%s\n' "$l" | sed "s/^PATH='//; s/'; export PATH$//")
-  fi
+${CRON_ENV_EXTRACT_SH}
 fi
-if [ -n "$cronpath" ]; then echo "source|cron|$f"; else echo "source|login|"; fi
+if [ -n "$cronenv" ]; then echo "source|cron|$f"; else echo "source|login|"; fi
 run() {
-  if [ -n "$cronpath" ]; then env -i HOME="$HOME" LOGNAME="\${LOGNAME:-$USER}" USER="\${USER:-$LOGNAME}" SHELL=/bin/sh PATH="$cronpath" /bin/sh -c "$1"; else bash -lc "$1"; fi
+  if [ -n "$cronenv" ]; then env -i HOME="$HOME" LOGNAME="\${LOGNAME:-$USER}" USER="\${USER:-$LOGNAME}" SHELL=/bin/sh /bin/sh -c "$cronenv
+$1"; else bash -lc "$1"; fi
 }
 for t in ${AGENT_HOST_TOOLS.join(' ')}; do
   p=$(run "command -v $t" 2>/dev/null)
@@ -80,6 +94,7 @@ done
 if run "gh extension list" 2>/dev/null | grep -qi '${GH_TOKEN_EXTENSION}'; then echo "gh-token|login|installed"; else echo "gh-token|none|"; fi
 `;
 }
+
 
 export type SshFailure = 'host-key' | 'permission' | 'no-route' | 'other';
 

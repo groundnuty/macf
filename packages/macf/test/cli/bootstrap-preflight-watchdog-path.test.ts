@@ -5,10 +5,11 @@
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, chmodSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, chmodSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { agentHostChecks, buildProbeScript } from '../../src/cli/bootstrap/preflight-agent-host.js';
+import { agentHostChecks, buildProbeScript, CRON_ENV_EXTRACT_SH } from '../../src/cli/bootstrap/preflight-agent-host.js';
+import { buildCronScript, cronEnvironmentLines } from '../../src/cli/commands/fleet-install-cron.js';
 import type { PreflightDeps } from '../../src/cli/bootstrap/preflight.js';
 
 const FLEET = { owner: 'acme', project: 'demo' };
@@ -75,6 +76,57 @@ describe('the probe script', () => {
     const out = probe(h);
     expect(out.get('source')).toContain('cron|');
     expect(out.get('gh-token')).toBe('login|installed');
+  });
+});
+
+function writeScript(h: string, body: string): void {
+  mkdirSync(join(h, '.macf', 'cron'), { recursive: true });
+  writeFileSync(join(h, '.macf', 'cron', 'acme__demo.sh'), body);
+}
+
+describe('the probe replays the script environment lines', () => {
+  it('sees a tool the prelude puts on PATH', () => {
+    const h = home(undefined);
+    const bin = join(h, 'pbin');
+    mkdirSync(bin);
+    writeFileSync(join(bin, 'jq'), '#!/bin/sh\necho jq-7.7\n');
+    chmodSync(join(bin, 'jq'), 0o755);
+    const prelude = join(h, 'prelude.sh');
+    writeFileSync(prelude, `PATH="${bin}:$PATH"; export PATH\n`);
+    writeScript(h, buildCronScript({ macfPath: '/x/macf', installPath: '/usr/bin:/bin', preludePath: prelude, tokenPrefix: '', reconcileFlags: [], marker: '# m' }));
+    const out = probe(h);
+    expect(out.get('source')).toContain('cron|');
+    expect(out.get('jq')).toBe('login|jq-7.7');
+  });
+
+  it('never runs the token line or the exec line', () => {
+    const h = home(undefined);
+    const marker = join(h, 'token-ran');
+    const execMarker = join(h, 'exec-ran');
+    const helper = join(h, 'helper.sh');
+    writeFileSync(helper, `#!/bin/sh\ntouch '${marker}'\necho ghs_x\n`);
+    chmodSync(helper, 0o755);
+    const macf = join(h, 'macf');
+    writeFileSync(macf, `#!/bin/sh\ntouch '${execMarker}'\n`);
+    chmodSync(macf, 0o755);
+    writeScript(h, buildCronScript({ macfPath: macf, installPath: '/usr/bin:/bin', preludePath: join(h, 'none.sh'), tokenPrefix: `GH_TOKEN=$('${helper}') || exit 1; export GH_TOKEN; `, reconcileFlags: [], marker: '# m' }));
+    const out = probe(h);
+    expect(out.get('source')).toContain('cron|');
+    expect(existsSync(marker)).toBe(false);
+    expect(existsSync(execMarker)).toBe(false);
+  });
+
+  it('extracts exactly the generator environment lines', () => {
+    for (const tokenPrefix of ['', "GH_TOKEN=$('/h/macf-gh-token.sh') || exit 1; export GH_TOKEN; "]) {
+      const parts = { macfPath: '/x/macf', installPath: '/usr/local/bin:/usr/bin', preludePath: '/p/prelude.sh', tokenPrefix, reconcileFlags: ['--yes'], marker: '# m' };
+      const h = home(undefined);
+      writeScript(h, buildCronScript(parts));
+      const f = join(h, '.macf', 'cron', 'acme__demo.sh');
+      const r = spawnSync('sh', ['-c', `f='${f}'\n${CRON_ENV_EXTRACT_SH}\nprintf '%s' "$cronenv"`], { encoding: 'utf-8' });
+      expect(r.stdout).toBe(cronEnvironmentLines(parts).join('\n'));
+      expect(r.stdout).not.toContain('GH_TOKEN');
+      expect(r.stdout).not.toContain('exec');
+    }
   });
 });
 
