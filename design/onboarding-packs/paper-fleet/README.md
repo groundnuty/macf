@@ -6,7 +6,7 @@ These are blocks for each agent's `AGENTS.md` in a MACF fleet that writes a rese
 
 Every agent starts with its role and the fleet's working style instead of being onboarded by hand.
 
-**The deploy agent fills and assembles the pack** at runbook §3.4a, by interviewing the operator. The operator edits no file.
+**The deploy agent interviews the operator for the pack during its Inputs step, before anything else, and assembles and commits it at runbook §3.4a.** The operator edits no file.
 
 ## 1. Fetch
 
@@ -21,6 +21,7 @@ Every agent starts with its role and the fleet's working style instead of being 
 - Never ask the operator to edit a file.
 - Ask in plain conversation, a few questions at a time.
 - Take what the deploy inputs already give, such as the operator's login and the work repos, instead of asking again.
+- **`<WORK_REPO>` must be one of the deploy inputs' work repos.** If they list several, ask which. If they are `n/a`, ask for it and add it to them: the science agent files the code agent's tasks there, so it needs routing.
 
 **What to ask:**
 1. **The paper:**
@@ -31,11 +32,11 @@ Every agent starts with its role and the fleet's working style instead of being 
    - the deadlines, with time zones;
    - the page budget: main pages, references, appendix, maximum.
 3. **Sources:**
-   - where the proposal and its review rounds are;
+   - where the proposal and its review rounds are (readable on the agent host);
    - the paper's Overleaf git URL;
    - earlier repos with reusable model-calling or harness code, or none.
 4. **Compute:** the clusters and storage the fleet may use, or none. If there are some, ask whether there is an HPC worker and what its home repo is.
-5. **Model API keys:** the paths of the key files. Never ask for, accept or write a key's value.
+5. **Model API keys:** the paths of the key files (readable on the agent host). Never ask for, accept or write a key's value.
 6. **The pack's choices** (see "Choices this pack makes" below): read them out and ask which to keep. Edit the blocks for any the operator changes.
 
 **Then confirm before committing:** show the filled `project.md` and each agent's assembled `AGENTS.md`, and ask the operator to confirm or correct them.
@@ -56,8 +57,9 @@ Every agent starts with its role and the fleet's working style instead of being 
    - **What it does not get:** no App, registry entry or routing.
    - **Where it runs:** on the code agent's host, so their sessions can message each other.
    - **Keep MACF's hooks out of its workspace** (no `macf init`, no `macf rules refresh`): the token hook blocks any `git push` made without a bot token.
+   - **Who sets it up:** the operator names an existing `<HPC_HOME_REPO>` in the interview. You push only its `AGENTS.md`, from the apply host as §3.4a does. The operator launches the worker on the agent host; list that launch in the run report. On two hosts, ask the operator how the worker will push without their `gh` login there.
 4. **Where the text goes:** if the agent repo's `AGENTS.md` has a `<!-- BEGIN template-managed … -->` region, put the text below its `<!-- END template-managed -->` line, never inside it. Otherwise put it at the top.
-5. **Fill every placeholder** from the interview, then check that none is left: `grep -nE '<[A-Z][A-Z_]+' AGENTS.md`. Leave the lowercase slots in the merge command (`<owner>`, `<repo>`, `<n>`, `<head-sha>`, `<message-file>`, `<verdict>`): agents fill those at run time.
+5. **Fill every placeholder** from the interview, replacing each `<…>` whole, including any hint after its colon (`<PAPER_SUMMARY: …>`, `<DONE: …>`). Then check that none is left: `grep -nE '<[A-Z][A-Z_]+' AGENTS.md`. Leave the lowercase slots in the merge command (`<owner>`, `<repo>`, `<n>`, `<head-sha>`, `<message-file>`, `<verdict>`): agents fill those at run time.
 6. **Commit and push** as §3.4a shows, before deploying.
 
 ## Placeholders
@@ -80,7 +82,7 @@ Every agent starts with its role and the fleet's working style instead of being 
 The operator can change any of these in the interview.
 1. **Agents merge their own PRs**, through the API, after a clean Gemini Argon and Codex Astra cross-review, with no peer or operator approval.
    - A code PR for an issue the science agent filed also needs science's confirmation.
-   - Two things on the fleet's repos would refuse this: branch protection that requires a review, and a permission check that blocks API merges. The repos need neither.
+   - Two things on the fleet's repos would refuse this: branch protection that requires a review, and a permission check that blocks API merges. Before §3.5, check that no fleet repo has branch protection that requires a review; if one does, tell the operator.
 2. **The squash message quotes a standing sanction in the operator's name:** "Standing sanction from <OPERATOR_LOGIN>: …".
 3. **Whoever governs compute does it without asking the operator:** the HPC worker, or the code agent when there is none.
 4. **The science and writing agents never contact each other.** The operator relays results.

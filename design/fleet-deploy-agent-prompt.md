@@ -8,7 +8,7 @@ MACF runs several Claude Code agents as a team. Each agent has its own GitHub Ap
 
 ## Inputs: get them all before anything else
 
-The operator may give some of these in their first message. **Ask the operator for every row that is still missing,** in plain conversation, a few at a time. `n/a` is a valid answer where a row does not apply. Until every row is answered you may read the walkthrough, but **do nothing else:** no installs, no repos, no other project.
+The operator may give some of these in their first message. **Ask the operator for every row that is still missing,** in plain conversation, a few at a time. `n/a` is a valid answer where a row does not apply. Until the operator has answered every row (never fill one from a guess), including an onboarding pack's interview, and has confirmed the read-back table, you may read the walkthrough and fetch and read the onboarding pack, but **do nothing else:** no installs, no repos, no other project.
 
 | field | |
 |---|---|
@@ -30,7 +30,7 @@ The operator may give some of these in their first message. **Ask the operator f
 | ready credentials | the Tailscale OAuth pair is created; the path of each existing age key (two hosts: one per host), or "generate" |
 
 **Read all the answers back once, as a table, and get the operator's confirmation.**
-- **With an onboarding pack** (for a paper fleet: `design/onboarding-packs/paper-fleet/`): fetch it and interview the operator for it as its README says. It replaces the project and agent rows, and its blocks go into each agent's `AGENTS.md` at §3.4a.
+- **With an onboarding pack** (for a paper fleet: `design/onboarding-packs/paper-fleet/`): fetch it from `main`, as its README §1 shows, and interview the operator for it as its README says. It replaces the project and agent rows, and its blocks go into each agent's `AGENTS.md` at §3.4a.
 - **Without one:** the project paragraph and the job lines go into each agent's `AGENTS.md` at §3.4a.
 - **If work repos is not `n/a`,** add a top-level `work_repos:` list to §2's manifest (§6.1).
 - **If the roles are not science, code and writing,** substitute the operator's roles in every loop and name the walkthrough uses, and recompute §3.3's click count and §1.2's length cap.
@@ -118,7 +118,8 @@ The operator may give some of these in their first message. **Ask the operator f
   - `~/.macf/{keys,certs}/<OWNER>/<PROJECT>/`;
   - its age keys;
   - the private `macf` prefix;
-  - its own cron script and watchdog line, through `macf fleet install-cron` only.
+  - its own cron script and watchdog line, through `macf fleet install-cron` only;
+  - with an onboarding pack's HPC worker, the `AGENTS.md` in `<HPC_HOME_REPO>`, and nothing else in that repo.
 
   Everything else on these machines, or in `OWNER`, belongs to someone else. Before §3.1, confirm `<OWNER>/<PROJECT>-control` does not exist, unless `run-log.md` shows this run created it.
 - **Never:**
