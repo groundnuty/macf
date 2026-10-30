@@ -37,7 +37,7 @@ ${opts.versions === false ? '' : `versions:\n  macf: ${opts.macf ?? '0.2.79'}\n 
 }
 
 const GH_OK = 'HTTP/2.0 200 OK\nX-Oauth-Scopes: admin:org, repo, workflow\n\n{"login":"someone"}';
-const PROBE_OK = 'node|login|v22.14.0\nclaude|login|2.1.300\ntmux|login|tmux 3.4\ncrontab|login|empty\ngh|login|gh version 2.60\nbash|login|GNU bash, version 5.2.21(1)-release\nmacf|login|0.2.79\n\ngh-token|login|installed';
+const PROBE_OK = 'node|login|v22.14.0\nclaude|login|2.1.300\ntmux|login|tmux 3.4\ncrontab|login|empty\ngh|login|gh version 2.60\nbash|login|GNU bash, version 5.2.21(1)-release\nmacf|login|0.2.79\ngit|login|git version 2.43.0\njq|login|jq-1.7\nopenssl|login|OpenSSL 3.0.13\ncurl|login|curl 8.5.0\ngh-token|login|installed';
 const ok = (stdout = ''): ExecResult => ({ code: 0, stdout, stderr: '' });
 const noSuchProgram: ExecResult = { code: null, stdout: '', stderr: 'ENOENT', spawnFailed: true };
 
@@ -64,6 +64,7 @@ function makeDeps(s: Setup = {}): { deps: PreflightDeps; execCalls: string[]; fe
       if (cmd === 'gh' && args[0] === 'extension') return ok('gh token\tLink-/gh-token\tv2.0.0\n');
       if (cmd === 'gh') return args[1]?.includes('vault.age') ? { code: 1, stdout: '', stderr: 'gh: Not Found (HTTP 404)' } : ok(GH_OK);
       if (cmd === 'age') return ok('v1.2.0\n');
+      if (cmd === 'git') return ok('git version 2.43.0\n');
       if (cmd === 'tailscale') return ok('{"BackendState":"Running","Peer":{}}');
       return { code: 1, stdout: '', stderr: 'unexpected call' };
     },
@@ -434,7 +435,8 @@ describe('agent host over ssh', () => {
 
   it('reports every tool on the VM when ready', async () => {
     const checks = await agentHostChecks(vmDeps(ok(PROBE_OK)), 'ubuntu@vm');
-    expect(checks.map((c) => c.status)).toEqual(['ok', 'ok', 'ok', 'ok', 'ok', 'ok', 'ok', 'ok', 'ok', 'ok']);
+    expect(checks.map((c) => c.status)).toEqual(Array(14).fill('ok'));
+    expect(checks.map((c) => c.id)).toEqual(expect.arrayContaining(['agent-host-git', 'agent-host-jq', 'agent-host-openssl', 'agent-host-curl']));
     expect(checks[0]?.detail).toBe('agents run on ubuntu@vm');
     expect(checks.find((c) => c.id === 'agent-host-macf')?.detail).toContain('0.2.79');
   });
@@ -672,5 +674,34 @@ describe('command: exit code and --json', () => {
     expect(json['to_fix']).toBe(1);
     expect(json['agent_host']).toBe('this machine');
     expect(json.checks.find((c) => c.id === 'secrets-file')).toMatchObject({ status: 'wrong', fix: expect.stringContaining('chmod 600') });
+  });
+});
+
+describe('every program apply and the agents run', () => {
+  it('the local checks run each apply-host program that has a command probe', async () => {
+    const { deps, execCalls } = makeDeps({ files: baseFiles() });
+    await runLocalPreflight(deps, { ...opts, agentHost: 'ubuntu@vm' });
+    const ran = new Set(execCalls.map((c) => c.split(' ')[0]));
+    for (const p of ['macf', 'gh', 'git', 'age', 'tailscale']) expect(ran.has(p), p).toBe(true);
+  });
+  it('apply host: git missing is reported with an install command; a failing git is wrong', async () => {
+    const run = async (r: ExecResult) => (await byId(makeDeps({ files: baseFiles(), exec: (c) => (c === 'git' ? r : undefined) }).deps)).git;
+    expect((await run(noSuchProgram))?.status).toBe('missing');
+    expect((await run(noSuchProgram))?.fix).toContain('install git');
+    expect((await run({ code: 1, stdout: '', stderr: 'boom' }))?.status).toBe('wrong');
+    expect((await run(ok('git version 2.43.0')))?.status).toBe('ok');
+  });
+  it.each(['git', 'jq', 'openssl', 'curl'])('agent host: %s absent from the login PATH is missing', async (tool) => {
+    const probe = PROBE_OK.replace(new RegExp(`${tool}\\|login\\|.*\n`), `${tool}|none|\n`);
+    const deps = makeDeps({ exec: (c, a, input) => (c === 'ssh' ? (a.includes('true') ? ok() : input !== undefined ? ok(probe) : undefined) : undefined) }).deps;
+    const c = (await agentHostChecks(deps, 'ubuntu@vm')).find((x) => x.id === `agent-host-${tool}`);
+    expect(c?.status).toBe('missing');
+  });
+  it('the probe script asks about every agent-host tool, and openssl by its own version command', async () => {
+    let script = '';
+    const deps = makeDeps({ exec: (c, _a, input) => { if (c === 'sh') { script = input ?? ''; return ok(PROBE_OK); } return undefined; } }).deps;
+    await agentHostChecks(deps, undefined);
+    for (const t of ['git', 'jq', 'openssl', 'curl']) expect(script).toContain(t);
+    expect(script).toContain('openssl version');
   });
 });

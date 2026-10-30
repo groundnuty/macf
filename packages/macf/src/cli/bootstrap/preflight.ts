@@ -173,6 +173,14 @@ async function ghTokenExtensionCheck(deps: PreflightDeps): Promise<PreflightChec
   return check('gh-token', 'tools', 'missing', 'the gh-token extension is not installed on this machine (apply mints App tokens with it)', fix);
 }
 
+/** apply runs `git clone`, `add`, `commit` and `push` on this machine (control repo, repo-init, deploy). */
+async function gitCheck(deps: PreflightDeps): Promise<PreflightCheck> {
+  const r = await deps.exec('git', ['--version'], { timeoutMs: 10000 });
+  if (r.spawnFailed === true) return check('git', 'tools', 'missing', 'git is not on PATH', 'install git (brew install git on Mac, sudo apt install git on Ubuntu)');
+  if (r.code !== 0) return check('git', 'tools', 'wrong', `git --version failed: ${probeFailure(r)}`, 'reinstall git and check the binary is executable');
+  return check('git', 'tools', 'ok', `git ${firstSemver(r.stdout) ?? 'present'}`);
+}
+
 async function ageCheck(deps: PreflightDeps): Promise<PreflightCheck> {
   const r = await deps.exec('age', ['--version'], { timeoutMs: 10000 });
   if (r.spawnFailed === true) {
@@ -497,15 +505,16 @@ export async function runLocalPreflight(deps: PreflightDeps, opts: PreflightOpti
   const load = loadManifestChecks(deps, opts.file);
   const vaultGiven = opts.vaultPath !== undefined && opts.identityKeyPath !== undefined;
   const secrets = secretsChecks(deps, load.manifest, opts.secretsPath, vaultGiven);
-  const [macf, gh, ghToken, age, tailscale, browser, endpoint, identity] = await Promise.all([
+  const [macf, gh, ghToken, git, age, tailscale, browser, endpoint, identity] = await Promise.all([
     macfOnPathCheck(deps),
     ghCheck(deps, load.manifest),
     opts.agentHost !== undefined ? ghTokenExtensionCheck(deps) : Promise.resolve(undefined),
+    gitCheck(deps),
     ageCheck(deps),
     tailscaleCheck(deps),
     browserCheck(deps),
     endpointCheck(deps, load.manifest, secrets.values),
     identityChecks(deps, load.manifest, opts.identityKeyPath),
   ]);
-  return [nodeCheck(deps), macf, gh, ...(ghToken !== undefined ? [ghToken] : []), age, tailscale, browser, ...load.checks, ...(load.manifest !== undefined ? applyManifestRefusalChecks(deps, load.manifest, opts) : []), ...secrets.checks, ...applyFlagRefusalChecks(deps, opts, secrets.values), ...endpoint, ...identity];
+  return [nodeCheck(deps), macf, gh, ...(ghToken !== undefined ? [ghToken] : []), git, age, tailscale, browser, ...load.checks, ...(load.manifest !== undefined ? applyManifestRefusalChecks(deps, load.manifest, opts) : []), ...secrets.checks, ...applyFlagRefusalChecks(deps, opts, secrets.values), ...endpoint, ...identity];
 }

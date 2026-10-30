@@ -6,8 +6,8 @@
  */
 import { compareSemver } from '@groundnuty/macf-core';
 import type { ExecResult, PreflightCheck, PreflightDeps } from './preflight.js';
+import { AGENT_HOST_TOOLS } from './preflight-programs.js';
 
-const AGENT_HOST_TOOLS = ['node', 'claude', 'tmux', 'crontab', 'gh', 'bash', 'macf'] as const;
 /** Every line the probe answers: the tools, plus the gh-token extension the agents mint App tokens with. */
 const PROBED = [...AGENT_HOST_TOOLS, 'gh-token'] as const;
 
@@ -41,6 +41,8 @@ const PROBE_SCRIPT = `for t in ${AGENT_HOST_TOOLS.join(' ')}; do
       if [ $rc -eq 0 ]; then v=present
       elif echo "$out" | grep -qi 'no crontab'; then v=empty
       else v="error: $(echo "$out" | head -n 1)"; fi
+    elif [ "$t" = openssl ]; then
+      v=$(bash -lc "openssl version 2>&1 | head -n 1")
     else
       v=$(bash -lc "$t --version 2>&1 | head -n 1")
     fi
