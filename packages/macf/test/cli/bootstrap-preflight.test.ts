@@ -47,6 +47,7 @@ interface Setup {
   env?: Record<string, string>;
   exec?: (cmd: string, args: readonly string[], input?: string) => ExecResult | undefined;
   fetch?: (url: string) => boolean;
+  status?: (url: string) => number | undefined;
   platform?: string;
 }
 
@@ -67,8 +68,10 @@ function makeDeps(s: Setup = {}): { deps: PreflightDeps; execCalls: string[]; fe
     },
     fetchUrl: async (url) => {
       fetchCalls.push(url);
+      const status = s.status?.(url);
+      if (status !== undefined) return { reached: true, status, detail: `HTTP ${String(status)}` };
       const reached = s.fetch?.(url) ?? true;
-      return { reached, detail: reached ? 'HTTP 200' : 'getaddrinfo ENOTFOUND' };
+      return { reached, ...(reached ? { status: 200 } : {}), detail: reached ? 'HTTP 200' : 'getaddrinfo ENOTFOUND' };
     },
     readText: (p) => s.files?.[p],
     fileMode: (p) => (s.files?.[p] !== undefined ? { exists: true, mode: s.modes?.[p] ?? 0o600 } : { exists: false }),
@@ -282,6 +285,37 @@ describe('runner platform endpoint', () => {
     expect(r['runner-endpoint']?.detail).toContain('unreachable by name and by IP');
     const noTs = await byId(makeDeps({ files: baseFiles(), fetch: () => false, exec: (c) => (c === 'tailscale' ? noSuchProgram : undefined) }).deps);
     expect(noTs['runner-endpoint']?.detail).toMatch(/^runner endpoint unreachable by name \(/);
+  });
+
+  it('503 by name is wrong, with the status in the detail', async () => {
+    const { deps } = makeDeps({ files: baseFiles(), status: () => 503 });
+    const r = await byId(deps);
+    expect(r['runner-endpoint']?.status).toBe('wrong');
+    expect(r['runner-endpoint']?.detail).toContain('HTTP 503');
+    expect(r['runner-endpoint']?.detail).toContain('by name');
+    expect(r['runner-endpoint']?.detail).not.toContain('unreachable');
+    expect(r['runner-endpoint']?.fix).toContain('health');
+  });
+
+  it('200 by name is ok, with the status in the detail', async () => {
+    const { deps } = makeDeps({ files: baseFiles(), status: () => 200 });
+    const r = await byId(deps);
+    expect(r['runner-endpoint']?.status).toBe('ok');
+    expect(r['runner-endpoint']?.detail).toContain('HTTP 200');
+  });
+
+  it('unreachable by name, then 503 by IP, is wrong and names the IP', async () => {
+    const { deps } = makeDeps({
+      files: baseFiles(),
+      fetch: () => false,
+      status: (u) => (u.includes('100.64.0.9') ? 503 : undefined),
+      exec: (c, a) => (c === 'tailscale' && a[0] === 'ip' ? ok('100.64.0.9\n') : undefined),
+    });
+    const r = await byId(deps);
+    expect(r['runner-endpoint']?.status).toBe('wrong');
+    expect(r['runner-endpoint']?.detail).toContain('HTTP 503');
+    expect(r['runner-endpoint']?.detail).toContain('by IP 100.64.0.9');
+    expect(r['runner-endpoint']?.detail).not.toContain('only by IP');
   });
 
   it('an exported but empty env var falls back to the secrets file, as apply does', async () => {

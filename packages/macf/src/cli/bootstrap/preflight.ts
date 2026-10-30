@@ -44,7 +44,10 @@ export interface ExecResult {
 }
 
 export interface FetchResult {
+  /** The host answered with an HTTP response (any status). */
   readonly reached: boolean;
+  /** The HTTP status when `reached`; absent when the host did not answer. */
+  readonly status?: number;
   readonly detail: string;
 }
 
@@ -410,6 +413,15 @@ export async function endpointCheck(
   return [sourceCheck, await probeEndpoint(deps, endpoint)];
 }
 
+/** The platform's `GET /` answers 2xx when it is up; any other status means the host is there but not healthy. */
+function isHealthy(r: FetchResult): boolean {
+  return r.status === undefined || (r.status >= 200 && r.status < 300);
+}
+
+function unhealthyCheck(r: FetchResult, via: string): PreflightCheck {
+  return check('runner-endpoint', 'endpoint', 'wrong', `runner endpoint answered HTTP ${String(r.status)} (${via})`, "the host answered but the runner platform is not healthy: check the platform's own health and logs");
+}
+
 async function probeEndpoint(deps: PreflightDeps, endpoint: string): Promise<PreflightCheck> {
   let url: URL;
   try {
@@ -418,12 +430,16 @@ async function probeEndpoint(deps: PreflightDeps, endpoint: string): Promise<Pre
     return check('runner-endpoint', 'endpoint', 'wrong', `${RUNNER_PLATFORM_ENDPOINT_ENV_VAR} is not a URL`, 'use http://<tailnet-host>:<port>');
   }
   const byName = await deps.fetchUrl(url.toString(), NET_TIMEOUT_MS);
-  if (byName.reached) return check('runner-endpoint', 'endpoint', 'ok', `runner endpoint reachable by name (${url.host})`);
+  if (byName.reached) {
+    if (!isHealthy(byName)) return unhealthyCheck(byName, 'by name');
+    return check('runner-endpoint', 'endpoint', 'ok', `runner endpoint reachable by name (${url.host}), ${byName.detail}`);
+  }
   const ip = await resolveTailnetIp(deps, url.hostname);
   if (ip !== undefined) {
     const ipUrl = new URL(url.toString());
     ipUrl.hostname = ip;
     const byIp = await deps.fetchUrl(ipUrl.toString(), NET_TIMEOUT_MS);
+    if (byIp.reached && !isHealthy(byIp)) return unhealthyCheck(byIp, `by IP ${ip}`);
     if (byIp.reached) {
       return check('runner-endpoint', 'endpoint', 'wrong', `runner endpoint reachable only by IP ${ip} (MagicDNS off here)`, `put http://${ip}:${url.port || '80'} in secrets.env as ${RUNNER_PLATFORM_ENDPOINT_ENV_VAR}`);
     }

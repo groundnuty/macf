@@ -81,7 +81,7 @@ function realExec(cmd: string, args: readonly string[], opts?: { readonly timeou
 async function realFetch(url: string, timeoutMs: number): Promise<FetchResult> {
   try {
     const res = await fetch(url, { method: 'GET', signal: AbortSignal.timeout(timeoutMs) });
-    return { reached: true, detail: `HTTP ${res.status}` };
+    return { reached: true, status: res.status, detail: `HTTP ${res.status}` };
   } catch (err) {
     const cause = err instanceof Error && err.cause instanceof Error ? err.cause.message : undefined;
     return { reached: false, detail: cause ?? (err instanceof Error ? err.message : String(err)) };
